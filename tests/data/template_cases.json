@@ -1,0 +1,1508 @@
+[
+ {
+  "name": "plain",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ]
+ },
+ {
+  "name": "system_low",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "low"
+  }
+ },
+ {
+  "name": "medium",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "medium"
+  }
+ },
+ {
+  "name": "multi_turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Think.",
+    "content": "Sunny."
+   },
+   {
+    "role": "user",
+    "content": "And tomorrow?"
+   }
+  ]
+ },
+ {
+  "name": "think_fast_field",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "think_fast": "Quick.",
+    "content": "Sunny."
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ]
+ },
+ {
+  "name": "empty_reasoning",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning": "",
+    "content": "Hi."
+   },
+   {
+    "role": "user",
+    "content": "Bye"
+   }
+  ]
+ },
+ {
+  "name": "late_system",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "",
+    "content": "Ok."
+   },
+   {
+    "role": "system",
+    "content": "Now answer in French."
+   },
+   {
+    "role": "user",
+    "content": "Encore?"
+   }
+  ]
+ },
+ {
+  "name": "tools_markdown",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "tools_markdown_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a weather bot."
+   },
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "tools_json",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "tool_presentation_format": "json"
+  }
+ },
+ {
+  "name": "tools_complex",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "create_event",
+     "description": "Create a calendar event with \"quotes\", a back\\slash and unicode: café ☕.",
+     "parameters": {
+      "type": "object",
+      "$defs": {
+       "Person": {
+        "type": "object",
+        "description": "A person",
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "email": {
+          "type": "string",
+          "format": "email"
+         }
+        },
+        "required": [
+         "name"
+        ]
+       },
+       "Color": {
+        "type": "string",
+        "enum": [
+         "red",
+         "it's green",
+         "blue\\ish"
+        ]
+       }
+      },
+      "properties": {
+       "title": {
+        "type": "string",
+        "title": "Title",
+        "examples": [
+         "Standup",
+         "1:1"
+        ]
+       },
+       "attendees": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/Person"
+        },
+        "description": "Who comes.\nAt least one."
+       },
+       "organizer": {
+        "$ref": "#/$defs/Person",
+        "description": "Overrides the def description"
+       },
+       "color": {
+        "$ref": "#/$defs/Color",
+        "default": "red"
+       },
+       "duration": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string",
+          "pattern": "^[0-9]+m$"
+         }
+        ]
+       },
+       "when": {
+        "oneOf": [
+         {
+          "type": "string",
+          "format": "date-time"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "priority": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "enum": [
+         1,
+         2,
+         3,
+         null
+        ],
+        "default": null
+       },
+       "ratio": {
+        "type": "number",
+        "default": 0.1,
+        "minimum": 1e-05,
+        "maximum": 1e+16
+       },
+       "weight": {
+        "type": "number",
+        "default": 2.0
+       },
+       "flags": {
+        "type": "object",
+        "additionalProperties": {
+         "type": "boolean"
+        },
+        "default": {
+         "a": true,
+         "b": false
+        }
+       },
+       "meta": {
+        "type": "object",
+        "additionalProperties": false,
+        "patternProperties": {
+         "^x-": {
+          "type": "string"
+         }
+        }
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "default": [],
+        "maxItems": 10
+       },
+       "note": {
+        "type": "string",
+        "default": ""
+       },
+       "big": {
+        "type": "integer",
+        "default": 12345678901234
+       }
+      },
+      "required": [
+       "title",
+       "attendees"
+      ]
+     },
+     "returns": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string",
+        "description": "Event id"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "description": "",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "lookup",
+     "description": "Look up.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       }
+      }
+     },
+     "response": {
+      "type": "string"
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "pick",
+     "parameters": {
+      "oneOf": [
+       {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "string"
+         }
+        }
+       },
+       {
+        "type": "object",
+        "properties": {
+         "b": {
+          "type": "integer"
+         }
+        }
+       }
+      ]
+     }
+    }
+   },
+   {
+    "name": "bare_fn",
+    "description": "A tool without the function wrapper.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "x": {
+       "type": "number"
+      }
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "tools_fallback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "fetch",
+     "description": "Fetch a URL.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "url": {
+        "$ref": "https://example.com/schemas/url"
+       }
+      }
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "tools_in_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Sys.",
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ]
+ },
+ {
+  "name": "call_xml",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "The user wants weather. Call get_weather.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 2,
+        "metric": true,
+        "hours": [
+         9,
+         12.5
+        ],
+        "opts": {
+         "lang": "fr",
+         "n": null
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp_c\": 18, \"sky\": \"clear\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "call_json",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "The user wants weather. Call get_weather.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 2,
+        "metric": true,
+        "hours": [
+         9,
+         12.5
+        ],
+        "opts": {
+         "lang": "fr",
+         "n": null
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp_c\": 18, \"sky\": \"clear\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "tool_call_format": "json"
+  }
+ },
+ {
+  "name": "call_xml_typed",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "The user wants weather. Call get_weather.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 2,
+        "metric": true,
+        "hours": [
+         9,
+         12.5
+        ],
+        "opts": {
+         "lang": "fr",
+         "n": null
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp_c\": 18, \"sky\": \"clear\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "create_event",
+     "description": "Create a calendar event with \"quotes\", a back\\slash and unicode: café ☕.",
+     "parameters": {
+      "type": "object",
+      "$defs": {
+       "Person": {
+        "type": "object",
+        "description": "A person",
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "email": {
+          "type": "string",
+          "format": "email"
+         }
+        },
+        "required": [
+         "name"
+        ]
+       },
+       "Color": {
+        "type": "string",
+        "enum": [
+         "red",
+         "it's green",
+         "blue\\ish"
+        ]
+       }
+      },
+      "properties": {
+       "title": {
+        "type": "string",
+        "title": "Title",
+        "examples": [
+         "Standup",
+         "1:1"
+        ]
+       },
+       "attendees": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/Person"
+        },
+        "description": "Who comes.\nAt least one."
+       },
+       "organizer": {
+        "$ref": "#/$defs/Person",
+        "description": "Overrides the def description"
+       },
+       "color": {
+        "$ref": "#/$defs/Color",
+        "default": "red"
+       },
+       "duration": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string",
+          "pattern": "^[0-9]+m$"
+         }
+        ]
+       },
+       "when": {
+        "oneOf": [
+         {
+          "type": "string",
+          "format": "date-time"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "priority": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "enum": [
+         1,
+         2,
+         3,
+         null
+        ],
+        "default": null
+       },
+       "ratio": {
+        "type": "number",
+        "default": 0.1,
+        "minimum": 1e-05,
+        "maximum": 1e+16
+       },
+       "weight": {
+        "type": "number",
+        "default": 2.0
+       },
+       "flags": {
+        "type": "object",
+        "additionalProperties": {
+         "type": "boolean"
+        },
+        "default": {
+         "a": true,
+         "b": false
+        }
+       },
+       "meta": {
+        "type": "object",
+        "additionalProperties": false,
+        "patternProperties": {
+         "^x-": {
+          "type": "string"
+         }
+        }
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "default": [],
+        "maxItems": 10
+       },
+       "note": {
+        "type": "string",
+        "default": ""
+       },
+       "big": {
+        "type": "integer",
+        "default": 12345678901234
+       }
+      },
+      "required": [
+       "title",
+       "attendees"
+      ]
+     },
+     "returns": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string",
+        "description": "Event id"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "tool_call_format": "xml_typed"
+  }
+ },
+ {
+  "name": "two_calls",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "",
+    "content": "Let me check both.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Oslo"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "Oslo \"events\" café"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "rain"
+   },
+   {
+    "role": "tool",
+    "content": "concert"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "tool_content_list",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "The user wants weather. Call get_weather.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 2,
+        "metric": true,
+        "hours": [
+         9,
+         12.5
+        ],
+        "opts": {
+         "lang": "fr",
+         "n": null
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": [
+     "a",
+     {
+      "type": "text",
+      "text": "b"
+     },
+     {
+      "k": 1
+     }
+    ]
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "tool_content_dict",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "The user wants weather. Call get_weather.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 2,
+        "metric": true,
+        "hours": [
+         9,
+         12.5
+        ],
+        "opts": {
+         "lang": "fr",
+         "n": null
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": {
+     "temp": 18.0,
+     "ok": true
+    }
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather.\nUse metric units by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City and country, e.g. Paris, FR"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "default": "celsius"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 7
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "typed_anyof",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "create_event",
+       "arguments": {
+        "title": "x",
+        "duration": 30,
+        "attendees": [
+         {
+          "name": "A"
+         }
+        ],
+        "color": "red",
+        "ratio": 0.5
+       }
+      }
+     }
+    ]
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "create_event",
+     "description": "Create a calendar event with \"quotes\", a back\\slash and unicode: café ☕.",
+     "parameters": {
+      "type": "object",
+      "$defs": {
+       "Person": {
+        "type": "object",
+        "description": "A person",
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "email": {
+          "type": "string",
+          "format": "email"
+         }
+        },
+        "required": [
+         "name"
+        ]
+       },
+       "Color": {
+        "type": "string",
+        "enum": [
+         "red",
+         "it's green",
+         "blue\\ish"
+        ]
+       }
+      },
+      "properties": {
+       "title": {
+        "type": "string",
+        "title": "Title",
+        "examples": [
+         "Standup",
+         "1:1"
+        ]
+       },
+       "attendees": {
+        "type": "array",
+        "items": {
+         "$ref": "#/$defs/Person"
+        },
+        "description": "Who comes.\nAt least one."
+       },
+       "organizer": {
+        "$ref": "#/$defs/Person",
+        "description": "Overrides the def description"
+       },
+       "color": {
+        "$ref": "#/$defs/Color",
+        "default": "red"
+       },
+       "duration": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "string",
+          "pattern": "^[0-9]+m$"
+         }
+        ]
+       },
+       "when": {
+        "oneOf": [
+         {
+          "type": "string",
+          "format": "date-time"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "priority": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "enum": [
+         1,
+         2,
+         3,
+         null
+        ],
+        "default": null
+       },
+       "ratio": {
+        "type": "number",
+        "default": 0.1,
+        "minimum": 1e-05,
+        "maximum": 1e+16
+       },
+       "weight": {
+        "type": "number",
+        "default": 2.0
+       },
+       "flags": {
+        "type": "object",
+        "additionalProperties": {
+         "type": "boolean"
+        },
+        "default": {
+         "a": true,
+         "b": false
+        }
+       },
+       "meta": {
+        "type": "object",
+        "additionalProperties": false,
+        "patternProperties": {
+         "^x-": {
+          "type": "string"
+         }
+        }
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "default": [],
+        "maxItems": 10
+       },
+       "note": {
+        "type": "string",
+        "default": ""
+       },
+       "big": {
+        "type": "integer",
+        "default": 12345678901234
+       }
+      },
+      "required": [
+       "title",
+       "attendees"
+      ]
+     },
+     "returns": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string",
+        "description": "Event id"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "tool_call_format": "xml_typed"
+  }
+ },
+ {
+  "name": "err_required_not_list",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "f",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": "a"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "err_required_missing",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "f",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "b"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "err_no_parameters",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "f"
+    }
+   }
+  ]
+ }
+]

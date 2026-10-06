@@ -1,0 +1,5 @@
+out/
+*.air
+*.metallib
+__pycache__/
+.DS_Store
