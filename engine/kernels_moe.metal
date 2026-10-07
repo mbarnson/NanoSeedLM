@@ -219,16 +219,29 @@ static inline float silu_bf(float g) {   // nn.silu on a BF16 tensor: g * sigmoi
 }
 
 // ---- embedding -------------------------------------------------------------------------------------------------------
-// x[t][:] = row ids[t] of the table (BF16, or Q8 dequantized to BF16)
+// x[t][:] = row ids[t] of the table (BF16, Q8 dequantized to BF16, or SEED4P4 decoded to BF16: W seeds, S coefficient
+// words, B the int32 bias, G the 32-bit stream table, EN exponent codes; tile_weights' arithmetic for one weight)
 kernel void k_embed(constant int& d [[buffer(0)]], device const ushort* W [[buffer(1)]], device const uint* QW [[buffer(2)]],
                     device const ushort* S [[buffer(3)]], device const ushort* B [[buffer(4)]],
-                    device const int* ids [[buffer(5)]], device float* x [[buffer(6)]],
-                    uint2 g [[thread_position_in_grid]]) {
+                    device const int* ids [[buffer(5)]], device float* x [[buffer(6)]], device const uint* G [[buffer(7)]],
+                    device const uchar* EN [[buffer(8)]], uint2 g [[thread_position_in_grid]]) {
     const uint c = g.x, t = g.y;
     if ((int) c >= d) return;
     const ulong row = (ulong) ids[t];
     float v;
-    if (FC_FMT == MF_Q8) {
+    if (FC_FMT == MF_SEED4P4) {
+        const ulong k = row * (ulong) (d / 8) + c / 8;
+        const uint s = W[k], gs = G[s], lo = s | (gs << 16), i = c % 8;
+        const int ci = (int) S[k];
+        const float q0 = float((ci << 28) >> 28), q1 = float((ci << 24) >> 28), q2 = float((ci << 20) >> 28), q3 = float((ci << 16) >> 28);
+        float cs[4];
+        for (uint p = 0; p < 4; ++p) {
+            const uint kk = 4 * i + p + 1;
+            cs[p] = as_type<float>(0x4B000000u | (kk <= 16 ? extract_bits(lo, kk, 16u) : extract_bits(gs, kk - 16, 16u))) - 8421376.0f;
+        }
+        const float sc = as_type<float>(uint(((device const int*) B)[0] + (int) ((EN[k >> 1] >> ((k & 1) * 4)) & 15) + 127) << 23) * (1.0f / 32767.0f);
+        v = bfr(((((cs[0] * q0) + (cs[1] * q1)) + (cs[2] * q2)) + (cs[3] * q3)) * sc);
+    } else if (FC_FMT == MF_Q8) {
         const uint w = QW[(row * (ulong) d + c) / 4];
         const float q = (float) ((w >> (8 * (c % 4))) & 255u);
         const ulong gi = (row * (ulong) d + c) / 64;

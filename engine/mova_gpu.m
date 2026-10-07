@@ -74,6 +74,7 @@ struct Eng {
     MW embed, norm, head;
     id<MTLBuffer> stab;                   // per-seed stream table (SEED4)
     id<MTLBuffer> stab32;                 // the 32-bit stream table (SEED4P4)
+    int n_seed4, n_seed4p4;               // tensors loaded in each seed format
     id<MTLBuffer> __strong* Kc;
     id<MTLBuffer> __strong* Vc;
     id<MTLBuffer> __strong* Ks;           // 8-bit KV cache (kv_q8): one f32 scale per (position, KV head); Kc / Vc are int8
@@ -325,9 +326,11 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         const int ok = t->kind == MOVA_K_EXPERTS ? 1
                        : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
                           t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4 || w->fmt == MF_SEED4P4))
-                       : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8)
+                       : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8 || w->fmt == MF_SEED4P4)
                        : w->fmt != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
         if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, w->fmt); return -1; }
+        e->n_seed4 += w->fmt == MF_SEED4;
+        e->n_seed4p4 += w->fmt == MF_SEED4P4;
         return 0;
     }
     return from_ckpt(e, t, w, err, errlen);
@@ -549,7 +552,6 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         LOAD(&e->embed, "model.embed_tokens.weight");
         LOAD(&e->norm, "model.norm.weight");
         LOAD(&e->head, "lm_head.weight");
-        int seeds = 0, seeds4 = 0;
         for (int l = 0; l < c->n_layer && !rc; ++l) {
             Layer* L = &e->L[l];
             L->sparse = l >= c->first_sparse;
@@ -567,8 +569,6 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
                 LOAD(&L->qm, "model.layers.%d.self_attn.mla.q_rope_mix", l);
                 LOAD(&L->ql, "model.layers.%d.self_attn.mla.q_lat", l);
                 LOAD(&L->vu, "model.layers.%d.self_attn.mla.v_up", l);
-                const MW* mw[6] = {&L->ka_x, &L->ka_v, &L->kr, &L->qm, &L->ql, &L->vu};
-                for (int i = 0; i < 6; ++i) seeds4 += mw[i]->fmt == MF_SEED4P4;   // the 32-bit stream table
             }
             if (!L->sparse) {
                 if (!c->mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
@@ -588,18 +588,16 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             LOAD(&L->sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight", l);
             LOAD(&L->su, "model.layers.%d.mlp.shared_experts.up_proj.weight", l);
             LOAD(&L->sd, "model.layers.%d.mlp.shared_experts.down_proj.weight", l);
-            seeds += L->eg.fmt == MF_SEED4 || L->ed.fmt == MF_SEED4;
-            seeds4 += L->eg.fmt == MF_SEED4P4 || L->eu.fmt == MF_SEED4P4 || L->ed.fmt == MF_SEED4P4;
         }
 #undef LOAD
         free(all);
         if (rc) { eng_close(e); return NULL; }
-        if (seeds) {   // the per-seed stream table
+        if (e->n_seed4) {   // the per-seed stream table
             e->stab = alloc_k(e, 65536 * 4, "stab", &e->mem.lut);
             uint32_t* g = (uint32_t*) e->stab.contents;
             for (uint32_t s = 0; s < 65536; ++s) g[s] = lfsr_stream24((uint16_t) s);
         } else e->stab = scratch(e, 256, "stab-dummy");
-        if (seeds4) {   // the 32-bit stream table (SEED4P4)
+        if (e->n_seed4p4) {   // the 32-bit stream table (SEED4P4)
             e->stab32 = alloc_k(e, 65536 * 4, "stab32", &e->mem.lut);
             uint32_t* g = (uint32_t*) e->stab32.contents;
             for (uint32_t s = 0; s < 65536; ++s) g[s] = lfsr_stream32((uint16_t) s);
@@ -1177,12 +1175,14 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
         const int32_t dd = d;
         cpipe(c, pipe_(e, "k_embed", e->embed.fmt, 0));
         cbytes(c, 0, &dd, 4);
-        cbuf(c, 1, e->embed.b[0], 0);
-        cbuf(c, 2, e->embed.b[0], 0);
-        cbuf(c, 3, e->embed.b[1] ? e->embed.b[1] : e->embed.b[0], 0);
-        cbuf(c, 4, e->embed.b[2] ? e->embed.b[2] : e->embed.b[0], 0);
+        cbuf(c, 1, e->embed.b[0], e->embed.o[0]);
+        cbuf(c, 2, e->embed.b[0], e->embed.o[0]);
+        cbuf(c, 3, e->embed.b[1] ? e->embed.b[1] : e->embed.b[0], e->embed.b[1] ? e->embed.o[1] : e->embed.o[0]);
+        cbuf(c, 4, e->embed.b[2] ? e->embed.b[2] : e->embed.b[0], e->embed.b[2] ? e->embed.o[2] : e->embed.o[0]);
         cbuf(c, 5, e->ids, 0);
         cbuf(c, 6, e->x, 0);
+        cbuf(c, 7, e->stab32, 0);
+        cbuf(c, 8, e->embed.fmt == MF_SEED4P4 ? e->embed.b[3] : e->embed.b[0], e->embed.fmt == MF_SEED4P4 ? e->embed.o[3] : 0);
         [c->enc dispatchThreads:MTLSizeMake((NSUInteger) d, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     int ns = (max_ctx + 127) / 128;
