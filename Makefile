@@ -81,6 +81,9 @@ $(BIN)/test_%: tests/test_%.c $(NSLM_HDRS) $(NSLM_LIB)
 $(BIN)/test_chat_template $(BIN)/test_tool_calls: $(BIN)/test_%: tests/test_%.c $(SERVE_C) $(SERVE_C:.c=.h) nslm/lib_json.c tests/data/template_golden.json
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -Iharness $< $(SERVE_C) nslm/lib_json.c -o $@ -lm
+$(BIN)/test_serve_splitter: tests/test_serve_splitter.m harness/nslm-serve.m harness/tokenizer.m harness/tokenizer.h $(SERVE_O) $(ENGINE) $(ENG_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(OBJCFLAGS) tests/test_serve_splitter.m harness/tokenizer.m $(SERVE_O) $(ENGINE) $(LIBS) -o $@
 $(BIN)/test_search_gpu: tests/test_search_gpu.m $(NSLM_HDRS) $(NSLM_LIB) $(RES)/search.metallib
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -ffp-contract=off tests/test_search_gpu.m $(NSLM_LIB) $(LIBS) -o $@

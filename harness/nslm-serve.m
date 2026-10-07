@@ -249,30 +249,49 @@ static bool emit_text(Conn* c, Gen* g, NSString* text, bool reasoning) {
     [g->content appendString:text];
     return flush_content(c, g, false);
 }
-// The first closing think tag in b[from, upto): the model may close with any of the three, whatever the prompt opened.
-static const char* find_close(const char* b, size_t from, size_t upto, size_t* tl) {
-    static const char* tags[] = {"</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>"};
+// The template already opens thinking, but models can echo an opening tag.
+static const char* thinking_tags[] = {
+    "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>",
+    "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>"
+};
+static const char* find_thinking_tag(const char* b, size_t from, size_t upto, size_t* tl, bool* closing) {
     for (size_t i = from; i < upto; ++i)
-        for (int t = 0; t < 3; ++t) {
-            const size_t l = strlen(tags[t]);
-            if (i + l <= upto && !memcmp(b + i, tags[t], l)) { *tl = l; return b + i; }
+        for (size_t t = 0; t < sizeof thinking_tags / sizeof *thinking_tags; ++t) {
+            const size_t l = strlen(thinking_tags[t]);
+            if (i + l <= upto && !memcmp(b + i, thinking_tags[t], l)) {
+                *tl = l;
+                *closing = thinking_tags[t][1] == '/';
+                return b + i;
+            }
         }
     return NULL;
 }
-// Hands out raw[sp->emitted .. upto), split at the closing think tag.
+// Keep a partial delimiter until the next decoded chunk; never emit its prefix as reasoning.
+static size_t thinking_tag_suffix(const char* b, size_t from, size_t upto) {
+    size_t keep = 0;
+    for (size_t t = 0; t < sizeof thinking_tags / sizeof *thinking_tags; ++t) {
+        const size_t max = MIN(strlen(thinking_tags[t]) - 1, upto - from);
+        for (size_t k = max; k > keep; --k)
+            if (!memcmp(b + upto - k, thinking_tags[t], k)) { keep = k; break; }
+    }
+    return keep;
+}
+// Hands out raw[sp->emitted .. upto), consuming thinking delimiters before the answer.
 static bool emit_upto(Conn* c, Gen* g, Splitter* sp, NSData* raw, size_t upto, bool final) {
     while (sp->emitted < upto) {
         const char* b = (const char*) raw.bytes;
         size_t end = upto;
         if (g->close_tag && !sp->in_content) {
             size_t tl = 0;
-            const char* hit = find_close(b, sp->emitted, upto, &tl);
+            bool closing = false;
+            const char* hit = find_thinking_tag(b, sp->emitted, upto, &tl, &closing);
             if (hit) end = (size_t) (hit - b);
+            else if (!final) end -= thinking_tag_suffix(b, sp->emitted, upto);
             size_t keep = end;   // newlines before a possible closing tag are held back
             while (keep > sp->emitted && b[keep - 1] == '\n') --keep;
             const size_t give = (final && !hit) ? end : keep;
             NSString* t = [[NSString alloc] initWithBytes:b + sp->emitted length:give - sp->emitted encoding:NSUTF8StringEncoding] ?: @"";
-            if (hit) { sp->in_content = true; sp->emitted = end + tl; }
+            if (hit) { sp->in_content = closing; sp->emitted = end + tl; }
             else sp->emitted = give;
             if (!emit_text(c, g, t, true)) return false;
             if (!hit) return true;
