@@ -124,6 +124,22 @@ def test_gather_gemm():
             assert rel_err(mx.array(want), got) < (4e-3 if dtype == mx.bfloat16 else 1e-5), (dtype, pairs)
 
 
+def test_combine_sorted():
+    """Expert-sorted rows reduced into tokens with the router weights: bitwise K2's (y * w).sum(-2) on unsorted y."""
+    for dtype in (mx.bfloat16, mx.float32):
+        rng = np.random.default_rng(17)
+        for tokens, k in ((5, 8), (300, 8), (37, 3)):
+            idx = mx.array(np.stack([rng.permutation(12)[:k] for _ in range(tokens)]).astype(np.uint32))
+            order = mx.argsort(idx.reshape(-1))
+            ys = mx.array(rng.standard_normal((tokens * k, 64)).astype(np.float32)).astype(dtype)
+            w = mx.array(rng.random((tokens, k)).astype(np.float32))
+            y = ns._unsort(ys, order, idx.shape)
+            want = (y * w.astype(dtype)[..., None]).sum(axis=-2)
+            got = ns.combine_sorted(ys, order, w)
+            assert got.shape == want.shape and got.dtype == dtype
+            assert bool(mx.all(got == want).item()), (dtype, tokens, k, rel_err(want, got))
+
+
 def test_switch_glu_without_decode():
     """SeedSwitchGLU above the mat-vec limit: matches SwitchGLU on the decoded weights, never builds a BF16 expert."""
     from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
@@ -200,6 +216,7 @@ def test_load_through_mlx_lm():
         layer.weight = mx.array(bf16_bits(ref_decode(*parts))).view(mx.bfloat16)
         ref.update_modules(tree_unflatten([(path, layer)]))
     assert type(model.model.layers[1].mlp.experts).__name__ == "SeedSwitchGLU"   # model_file is imported as its own module
+    assert type(model.model.layers[1].mlp).__name__ == "SeedSparseMoeBlock"
     assert model.model.layers[1].self_attn.v_experts.bits == 4
     assert isinstance(model.model.embed_tokens, nn.QuantizedEmbedding)
     for ids in (mx.array([[5]]), mx.array([list(range(1, 41))])):

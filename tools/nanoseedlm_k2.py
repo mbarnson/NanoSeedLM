@@ -49,6 +49,11 @@ inline float block_dot(uint g, const device uint16_t* seeds, const device uint16
     }
     return d * sc;
 }
+template <typename U> inline float round_to(float x) { return float(static_cast<U>(x)); }
+template <> inline float round_to<bfloat16_t>(float x) {   // nearest even, in integer ops (kept by the compiler)
+    uint u = as_type<uint>(x);
+    return as_type<float>((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
 """
 
 _DECODE = """
@@ -134,6 +139,21 @@ _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) {
         if (r < N && n + 1 < count) out[(p0 + n + 1) * N + r] = static_cast<T>(v[1]);
     }
 }
+"""
+
+# out[t] = sum_j T(y[inverse[t K + j]] * T(w[t][j])): K2's routed (y * w).sum(-2) on the expert-sorted rows, rounded as
+# mlx does it (products in T, then a sequential sum in T), 4 columns per thread. The rounding to T is explicit
+# (round_to): the compiler may keep a loop-carried bfloat in f32.
+_COMBINE = """
+const uint d = thread_position_in_grid.x * 4, t = thread_position_in_grid.y;
+if (d >= D) return;
+float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+for (uint j = 0; j < K; ++j) {
+    const device T* yr = y + inverse[t * K + j] * D + d;
+    const float w = round_to<T>(float(weights[t * K + j]));
+    for (uint c = 0; c < 4; ++c) acc[c] = round_to<T>(round_to<T>(float(yr[c]) * w) + acc[c]);
+}
+for (uint c = 0; c < 4; ++c) out[t * D + d + c] = static_cast<T>(acc[c]);
 """
 
 # One threadgroup: starts[e] = first pair of expert e in the sorted indices (binary search), tiles = the cumulative
@@ -247,6 +267,25 @@ def gather_gemm(x, sorted_indices, seeds, coefs, codes, exp_bias, tiles=None) ->
     )[0]
 
 
+def combine_sorted(ys, order, weights) -> mx.array:
+    """(y * weights[..., None]).sum(-2) for y = the expert-sorted rows ys (P, D) back in token order, without
+    building y: weights (..., k), order = the sort permutation of the flattened (token, k) pairs."""
+    k, (p, d) = weights.shape[-1], ys.shape
+    if d % 4:
+        raise ValueError("combine_sorted needs a hidden size divisible by 4")
+    inverse = mx.zeros((p,), mx.uint32)
+    inverse[order] = mx.arange(p, dtype=mx.uint32)
+    kernel = _kernel("combine", ["y", "inverse", "weights"], _COMBINE)
+    return kernel(
+        inputs=[ys, inverse, weights.reshape(-1, k)],
+        template=[("T", ys.dtype), ("D", d), ("K", k)],
+        grid=(d // 4, p // k, 1),
+        threadgroup=(min(256, d // 4), 1, 1),
+        output_shapes=[(p // k, d)],
+        output_dtypes=[ys.dtype],
+    )[0].reshape(weights.shape[:-1] + (d,))
+
+
 def _sort_pairs(x, indices):
     """x (..., cols) per token and indices (..., k) -> x per (token, expert) pair sorted by expert, the sorted indices
     and the order."""
@@ -307,13 +346,38 @@ class SeedSwitchGLU(SwitchGLU):
         x_gate = self.gate_proj.matvec(x, indices)
         return self.down_proj.matvec(self.activation(x_up, x_gate), indices).squeeze(-2)
 
-    def __call__(self, x, indices) -> mx.array:
-        if indices.size <= MATVEC_MAX_PAIRS:
-            return self._matvec(x, indices)
+    def _sorted(self, x, indices):
+        """The down projection's output per (token, expert) pair, sorted by expert, and the sort order."""
         xs, idx, order = _sort_pairs(x, indices)
         tiles = expert_tiles(idx, self.up_proj.seeds.shape[0])
         h = self.activation(self.up_proj.gemm(xs, idx, tiles), self.gate_proj.gemm(xs, idx, tiles))
-        return _unsort(self.down_proj.gemm(h, idx, tiles), order, indices.shape)
+        return self.down_proj.gemm(h, idx, tiles), order
+
+    def __call__(self, x, indices) -> mx.array:
+        if indices.size <= MATVEC_MAX_PAIRS:
+            return self._matvec(x, indices)
+        ys, order = self._sorted(x, indices)
+        return _unsort(ys, order, indices.shape)
+
+    def weighted(self, x, indices, weights) -> mx.array:
+        """(self(x, indices) * weights[..., None]).sum(-2); above the mat-vec limit without the [..., k, hidden] tensor."""
+        if indices.size <= MATVEC_MAX_PAIRS:
+            return (self._matvec(x, indices) * weights.astype(x.dtype)[..., None]).sum(axis=-2)
+        return combine_sorted(*self._sorted(x, indices), weights)
+
+
+class SeedSparseMoeBlock(getattr(_k2, "SparseMoeBlock", nn.Module)):
+    """K2's SparseMoeBlock whose routed sum comes from SeedSwitchGLU.weighted. __call__ mirrors oMLX's
+    (k2_horizon_model.py, main 2026-10-07) with only the routed line changed; keep the two in step."""
+
+    def __call__(self, x: mx.array) -> mx.array:
+        inds, weights = _k2.route(x, self.gate.weight, self.expert_bias, self.top_k, self.scaling_factor,
+                                  partitions=self.router_partitions)
+        ane = getattr(self.shared_experts, "_omlx_ane_prefill", None)
+        prepared = ane.prepare(x) if ane is not None and ane.active else None
+        routed = self.experts.weighted(x, inds, weights)
+        shared = self.shared_experts(x) if prepared is None else ane.finish(prepared, alongside=routed)
+        return routed + shared
 
 
 @dataclass
@@ -348,4 +412,7 @@ class Model(_k2.Model):
             m = _module(self, parent)
             if type(m) is SwitchGLU and all(isinstance(getattr(m, k), SeedSwitchLinear) for k in ("gate_proj", "up_proj", "down_proj")):
                 m.__class__ = SeedSwitchGLU
+                block = _module(self, parent.rsplit(".", 1)[0])
+                if type(block) is getattr(_k2, "SparseMoeBlock", None) and hasattr(_k2, "route"):
+                    block.__class__ = SeedSparseMoeBlock
         return weights
