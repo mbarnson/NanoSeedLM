@@ -104,6 +104,52 @@ def test_switch_linear():
         assert got.shape == want.shape and rel_err(want, got) < 1e-2, tokens
 
 
+def sorted_pairs(rng, pairs, experts, empty=()):
+    live = [e for e in range(experts) if e not in empty]
+    return np.sort(rng.choice(live, pairs)).astype(np.uint32)
+
+
+def test_gather_gemm():
+    """Expert-sorted pairs through the seeded tile GEMM: weights rebuilt as decode's BF16, f32 accumulation."""
+    for dtype in (mx.bfloat16, mx.float32):
+        rng = np.random.default_rng(9)
+        parts = random_seeds((5, 37, 96), rng, -20)
+        w = np.array(mx.array(ref_decode(*parts)).astype(mx.bfloat16).astype(mx.float32))
+        for pairs in (33, 150, 700):
+            idx = sorted_pairs(rng, pairs, 5, empty=(2,))
+            x = mx.array(rng.standard_normal((pairs, 96)).astype(np.float32)).astype(dtype)
+            got = ns.gather_gemm(x, mx.array(idx), *map(mx.array, parts))
+            want = np.einsum("mk,mnk->mn", np.array(x.astype(mx.float32)), w[idx])
+            assert got.shape == (pairs, 37) and got.dtype == dtype
+            assert rel_err(mx.array(want), got) < (4e-3 if dtype == mx.bfloat16 else 1e-5), (dtype, pairs)
+
+
+def test_switch_glu_without_decode():
+    """SeedSwitchGLU above the mat-vec limit: matches SwitchGLU on the decoded weights, never builds a BF16 expert."""
+    from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
+    real_decode, ns.decode = ns.decode, None
+    try:
+        for tokens in (5, 40, 300):
+            rng = np.random.default_rng(tokens)
+            glu, ref = SwitchGLU(64, 96, 6), SwitchGLU(64, 96, 6)
+            glu.__class__ = ns.SeedSwitchGLU
+            for name, (k, n) in {"gate_proj": (64, 96), "up_proj": (64, 96), "down_proj": (96, 64)}.items():
+                parts = random_seeds((6, n, k), rng, -18)
+                layer = ns.SeedSwitchLinear(k, n, 6)
+                layer.seeds, layer.coefs, layer.codes, layer.exp_bias = map(mx.array, parts)
+                setattr(glu, name, layer)
+                lin = SwitchLinear(k, n, 6, bias=False)
+                lin.weight = mx.array(ref_decode(*parts)).astype(mx.bfloat16)
+                setattr(ref, name, lin)
+            x = mx.array(rng.standard_normal((1, tokens, 64)).astype(np.float32)).astype(mx.bfloat16)
+            idx = mx.array(np.stack([rng.permutation(6)[:4] for _ in range(tokens)])[None].astype(np.uint32))
+            want, got = ref(x, idx), glu(x, idx)
+            assert got.shape == want.shape == (1, tokens, 4, 64)
+            assert rel_err(want, got) < 1e-2, tokens
+    finally:
+        ns.decode = real_decode
+
+
 def small_config():
     return dict(model_type="k2_horizon", hidden_size=64, num_hidden_layers=2, intermediate_size=128, num_attention_heads=4,
                 num_key_value_heads=2, head_dim=16, vocab_size=128, rms_norm_eps=1e-5, layernorm_num_groups=2,
