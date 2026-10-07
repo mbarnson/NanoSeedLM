@@ -30,7 +30,7 @@ ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm
 METALLIBS := $(RES)/kernels_moe.metallib $(RES)/search.metallib $(RES)/search4.metallib
 ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes \
              nslm-mova-mlacapture
-TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-mova-pack nslm-bits-probe)
+TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-bits-probe)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c \
                             tests/test_mova_kernels.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
@@ -88,6 +88,9 @@ $(OBJ)/%_metal.o: nslm/%_metal.m $(NSLM_HDRS)
 $(BIN)/nslm-moe: nslm/moe.c $(SEARCH_O) $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -O3 nslm/moe.c $(SEARCH_O) $(LIB_O) -o $@ -lm -lpthread $(LIBS)
+$(BIN)/nslm-dense: nslm/dense.c $(OBJ)/search4_metal.o $(LIB_O) $(NSLM_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -O3 nslm/dense.c $(OBJ)/search4_metal.o $(LIB_O) -o $@ -lm -lpthread $(LIBS)
 $(BIN)/nslm-mova-pack: nslm/mova_pack.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -O3 $< $(LIB_O) -o $@ -lm -lpthread
