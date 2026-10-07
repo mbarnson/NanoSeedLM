@@ -47,6 +47,25 @@ int main(void) {
             }
         }
         printf("search4 GPU vs C (%d x %d, %d seeds): %ld blocks differ, %ld error bits differ, of %zu\n", rows, cols, NS, bad, badr, nb);
+        // full transform: a lower-triangular A per column group (nslm4_gpu_search_a vs nslm4_search_ref_a)
+        float* A = calloc((size_t) ng * 64, sizeof(float));
+        for (int gi = 0; gi < ng; ++gi)
+            for (int i = 0; i < 8; ++i)
+                for (int j = 0; j <= i; ++j) A[gi * 64 + i * 8 + j] = i == j ? (float) (1.0 + fabs(frand(&sd))) : (float) (frand(&sd) * 0.5);
+        if (nslm4_gpu_search_a(g, w, rows, cols, A, bias, &o, gs, gc, ge, gr, err, sizeof err)) { printf("FAIL: %s\n", err); return 1; }
+        long bada = 0, badra = 0;
+        for (int gi = 0; gi < ng; ++gi) {
+            for (int s = 1; s <= NS; ++s) ok[s] = (uint8_t) nslm4_seed_entry_a(s, A + gi * 64, tab + (size_t) s * NSLM4_ENT);
+            for (int r = 0; r < rows; ++r) memcpy(wg + r * 8, w + (size_t) r * cols + gi * 8, 32);
+            nslm4_search_ref_a(tab, ok, wg, rows, A + gi * 64, bias, &o, cs, cc, ce, cr);
+            for (int r = 0; r < rows; ++r) {
+                const size_t k = (size_t) r * ng + gi;
+                bada += !(gs[k] == cs[r] && gc[k] == cc[r] && ge[k] == ce[r]);
+                badra += memcmp(&gr[k], &cr[r], 4) != 0;
+            }
+        }
+        printf("search4 full A GPU vs C: %ld blocks differ, %ld error bits differ, of %zu\n", bada, badra, nb);
+        bad += bada; badr += badra;
         nslm4_gpu_close(g);
         printf(bad || badr ? "FAIL\n" : "PASS\n");
         return bad || badr;

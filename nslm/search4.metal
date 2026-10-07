@@ -9,6 +9,7 @@ using namespace metal;
 #include "search4_gpu.h"
 
 #define MAGIC 12582912.0f
+constant bool kFull [[function_constant(0)]];   // SH holds a lower-triangular 8 x 8 A per column group, not sqrt(h)
 constant float kR32 = 1.0f / 32767.0f;
 
 static inline float pow2f(int e) { return as_type<float>((uint) (e + 127) << 23); }
@@ -25,14 +26,24 @@ static inline float f2bf_f(float f) {   // round to BF16 (nearest even), as f32
 }
 
 // nslm4_seed_entry: U[32], L[10], 1/diag[4], ok (ent[46])
-static inline void seed_entry(int s, thread const float (&sh)[8], threadgroup float * ent) {
+// U = (S R32) sh, or A (S R32) (nslm4_seed_entry_a)
+static inline void scaled_u(int s, thread const float (&sh)[8], thread const float (&A)[64], thread float (&U)[32]) {
     ushort st = (ushort) s;
+    float u0[32];
+    for (short k = 0; k < 32; ++k) { st = lfsr_step(st); u0[k] = (float) ((int) st - 32768) * kR32; }
+    for (short c = 0; c < 8; ++c)
+        for (short p = 0; p < 4; ++p) {
+            if (kFull) {
+                float acc = 0.0f;
+                for (short k = 0; k <= c; ++k) acc = acc + A[c * 8 + k] * u0[4 * k + p];
+                U[4 * c + p] = acc;
+            } else U[4 * c + p] = u0[4 * c + p] * sh[c];
+        }
+}
+
+static inline void seed_entry(int s, thread const float (&sh)[8], thread const float (&A)[64], threadgroup float * ent) {
     float U[32];
-    for (short k = 0; k < 32; ++k) {
-        st = lfsr_step(st);
-        const float u = (float) ((int) st - 32768) * kR32;
-        U[k] = u * sh[k / 4];
-    }
+    scaled_u(s, sh, A, U);
     float G[4][4];
     for (short i = 0; i < 4; ++i)
         for (short j = 0; j < 4; ++j) {
@@ -87,7 +98,8 @@ static inline float cand_err(threadgroup const float * L, thread const float (&q
 }
 
 // nslm4_decode_block + the weighted error, for (seed, e, q)
-static inline float decoded_err4(thread const float (&x)[8], thread const float (&sh)[8], int seed, int e, thread const int (&q)[4]) {
+static inline float decoded_err4(thread const float (&x)[8], thread const float (&sh)[8], thread const float (&A)[64], int seed, int e,
+                                 thread const int (&q)[4]) {
     ushort st = (ushort) seed;
     const float sc = kR32 * pow2f(e);
     float er = 0.0f;
@@ -98,7 +110,10 @@ static inline float decoded_err4(thread const float (&x)[8], thread const float 
         wv[c] = f2bf_f((float) isum * sc);
     }
     for (short c = 0; c < 8; ++c) {
-        const float d = x[c] - sh[c] * wv[c];
+        float v;
+        if (kFull) { v = 0.0f; for (short k = 0; k <= c; ++k) v = v + A[c * 8 + k] * wv[k]; }
+        else v = sh[c] * wv[c];
+        const float d = x[c] - v;
         er = er + d * d;
     }
     return er;
@@ -111,21 +126,28 @@ kernel void k_seed_search4(constant Search4Args & a [[buffer(0)]], device const 
                            ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float tab[S4_NCH * S4_ENT];
     const int g = a.g0 + (int) tg.x, ng = a.cols / 8, lo = a.bias, hi = a.bias + 15;
-    float sh[8];
-    for (short c = 0; c < 8; ++c) sh[c] = SH[g * 8 + c];
+    float sh[8], A[64];
+    for (short c = 0; c < 8; ++c) sh[c] = kFull ? 1.0f : SH[g * 8 + c];
+    for (short k = 0; k < 64; ++k) A[k] = kFull ? SH[g * 64 + k] : 0.0f;
     float x[S4_BPT][8], wn[S4_BPT], best[S4_BPT];
     int bs[S4_BPT], be[S4_BPT], row[S4_BPT];
     for (short j = 0; j < S4_BPT; ++j) {
         row[j] = (int) tg.y * S4_ROWS + j * S4_TPB + tid;
         const int r = min(row[j], a.rows - 1);
-        for (short c = 0; c < 8; ++c) x[j][c] = W[(ulong) r * a.cols + g * 8 + c] * sh[c];
+        for (short c = 0; c < 8; ++c) {
+            if (kFull) {
+                float acc = 0.0f;
+                for (short k = 0; k <= c; ++k) acc = acc + A[c * 8 + k] * W[(ulong) r * a.cols + g * 8 + k];
+                x[j][c] = acc;
+            } else x[j][c] = W[(ulong) r * a.cols + g * 8 + c] * sh[c];
+        }
         float n = 0.0f;
         for (short c = 0; c < 8; ++c) n = n + x[j][c] * x[j][c];
         wn[j] = n; best[j] = INFINITY; bs[j] = 1; be[j] = lo;
     }
     for (int s0 = 1; s0 <= a.n_seeds; s0 += S4_NCH) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < S4_NCH && s0 + tid <= a.n_seeds) seed_entry(s0 + tid, sh, tab + tid * S4_ENT);
+        if (tid < S4_NCH && s0 + tid <= a.n_seeds) seed_entry(s0 + tid, sh, A, tab + tid * S4_ENT);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const int nk = min(S4_NCH, a.n_seeds - s0 + 1);
         for (int k = 0; k < nk; ++k) {
@@ -156,9 +178,8 @@ kernel void k_seed_search4(constant Search4Args & a [[buffer(0)]], device const 
     // refit: rebuild the winner's entry in registers
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (short j = 0; j < S4_BPT; ++j) {
-        ushort st = (ushort) bs[j];
         float U[32];
-        for (short k = 0; k < 32; ++k) { st = lfsr_step(st); U[k] = ((float) ((int) st - 32768) * kR32) * sh[k / 4]; }
+        scaled_u(bs[j], sh, A, U);
         float G[4][4];
         for (short i = 0; i < 4; ++i)
             for (short jj = 0; jj < 4; ++jj) {
@@ -184,14 +205,14 @@ kernel void k_seed_search4(constant Search4Args & a [[buffer(0)]], device const 
         const float inv = pow2f(-e);
         int q[4], bq[4];
         for (short p = 0; p < 4; ++p) bq[p] = q[p] = (int) clampq((t[p] * inv + MAGIC) - MAGIC);
-        float bde = decoded_err4(x[j], sh, bs[j], e, q);
+        float bde = decoded_err4(x[j], sh, A, bs[j], e, q);
         if (a.refit)
             for (int d = 0; d < 81; ++d) {
                 int c4[4], dd = d;
                 bool okq = true;
                 for (short p = 0; p < 4; ++p) { c4[p] = q[p] + dd % 3 - 1; dd /= 3; okq = okq && c4[p] >= -8 && c4[p] <= 7; }
                 if (!okq) continue;
-                const float ee = decoded_err4(x[j], sh, bs[j], e, c4);
+                const float ee = decoded_err4(x[j], sh, A, bs[j], e, c4);
                 if (ee < bde) { bde = ee; for (short p = 0; p < 4; ++p) bq[p] = c4[p]; }
             }
         if (row[j] >= a.rows) continue;

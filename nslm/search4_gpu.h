@@ -34,6 +34,9 @@ Nslm4Gpu* nslm4_gpu_open(const char* library, char* err, int errlen);
 // sh: sqrt(h) per input channel (cols floats), or NULL for 1.  Returns 0 on success.
 int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const float* sh, int bias, const Search4Opts* o,
                      uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen);
+// The same with a lower-triangular 8 x 8 transform A per column group (ng x 64 floats, row-major; nslm4_search_ref_a).
+int nslm4_gpu_search_a(Nslm4Gpu* g, const float* w, int rows, int cols, const float* A, int bias, const Search4Opts* o,
+                       uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen);
 void nslm4_gpu_close(Nslm4Gpu* g);
 #ifdef __cplusplus
 }

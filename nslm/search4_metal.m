@@ -10,7 +10,7 @@
 struct Nslm4Gpu {
     id<MTLDevice> dev;
     id<MTLCommandQueue> q;
-    id<MTLComputePipelineState> pipe;
+    id<MTLComputePipelineState> pipe, pipe_a;   // sqrt(h); a full 8 x 8 transform per column group
 };
 
 Nslm4Gpu* nslm4_gpu_open(const char* metallib, char* err, int errlen) {
@@ -20,9 +20,15 @@ Nslm4Gpu* nslm4_gpu_open(const char* metallib, char* err, int errlen) {
         if (!g->dev) { snprintf(err, errlen, "no Metal device"); free(g); return NULL; }
         NSError* e = nil;
         id<MTLLibrary> lib = g->dev ? [g->dev newLibraryWithURL:[NSURL fileURLWithPath:@(metallib)] error:&e] : nil;
-        id<MTLFunction> f = lib ? [lib newFunctionWithName:@"k_seed_search4"] : nil;
-        g->pipe = f ? [g->dev newComputePipelineStateWithFunction:f error:&e] : nil;
-        if (!g->pipe) {
+        for (int full = 0; full <= 1; ++full) {
+            MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+            bool fb = full != 0;
+            [cv setConstantValue:&fb type:MTLDataTypeBool atIndex:0];
+            id<MTLFunction> f = lib ? [lib newFunctionWithName:@"k_seed_search4" constantValues:cv error:&e] : nil;
+            id<MTLComputePipelineState> ps = f ? [g->dev newComputePipelineStateWithFunction:f error:&e] : nil;
+            if (full) g->pipe_a = ps; else g->pipe = ps;
+        }
+        if (!g->pipe || !g->pipe_a) {
             snprintf(err, errlen, "%s: %s", metallib, e ? e.localizedDescription.UTF8String : "no k_seed_search4");
             g->dev = nil;
             free(g);
@@ -33,16 +39,20 @@ Nslm4Gpu* nslm4_gpu_open(const char* metallib, char* err, int errlen) {
     }
 }
 
-int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const float* sh, int bias, const Search4Opts* o,
-                     uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen) {
+static int search(Nslm4Gpu* g, const float* w, int rows, int cols, const float* sh, const float* A, int bias, const Search4Opts* o,
+                  uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen) {
     @autoreleasepool {
         if (cols % 8 || rows < 1 || o->n_exp < 1 || o->n_exp > 3) { snprintf(msg, msglen, "bad shape or options"); return -1; }
         const int ng = cols / 8;
         const size_t nb = (size_t) rows * ng;
         id<MTLBuffer> W = [g->dev newBufferWithBytes:w length:sizeof(float) * (size_t) rows * cols options:MTLResourceStorageModeShared];
-        id<MTLBuffer> SH = [g->dev newBufferWithLength:sizeof(float) * (size_t) cols options:MTLResourceStorageModeShared];
-        float* shp = (float*) SH.contents;
-        for (int c = 0; c < cols; ++c) shp[c] = sh ? sh[c] : 1.0f;
+        id<MTLBuffer> SH;
+        if (A) SH = [g->dev newBufferWithBytes:A length:sizeof(float) * 64 * (size_t) ng options:MTLResourceStorageModeShared];
+        else {
+            SH = [g->dev newBufferWithLength:sizeof(float) * (size_t) cols options:MTLResourceStorageModeShared];
+            float* shp = (float*) SH.contents;
+            for (int c = 0; c < cols; ++c) shp[c] = sh ? sh[c] : 1.0f;
+        }
         id<MTLBuffer> So = [g->dev newBufferWithLength:2 * nb options:MTLResourceStorageModeShared];
         id<MTLBuffer> Co = [g->dev newBufferWithLength:2 * nb options:MTLResourceStorageModeShared];
         id<MTLBuffer> Eo = [g->dev newBufferWithLength:nb options:MTLResourceStorageModeShared];
@@ -57,7 +67,7 @@ int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const floa
             Search4Args a = {rows, cols, g0, bias, o->n_seeds, o->n_exp, o->refit, {o->exp_delta[0], o->exp_delta[1], o->exp_delta[2]}};
             id<MTLCommandBuffer> cb = [g->q commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:g->pipe];
+            [enc setComputePipelineState:A ? g->pipe_a : g->pipe];
             [enc setBytes:&a length:sizeof a atIndex:0];
             [enc setBuffer:W offset:0 atIndex:1];
             [enc setBuffer:SH offset:0 atIndex:2];
@@ -83,8 +93,18 @@ int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const floa
     }
 }
 
+int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const float* sh, int bias, const Search4Opts* o,
+                     uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen) {
+    return search(g, w, rows, cols, sh, NULL, bias, o, seed, coef, ecode, err, msg, msglen);
+}
+
+int nslm4_gpu_search_a(Nslm4Gpu* g, const float* w, int rows, int cols, const float* A, int bias, const Search4Opts* o,
+                       uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen) {
+    return search(g, w, rows, cols, NULL, A, bias, o, seed, coef, ecode, err, msg, msglen);
+}
+
 void nslm4_gpu_close(Nslm4Gpu* g) {
     if (!g) return;
-    g->pipe = nil; g->q = nil; g->dev = nil;
+    g->pipe = nil; g->pipe_a = nil; g->q = nil; g->dev = nil;
     free(g);
 }

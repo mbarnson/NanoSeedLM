@@ -125,6 +125,47 @@ int main(void) {
         CHECK(!rf, "refit: %d blocks worse or with another seed / exponent", rf);
         free(tab); free(ok); free(w);
     }
+    // full transform A: diag(sh) reproduces the sh search bit for bit; a lower-triangular A reports |A (w - w')|^2
+    {
+        enum { NS = 1024, NB = 64 };
+        const int bias = -22;
+        unsigned sd = 21;
+        float* tab = calloc((size_t) 65536 * NSLM4_ENT, sizeof(float)), *taba = calloc((size_t) 65536 * NSLM4_ENT, sizeof(float));
+        uint8_t* ok = calloc(65536, 1), *oka = calloc(65536, 1);
+        float w[NB * 8], sh[8], A[64] = {0};
+        for (int i = 0; i < NB * 8; ++i) w[i] = (float) (frand(&sd) * 0.03);
+        for (int c = 0; c < 8; ++c) A[c * 9] = sh[c] = (float) (0.5 + (frand(&sd) + 1));
+        Search4Opts o = {NS, 3, {0, -1, 1}, 1};
+        for (int s = 1; s <= NS; ++s) {
+            ok[s] = (uint8_t) nslm4_seed_entry(s, sh, tab + (size_t) s * NSLM4_ENT);
+            oka[s] = (uint8_t) nslm4_seed_entry_a(s, A, taba + (size_t) s * NSLM4_ENT);
+        }
+        CHECK(!memcmp(tab, taba, sizeof(float) * (size_t) (NS + 1) * NSLM4_ENT) && !memcmp(ok, oka, NS + 1), "diag A: seed table differs");
+        uint16_t s1[NB], c1[NB], s2[NB], c2[NB];
+        uint8_t e1[NB], e2[NB];
+        float r1[NB], r2[NB];
+        nslm4_search_ref(tab, ok, w, NB, sh, bias, &o, s1, c1, e1, r1);
+        nslm4_search_ref_a(taba, oka, w, NB, A, bias, &o, s2, c2, e2, r2);
+        CHECK(!memcmp(s1, s2, sizeof s1) && !memcmp(c1, c2, sizeof c1) && !memcmp(e1, e2, sizeof e1) && !memcmp(r1, r2, sizeof r1),
+              "diag A: blocks differ from the sh search");
+        for (int i = 0; i < 8; ++i) for (int j = 0; j <= i; ++j) A[i * 8 + j] = i == j ? 1.0f + (float) fabs(frand(&sd)) : (float) (frand(&sd) * 0.5);
+        for (int s = 1; s <= NS; ++s) oka[s] = (uint8_t) nslm4_seed_entry_a(s, A, taba + (size_t) s * NSLM4_ENT);
+        nslm4_search_ref_a(taba, oka, w, NB, A, bias, &o, s2, c2, e2, r2);
+        int bad = 0;
+        for (int k = 0; k < NB; ++k) {
+            uint16_t bf[8];
+            nslm4_decode_block(s2[k], c2[k], e2[k] + bias, bf);
+            double er = 0;
+            for (int c = 0; c < 8; ++c) {
+                double d = 0;
+                for (int j = 0; j <= c; ++j) d += (double) A[c * 8 + j] * ((double) w[k * 8 + j] - nslm4_bf2f(bf[j]));
+                er += d * d;
+            }
+            bad += fabs(er - r2[k]) > 1e-4 * er + 1e-12;
+        }
+        CHECK(!bad, "full A: %d of %d reported errors differ from |A (w - w')|^2", bad, NB);
+        free(tab); free(taba); free(ok); free(oka);
+    }
     printf(fails ? "FAIL\n" : "PASS\n");
     return fails != 0;
 }

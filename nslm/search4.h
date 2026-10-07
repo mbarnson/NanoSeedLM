@@ -55,3 +55,10 @@ int nslm4_seed_entry(int s, const float* sh, float* ent);
 // for this column group (entry 0 unused); ok[s] = 0 marks seeds whose entry failed.
 void nslm4_search_ref(const float* tab, const uint8_t* ok, const float* w, int nb, const float* sh, int bias,
                       const Search4Opts* o, uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err);
+
+// The same search with a lower-triangular 8 x 8 transform A (row-major) in place of sh: x = A w, U = A (S R32), error
+// |A (w - w')|^2 (GPTQ: A = T^T, T the inverse of the column group's 8 x 8 block of the upper Cholesky factor of H^-1).
+// sh = the diagonal of A gives nslm4_seed_entry / nslm4_search_ref's results bit for bit.
+int nslm4_seed_entry_a(int s, const float A[64], float* ent);
+void nslm4_search_ref_a(const float* tab, const uint8_t* ok, const float* w, int nb, const float A[64], int bias,
+                        const Search4Opts* o, uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err);

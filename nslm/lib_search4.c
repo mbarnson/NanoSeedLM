@@ -30,15 +30,22 @@ void nslm4_decode_block(uint16_t seed, uint16_t coef, int e, uint16_t out[NSLM4_
     }
 }
 
-int nslm4_seed_entry(int s, const float* sh, float* ent) {
+// U = (S R32) scaled by sh, or A (S R32) for a lower-triangular A (row-major 8 x 8): acc = acc + A[c][k] u[k][p],
+// k = 0 .. c.
+static int seed_entry(int s, const float* sh, const float* A, float* ent) {
     memset(ent, 0, sizeof(float) * NSLM4_ENT);
     uint16_t st[32];
     lfsr_states((uint16_t) s, 32, st);
     float* U = ent;
+    float u0[32];
+    for (int k = 0; k < 32; ++k) u0[k] = (float) ((int32_t) st[k] - 32768) * NSLM_R32;
     for (int c = 0; c < 8; ++c)
         for (int p = 0; p < 4; ++p) {
-            const float u = (float) ((int32_t) st[4 * c + p] - 32768) * NSLM_R32;
-            U[4 * c + p] = sh ? u * sh[c] : u;
+            if (A) {
+                float acc = 0.0f;
+                for (int k = 0; k <= c; ++k) acc = acc + A[c * 8 + k] * u0[4 * k + p];
+                U[4 * c + p] = acc;
+            } else U[4 * c + p] = sh ? u0[4 * c + p] * sh[c] : u0[4 * c + p];
         }
     float G[4][4];
     for (int i = 0; i < 4; ++i)
@@ -70,6 +77,9 @@ int nslm4_seed_entry(int s, const float* sh, float* ent) {
     return 1;
 }
 
+int nslm4_seed_entry(int s, const float* sh, float* ent) { return seed_entry(s, sh, NULL, ent); }
+int nslm4_seed_entry_a(int s, const float A[64], float* ent) { return seed_entry(s, NULL, A, ent); }
+
 // t = G^-1 b through L: L y = b, L^T t = y (reciprocal diagonals).
 static inline void solve4(const float* L, const float* D, const float b[4], float t[4]) {
     const float y0 = b[0] * D[0];
@@ -95,24 +105,35 @@ static inline float cand_err(const float* L, const float q[4], const float b[4],
     return rec > 4.0f * wn ? INFINITY : (wn - (2.0f * sc) * qb) + rec;
 }
 
-// Decoded weighted error of (seed, e, q) against x = w * sh.
-static float decoded_err4(const float x[8], const float* sh, int seed, int e, const int q[4]) {
+// Decoded weighted error of (seed, e, q) against x = w * sh (or A w).
+static float decoded_err4(const float x[8], const float* sh, const float* A, int seed, int e, const int q[4]) {
     uint16_t bf[8];
     nslm4_decode_block((uint16_t) seed, nslm4_pack(q), e, bf);
     float er = 0.0f;
     for (int c = 0; c < 8; ++c) {
-        const float d = x[c] - (sh ? sh[c] * nslm4_bf2f(bf[c]) : nslm4_bf2f(bf[c]));
+        float v;
+        if (A) {
+            v = 0.0f;
+            for (int k = 0; k <= c; ++k) v = v + A[c * 8 + k] * nslm4_bf2f(bf[k]);
+        } else v = sh ? sh[c] * nslm4_bf2f(bf[c]) : nslm4_bf2f(bf[c]);
+        const float d = x[c] - v;
         er = er + d * d;
     }
     return er;
 }
 
-void nslm4_search_ref(const float* tab, const uint8_t* ok, const float* w, int nb, const float* sh, int bias,
-                      const Search4Opts* o, uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err) {
+static void search_ref(const float* tab, const uint8_t* ok, const float* w, int nb, const float* sh, const float* A,
+                       int bias, const Search4Opts* o, uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err) {
     const int lo = bias, hi = bias + 15;
     for (int k = 0; k < nb; ++k) {
         float x[8], wn = 0.0f;
-        for (int c = 0; c < 8; ++c) x[c] = sh ? w[k * 8 + c] * sh[c] : w[k * 8 + c];
+        for (int c = 0; c < 8; ++c) {
+            if (A) {
+                float acc = 0.0f;
+                for (int j = 0; j <= c; ++j) acc = acc + A[c * 8 + j] * w[k * 8 + j];
+                x[c] = acc;
+            } else x[c] = sh ? w[k * 8 + c] * sh[c] : w[k * 8 + c];
+        }
         for (int c = 0; c < 8; ++c) wn = wn + x[c] * x[c];
         float best = INFINITY;
         int bs = 1, be = lo;
@@ -147,13 +168,13 @@ void nslm4_search_ref(const float* tab, const uint8_t* ok, const float* w, int n
         const float inv = pow2f(-be);
         int q[4], bq[4];
         for (int p = 0; p < 4; ++p) bq[p] = q[p] = (int) clampq((t[p] * inv + MAGIC) - MAGIC);
-        float bde = decoded_err4(x, sh, bs, be, q);
+        float bde = decoded_err4(x, sh, A, bs, be, q);
         if (o->refit)
             for (int d = 0; d < 81; ++d) {
                 int c4[4], okq = 1, dd = d;
                 for (int p = 0; p < 4; ++p) { c4[p] = q[p] + dd % 3 - 1; dd /= 3; okq &= c4[p] >= -8 && c4[p] <= 7; }
                 if (!okq) continue;
-                const float ee = decoded_err4(x, sh, bs, be, c4);
+                const float ee = decoded_err4(x, sh, A, bs, be, c4);
                 if (ee < bde) { bde = ee; for (int p = 0; p < 4; ++p) bq[p] = c4[p]; }
             }
         seed[k] = (uint16_t) bs;
@@ -161,4 +182,14 @@ void nslm4_search_ref(const float* tab, const uint8_t* ok, const float* w, int n
         ecode[k] = (uint8_t) (be - bias);
         if (err) err[k] = bde;
     }
+}
+
+void nslm4_search_ref(const float* tab, const uint8_t* ok, const float* w, int nb, const float* sh, int bias,
+                      const Search4Opts* o, uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err) {
+    search_ref(tab, ok, w, nb, sh, NULL, bias, o, seed, coef, ecode, err);
+}
+
+void nslm4_search_ref_a(const float* tab, const uint8_t* ok, const float* w, int nb, const float A[64], int bias,
+                        const Search4Opts* o, uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err) {
+    search_ref(tab, ok, w, nb, NULL, A, bias, o, seed, coef, ecode, err);
 }
