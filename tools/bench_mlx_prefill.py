@@ -9,7 +9,8 @@ Per prompt length: prefill of BOS + held-out text in 2048-token chunks (mlx-lm's
 mx.eval of the cache state), the median tok/s of --repeats runs, and the peak memory over the weights
 (mx.reset_peak_memory before the prefill). Decode: stream_generate, greedy, --gen tokens (no EOS stop), median.
 --ane: oMLX's K2 ANE MLP prefill (enable_ane_prefill: dense MLPs and shared experts), prefill through
-model._omlx_prefill. Machine state (power, load, other CPU, thermal) before and after.
+model._omlx_prefill. Machine state (power, load, other CPU, free memory and the largest other processes, thermal) before and after:
+another model resident in oMLX or LM Studio shows in top_rss_gb.
 """
 import argparse
 import json
@@ -35,10 +36,12 @@ def machine_state():
         st["load1"], st["load5"] = (round(x, 2) for x in os.getloadavg()[:2])
         th = subprocess.run(["pmset", "-g", "therm"], capture_output=True, text=True).stdout
         st["thermal_warning"] = "No thermal warning" not in th
-        ps = subprocess.run(["ps", "-A", "-o", "pid=,%cpu=,comm="], capture_output=True, text=True).stdout.splitlines()
-        procs = [(float(c), Path(n).name) for p, c, n in (line.split(None, 2) for line in ps) if int(p) != os.getpid()]
-        st["other_cpu_pct"] = round(sum(c for c, _ in procs), 1)
-        st["top_other"] = [f"{n} {c:.0f}%" for c, n in sorted(procs, reverse=True)[:3]]
+        ps = subprocess.run(["ps", "-A", "-o", "pid=,%cpu=,rss=,comm="], capture_output=True, text=True).stdout.splitlines()
+        procs = [(float(c), int(r), Path(n).name) for p, c, r, n in (line.split(None, 3) for line in ps) if int(p) != os.getpid()]
+        st["other_cpu_pct"] = round(sum(c for c, _, _ in procs), 1)
+        st["top_other"] = [f"{n} {c:.0f}%" for c, _, n in sorted(procs, reverse=True)[:3]]
+        st["top_rss_gb"] = [f"{n} {r / 1e6:.1f}" for _, r, n in sorted(procs, key=lambda q: -q[1])[:3]]
+        st["mem_free_pct"] = int(subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True).stdout)
     except Exception as e:  # noqa: BLE001
         st["error"] = str(e)
     return st
