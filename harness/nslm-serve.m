@@ -1,7 +1,7 @@
 // harness/nslm-serve.m - OpenAI-compatible HTTP server for K2-Horizon-MoVA on the nslm engine.
 //
 //   nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080]
-//              [--ctx 4096] [--model-id ID] [--quiet]
+//              [--ctx 65536] [--model-id ID] [--quiet]
 //   nslm-serve --render REQUEST.json     print the prompt a chat request renders to, and exit
 //
 // GET /v1/models, GET /health, POST /v1/chat/completions, POST /v1/completions (stream or not).
@@ -39,7 +39,7 @@ static char g_model_id[256];
 static Eng* g_eng;
 static Tok* g_tok;
 static pthread_mutex_t g_eng_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_ctx = 4096;
+static int g_ctx = 65536;
 static int g_verbose = 1;
 
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
@@ -589,11 +589,11 @@ int main(int argc, char** argv) {
         if (opt(argc, argv, "--render", NULL)) return render_file(opt(argc, argv, "--render", NULL));
         const char *model = opt(argc, argv, "--model", NULL), *host = opt(argc, argv, "--host", "127.0.0.1");
         const int port = atoi(opt(argc, argv, "--port", "8080"));
-        g_ctx = atoi(opt(argc, argv, "--ctx", "4096"));
+        g_ctx = atoi(opt(argc, argv, "--ctx", "65536"));
         if (opt_flag(argc, argv, "--quiet")) g_verbose = 0;
         if (!model || g_ctx < 64) {
             fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
-                            "[--ctx 4096] [--model-id ID] [--quiet]\n       nslm-serve --render REQUEST.json\n");
+                            "[--ctx 65536] [--model-id ID] [--quiet]\n       nslm-serve --render REQUEST.json\n");
             return 2;
         }
         NSString* dir = [@(model) stringByStandardizingPath];
