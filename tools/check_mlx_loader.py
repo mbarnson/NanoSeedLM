@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""tools/check_mlx_loader.py - a model folder's MLX outputs against a saved reference (a loader change must not change
-the model): logits at 1 and 40 tokens (relative error <= 1e-3) and greedy output for 3 prompts x 300 tokens
-(identical; no EOS stop).
+"""A folder's MLX outputs against a saved reference: logits at 1 and 40 tokens (relative error <= 1e-3), greedy
+output for 3 prompts x 300 tokens (identical).
 
-  PYTHONPATH=~/devel/omlx-nslm python tools/check_mlx_loader.py FOLDER --save ref.npz      (with the current loader)
-  PYTHONPATH=~/devel/omlx-nslm python tools/check_mlx_loader.py FOLDER --compare ref.npz   (with the candidate)
+  PYTHONPATH=/path/to/omlx python tools/check_mlx_loader.py FOLDER --text FILE (--save | --compare) REF.npz
 """
 import argparse
 import sys
@@ -14,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_mlx_prefill import FILLER, load  # noqa: E402
+from bench_mlx_prefill import load  # noqa: E402
 
 PROMPTS = ["Write a short essay about the history of the bicycle.",
            "Explain how a hash table handles collisions, with a small Python example.",
@@ -22,9 +20,9 @@ PROMPTS = ["Write a short essay about the history of the bicycle.",
 GEN, MAX_REL = 300, 1e-3
 
 
-def outputs(model, tok):
+def outputs(model, tok, text):
     from mlx_lm import stream_generate
-    filler = tok.encode(FILLER.read_text(), add_special_tokens=False)
+    filler = tok.encode(Path(text).read_text(), add_special_tokens=False)
     out = {}
     for n in (1, 40):
         out[f"logits{n}"] = np.array(model(mx.array([[0] + filler[:n - 1]])).astype(mx.float32))
@@ -38,11 +36,12 @@ def outputs(model, tok):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder")
+    ap.add_argument("--text", required=True, help="prompt text (held-out prose)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--save")
     g.add_argument("--compare")
     a = ap.parse_args()
-    got = outputs(*load(a.folder))
+    got = outputs(*load(a.folder), a.text)
     if a.save:
         np.savez(a.save, **got)
         print(f"saved {a.save}")

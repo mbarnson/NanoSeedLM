@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
-"""tools/bench_mlx_prefill.py - MLX prefill and decode speed of a model folder, loaded through oMLX's load_text_model
-(Trust Remote Code on), as oMLX serves it.
+"""MLX prefill / decode speed of a model folder loaded through oMLX (Trust Remote Code), with machine state.
 
-  PYTHONPATH=~/devel/omlx-nslm python tools/bench_mlx_prefill.py FOLDER [--lengths 512,2048,8192] [--repeats 3]
-      [--ane] [--out FILE.json]
+  PYTHONPATH=/path/to/omlx python tools/bench_mlx_prefill.py FOLDER --text FILE [--lengths 512,2048,8192] [--ane]
 
-Per prompt length: prefill of BOS + held-out text in 2048-token chunks (mlx-lm's generate_step: model(chunk), then
-mx.eval of the cache state), the median tok/s of --repeats runs, and the peak memory over the weights
-(mx.reset_peak_memory before the prefill). Decode: stream_generate, greedy, --gen tokens (no EOS stop), median.
---ane: oMLX's K2 ANE MLP prefill (enable_ane_prefill: dense MLPs and shared experts), prefill through
-model._omlx_prefill. Machine state (power, load, other CPU, free memory and the largest other processes, thermal) before and after:
-another model resident in oMLX or LM Studio shows in top_rss_gb.
+Prefill: BOS + FILE's tokens in 2048-token chunks; median tok/s and peak memory over the weights. Decode: greedy.
 """
 import argparse
 import json
@@ -25,7 +18,6 @@ from types import SimpleNamespace
 import mlx.core as mx
 
 ROOT = Path(__file__).resolve().parent.parent
-FILLER = Path(os.environ.get("NSLM_FILLER", Path.home() / "devel/NSLMv2/eval/heldout/heldout.txt"))
 CHUNK = 2048
 
 
@@ -51,7 +43,7 @@ def load(folder):
     try:
         from omlx.utils.model_loading import load_text_model
     except ImportError as error:
-        raise SystemExit("put an oMLX checkout on PYTHONPATH (e.g. PYTHONPATH=~/devel/omlx-nslm)") from error
+        raise SystemExit("put an oMLX checkout on PYTHONPATH") from error
     model, tok = load_text_model(str(folder), model_settings=SimpleNamespace(trust_remote_code=True))[:2]
     mx.eval(model.parameters())
     return model, tok
@@ -94,6 +86,7 @@ def decode_once(model, tok, prompt, gen):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder")
+    ap.add_argument("--text", required=True, help="prompt text (held-out prose)")
     ap.add_argument("--lengths", default="512,2048,8192")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--gen", type=int, default=256, help="decode tokens (0: no decode run)")
@@ -110,7 +103,7 @@ def main():
         res["ane_programs"] = model._omlx_k2_ane_prefill_count
         res["weights_gb_ane"] = mx.get_active_memory() / 1e9
     prefill = prefill_fn(model)
-    filler = tok.encode(FILLER.read_text(), add_special_tokens=False)
+    filler = tok.encode(Path(a.text).read_text(), add_special_tokens=False)
     bos = tok.bos_token_id if tok.bos_token_id is not None else 0
     prefill_once(model, prefill, mx.array([bos] + filler[:511]))   # warm-up (kernel compilation)
 

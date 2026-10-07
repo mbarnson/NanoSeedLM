@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""tools/ab_mlx_prefill.py - paired prefill A/B: two model folders resident in one process, prefill runs alternated
-(A, B, A, B, ...), so drift between processes and over time cancels; reports median tok/s and the median of the
-per-round B/A ratios.
+"""Paired prefill A/B: both folders loaded in one process, runs alternated; median of the per-round B/A ratios.
 
-  PYTHONPATH=~/devel/omlx-nslm python tools/ab_mlx_prefill.py FOLDER_A FOLDER_B [--lengths 512,2048,8192] [--rounds 5]
-      [--ane-b] [--out FILE.json]
+  PYTHONPATH=/path/to/omlx python tools/ab_mlx_prefill.py FOLDER_A FOLDER_B --text FILE [--rounds 5] [--ane-b]
 """
 import argparse
 import json
@@ -15,13 +12,14 @@ from pathlib import Path
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_mlx_prefill import FILLER, load, machine_state, prefill_fn, prefill_once  # noqa: E402
+from bench_mlx_prefill import load, machine_state, prefill_fn, prefill_once  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("a")
     ap.add_argument("b")
+    ap.add_argument("--text", required=True, help="prompt text (held-out prose)")
     ap.add_argument("--lengths", default="512,2048,8192")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--ane-b", action="store_true", help="oMLX K2 ANE MLP prefill on B")
@@ -33,7 +31,7 @@ def main():
         from omlx.patches.k2_horizon.ane_prefill import enable_ane_prefill
         enable_ane_prefill(mb)
     fa, fb = prefill_fn(ma), prefill_fn(mb)
-    filler = tok.encode(FILLER.read_text(), add_special_tokens=False)
+    filler = tok.encode(Path(a.text).read_text(), add_special_tokens=False)
     warm = mx.array([0] + filler[:511])
     prefill_once(ma, fa, warm), prefill_once(mb, fb, warm)
     for n in (int(x) for x in a.lengths.split(",")):
