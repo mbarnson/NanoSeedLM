@@ -33,19 +33,25 @@ _HEADER = """
 constant float R32 = as_type<float>(0x38000100u);
 inline float block_dot(uint g, const device uint16_t* seeds, const device uint16_t* coefs, const device uint8_t* codes,
                        const device uint32_t* table, thread const float* xv, int bias, thread float* w) {
+    // isum_c / 2^16 exactly in f32: states as 1 + V / 2^16 from 32-bit stream words (two ops each),
+    // sum_p q_p v_p - 1.5 sum_p q_p (every term and partial sum is a multiple of 2^-16 below 2^6)
     uint s = seeds[g];
     uint q = coefs[g];
     int code = (codes[g >> 1] >> ((g & 1) * 4)) & 15;
-    float sc = ldexp(R32, bias + code);
-    ulong st = ulong(s) | (ulong(table[s]) << 16);
-    int q0 = int(q << 28) >> 28, q1 = int(q << 24) >> 28, q2 = int(q << 20) >> 28, q3 = int(q << 16) >> 28;
+    float sc = ldexp(R32, bias + code + 16);
+    uint t = table[s], lo = s | (t << 16);
+    float q0 = float(int(q << 28) >> 28), q1 = float(int(q << 24) >> 28), q2 = float(int(q << 20) >> 28), q3 = float(int(q << 16) >> 28);
+    float qs = 1.5f * (((q0 + q1) + q2) + q3);
     float d = 0.0f;
     for (uint c = 0; c < 8; ++c) {
-        uint k = 4 * c + 1;
-        int isum = (int((st >> k) & 0xFFFF) - 32768) * q0 + (int((st >> (k + 1)) & 0xFFFF) - 32768) * q1
-                 + (int((st >> (k + 2)) & 0xFFFF) - 32768) * q2 + (int((st >> (k + 3)) & 0xFFFF) - 32768) * q3;
-        if (w) w[c] = float(isum) * sc;
-        if (xv) d += float(isum) * xv[c];
+        float v[4];
+        for (uint p = 0; p < 4; ++p) {
+            uint k = 4 * c + p + 1;
+            v[p] = as_type<float>(insert_bits(0x3F800000u, k <= 16 ? lo >> k : t >> (k - 16), 7u, 16u));
+        }
+        float isum = (((v[0] * q0 + v[1] * q1) + v[2] * q2) + v[3] * q3) - qs;
+        if (w) w[c] = isum * sc;
+        if (xv) d += isum * xv[c];
     }
     return d * sc;
 }
