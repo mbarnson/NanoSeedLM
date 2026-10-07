@@ -26,6 +26,11 @@ K2-Horizon-MoVA is an atypical MoE. Between mixture of values, gated attention, 
 ```bash
 make
 make test
+```
+
+If you want to test the MLX remote code, use the k2_horizon_model.py script included with the model on HuggingFace.
+
+```
 OMLX_K2_MODEL=/path/to/k2_horizon_model.py make test-mlx   # the MLX loader
 ```
 
