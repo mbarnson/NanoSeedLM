@@ -166,6 +166,36 @@ def test_switch_glu_without_decode():
         ns.decode = real_decode
 
 
+def test_seed_linear():
+    """A dense seeded projection: the mat-vec for few rows, the tile GEMM above; x @ W^T on the decoded BF16."""
+    for tokens in (1, 3, 40):
+        rng = np.random.default_rng(100 + tokens)
+        parts = random_seeds((1, 40, 64), rng, -20)
+        layer = ns.SeedLinear(64, 40)
+        layer.seeds, layer.coefs, layer.codes, layer.exp_bias = map(mx.array, parts)
+        x = mx.array(rng.standard_normal((1, tokens, 64)).astype(np.float32)).astype(mx.bfloat16)
+        want = x @ mx.array(ref_decode(*parts)[0]).astype(mx.bfloat16).T
+        got = layer(x)
+        assert got.shape == want.shape == (1, tokens, 40) and rel_err(want, got) < 1e-2, tokens
+
+
+def test_seed_embedding():
+    """Seeded embedding rows: bitwise the decoded BF16 rows."""
+    rng = np.random.default_rng(7)
+    parts = random_seeds((1, 50, 64), rng, -18)
+    emb = ns.SeedEmbedding(50, 64)
+    emb.seeds, emb.coefs, emb.codes, emb.exp_bias = map(mx.array, parts)
+    ids = mx.array(rng.integers(0, 50, (2, 7)).astype(np.int32))
+    got = emb(ids)
+    want = bf16_bits(ref_decode(*parts)[0])[np.array(ids)]
+    assert got.shape == (2, 7, 64) and got.dtype == mx.bfloat16
+    assert np.array_equal(np.array(got.view(mx.uint16)), want)
+
+
+DENSE_SEEDED = ("model.layers.1.self_attn.q_proj", "model.layers.1.self_attn.o_proj", "model.layers.1.mlp.shared_experts.down_proj",
+                "lm_head", "model.embed_tokens")
+
+
 def small_config():
     return dict(model_type="k2_horizon", hidden_size=64, num_hidden_layers=2, intermediate_size=128, num_attention_heads=4,
                 num_key_value_heads=2, head_dim=16, vocab_size=128, rms_norm_eps=1e-5, layernorm_num_groups=2,
@@ -189,8 +219,8 @@ def test_load_through_mlx_lm():
     for name, value in tree_flatten(ref.parameters()):
         path = name.rsplit(".", 1)[0]
         hf = name.replace("mlp.expert_bias", "mlp.gate.bias").replace("self_attn.v_expert_bias", "self_attn.v_router.bias")
-        if "mlp.experts." in name:
-            parts = random_seeds(value.shape, rng)
+        if "mlp.experts." in name or "v_experts" in name or path in DENSE_SEEDED:
+            parts = random_seeds(value.shape if value.ndim == 3 else (1,) + value.shape, rng)
             seeded[path] = parts
             for k, v in zip(("seeds", "coefs", "codes", "exp_bias"), parts):
                 weights[f"{path}.{k}"] = mx.array(v)
@@ -212,13 +242,21 @@ def test_load_through_mlx_lm():
     nn.quantize(ref, class_predicate=lambda p, m: {"group_size": 64, "bits": quant[p]} if p in quant else False)
     for path, parts in seeded.items():
         e, n, k = parts[0].shape
-        layer = SwitchLinear(k * 8, n, e, bias=False)
-        layer.weight = mx.array(bf16_bits(ref_decode(*parts))).view(mx.bfloat16)
+        w = mx.array(bf16_bits(ref_decode(*parts))).view(mx.bfloat16)
+        if path in DENSE_SEEDED:
+            layer = nn.Embedding(n, k * 8) if path.endswith("embed_tokens") else nn.Linear(k * 8, n, bias=False)
+            layer.weight = w[0]
+        else:
+            layer = SwitchLinear(k * 8, n, e, bias=False)
+            layer.weight = w
         ref.update_modules(tree_unflatten([(path, layer)]))
     assert type(model.model.layers[1].mlp.experts).__name__ == "SeedSwitchGLU"   # model_file is imported as its own module
+    assert type(model.model.layers[1].self_attn.v_experts).__name__ == "SeedSwitchLinear"
+    assert type(model.model.layers[1].self_attn.q_proj).__name__ == "SeedLinear"
+    assert type(model.lm_head).__name__ == "SeedLinear"
+    assert type(model.model.embed_tokens).__name__ == "SeedEmbedding"
+    assert isinstance(model.model.layers[1].self_attn.k_proj, nn.QuantizedLinear)
     assert type(model.model.layers[1].mlp).__name__ == "SeedSparseMoeBlock"
-    assert model.model.layers[1].self_attn.v_experts.bits == 4
-    assert isinstance(model.model.embed_tokens, nn.QuantizedEmbedding)
     for ids in (mx.array([[5]]), mx.array([list(range(1, 41))])):
         err = rel_err(ref(ids), model(ids))
         assert err < 0.02, err

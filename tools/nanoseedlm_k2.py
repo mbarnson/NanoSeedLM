@@ -175,6 +175,15 @@ if (e == 0) {
 }
 """
 
+# Embedding rows: one thread per (token, block), decode's BF16.
+_EMBED = """
+uint b = thread_position_in_grid.x, t = thread_position_in_grid.y;
+if (b >= KB) return;
+float w[8];
+block_dot(uint(ids[t]) * KB + b, seeds, coefs, codes, table, nullptr, exp_bias[0], w);
+for (uint c = 0; c < 8; ++c) out[(t * KB + b) * 8 + c] = static_cast<bfloat16_t>(w[c]);
+"""
+
 _SEED_INPUTS = ["seeds", "coefs", "codes", "exp_bias", "table"]
 _kernels: dict = {}
 _table = None
@@ -286,6 +295,22 @@ def combine_sorted(ys, order, weights) -> mx.array:
     )[0].reshape(weights.shape[:-1] + (d,))
 
 
+def embed_rows(ids, seeds, coefs, codes, exp_bias) -> mx.array:
+    """Rows ids of a seeded [1, vocab, dims] table as BF16, shape ids.shape + (dims,)."""
+    kb = seeds.shape[-1]
+    flat = ids.reshape(-1).astype(mx.int32)
+    kernel = _kernel("embed", ["ids"] + _SEED_INPUTS, _EMBED)
+    out = kernel(
+        inputs=[flat, seeds, coefs, codes, exp_bias, lfsr_table()],
+        template=[("KB", kb)],
+        grid=(kb, flat.size, 1),
+        threadgroup=(min(kb, 256), 1, 1),
+        output_shapes=[(flat.size, kb * 8)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    return out.reshape(ids.shape + (kb * 8,))
+
+
 def _sort_pairs(x, indices):
     """x (..., cols) per token and indices (..., k) -> x per (token, expert) pair sorted by expert, the sorted indices
     and the order."""
@@ -335,6 +360,41 @@ class SeedSwitchLinear(nn.Module):
             raise ValueError("SeedSwitchLinear: one row per token above the mat-vec limit")
         xs, idx, order = _sort_pairs(x, indices)
         return _unsort(self.gemm(xs, idx), order, indices.shape).reshape(indices.shape + (1, self.output_dims))
+
+
+class SeedLinear(nn.Module):
+    """nn.Linear (no bias) with SeedLM P=4 weights: a one-expert SeedSwitchLinear."""
+
+    def __init__(self, input_dims: int, output_dims: int):
+        super().__init__()
+        if input_dims % BK:
+            raise ValueError(f"SeedLM P=4 in MLX needs input_dims divisible by {BK}")
+        self.seeds = mx.zeros((1, output_dims, input_dims // 8), mx.uint16)
+        self.coefs = mx.zeros((1, output_dims, input_dims // 8), mx.uint16)
+        self.codes = mx.zeros((1, output_dims, input_dims // 16), mx.uint8)
+        self.exp_bias = mx.zeros((1,), mx.int32)
+        self.input_dims, self.output_dims = input_dims, output_dims
+
+    def __call__(self, x):
+        xs = x.reshape(-1, self.input_dims)
+        idx = mx.zeros((xs.shape[0],), mx.uint32)
+        parts = (self.seeds, self.coefs, self.codes, self.exp_bias)
+        y = gather_matvec(xs, idx, *parts) if xs.shape[0] <= MATVEC_MAX_PAIRS else gather_gemm(xs, idx, *parts)
+        return y.reshape(x.shape[:-1] + (self.output_dims,))
+
+
+class SeedEmbedding(nn.Module):
+    """nn.Embedding with SeedLM P=4 rows, decoded per token."""
+
+    def __init__(self, num_embeddings: int, dims: int):
+        super().__init__()
+        self.seeds = mx.zeros((1, num_embeddings, dims // 8), mx.uint16)
+        self.coefs = mx.zeros((1, num_embeddings, dims // 8), mx.uint16)
+        self.codes = mx.zeros((1, num_embeddings, dims // 16), mx.uint8)
+        self.exp_bias = mx.zeros((1,), mx.int32)
+
+    def __call__(self, ids):
+        return embed_rows(ids, self.seeds, self.coefs, self.codes, self.exp_bias)
 
 
 class SeedSwitchGLU(SwitchGLU):
@@ -393,7 +453,7 @@ def _module(root: nn.Module, path: str) -> nn.Module:
 
 
 class Model(_k2.Model):
-    """K2-Horizon whose expert stacks with NAME.seeds tensors become SeedSwitchLinear."""
+    """K2-Horizon whose tensors with NAME.seeds become SeedSwitchLinear (expert stacks), SeedLinear or SeedEmbedding."""
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})
@@ -405,9 +465,16 @@ class Model(_k2.Model):
         for p in seeded:
             weights.pop(p + ".weight")
             e, n, kb = weights[p + ".seeds"].shape
-            if not hasattr(_module(self, p), "num_experts"):
-                raise ValueError(f"{p}: seed weights need a SwitchLinear module")
-            self.update_modules(tree_unflatten([(p, SeedSwitchLinear(kb * 8, n, e))]))
+            m = _module(self, p)
+            if hasattr(m, "num_experts"):
+                new = SeedSwitchLinear(kb * 8, n, e)
+            elif isinstance(m, nn.Embedding) and e == 1:
+                new = SeedEmbedding(n, kb * 8)
+            elif isinstance(m, nn.Linear) and e == 1 and "bias" not in m:
+                new = SeedLinear(kb * 8, n)
+            else:
+                raise ValueError(f"{p}: seed weights need a SwitchLinear, bias-free Linear or Embedding module")
+            self.update_modules(tree_unflatten([(p, new)]))
         for parent in {p.rsplit(".", 1)[0] for p in seeded}:
             m = _module(self, parent)
             if type(m) is SwitchGLU and all(isinstance(getattr(m, k), SeedSwitchLinear) for k in ("gate_proj", "up_proj", "down_proj")):
