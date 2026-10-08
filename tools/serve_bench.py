@@ -7,7 +7,7 @@ Each level starts N streaming chat requests at once (distinct short prompts, tem
 reasoning_effort high so the model keeps going; max_tokens --tokens).  Reported per level (median of --runs, a third run
 when two differ by more than 5%): aggregate decode tok/s (tokens after each stream's first, over the span from the first
 stream's first token to the last stream's end), per-request decode tok/s and time to first token, and the machine state
-(power, load, the busiest other processes, thermal, GPU utilization) before and after; each level first waits (up to
+(power, load, the busiest other processes, GPU utilization) before and after; each level first waits (up to
 --idle-wait s) for the GPU to be idle (macOS: under 5% busy), so another GPU job does not share the run.  The server's
 --max-seqs must be >= the largest N.
 """
@@ -40,7 +40,6 @@ def sh(cmd):
 def machine_state():
     s = {"load": sh("sysctl -n vm.loadavg || cat /proc/loadavg"),
          "power": sh("pmset -g batt | head -1 || echo unknown"),
-         "thermal": sh("pmset -g therm | grep -i -E 'level|warning' | tr '\\n' ' ' || echo unknown"),
          "lowpower": sh("pmset -g | grep -i lowpowermode | tr -s ' '"),
          "top_cpu": sh("ps -A -o %cpu=,comm= | sort -rn | head -5 | tr -s ' ' | tr '\\n' ';'"),
          "gpu_util": gpu_util()}
@@ -133,7 +132,7 @@ def main():
         print(f"{a.label} {n:3d} streams: aggregate {med['agg']:7.1f} tok/s (runs {row['agg_runs']}), per request "
               f"{med['per_med']:6.1f} tok/s (min {med['per_min']:.1f}), ttft {med['ttft_med']:.2f} s (max {med['ttft_max']:.2f})",
               flush=True)
-        print(f"     state: GPU busy before {idle}% | load {after['load']} | {after['power']} | thermal {after['thermal']} | top {after['top_cpu']}",
+        print(f"     state: GPU busy before {idle}% | load {after['load']} | {after['power']} | top {after['top_cpu']}",
               flush=True)
     if a.out:
         with open(a.out, "a") as f:
