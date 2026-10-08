@@ -159,6 +159,26 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
         }
         return acc;
     }
+    if (fmt == MF_Q8 && nbk % 64 == 0) {   // two adjacent blocks per lane: one 16-byte load, one group's scale and bias
+        const uint16_t* S = (const uint16_t*) w->p[1];
+        const uint16_t* B = (const uint16_t*) w->p[2];
+        const uint4* qr = (const uint4*) ((const uint32_t*) w->p[0] + ((size_t) r * K) / 4);
+#pragma unroll 2
+        for (int jq = lane; jq < nbk / 2; jq += 32) {
+            const size_t gi = ((size_t) r * K + (size_t) jq * 16) / 64;
+            const float s = bf(S[gi]), b = bf(B[gi]);
+            const uint4 q = qr[jq];
+            const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
+            const float4* xr = (const float4*) (xb + (size_t) jq * 16);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 xv = xr[i];
+                acc += bfr(s * (float) (qw[i] & 255u) + b) * xv.x + bfr(s * (float) ((qw[i] >> 8) & 255u) + b) * xv.y +
+                       bfr(s * (float) ((qw[i] >> 16) & 255u) + b) * xv.z + bfr(s * (float) (qw[i] >> 24) + b) * xv.w;
+            }
+        }
+        return acc;
+    }
     for (int j = lane; j < nbk; j += 32) {
         float wv[8];
         wblock(fmt, w, r, K, j, wv);
@@ -751,24 +771,28 @@ __global__ void k_attn_reduce(AttnArgs a, const float* part, const float* g, flo
     o[i] = bfr(att * softplus_gate(g[i]));
 }
 
-// Prefill attention on tensor cores: block (16 rows, KV head), one warp per query head of the group (ATTF_G); keys in
-// tiles of FA_BK through shared memory, shared by the group's heads.  MLX's prefill rounding points as mma operands:
+// Prefill attention on tensor cores: block (FA_RG x 16 rows, KV head), one warp per (query head of the group, 16 rows);
+// keys in tiles of FA_BK through shared memory, shared by the block's heads and rows (FA_RG x ATTF_G warps).  MLX's prefill rounding points as mma operands:
 // S = bf16(q * scale) K^T (BF16 products, f32 sums); online softmax per row in f32 (causal: key <= the row's
 // position); P = bf16(exp(S - running max)) is the A operand of O += P V; the row sum from the unrounded P; then the
 // softplus gate as k_attn_reduce.  Fragments follow mma.m16n8k16: the S accumulator of key tiles 2j, 2j + 1 is the A
 // fragment of P for key step j.
-#define FA_ROWS 16
+#define FA_ROWS 16             // rows per warp (the mma M)
+#ifndef FA_RG
+#define FA_RG 2                // row groups per block: each K / V tile serves FA_RG x 16 rows of ATTF_G heads
+#endif
 #define FA_BK 64
 #define FA_KLD (ATT_HD + 8)    // Ks [key][dim] row stride (BF16)
 #define FA_VLD (FA_BK + 8)     // Vt [dim][key] row stride
-__global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, const float* q, KvView kv, const RowInfo* ri,
-                                                                 const float* g, float* o, int T) {
+__global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArgs a, const float* q, KvView kv, const RowInfo* ri,
+                                                                         const float* g, float* o, int T) {
     __shared__ __align__(16) uint16_t Ks[FA_BK * FA_KLD];
     __shared__ __align__(16) uint16_t Vt[ATT_HD * FA_VLD];
-    const int kvh = (int) blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, h = kvh * ATTF_G + w;
+    const int kvh = (int) blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, h = kvh * ATTF_G + w % ATTF_G;
     const int gq = lane >> 2, t4 = lane & 3;
-    const int t0 = (int) blockIdx.x * FA_ROWS, nrows = min(FA_ROWS, T - t0);
-    const int kend = ri[t0 + nrows - 1].pos + 1;
+    const int b0 = (int) blockIdx.x * FA_ROWS * FA_RG, kend = ri[min(b0 + FA_ROWS * FA_RG, T) - 1].pos + 1;
+    const int tw = b0 + (w / ATTF_G) * FA_ROWS, live = tw < T;   // this warp's rows (none past T: it only loads tiles)
+    const int t0 = live ? tw : T - 1, nrows = live ? min(FA_ROWS, T - tw) : 1;
     // this thread's two rows (gq, gq + 8) and their positions; rows past T repeat the last
     const int ra = t0 + min(gq, nrows - 1), rb = t0 + min(gq + 8, nrows - 1);
     const int pa = ri[ra].pos, pb = ri[rb].pos;
@@ -792,7 +816,7 @@ __global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, con
     float ma = -INFINITY, mb = -INFINITY, la = 0, lb = 0;
     for (int k0 = 0; k0 < kend; k0 += FA_BK) {
         // K tile [key][dim] and V tile transposed [dim][key], 8 dims per load
-        for (int e = threadIdx.x; e < FA_BK * ATT_HD / 8; e += 32 * ATTF_G) {
+        for (int e = threadIdx.x; e < FA_BK * ATT_HD / 8; e += 32 * ATTF_G * FA_RG) {
             const int key = e / (ATT_HD / 8), d8 = (e % (ATT_HD / 8)) * 8, p = k0 + key;
             uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
             if (p < kend) {
@@ -808,7 +832,7 @@ __global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, con
             }
         }
         __syncthreads();
-        if (k0 <= max(pa, pb)) {
+        if (live && k0 <= max(pa, pb)) {
             // S = Q K^T: 8 key tiles of 8
             float S[8][4];
 #pragma unroll
@@ -876,7 +900,7 @@ __global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, con
 #pragma unroll
         for (int q2 = 0; q2 < 4; ++q2) {
             const int r = (q2 >> 1) ? gq + 8 : gq;
-            if (r >= nrows) continue;
+            if (!live || r >= nrows) continue;
             const size_t i = ((size_t) (t0 + r) * a.n_head + h) * ATT_HD + j * 8 + t4 * 2 + (q2 & 1);
             o[i] = bfr(bfr(O[j][q2] / ((q2 >> 1) ? lb : la)) * softplus_gate(g[i]));
         }
@@ -1068,7 +1092,7 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
     k_attn_reduce<<<dim3((unsigned) a.n_head, (unsigned) T), ATT_HD, 0, s>>>(a, part, g, o);
 }
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T) {
-    k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS - 1) / FA_ROWS, (unsigned) a.n_kv), 32 * ATTF_G, 0, s>>>(a, q, kv, ri, g, o, T);
+    k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS * FA_RG - 1) / (FA_ROWS * FA_RG), (unsigned) a.n_kv), 32 * ATTF_G * FA_RG, 0, s>>>(a, q, kv, ri, g, o, T);
 }
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int stream) {
     k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count, stream);

@@ -1,7 +1,8 @@
 // harness/nslm-chat.c - single-turn chat with K2-Horizon-MoVA through the engine, streaming the reply to stdout.
 //
 //   nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N]
-//             [--system TEXT] [--effort high|medium|low] [--kv bf16|q8] [--ctx N] [--print-ids] "prompt text"
+//             [--system TEXT] [--effort high|medium|low] [--kv bf16|q8] [--ctx N] [--print-ids]
+//             ("prompt text" | --prompt-file FILE)
 //
 // The prompt is MoVA's chat_template.jinja rendered for an optional system message and one user message, with the
 // generation prompt (reasoning effort high = <ifm|think>, the template's default).  temp 0 = greedy (arg max, ties to
@@ -66,6 +67,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--effort") && has_val) effort = argv[++i];
         else if (!strcmp(a, "--kv") && has_val) kvq8 = !strcmp(argv[++i], "q8");
         else if (!strcmp(a, "--ctx") && has_val) ctx = atoi(argv[++i]);
+        else if (!strcmp(a, "--prompt-file") && has_val) {
+            prompt = plat_slurp(argv[++i], NULL);
+            if (!prompt) { fprintf(stderr, "cannot read %s\n", argv[i]); return 2; }
+        }
         else if (a[0] == '-' && a[1] == '-') { fprintf(stderr, "unknown or incomplete option %s\n", a); return usage(); }
         else if (!prompt) prompt = a;
         else return usage();
