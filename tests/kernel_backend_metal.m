@@ -432,7 +432,7 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
     id<MTLBuffer> lb = buf(ql, on), qb = buf(qr, 4 * (size_t) T * a.n_head * 128), Kb = buf(Kc, 2 * (size_t) npos * 128),
                   Vb = buf(Vc, 2 * (size_t) npos * a.r), rb = buf(ri, sizeof(RowInfo) * (size_t) T), ob = buf(NULL, on),
                   pb = buf(NULL, 4 * (size_t) T * a.n_head * a.n_splits * (a.r + 2));
-    id<MTLComputePipelineState> pa = pipe_("k_mla_attn", 0, 0), pd = pipe_("k_mla_reduce", 0, 0);
+    id<MTLComputePipelineState> pa = pipe_("k_mla_attn", 0, (a.r + MLAF_DC - 1) / MLAF_DC), pd = pipe_("k_mla_reduce", 0, 0);
     if (!pa || !pd) return -1;
     const int ng = (a.n_head + MLAF_Q - 1) / MLAF_Q;
     if (run(^(id<MTLComputeCommandEncoder> e) {

@@ -756,7 +756,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     cbuf(c, 7, e->inv, 0);
     const int nx = (H + 1) * 64 > r ? (H + 1) * 64 : r;
     [c->enc dispatchThreads:MTLSizeMake((NSUInteger) nx, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-    cpipe(c, pipe_(e, "k_mla_attn", 0, 0));
+    cpipe(c, pipe_(e, "k_mla_attn", 0, (r + MLAF_DC - 1) / MLAF_DC));
     cbytes(c, 0, &ma, sizeof ma);
     cbuf(c, 1, e->qlat, 0);
     cbuf(c, 2, e->qrp, 0);
