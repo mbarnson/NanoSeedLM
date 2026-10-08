@@ -232,7 +232,7 @@ int kt_swiglu(const float* g, const float* u, float* a, int n) {
 int kt_combine(const float* D, const float* w, const float* shared, float* x, float* v, int d, int k, int T) {
     id<MTLBuffer> Db = buf(D, 4 * (size_t) T * k * d), wb = buf(w, 4 * (size_t) T * k), shb = buf(shared, 4 * (size_t) T * d),
                   xb = buf(x, 4 * (size_t) T * d), vb = buf(NULL, 4 * (size_t) T * d);
-    const int32_t dk[2] = {d, k};
+    const int32_t dk2[2] = {d, k}, *dk = dk2;   // blocks cannot capture arrays
     id<MTLComputePipelineState> pc = pipe_("k_moe_combine", 0, 0), pv = pipe_("k_vcombine", 0, 0);
     if (!pc || !pv || run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:pc]; [e setBuffer:Db offset:0 atIndex:0]; [e setBuffer:wb offset:0 atIndex:1];
@@ -264,7 +264,7 @@ int kt_rope_attn(AttnArgs a, float* q, const float* k, const float* v, uint16_t*
     id<MTLBuffer> qb = buf(q, qn), kb = buf(k, kn), vb = buf(v, kn), Kb = buf(Kc, cn), Vb = buf(Vc, cn),
                   rb = buf(ri, sizeof(RowInfo) * (size_t) T), ib = buf(inv, 4 * 64), gb = buf(g, qn), ob = buf(NULL, qn),
                   pb = buf(NULL, 4 * (size_t) T * a.n_head * a.n_splits * 130);
-    const int32_t hk[2] = {a.n_head, a.n_kv};
+    const int32_t hk2[2] = {a.n_head, a.n_kv}, *hk = hk2;   // blocks cannot capture arrays
     id<MTLComputePipelineState> pr = pipe_("k_rope_kv", 0, 0), pa = pipe_("k_attn", 0, 0), pd = pipe_("k_attn_reduce", 0, 0);
     if (!pr || !pa || !pd || run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:pr];
