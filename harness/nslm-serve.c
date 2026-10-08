@@ -499,8 +499,8 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // queue, slots, jo
 static pthread_cond_t g_wake = PTHREAD_COND_INITIALIZER;     // the scheduler: a job queued or cancelled, a slot saved
 static Job* g_queue;
 static Slot* g_slots;
-typedef struct Save {   // a slot's blocks [b0, nb) for the writer (the tokens of blocks [0, nb))
-    int slot, b0, nb;
+typedef struct Save {   // for the writer: a slot's cache of nb blocks (their tokens); blocks on disk are skipped
+    int slot, nb;
     int32_t* ids;
     struct Save* next;
 } Save;

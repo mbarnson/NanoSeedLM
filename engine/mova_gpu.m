@@ -77,6 +77,8 @@ struct Eng {
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     int mla_hg;                           // MLA: query heads per latent-attention threadgroup (pipeline limit)
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
+    int batch_gemm;                       // NSLM_BATCH_GEMM: a decode step of more than MV_MAXT rows in one forward (GEMMs)
+    int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
     EngMem mem;
     Seq* seqs;                            // slot s: KV cache rows s * slot_cap ..
     int nseqs;
@@ -455,7 +457,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->ri = scratch(e, (uint64_t) T * sizeof(RowInfo), "rowinfo");
         e->inv = scratch(e, 64 * 4, "invfreq");
         // rows x splits <= 1024 (encode_forward); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
-        const uint64_t prow = c->mla ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
+        const uint64_t prow = c->mla && !getenv("NSLM_BATCH_GEMM") ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
+        e->batch_gemm = getenv("NSLM_BATCH_GEMM") != NULL;
         e->part = scratch(e, prow * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");
         if (c->mla) {
             e->lat = scratch(e, (uint64_t) T * rmax * 4, "MLA latent");
@@ -711,7 +714,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     enc_heads_mv(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);
     enc_heads_mv(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);
     cmd_group(c, MOVA_TG_ATTN);
-    const int big = T > MV_MAXT || e->prompt, nsp = big ? 1 : ns;
+    const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns;
     const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
     cpipe(c, pipe_(e, "k_mla_rope", 0, 0));
     cbytes(c, 0, &ma, sizeof ma);
@@ -815,7 +818,7 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
             cbytes(c, 7, hk, 8);
             if (q8) { cbuf(c, 8, e->Ks[l], 0); cbuf(c, 9, e->Vs[l], 0); }
             [c->enc dispatchThreads:MTLSizeMake((NSUInteger) g->n_head * 64, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-            if (big) {   // prefill: key tiles on simdgroup matrices, the gate fused
+            if (big && !e->decode_rows) {   // prefill: key tiles on simdgroup matrices, the gate fused
                 const int32_t TT = T;
                 cpipe(c, pipe_(e, q8 ? "k_attn_prefill_q8" : "k_attn_prefill", 0, 0));
                 cbytes(c, 0, &aa, sizeof aa);
@@ -1078,16 +1081,20 @@ int eng_push(Eng* e, int seq, int32_t tok) {
 // The pending tokens of seqs[0..n-1] (ready()) in forwards of up to MV_MAXT rows (the decode kernels compute each row
 // as a one-row forward does): logits (n x vocab) and / or arg max (n).
 static int step_rows(Eng* e, const int* seqs, int n, float* logits, int32_t* am) {
-    for (int i0 = 0; i0 < n; i0 += MV_MAXT) {
-        const int T = n - i0 < MV_MAXT ? n - i0 : MV_MAXT;
-        int32_t tok[MV_MAXT];
-        RowInfo ri[MV_MAXT];
+    const int per = e->batch_gemm ? MAX_LOGIT_ROWS : MV_MAXT;
+    for (int i0 = 0; i0 < n; i0 += per) {
+        const int T = n - i0 < per ? n - i0 : per;
+        int32_t tok[MAX_LOGIT_ROWS];
+        RowInfo ri[MAX_LOGIT_ROWS];
         for (int t = 0; t < T; ++t) {
             const Seq* s = &e->seqs[seqs[i0 + t]];
             tok[t] = s->hist[s->len - 1];
             ri[t] = (RowInfo){s->len - 1, (int) (seqs[i0 + t] * e->slot_cap), {0}};
         }
-        if (forward_rows(e, tok, ri, T, 0, logits ? logits + (size_t) i0 * e->c.vocab : NULL, am ? am + i0 : NULL)) return -1;
+        e->decode_rows = T > MV_MAXT;
+        const int rc = forward_rows(e, tok, ri, T, 0, logits ? logits + (size_t) i0 * e->c.vocab : NULL, am ? am + i0 : NULL);
+        e->decode_rows = 0;
+        if (rc) return -1;
         for (int t = 0; t < T; ++t) e->seqs[seqs[i0 + t]].done = e->seqs[seqs[i0 + t]].len;
     }
     return 0;

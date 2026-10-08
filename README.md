@@ -99,11 +99,21 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   `tool_call_format` (`xml`, `json`, `xml_typed`).
 - `reasoning_effort` is `low`, `medium` or `high` (the default when a request names none). The model always thinks
   first; the reasoning text is in `reasoning_content`.
-- Sampling defaults: `temperature` 1.0, `top_p` 0.95 (IFM). Use `temperature` 0 for greedy decode.
-- The server keeps the KV cache of the previous request's common prefix. Repeated system prompts and tools are not
-  computed again.
-- `--ctx` sets the context (prompt and output). On a 32 GB Mac, 4096 fits; on a larger Mac, use a larger value, for
-  example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held.
+- Sampling defaults: `temperature` 1.0, `top_p` 0.95 (IFM). Use `temperature` 0 for greedy decode. `top_k`, `min_p`
+  and `seed` are per request.
+- Continuous batching: concurrent requests share the GPU. Each gets one of `--max-seqs` sequence slots of `--ctx`
+  tokens (default: as many as half of the memory left after the weights holds, up to 16); more requests wait in line.
+  Prompts are computed in chunks of 256 tokens between decode steps, so a new prompt does not stall the others. A
+  request's tokens do not depend on what else runs: with a `seed` (or greedy) it gets the same answer alone or among
+  others (on Metal, bit for bit).
+- Prefix reuse: a request takes the free slot whose cache shares the longest prefix with its prompt. Repeated system
+  prompts, tools and earlier turns are not computed again.
+- Cold cache: a request that ends with at least `--kv-disk-min` (2048) cached tokens has its cache saved to disk in
+  256-token blocks (`--kv-disk`, default `~/.cache/nslm/kv`; `--kv-disk-gb` 32, least recently used blocks go first;
+  0 turns it off). A later request with the same prefix reads it back instead of computing it. Blocks are keyed by the
+  tokens and the model's weights, so another model or quantization never reuses them.
+- `--ctx` sets each slot's context (prompt and output). On a 32 GB Mac, 4096 fits; on a larger Mac, use a larger value,
+  for example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held.
 - `--kv q8` keeps the KV cache in 8 bits (int8 with a scale per token and head) on either engine: half the memory, so a
   200k-token cache takes about 20 GB instead of 39 GB.  On an M4 Max it costs little quality (KLD against BF16,
   held-out / chat: 0.0267 / 0.0136 against BF16 KV's 0.0260 / 0.0126, each within about one standard error; top-1
