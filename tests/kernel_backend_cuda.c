@@ -354,6 +354,12 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
 }
 int kt_bf16_f32(const uint16_t* x, float* y, int n) { return 1; }   // Metal only so far
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) { return 1; }
+int kt_mla_rope_q(MlaArgs a, int fmt, float* qr, const float* kr, const float* c, KtKvMla kv, int npos, const RowInfo* ri,
+                  const float* inv, int T) { return 1; }   // FP8 / FP4 caches: Metal only so far
+int kt_mla_attn_q(MlaArgs a, int fmt, const float* ql, const float* qr, KtKvMla kv, int npos, const RowInfo* ri, float* olat, int T) { return 1; }
+int kt_mla_attn_xq(int fmt, int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                   const float* vn, const uint8_t* Kq, const uint8_t* Ks, int npos, const RowInfo* ri, const float* g, float* o, int T) { return 1; }
+int kt_kv_f32(int fmt, const uint8_t* codes, const uint8_t* scales, int len, int rows, float* y) { return 1; }
 int kt_argmax(const float* logits, int V, int n, int32_t* out) {
     int32_t* d = (int32_t*) dev(NULL, 4 * (size_t) n);
     kc_argmax(0, (const float*) dev(logits, 4 * (size_t) V * n), d, V, n);

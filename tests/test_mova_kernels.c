@@ -9,7 +9,9 @@
 #include <string.h>
 
 #include "affine.h"
+#include "engine_api.h"
 #include "kernel_backend.h"
+#include "kvq.h"
 #include "lfsr.h"
 
 static int fails = 0;
@@ -984,6 +986,126 @@ static void test_mla_attn_x(void) {
     free(qn); free(qr); free(g); free(o); free(kn); free(vn); free(Kc); free(ri);
 }
 
+// ---- MLA caches in FP8 / FP4 (nslm/kvq.h): the cache write's codes are the C codec's, and every reader decodes them
+// exactly, so attention over a quantized cache is bit-equal to attention over its decoded BF16 values
+// the layout (nslm/kvq.h): key: the RoPE key (all FP8); else the latent (FP4: its first KVQ_FP4_LEAD values FP8)
+static int kvq_lead(int fmt, int n, int key) { return fmt == ENG_KV_FP4 && !key ? (n < KVQ_FP4_LEAD ? n : KVQ_FP4_LEAD) : n; }
+static size_t kvq_rowb(int fmt, int n, int key) { return (size_t) kvq_row_bytes(kvq_lead(fmt, n, key), n); }
+static size_t kvq_srowb(int fmt, int n, int key) { return (size_t) kvq_row_scales(kvq_lead(fmt, n, key), n); }
+// a random quantized cache of np positions of n values (scales varying by position), and its decoded BF16 values
+static void kvq_fill(int fmt, int key, unsigned* sd, int np, int n, uint8_t* codes, uint8_t* scales, uint16_t* dec) {
+    float* x = malloc(4 * (size_t) n);
+    const int ld = kvq_lead(fmt, n, key);
+    for (int p = 0; p < np; ++p) {
+        uint8_t* cp = codes + p * kvq_rowb(fmt, n, key), *sp = scales + p * kvq_srowb(fmt, n, key);
+        for (int i = 0; i < n; ++i) x[i] = bfr(frand(sd) * (0.2 + (p + i / 16) % 7));
+        kvq_row(x, n, ld, cp, sp);
+        for (int i = 0; i < n; ++i) dec[(size_t) p * n + i] = f2bf(kvq_row_get(cp, sp, ld, i));
+    }
+    free(x);
+}
+static void test_mla_kvq(int fmt) {
+    const char* fn = fmt == ENG_KV_FP8 ? "FP8" : "FP4";
+    unsigned sd = 77;
+    {   // the cache write: 4 heads, r 96, rows at positions 3 and 4 of two slots; latent codes as the C codec's, RoPE key
+        // values within a code of it (the rotation may differ from the reference's by a BF16 ulp)
+        enum { nh = 4, r = 320, P = 10, T = 2 };   // r 320: FP4 has both FP8 and FP4 latent dims
+        float qr[T * nh * 128], kr[T * 128], c[T * r], inv[64];
+        for (int i = 0; i < T * nh * 128; ++i) qr[i] = bfr(frand(&sd));
+        for (int i = 0; i < T * 128; ++i) kr[i] = bfr(frand(&sd) * (1 + i % 5));
+        for (int i = 0; i < T * r; ++i) c[i] = bfr(frand(&sd) * (0.1 + i / 16 % 6));
+        for (int p = 0; p < 64; ++p) inv[p] = (float) pow(1e7, -2.0 * p / 128);
+        KtKvMla kv = {calloc(P, kvq_rowb(fmt, 128, 1)), calloc(P, kvq_rowb(fmt, r, 0)), calloc(P, kvq_srowb(fmt, 128, 1)), calloc(P, kvq_srowb(fmt, r, 0))};
+        const RowInfo ri[2] = {{3, 0, {0}}, {4, 5, {0}}};
+        const MlaArgs a = {nh, r, 128, 1, (float) (1 / sqrt(128.0)), {0}};
+        const int rc = kt_mla_rope_q(a, fmt, qr, kr, c, kv, P, ri, inv, T);
+        if (rc == 1) { printf("MLA %s cache: not in this backend\n", fn); free(kv.k); free(kv.v); free(kv.ks); free(kv.vs); return; }
+        int bad = 0, kdiff = 0;
+        if (rc) ++fails;
+        else
+            for (int t = 0; t < T; ++t) {
+                const int pos = ri[t].pos, at = ri[t].kv0 + pos;
+                uint8_t vc[r], vs[r / 16], kc[128], ks[8];
+                kvq_row(c + t * r, r, kvq_lead(fmt, r, 0), vc, vs);
+                bad += memcmp(vc, kv.v + at * kvq_rowb(fmt, r, 0), kvq_rowb(fmt, r, 0)) != 0;
+                bad += memcmp(vs, kv.vs + at * kvq_srowb(fmt, r, 0), kvq_srowb(fmt, r, 0)) != 0;
+                float k[128];
+                for (int i = 0; i < 64; ++i) {
+                    const double th = (double) (float) ((float) pos * inv[i]), cs = cos(th), sn = sin(th);
+                    const double k0 = kr[t * 128 + i], k1 = kr[t * 128 + i + 64];
+                    k[i] = bfr(k0 * cs - k1 * sn);
+                    k[i + 64] = bfr(k1 * cs + k0 * sn);
+                }
+                kvq_row(k, 128, 128, kc, ks);   // the RoPE key: FP8
+                for (int i = 0; i < 128; ++i) {
+                    const float want = kvq_row_get(kc, ks, 128, i), got = kvq_row_get(kv.k + at * 128, kv.ks + at * 4, 128, i);
+                    const float sc = ldexpf(1, ks[i / 32] - 127), step = fmaxf(fabsf(want) / 8, sc * 0.001953125f);
+                    kdiff += got != want;
+                    bad += fabsf(got - want) > step * 1.0001f;
+                }
+            }
+        CHECK(!bad, "MLA %s cache write: %d mismatches", fn, bad);
+        printf("MLA %s cache write: latent codes as the C codec's, %d of %d RoPE-key (FP8) values a code off\n", fn, kdiff, T * 128);
+        free(kv.k); free(kv.v); free(kv.ks); free(kv.vs);
+    }
+    {   // k_kv_f32: rows decoded exactly
+        enum { len = 320, rows = 5 };
+        uint8_t codes[rows * len], scales[rows * len / 16];
+        uint16_t dec[rows * len];
+        float y[rows * len];
+        kvq_fill(fmt, 0, &sd, rows, len, codes, scales, dec);
+        int bad = 0;
+        if (kt_kv_f32(fmt, codes, scales, len, rows, y)) ++fails;
+        else for (int i = 0; i < rows * len; ++i) bad += y[i] != bf2f(dec[i]);
+        CHECK(!bad, "MLA %s cache rows to f32: %d mismatches", fn, bad);
+    }
+    // latent attention (the cases of test_mla): bit-equal to the BF16 kernel on the decoded cache
+    static const struct { int nh, r, T, ns; } C[4] = {{32, 768, 3, 1}, {32, 768, 3, 5}, {20, 64, 3, 3}, {8, 96, 45, 1}};
+    for (int cs = 0; cs < 4; ++cs) {
+        const int nh = C[cs].nh, r = C[cs].r, NP = 640, T = C[cs].T, ns = C[cs].ns;
+        float* ql = malloc(4 * (size_t) T * nh * r), *qr = malloc(4 * (size_t) T * nh * 128);
+        float* o1 = malloc(4 * (size_t) T * nh * r), *o2 = malloc(4 * (size_t) T * nh * r);
+        KtKvMla kv = {malloc(NP * kvq_rowb(fmt, 128, 1)), malloc(NP * kvq_rowb(fmt, r, 0)), malloc(NP * kvq_srowb(fmt, 128, 1)), malloc(NP * kvq_srowb(fmt, r, 0))};
+        uint16_t* Kd = malloc(2 * (size_t) NP * 128), *Vd = malloc(2 * (size_t) NP * r);
+        for (int i = 0; i < T * nh * r; ++i) ql[i] = bfr(frand(&sd) * 0.3);
+        for (int i = 0; i < T * nh * 128; ++i) qr[i] = bfr(frand(&sd));
+        kvq_fill(fmt, 1, &sd, NP, 128, kv.k, kv.ks, Kd);
+        kvq_fill(fmt, 0, &sd, NP, r, kv.v, kv.vs, Vd);
+        RowInfo ri[45];
+        memset(ri, 0, sizeof ri);
+        for (int t = 0; t < T; ++t) {
+            ri[t].pos = T == 3 ? (const int[3]){300, 299, 37}[t] : 37 + t;
+            ri[t].kv0 = T == 3 ? (const int[3]){0, 310, 600}[t] : 19;
+        }
+        const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
+        if (kt_mla_attn_q(a, fmt, ql, qr, kv, NP, ri, o1, T) || kt_mla_attn(a, ql, qr, Kd, Vd, NP, ri, o2, T)) ++fails;
+        else CHECK(!memcmp(o1, o2, 4 * (size_t) T * nh * r), "MLA %s latent attention (%d heads, r %d, %d rows, %d splits): "
+                   "differs from the decoded BF16 cache's", fn, nh, r, T, ns);
+        free(ql); free(qr); free(o1); free(o2); free(kv.k); free(kv.v); free(kv.ks); free(kv.vs); free(Kd); free(Vd);
+    }
+    {   // expanded prompt attention (k_mla_prefill): the RoPE keys from the quantized cache, bit-equal likewise
+        const int nh = 6, T = 45, P0 = 37, B = 19, NP = B + P0 + T, NK = P0 + T;
+        const size_t qn_n = (size_t) T * nh * 128, kv_n = (size_t) NK * nh * 128;
+        float* qn = malloc(4 * qn_n), *qr = malloc(4 * qn_n), *g = malloc(4 * qn_n), *o1 = malloc(4 * qn_n), *o2 = malloc(4 * qn_n);
+        float* kn = malloc(4 * kv_n), *vn = malloc(4 * kv_n);
+        uint8_t* Kq = malloc(NP * kvq_rowb(fmt, 128, 1)), *Ks = malloc(NP * kvq_srowb(fmt, 128, 1));
+        uint16_t* Kd = malloc(2 * (size_t) NP * 128);
+        for (size_t i = 0; i < qn_n; ++i) { qn[i] = bfr(frand(&sd)); qr[i] = bfr(frand(&sd)); g[i] = bfr(frand(&sd) * 3); }
+        for (size_t i = 0; i < kv_n; ++i) { kn[i] = bfr(frand(&sd) * 2); vn[i] = bfr(frand(&sd)); }
+        kvq_fill(fmt, 1, &sd, NP, 128, Kq, Ks, Kd);
+        RowInfo* ri = calloc((size_t) T, sizeof(RowInfo));
+        for (int t = 0; t < T; ++t) { ri[t].pos = P0 + t; ri[t].kv0 = B; }
+        const int kb3[4] = {0, 16, 50, NK};
+        const float scale = (float) (1 / sqrt(256.0));
+        const int rc = kt_mla_attn_xq(fmt, nh, scale, kb3, 3, qn, qr, kn, vn, Kq, Ks, NP, ri, g, o1, T);
+        if (rc == 1) printf("MLA %s prompt attention (expanded): not in this backend\n", fn);
+        else if (rc || kt_mla_attn_x(nh, scale, kb3, 3, qn, qr, kn, vn, Kd, NP, ri, g, o2, T)) ++fails;
+        else CHECK(!memcmp(o1, o2, 4 * qn_n), "MLA %s prompt attention (expanded): differs from the decoded BF16 cache's", fn);
+        free(qn); free(qr); free(g); free(o1); free(o2); free(kn); free(vn); free(Kq); free(Ks); free(Kd); free(ri);
+    }
+    printf("MLA %s cache: write, decode, latent attention (4 cases) and expanded prompt attention checked\n", fn);
+}
+
 int main(void) {
     char err[256] = "";
     if (kt_open(err, sizeof err)) {
@@ -1003,6 +1125,8 @@ int main(void) {
     test_attn_decode(1);
     test_mla();
     test_mla_attn_x();
+    test_mla_kvq(ENG_KV_FP8);
+    test_mla_kvq(ENG_KV_FP4);
     kt_close();
     printf("test_mova_kernels: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

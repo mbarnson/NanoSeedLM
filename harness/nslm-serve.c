@@ -1,7 +1,7 @@
 // harness/nslm-serve.c - OpenAI-compatible HTTP server for K2-Horizon-MoVA on the nslm engine.
 //
 //   nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080]
-//              [--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]
+//              [--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]
 //              [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048]
 //   nslm-serve --render REQUEST.json     print the prompt a chat request renders to, and exit
 //
@@ -18,7 +18,7 @@
 // tokens has its slot's cache saved to disk in blocks of 256 tokens (by a writer thread, the slot held meanwhile); a
 // new request restores the longest saved prefix of its prompt that beats its slot's own, a few blocks per scheduler
 // step, and computes the rest.  Default directory: ~/.cache/nslm/kv (Windows: %LOCALAPPDATA%/nslm/kv).
-// --kv q8: the 8-bit KV cache (long contexts in less memory; see engine_api.h).
+// --kv q8 (GQA), fp8 / fp4 (MLA): smaller KV caches for long contexts (engine_api.h).
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -1077,12 +1077,16 @@ static void base_name(const char* path, char* out, size_t cap) {
 }
 
 // The --max-seqs default: slots of --ctx tokens in half of the memory available beyond the weights (1 .. 16).
-static int default_max_seqs(const char* model, int kv_q8) {
+static int default_max_seqs(const char* model, int kv_format) {
     MovaCfg c;
     char err[256];
     if (mova_cfg_load(&c, model, err, sizeof err)) return 1;
-    double per = 0, wb = 0;   // KV bytes per position, weight bytes
-    for (int l = 0; l < c.n_layer; ++l) per += c.mla ? 2.0 * (c.mla_rope + c.mla_rank[l]) : 2.0 * c.n_kv * (kv_q8 ? c.head_dim + 4 : 2 * c.head_dim);
+    double per = 0, wb = 0;   // KV bytes per position (as the engine allocates them), weight bytes
+    for (int l = 0; l < c.n_layer; ++l) {
+        const double n = c.mla ? c.mla_rope + c.mla_rank[l] : 0;   // MLA: codes + block scales (nslm/kvq.h)
+        per += !c.mla ? 2.0 * c.n_kv * (kv_format == ENG_KV_Q8 ? c.head_dim + 4 : 2 * c.head_dim)
+             : kv_format == ENG_KV_FP8 ? n + n / 32 : kv_format == ENG_KV_FP4 ? n / 2 + n / 16 : 2 * n;
+    }
     NsModel nm;
     if (!ns_open(&nm, model, err, sizeof err)) {
         for (int i = 0; i < nm.n; ++i) for (int k = 0; k < 4; ++k) wb += (double) nm.t[i].s[k].len;
@@ -1101,7 +1105,7 @@ int main(int argc, char** argv) {
     if (opt_flag(argc, argv, "--quiet")) g_verbose = 0;
     if (!model || g_ctx < 64) {
         fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
-                        "[--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]\n"
+                        "[--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]\n"
                         "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048]\n       nslm-serve --render REQUEST.json\n");
         return 2;
     }
@@ -1120,8 +1124,9 @@ int main(int argc, char** argv) {
     memset(&o, 0, sizeof o);
     o.model_dir = model;
     o.resource_dir = opt(argc, argv, "--res", res);
-    o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
-    g_max_seqs = opt(argc, argv, "--max-seqs", NULL) ? atoi(opt(argc, argv, "--max-seqs", NULL)) : default_max_seqs(model, o.kv_format == ENG_KV_Q8);
+    o.kv_format = eng_kv_parse(opt(argc, argv, "--kv", "bf16"));
+    if (o.kv_format < 0) { fprintf(stderr, "%s: --kv: bf16, q8, fp8 or fp4\n", argv[0]); return 2; }
+    g_max_seqs = opt(argc, argv, "--max-seqs", NULL) ? atoi(opt(argc, argv, "--max-seqs", NULL)) : default_max_seqs(model, o.kv_format);
     if (g_max_seqs < 1) g_max_seqs = 1;
     o.max_seqs = g_max_seqs;
     o.kv_tokens = (int64_t) g_ctx * g_max_seqs;

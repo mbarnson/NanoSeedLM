@@ -5,6 +5,7 @@
 // Each slot has kv_tokens / max_seqs positions of the KV cache.
 #pragma once
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,16 +22,25 @@ typedef struct {
     const char* resource_dir;  // directory holding kernels_moe.metallib
     int max_seqs;              // sequence slots, ids 0..max_seqs-1
     int64_t kv_tokens;         // total KV capacity across all slots, in tokens
-    int kv_format;             // ENG_KV_BF16 (0, the default: exact), or ENG_KV_Q8 (int8 with a scale per token and
-                               // head: half the memory, for long contexts); an engine may only support BF16
-                               // (eng_open then fails with "... not supported ...")
+    int kv_format;             // ENG_KV_BF16 (0, the default: exact), or ENG_KV_Q8 (GQA: int8 with a scale per token and
+                               // head: half the memory, for long contexts), ENG_KV_FP8 / ENG_KV_FP4 (MLA, Metal: DeepSeek
+                               // V4.1's E4M3 with a power-of-two scale per 32 values / E2M1 with an E4M3 scale per 16,
+                               // nslm/kvq.h: 52% / 28% of the memory); an engine may support fewer (eng_open then fails
+                               // naming the formats it supports)
     int mla_expand_min;        // MLA (Metal), B (0: 256): a prefill of at least B new tokens attends with the latent
                                // expanded per head (long prompts: faster) up to the last multiple of B, the rest and
                                // shorter prefills (chat turns over a long cached context) in latent space (no expanding
                                // every cached position).  A prompt whose cache is restored in blocks of B and its tail
                                // recomputed gets the cache computed whole, bit for bit.
 } EngOpts;
-enum { ENG_KV_BF16 = 0, ENG_KV_Q8 = 1 };
+enum { ENG_KV_BF16 = 0, ENG_KV_Q8 = 1, ENG_KV_FP8 = 2, ENG_KV_FP4 = 3 };
+// A --kv option's value (bf16, q8, fp8, fp4) as ENG_KV_*; -1 for anything else
+static inline int eng_kv_parse(const char* s) {
+    static const char* const names[4] = {"bf16", "q8", "fp8", "fp4"};
+    for (int i = 0; i < 4; ++i)
+        if (s && !strcmp(s, names[i])) return i;
+    return -1;
+}
 
 typedef struct {
     int64_t tokens;      // tokens committed

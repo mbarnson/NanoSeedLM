@@ -73,7 +73,8 @@ int main(int argc, char** argv) {
     o.model_dir = model;
     o.resource_dir = res;
     o.max_seqs = 1;
-    o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
+    o.kv_format = eng_kv_parse(opt(argc, argv, "--kv", "bf16"));
+    if (o.kv_format < 0) { fprintf(stderr, "%s: --kv: bf16, q8, fp8 or fp4\n", argv[0]); return 2; }
     o.kv_tokens = n + 64;
     Eng* e = eng_open(&o, err, sizeof err);
     if (!e) { fprintf(stderr, "eng_open: %s\n", err); return 1; }

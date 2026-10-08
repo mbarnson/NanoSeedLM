@@ -78,6 +78,7 @@ typedef struct { int pos, kv0; int pad[2]; } RowInfo;   // kv0: the KV cache row
 #define MLA_MAXL 32        // latent dims per lane (r <= 1024)
 #define MLPF_R 4           // Metal k_mla_prefill: simdgroups of 8 rows each
 #define MLPF_BK 16         // keys per tile
+#define MLA_FP4_LEAD 256   // MLA FP4 caches: the latent's leading dims kept in FP8 (a multiple of 32)
 #define MLAF_Q 16          // Metal k_mla_attn: query heads per threadgroup
 #define MLAF_K 64          // keys per tile
 #define MLAF_SG 16         // simdgroups: one 8x8 score block each (MLAF_K / 8 x MLAF_Q / 8), one 8-dim output column
@@ -120,6 +121,10 @@ typedef struct { int slice, start, count, pad; } MmTile;   // grouped GEMM: one 
 
 constant short FC_FMT [[function_constant(0)]];
 constant short FC_T [[function_constant(1)]];
+// MLA quantized caches: the RoPE key FP8; the latent FP8 (KV_FP8) or its first MLA_FP4_LEAD dims FP8, the rest FP4
+#define KLH ATT_HD
+#define LLH(r) (FC_FMT == KV_FP8 ? (r) : min(MLA_FP4_LEAD, (r)))
+enum { KV_BF16 = 0, KV_Q8 = 1, KV_FP8 = 2, KV_FP4 = 3 };   // = ENG_KV_* (engine/engine_api.h); FP8 / FP4: nslm/kvq.h
 
 static inline float bfr(float x) {   // round to BF16 (nearest even), as f32
     uint u = as_type<uint>(x);
@@ -131,6 +136,85 @@ static inline ushort tobf(float x) {
     uint u = as_type<uint>(x);
     u += 0x7FFFu + ((u >> 16) & 1u);
     return (ushort) (u >> 16);
+}
+// ---- the low-bit KV cache codecs (nslm/kvq.h, the spec: same codes bit for bit) ----
+static inline float e4m3_dec(uint c) {
+    const uint e = (c >> 3) & 15u, m = c & 7u;
+    const float v = e ? as_type<float>(((e + 120u) << 23) | (m << 20)) : (float) m * 0x1p-9f;
+    return c & 0x80u ? -v : v;
+}
+static inline float e8m0_dec(uint s) { return as_type<float>(s << 23); }   // 2^(s - 127), s in 1 .. 254
+static inline float e2m1_dec(uint n) {
+    const uint k = n & 7u;   // 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    const float v = k < 4u ? (float) k * 0.5f : (float) (1u << ((k >> 1) - 1u)) * ((k & 1u) ? 1.5f : 1.0f);
+    return n & 8u ? -v : v;
+}
+static inline uint e4m3_enc_abs(float a) {
+    if (!(a < 448.0f)) return 0x7Eu;
+    if (a < 0x1p-6f) return (uint) rint(a * 512.0f);
+    int e;
+    const float f = frexp(a, e);
+    int E = e - 1, m = (int) rint((2 * f - 1) * 8);
+    if (m == 8) { ++E; m = 0; }
+    return min((uint) (((E + 7) << 3) | m), 0x7Eu);
+}
+static inline uint e2m1_enc(float x, float s) {   // midpoints 0.25 0.75 1.25 1.75 2.5 3.5 5 (times s: exact); ties even
+    const float a = fabs(x);
+    uint k = (uint) (a > 0.25f * s) + (uint) (a > 0.75f * s) + (uint) (a > 1.25f * s) + (uint) (a > 1.75f * s) +
+             (uint) (a > 2.5f * s) + (uint) (a > 3.5f * s) + (uint) (a > 5.0f * s);
+    k += (uint) (a == 0.75f * s || a == 1.75f * s || a == 3.5f * s);   // a tie above an odd code: the even one
+    return k && x < 0 ? k | 8u : k;
+}
+static inline uint fp8_scale(float amax) {
+    if (!(amax > 0)) return 127u;
+    int k;
+    frexp(amax, k);
+    const int e = clamp(amax <= ldexp(448.0f, k - 9) ? k - 9 : k - 8, -126, 127);
+    return (uint) (e + 127);
+}
+static inline uint fp4_scale(float amax) {
+    if (!(amax > 0)) return 0u;
+    const int c0 = (int) e4m3_enc_abs(amax / 6);
+    int best = -1;
+    float bd = 0;
+    for (int c = max(c0 - 1, 0); c <= min(c0 + 1, 0x7E); ++c) {
+        const float d = fabs(6 * e4m3_dec((uint) c) - amax);
+        if (best < 0 || d < bd || (d == bd && !(c & 1))) { best = c; bd = d; }
+    }
+    return (uint) best;
+}
+// Quantized cache rows (nslm/kvq.h): the first lh values FP8 (E8M0 scale per 32), the rest FP4 (E4M3 scale per 16):
+// lh + (len - lh) / 2 code bytes a row, lh / 32 + (len - lh) / 16 scales.  fmt KV_BF16: plain BF16 rows.
+static inline ulong kv_rowb(int lh, int len) { return (ulong) (lh + (len - lh) / 2); }
+static inline ulong kv_srowb(int lh, int len) { return (ulong) (lh / 32 + (len - lh) / 16); }
+// Value d of cache row `row` (len values)
+static inline float kv_get(short fmt, int lh, device const uchar* C, device const uchar* S, ulong row, int len, int d) {
+    if (fmt == KV_BF16) return bf(((device const ushort*) C)[row * len + d]);
+    C += row * kv_rowb(lh, len);
+    S += row * kv_srowb(lh, len);
+    if (d < lh) return e4m3_dec(C[d]) * e8m0_dec(S[d / 32]);
+    const int e = d - lh;
+    return e2m1_dec(C[lh + e / 2] >> (4 * (e & 1))) * e4m3_dec(S[lh / 32 + e / 16]);
+}
+// Values d .. d + 7 (d a multiple of 8) of a cache row as BF16 pairs (exact: a code times its scale).
+static inline uint4 kv_get8(short fmt, int lh, device const uchar* C, device const uchar* S, ulong row, int len, int d) {
+    if (fmt == KV_BF16) return *(device const uint4*) (C + (row * len + d) * 2);
+    C += row * kv_rowb(lh, len);
+    S += row * kv_srowb(lh, len);
+    float v[8];
+    if (d < lh) {
+        const uint2 w = *(device const uint2*) (C + d);
+        const float s = e8m0_dec(S[d / 32]);
+        for (int i = 0; i < 4; ++i) { v[i] = e4m3_dec(w.x >> (8 * i)) * s; v[4 + i] = e4m3_dec(w.y >> (8 * i)) * s; }
+    } else {
+        const int e = d - lh;
+        const uint w = *(device const uint*) (C + lh + e / 2);
+        const float s = e4m3_dec(S[lh / 32 + e / 16]);
+        for (int i = 0; i < 8; ++i) v[i] = e2m1_dec(w >> (4 * i)) * s;
+    }
+    uint4 o;
+    for (int i = 0; i < 4; ++i) o[i] = (uint) tobf(v[2 * i]) | (uint) tobf(v[2 * i + 1]) << 16;
+    return o;
 }
 static inline float silu_bf(float g) {   // nn.silu on a BF16 tensor: g * sigmoid(g), each op rounded to BF16
     const float s = bfr(1.0f / (1.0f + exp(-g)));
@@ -912,36 +996,79 @@ kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const ushort* W
     }
 }
 
+// One value v at dim d of a quantized cache row (len values, the first lh FP8, the rest FP4), stored when `store`: each
+// block of consecutive dims lies on consecutive lanes of one simdgroup (d % 32 == lane), which share its max |v|; FP4
+// pairs lanes into bytes.  Every lane of the simdgroup must call it (the shuffles run in uniform control flow).
+static inline void kv_put(bool store, int lh, float v, device uchar* C, device uchar* S, ulong row, int len, int d) {
+    float a16 = fabs(v);
+    for (ushort o = 1; o < 16; o <<= 1) a16 = max(a16, simd_shuffle_xor(a16, o));
+    const float a32 = max(a16, simd_shuffle_xor(a16, 16));
+    const bool f8 = d < lh;
+    const uint sc = f8 ? fp8_scale(a32) : fp4_scale(a16);
+    const float s4 = e4m3_dec(sc);
+    const uint c = f8 ? e4m3_enc_abs(fabs(v) * e8m0_dec(254u - sc)) : (s4 > 0 ? e2m1_enc(v, s4) : 0u);
+    const uint hi = simd_shuffle_xor(c, 1);
+    if (!store) return;
+    C += row * kv_rowb(lh, len);
+    S += row * kv_srowb(lh, len);
+    const int e = d - lh;
+    if (f8) {
+        C[d] = (uchar) (c && v < 0 ? c | 0x80u : c);
+        if (d % 32 == 0) S[d / 32] = (uchar) sc;
+    } else {
+        if (!(e & 1)) C[lh + e / 2] = (uchar) (c | hi << 4);
+        if (e % 16 == 0) S[lh / 32 + e / 16] = (uchar) sc;
+    }
+}
+
 // RoPE (as k_rope_kv) on the query RoPE parts qr [T][n_head][128] in place and on the RoPE key kr [T][128] into
-// Kc [cap][128]; the latent c [T][r] into Vc [cap][r].  BF16 caches.  Grid (max((n_head + 1) * 64, r), T).
+// Kc [cap][128]; the latent c [T][r] into Vc [cap][r].  Grid (max((n_head + 1) * 64, r), T), threadgroups of 64.  Cache
+// format FC_FMT: BF16, or FP8 / FP4 (the BF16 values' codes, block scales into Ks / Vs; r a multiple of 32).
+// kv_put for an all-FP8 row (the RoPE key): the same codes, its own address arithmetic
+static inline void kv_put8(bool store, float v, device uchar* C, device uchar* S, ulong row, int len, int d) {
+    float amax = fabs(v);
+    for (ushort o = 1; o < 32; o <<= 1) amax = max(amax, simd_shuffle_xor(amax, o));
+    const uint sc = fp8_scale(amax), c = e4m3_enc_abs(fabs(v) * e8m0_dec(254u - sc));
+    if (!store) return;
+    C[row * (ulong) len + d] = (uchar) (c && v < 0 ? c | 0x80u : c);
+    if (d % 32 == 0) S[row * (ulong) (len / 32) + d / 32] = (uchar) sc;
+}
 kernel void k_mla_rope(constant MlaArgs& a [[buffer(0)]], device float* qr [[buffer(1)]], device const float* kr [[buffer(2)]],
-                       device const float* c [[buffer(3)]], device ushort* Kc [[buffer(4)]], device ushort* Vc [[buffer(5)]],
+                       device const float* c [[buffer(3)]], device uchar* Kc [[buffer(4)]], device uchar* Vc [[buffer(5)]],
                        device const RowInfo* ri [[buffer(6)]], device const float* inv [[buffer(7)]],
+                       device uchar* Ks [[buffer(8)]], device uchar* Vs [[buffer(9)]],
                        uint2 g [[thread_position_in_grid]]) {
     const int i = (int) g.x, t = (int) g.y, pos = ri[t].pos;
     const ulong at = (ulong) (ri[t].kv0 + pos);   // the cache row
-    if (i < a.r) Vc[at * a.r + i] = tobf(c[(ulong) t * a.r + i]);
     const int head = i / 64, p = i % 64;
-    if (head > a.n_head) return;
-    const float th = (float) pos * inv[p];
-    const float cs = cos(th), sn = sin(th);
-    if (head < a.n_head) {
-        device float* qh = qr + ((ulong) t * a.n_head + head) * ATT_HD;
-        const float x0 = qh[p], x1 = qh[p + 64];
-        qh[p] = bfr(x0 * cs - x1 * sn);
-        qh[p + 64] = bfr(x1 * cs + x0 * sn);
-    } else {
-        device const float* kh = kr + (ulong) t * ATT_HD;
-        const float x0 = kh[p], x1 = kh[p + 64];
-        Kc[at * ATT_HD + p] = tobf(x0 * cs - x1 * sn);
-        Kc[at * ATT_HD + p + 64] = tobf(x1 * cs + x0 * sn);
+    const bool lat = i < a.r, key = head == a.n_head;
+    const float v = lat ? c[(ulong) t * a.r + i] : 0.0f;
+    float y0 = 0, y1 = 0;
+    if (head <= a.n_head) {
+        const float th = (float) pos * inv[p];
+        const float cs = cos(th), sn = sin(th);
+        device float* qh = qr + ((ulong) t * a.n_head + (key ? 0 : head)) * ATT_HD;
+        device const float* xh = key ? kr + (ulong) t * ATT_HD : (device const float*) qh;
+        const float x0 = xh[p], x1 = xh[p + 64];
+        y0 = x0 * cs - x1 * sn;
+        y1 = x1 * cs + x0 * sn;
+        if (!key) { qh[p] = bfr(y0); qh[p + 64] = bfr(y1); }
+    }
+    if (FC_FMT == KV_BF16) {
+        if (lat) ((device ushort*) Vc)[at * a.r + i] = tobf(v);
+        if (key) { ((device ushort*) Kc)[at * ATT_HD + p] = tobf(y0); ((device ushort*) Kc)[at * ATT_HD + p + 64] = tobf(y1); }
+    } else {   // every thread runs the shuffles; latent dims d = i, RoPE-key dims p and p + 64
+        kv_put(lat, LLH(a.r), bfr(v), Vc, Vs, at, a.r, i);
+        kv_put8(key, bfr(y0), Kc, Ks, at, ATT_HD, p);
+        kv_put8(key, bfr(y1), Kc, Ks, at, ATT_HD, p + 64);
     }
 }
 
 // Latent attention (absorbed MLA: multi-query over the shared latent), flash style.  Threadgroup (split, block of
 // MLAF_Q query heads, row) of MLAF_SG simdgroups; per tile of MLAF_K keys:
 //   scores: S^T [keys][heads] = [c, k] . [ql, qr]^T, MLAF_DC dims at a time: the tile's keys and the heads' queries are
-//     staged in threadgroup memory (BF16: the cache's and the queries' values, exact) with wide loads, then each
+//     staged in threadgroup memory (BF16: the cache's values, decoded when FC_FMT is FP8 / FP4, and the queries'
+//     values, exact) with wide loads, then each
 //     simdgroup accumulates its 8x8 block on f32 simdgroup matrices; times the scale;
 //   online softmax per head (max, rescale, row sums) in threadgroup memory;
 //   O [heads][r] += P c, MLAF_DC latent dims at a time (staged as the keys): each simdgroup one 8-dim column, both
@@ -952,13 +1079,13 @@ static inline float2 bf2(uint w) { return float2(as_type<float>(w << 16), as_typ
 // Staging (N8 / N4 > 0: a full chunk, the index arithmetic constant-folded; 0: n8 / n4 at run time).  Keys k0.. (before
 // p1) of the slot at kv0, dims [dc, dc + 8 n8) of [c, k] into Kt [key][dim]; queries of heads h0.. into Qt [dim][head].
 template <int N8>
-static inline void mlaf_keys(threadgroup ushort* Kt, device const ushort* Kc, device const ushort* Vc, ulong kv0, int k0, int p1,
-                             int dc, int r, int n8, uint tid) {
+static inline void mlaf_keys(threadgroup ushort* Kt, device const uchar* Kc, device const uchar* Vc, device const uchar* Ks,
+                             device const uchar* Vs, ulong kv0, int k0, int p1, int dc, int r, int n8, uint tid) {
     const int n = N8 > 0 ? N8 : n8;
     for (int e = (int) tid; e < MLAF_K * n; e += 32 * MLAF_SG) {
         const int key = e / n, d = dc + (e % n) * 8, p = k0 + key;
         uint4 w = 0;
-        if (p < p1) w = *(device const uint4*) (d < r ? Vc + (kv0 + (ulong) p) * r + d : Kc + (kv0 + (ulong) p) * ATT_HD + d - r);
+        if (p < p1) w = d < r ? kv_get8(FC_FMT, LLH(r), Vc, Vs, kv0 + (ulong) p, r, d) : kv_get8(FC_FMT, KLH, Kc, Ks, kv0 + (ulong) p, ATT_HD, d - r);
         threadgroup uint* kt = (threadgroup uint*) (Kt + key * MLAF_KLD + d - dc);
         kt[0] = w.x; kt[1] = w.y; kt[2] = w.z; kt[3] = w.w;
     }
@@ -975,8 +1102,9 @@ static inline void mlaf_queries(threadgroup ushort* Qt, device const float* ql, 
     }
 }
 kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql [[buffer(1)]], device const float* qr [[buffer(2)]],
-                       device const ushort* Kc [[buffer(3)]], device const ushort* Vc [[buffer(4)]],
+                       device const uchar* Kc [[buffer(3)]], device const uchar* Vc [[buffer(4)]],
                        device const RowInfo* ri [[buffer(5)]], device float* out [[buffer(6)]],
+                       device const uchar* Ks [[buffer(7)]], device const uchar* Vs [[buffer(8)]],
                        uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
     threadgroup float Kbuf[MLAF_K * MLAF_KLD / 2];     // staged keys (or latent values) [key][dim] (BF16); at the end, out
@@ -1007,10 +1135,10 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
             const int cw = min(MLAF_DC, D - dc);
             threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous chunk's (or phase's) readers are done
             if (cw == MLAF_DC) {
-                mlaf_keys<MLAF_DC / 8>(Kt, Kc, Vc, kv0, k0, p1, dc, r, 0, tid);
+                mlaf_keys<MLAF_DC / 8>(Kt, Kc, Vc, Ks, Vs, kv0, k0, p1, dc, r, 0, tid);
                 mlaf_queries<MLAF_DC / 4>(Qt, ql, qr, t, H, h0, dc, r, 0, tid);
             } else {
-                mlaf_keys<0>(Kt, Kc, Vc, kv0, k0, p1, dc, r, cw / 8, tid);
+                mlaf_keys<0>(Kt, Kc, Vc, Ks, Vs, kv0, k0, p1, dc, r, cw / 8, tid);
                 mlaf_queries<0>(Qt, ql, qr, t, H, h0, dc, r, cw / 4, tid);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1064,8 +1192,8 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
                 if (ci >= nc) continue;   // unrolled with constant indices: O stays in registers
                 const int dc = ci * MLAF_DC, cw = min(MLAF_DC, r - dc);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (cw == MLAF_DC) mlaf_keys<MLAF_DC / 8>(Kt, Kc, Vc, kv0, k0, p1, dc, r, 0, tid);   // latent values (d < r)
-                else mlaf_keys<0>(Kt, Kc, Vc, kv0, k0, p1, dc, r, cw / 8, tid);
+                if (cw == MLAF_DC) mlaf_keys<MLAF_DC / 8>(Kt, Kc, Vc, Ks, Vs, kv0, k0, p1, dc, r, 0, tid);   // latent values (d < r)
+                else mlaf_keys<0>(Kt, Kc, Vc, Ks, Vs, kv0, k0, p1, dc, r, cw / 8, tid);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if ((int) sgi * 8 >= cw) continue;
                 for (int j = 0; j < nkb; ++j) {
@@ -1108,6 +1236,11 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
     }
 }
 
+// y[i] = value i of n / len consecutive cache rows of len values (format FC_FMT; codes C and scales S from the first row)
+kernel void k_kv_f32(device const uchar* C [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                     device const uchar* S [[buffer(3)]], constant uint& len [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i < n) y[i] = kv_get(FC_FMT, LLH((int) len), C, S, i / len, (int) len, (int) (i % len));
+}
 // y[i] = x[i]: BF16 to f32 (the MLA prompt path's latent rows from the cache)
 kernel void k_bf16_f32(device const ushort* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
                        uint i [[thread_position_in_grid]]) {
@@ -1125,9 +1258,9 @@ kernel void k_bf16_f32(device const ushort* x [[buffer(0)]], device float* y [[b
 // and vn MLPF_BK rows past the pass (finite: zero or earlier values).
 kernel void k_mla_prefill(constant MlpArgs& a [[buffer(0)]], device const float* qn [[buffer(1)]], device const float* qr [[buffer(2)]],
                           device const float* kn [[buffer(3)]], device const float* vn [[buffer(4)]],
-                          device const ushort* Kc [[buffer(5)]], device const RowInfo* ri [[buffer(6)]], device float* ms [[buffer(7)]],
+                          device const uchar* Kc [[buffer(5)]], device const RowInfo* ri [[buffer(6)]], device float* ms [[buffer(7)]],
                           device float* ls [[buffer(8)]], device float* Os [[buffer(9)]], device const float* g [[buffer(10)]],
-                          device float* o [[buffer(11)]], uint2 tg [[threadgroup_position_in_grid]],
+                          device float* o [[buffer(11)]], device const uchar* Ks [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                           uint sgi [[simdgroup_index_in_threadgroup]]) {
     threadgroup float Kr[MLPF_BK * ATT_HD];            // the tile's RoPE keys [key][dim]
@@ -1157,7 +1290,7 @@ kernel void k_mla_prefill(constant MlpArgs& a [[buffer(0)]], device const float*
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int e = (int) tid; e < MLPF_BK * ATT_HD; e += 32 * MLPF_R) {
             const int p = k0 + e / ATT_HD;
-            Kr[e] = p < kend ? bf(Kc[(kv0 + (ulong) p) * ATT_HD + e % ATT_HD]) : 0.0f;
+            Kr[e] = p < kend ? kv_get(FC_FMT, KLH, Kc, Ks, kv0 + (ulong) p, ATT_HD, e % ATT_HD) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         device const float* knb = kn + (ulong) (k0 - a.kb0) * ld + h * ATT_HD;

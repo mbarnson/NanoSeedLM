@@ -521,8 +521,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Eng* e = (Eng*) calloc(1, sizeof *e);
     if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
     const MovaCfg* c = &e->c;
-    if (c->mla && o->kv_format != ENG_KV_BF16) {   // engine_api.h: never ignore a format
-        snprintf(err, (size_t) errlen, "MLA models: only the BF16 KV cache is supported so far");
+    if (o->kv_format < ENG_KV_BF16 || o->kv_format > ENG_KV_Q8 || (c->mla && o->kv_format != ENG_KV_BF16)) {   // engine_api.h
+        snprintf(err, (size_t) errlen, "KV format %d not supported by the CUDA engine (MLA: bf16; GQA: bf16, q8)", o->kv_format);
         free(e);
         return NULL;
     }

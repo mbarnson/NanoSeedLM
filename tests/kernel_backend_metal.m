@@ -405,19 +405,29 @@ int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, 
     memcpy(y, yb.contents, yn);
     return 0;
 }
-int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
-                  const float* vn, const uint16_t* Kc, int npos, const RowInfo* ri, const float* g, float* o, int T) {
+// MLA cache bytes a position for n values in fmt (ENG_KV_*: 0 BF16, 2 FP8, 3 FP4): codes, block scales
+// (key: the RoPE key, all FP8 when quantized; else the latent)
+static int kv_lead(int fmt, int n, int key) { return fmt == 3 && !key ? (n < MLA_FP4_LEAD ? n : MLA_FP4_LEAD) : n; }
+static size_t kv_rowb(int fmt, int n, int key) {
+    return fmt >= 2 ? (size_t) (kv_lead(fmt, n, key) + (n - kv_lead(fmt, n, key)) / 2) : 2 * (size_t) n;
+}
+static size_t kv_srowb(int fmt, int n, int key) {
+    return fmt >= 2 ? (size_t) (kv_lead(fmt, n, key) / 32 + (n - kv_lead(fmt, n, key)) / 16) : 0;
+}
+static int mla_attn_x(int fmt, int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                      const float* vn, const void* Kc, const uint8_t* Ks, int npos, const RowInfo* ri, const float* g, float* o, int T) {
     const int ld = n_head * 128, Tp = (T + 8 * MLPF_R - 1) / (8 * MLPF_R) * (8 * MLPF_R), nk = kb[nb];
     const size_t qn_n = 4 * (size_t) T * ld, pad_n = 4 * (size_t) Tp * ld, kv_n = 4 * (size_t) nk * ld;
     id<MTLBuffer> qb = buf(NULL, pad_n), rb_ = buf(NULL, pad_n), kb_ = buf(NULL, kv_n + 4 * (size_t) MLPF_BK * ld),
-                  vb = buf(NULL, kv_n + 4 * (size_t) MLPF_BK * ld), Kb = buf(Kc, 2 * (size_t) npos * 128),
+                  vb = buf(NULL, kv_n + 4 * (size_t) MLPF_BK * ld), Kb = buf(Kc, kv_rowb(fmt, 128, 1) * (size_t) npos),
+                  Sb = buf(Ks, kv_srowb(fmt, 128, 1) * (size_t) npos),
                   rib = buf(ri, sizeof(RowInfo) * (size_t) T), mb = buf(NULL, 4 * (size_t) Tp * n_head),
                   lb = buf(NULL, 4 * (size_t) Tp * n_head), ob = buf(NULL, pad_n), gb = buf(g, qn_n), out = buf(NULL, qn_n);
     memcpy(qb.contents, qn, qn_n);
     memcpy(rb_.contents, qr, qn_n);
     memcpy(kb_.contents, kn, kv_n);
     memcpy(vb.contents, vn, kv_n);
-    id<MTLComputePipelineState> pp = pipe_("k_mla_prefill", 0, 0);
+    id<MTLComputePipelineState> pp = pipe_("k_mla_prefill", fmt, 0);
     if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:pp];
             for (int i = 0; i < nb; ++i) {
@@ -427,7 +437,7 @@ int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* q
                 [e setBuffer:kb_ offset:(NSUInteger) kb[i] * ld * 4 atIndex:3]; [e setBuffer:vb offset:(NSUInteger) kb[i] * ld * 4 atIndex:4];
                 [e setBuffer:Kb offset:0 atIndex:5]; [e setBuffer:rib offset:0 atIndex:6]; [e setBuffer:mb offset:0 atIndex:7];
                 [e setBuffer:lb offset:0 atIndex:8]; [e setBuffer:ob offset:0 atIndex:9]; [e setBuffer:gb offset:0 atIndex:10];
-                [e setBuffer:out offset:0 atIndex:11];
+                [e setBuffer:out offset:0 atIndex:11]; [e setBuffer:Sb offset:0 atIndex:12];
                 [e dispatchThreadgroups:MTLSizeMake((NSUInteger) Tp / (8 * MLPF_R), (NSUInteger) n_head, 1)
                   threadsPerThreadgroup:MTLSizeMake(32 * MLPF_R, 1, 1)];
             }
@@ -436,34 +446,53 @@ int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* q
     memcpy(o, out.contents, qn_n);
     return 0;
 }
-int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
-                const RowInfo* ri, const float* inv, int T) {
-    const size_t qn = 4 * (size_t) T * a.n_head * 128;
+int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                  const float* vn, const uint16_t* Kc, int npos, const RowInfo* ri, const float* g, float* o, int T) {
+    return mla_attn_x(0, n_head, scale, kb, nb, qn, qr, kn, vn, Kc, NULL, npos, ri, g, o, T);
+}
+int kt_mla_attn_xq(int fmt, int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                   const float* vn, const uint8_t* Kq, const uint8_t* Ks, int npos, const RowInfo* ri, const float* g, float* o, int T) {
+    return mla_attn_x(fmt, n_head, scale, kb, nb, qn, qr, kn, vn, Kq, Ks, npos, ri, g, o, T);
+}
+static int mla_rope(MlaArgs a, int fmt, float* qr, const float* kr, const float* c, void* Kc, void* Vc, uint8_t* Ks, uint8_t* Vs,
+                    int npos, const RowInfo* ri, const float* inv, int T) {
+    const size_t qn = 4 * (size_t) T * a.n_head * 128, kn = kv_rowb(fmt, 128, 1) * npos, vn = kv_rowb(fmt, a.r, 0) * npos;
+    const size_t ksn = kv_srowb(fmt, 128, 1) * npos, vsn = kv_srowb(fmt, a.r, 0) * npos;
     id<MTLBuffer> qb = buf(qr, qn), kb = buf(kr, 4 * (size_t) T * 128), cb = buf(c, 4 * (size_t) T * a.r),
-                  Kb = buf(Kc, 2 * (size_t) npos * 128), Vb = buf(Vc, 2 * (size_t) npos * a.r),
+                  Kb = buf(Kc, kn), Vb = buf(Vc, vn), Ksb = buf(Ks, ksn), Vsb = buf(Vs, vsn),
                   rb = buf(ri, sizeof(RowInfo) * (size_t) T), ib = buf(inv, 4 * 64);
-    id<MTLComputePipelineState> pp = pipe_("k_mla_rope", 0, 0);
+    id<MTLComputePipelineState> pp = pipe_("k_mla_rope", fmt, 0);
     const int nx = (a.n_head + 1) * 64 > a.r ? (a.n_head + 1) * 64 : a.r;
     if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
             [e setBuffer:qb offset:0 atIndex:1]; [e setBuffer:kb offset:0 atIndex:2]; [e setBuffer:cb offset:0 atIndex:3];
             [e setBuffer:Kb offset:0 atIndex:4]; [e setBuffer:Vb offset:0 atIndex:5]; [e setBuffer:rb offset:0 atIndex:6];
-            [e setBuffer:ib offset:0 atIndex:7];
+            [e setBuffer:ib offset:0 atIndex:7]; [e setBuffer:Ksb offset:0 atIndex:8]; [e setBuffer:Vsb offset:0 atIndex:9];
             [e dispatchThreads:MTLSizeMake(nx, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         }))
         return -1;
     memcpy(qr, qb.contents, qn);
-    memcpy(Kc, Kb.contents, 2 * (size_t) npos * 128);
-    memcpy(Vc, Vb.contents, 2 * (size_t) npos * a.r);
+    memcpy(Kc, Kb.contents, kn);
+    memcpy(Vc, Vb.contents, vn);
+    if (Ks) { memcpy(Ks, Ksb.contents, ksn); memcpy(Vs, Vsb.contents, vsn); }
     return 0;
 }
-int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
-                const RowInfo* ri, float* olat, int T) {
+int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
+                const RowInfo* ri, const float* inv, int T) {
+    return mla_rope(a, 0, qr, kr, c, Kc, Vc, NULL, NULL, npos, ri, inv, T);
+}
+int kt_mla_rope_q(MlaArgs a, int fmt, float* qr, const float* kr, const float* c, KtKvMla kv, int npos, const RowInfo* ri,
+                  const float* inv, int T) {
+    return mla_rope(a, fmt, qr, kr, c, kv.k, kv.v, kv.ks, kv.vs, npos, ri, inv, T);
+}
+static int mla_attn(MlaArgs a, int fmt, const float* ql, const float* qr, const void* Kc, const void* Vc, const uint8_t* Ks,
+                    const uint8_t* Vs, int npos, const RowInfo* ri, float* olat, int T) {
     const size_t on = 4 * (size_t) T * a.n_head * a.r;
-    id<MTLBuffer> lb = buf(ql, on), qb = buf(qr, 4 * (size_t) T * a.n_head * 128), Kb = buf(Kc, 2 * (size_t) npos * 128),
-                  Vb = buf(Vc, 2 * (size_t) npos * a.r), rb = buf(ri, sizeof(RowInfo) * (size_t) T), ob = buf(NULL, on),
+    id<MTLBuffer> lb = buf(ql, on), qb = buf(qr, 4 * (size_t) T * a.n_head * 128), Kb = buf(Kc, kv_rowb(fmt, 128, 1) * npos),
+                  Vb = buf(Vc, kv_rowb(fmt, a.r, 0) * npos), Ksb = buf(Ks, kv_srowb(fmt, 128, 1) * npos),
+                  Vsb = buf(Vs, kv_srowb(fmt, a.r, 0) * npos), rb = buf(ri, sizeof(RowInfo) * (size_t) T), ob = buf(NULL, on),
                   pb = buf(NULL, 4 * (size_t) T * a.n_head * a.n_splits * (a.r + 2));
-    id<MTLComputePipelineState> pa = pipe_("k_mla_attn", 0, (a.r + MLAF_DC - 1) / MLAF_DC), pd = pipe_("k_mla_reduce", 0, 0);
+    id<MTLComputePipelineState> pa = pipe_("k_mla_attn", fmt, (a.r + MLAF_DC - 1) / MLAF_DC), pd = pipe_("k_mla_reduce", 0, 0);
     if (!pa || !pd) return -1;
     const int ng = (a.n_head + MLAF_Q - 1) / MLAF_Q;
     if (run(^(id<MTLComputeCommandEncoder> e) {
@@ -471,6 +500,7 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
             [e setBuffer:lb offset:0 atIndex:1]; [e setBuffer:qb offset:0 atIndex:2]; [e setBuffer:Kb offset:0 atIndex:3];
             [e setBuffer:Vb offset:0 atIndex:4]; [e setBuffer:rb offset:0 atIndex:5];
             [e setBuffer:(a.n_splits > 1 ? pb : ob) offset:0 atIndex:6];
+            [e setBuffer:Ksb offset:0 atIndex:7]; [e setBuffer:Vsb offset:0 atIndex:8];
             [e dispatchThreadgroups:MTLSizeMake(a.n_splits, ng, T) threadsPerThreadgroup:MTLSizeMake(32 * MLAF_SG, 1, 1)];
             if (a.n_splits > 1) {
                 [e setComputePipelineState:pd]; [e setBytes:&a length:sizeof a atIndex:0];
@@ -481,6 +511,13 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
         return -1;
     memcpy(olat, ob.contents, on);
     return 0;
+}
+int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
+                const RowInfo* ri, float* olat, int T) {
+    return mla_attn(a, 0, ql, qr, Kc, Vc, NULL, NULL, npos, ri, olat, T);
+}
+int kt_mla_attn_q(MlaArgs a, int fmt, const float* ql, const float* qr, KtKvMla kv, int npos, const RowInfo* ri, float* olat, int T) {
+    return mla_attn(a, fmt, ql, qr, kv.k, kv.v, kv.ks, kv.vs, npos, ri, olat, T);
 }
 
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
@@ -517,6 +554,19 @@ int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs
         }))
         return -1;
     memcpy(y, yb.contents, yn);
+    return 0;
+}
+int kt_kv_f32(int fmt, const uint8_t* codes, const uint8_t* scales, int len, int rows, float* y) {
+    const uint32_t n = (uint32_t) len * rows, l = (uint32_t) len;
+    id<MTLBuffer> cb = buf(codes, kv_rowb(fmt, len, 0) * rows), sb = buf(scales, kv_srowb(fmt, len, 0) * rows), yb = buf(NULL, 4 * (size_t) n);
+    id<MTLComputePipelineState> pp = pipe_("k_kv_f32", fmt, 0);
+    if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
+            [e setComputePipelineState:pp]; [e setBuffer:cb offset:0 atIndex:0]; [e setBuffer:yb offset:0 atIndex:1];
+            [e setBytes:&n length:4 atIndex:2]; [e setBuffer:sb offset:0 atIndex:3]; [e setBytes:&l length:4 atIndex:4];
+            [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }))
+        return -1;
+    memcpy(y, yb.contents, 4 * (size_t) n);
     return 0;
 }
 int kt_bf16_f32(const uint16_t* x, float* y, int n) {

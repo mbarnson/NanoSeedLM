@@ -117,7 +117,8 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
 - `--ctx` sets each slot's context (prompt and output). On a 32 GB Mac, 4096 fits; on a larger Mac, use a larger value,
   for example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held.
 - `--kv q8` keeps the KV cache in 8 bits (int8 with a scale per token and head) on either engine: half the memory, so a
-  200k-token cache takes about 20 GB instead of 39 GB.  On an M4 Max it costs little quality (KLD against BF16,
+  200k-token cache takes about 20 GB instead of 39 GB. MLA models take `--kv fp8` or `--kv fp4` instead (Metal; see
+  [MLA models](#mla-models-experimental)).  On an M4 Max it costs little quality (KLD against BF16,
   held-out / chat: 0.0267 / 0.0136 against BF16 KV's 0.0260 / 0.0126, each within about one standard error; top-1
   agreement unchanged) and about a tenth of decode speed at 4k context.
 
@@ -225,8 +226,34 @@ holmes.txt --decode 256`; the one-pass kernel is the earlier `k_mla_attn` with p
 | decode, 1k / 4k / 8k context | 37.7 / 32.1 / 20.0 | 54.1 / 51.2 / 47.7 | 61.2 / 58.6 / 50.6 |
 
 The KV cache places MLA's per-layer latent widths in VRAM and host memory as it does GQA's rows. Decode is still
-slower than GQA's mostly because it streams the BF16 MLA projections (945 MB per token at rank 768). Not yet: the
-8-bit cache for MLA (`--kv q8` is refused) and packed (Q8 / seed) MLA tensors (the MLA projections stay BF16).
+slower than GQA's mostly because it streams the BF16 MLA projections (945 MB per token at rank 768). Not yet: packed
+(Q8 / seed) MLA tensors (the MLA projections stay BF16).
+
+On Metal, long prompts (256 or more new tokens) attend with the latent expanded per head, as CUDA's prompt rows do:
+`k_mla_prefill` over `q · (q_latᵀ c) + q_rope · k_rope` with values `v_up c`, the keys expanded 512 cached positions at a
+time by per-head GEMMs (`q_lat` read transposed in place). Shorter prefills (a chat turn over a long cached context) stay
+absorbed, so they do not expand every cached position: 15 new tokens after 12k cached take 0.57 s instead of 2.8 s.
+Expansion stops at the last multiple of 256 positions, so a prompt restored from the cold cache in 256-token blocks
+gets the cache computed whole, bit for bit. M4 Max, p4mx-q4v seeds: prefill of 2048 tokens 6.4 s -> 5.4 s, of 8192
+tokens 57.9 s -> 42.5 s; decode unchanged.
+
+`--kv fp8` / `--kv fp4` (Metal) store the MLA cache in DeepSeek-V4.1's codes ([`nslm/kvq.h`](nslm/kvq.h)): FP8 is E4M3
+with a power-of-two scale per 32 values, FP4 is E2M1 with an E4M3 scale per 16. Values are quantized as they are
+written, and every reader decodes them exactly to BF16, so attention is otherwise unchanged. `fp8` keeps the latent
+and the RoPE key in FP8 (924 bytes per token per layer at rank 768, 52% of BF16). `fp4` keeps the RoPE key and the
+latent's first 256 dims in FP8 and the rest of the latent in FP4 (684 bytes, 38%). TransMLA latents put most of their
+variance in the leading dims, and an FP4 RoPE key cost most of DeepSeek's all-FP4 layout's quality. Held-out KLD
+against BF16, J768 conversion with p4mx-q4v seeds (31 windows of 2048 tokens, standard error 0.003):
+
+| MLA cache | Bytes per token and layer | 200k tokens | KLD | top-1 agreement |
+|---|---|---|---|---|
+| BF16 | 1792 | 17.2 GB | 0.2199 | 80.35% |
+| `fp8` | 924 | 8.9 GB | 0.2221 | 80.20% |
+| `fp4` | 684 | 6.6 GB | 0.2223 | 80.22% |
+| FP4 with 128 / 0 leading FP8 latent dims | 624 / 564 | 6.0 / 5.4 GB | 0.2264 / 0.2307 | 80.14 / 79.81% |
+| all FP4 (DeepSeek-V4.1's layout) | 504 | 4.8 GB | 0.2677 | 78.10% |
+
+GQA's cache at 200k tokens is 39 GB, or 20 GB with `--kv q8`.
 
 ## Make a model folder
 

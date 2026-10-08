@@ -98,6 +98,21 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
 // kv0); the keys in nb passes [kb[i], kb[i + 1]) carrying the softmax state.  Returns 1 where the backend lacks it.
 int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
                   const float* vn, const uint16_t* Kc, int npos, const RowInfo* ri, const float* g, float* o, int T);
+// MLA caches in FP8 / FP4 (fmt ENG_KV_FP8 / ENG_KV_FP4, nslm/kvq.h): per position the RoPE key's codes k (128 or 64
+// bytes) and block scales ks (4 or 8), the latent's v (r or r / 2) and vs (r / 32 or r / 16).  1 where a backend lacks them.
+typedef struct {
+    uint8_t *k, *v, *ks, *vs;
+} KtKvMla;
+// kt_mla_rope with the cache written in fmt
+int kt_mla_rope_q(MlaArgs a, int fmt, float* qr, const float* kr, const float* c, KtKvMla kv, int npos, const RowInfo* ri,
+                  const float* inv, int T);
+// kt_mla_attn over a cache in fmt
+int kt_mla_attn_q(MlaArgs a, int fmt, const float* ql, const float* qr, KtKvMla kv, int npos, const RowInfo* ri, float* olat, int T);
+// kt_mla_attn_x with the RoPE keys in fmt (codes Kq, scales Ks)
+int kt_mla_attn_xq(int fmt, int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                   const float* vn, const uint8_t* Kq, const uint8_t* Ks, int npos, const RowInfo* ri, const float* g, float* o, int T);
+// y[row][d] = value d of `rows` cache rows of len values in fmt (k_kv_f32)
+int kt_kv_f32(int fmt, const uint8_t* codes, const uint8_t* scales, int len, int rows, float* y);
 // fmt MF_BF16 (E) or MF_Q8 (q8, s8, b8): x[t] = row ids[t]
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x);

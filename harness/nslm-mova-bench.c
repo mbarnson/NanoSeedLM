@@ -1,7 +1,7 @@
 // harness/nslm-mova-bench.c - speed and memory footprint of one MoVA configuration on one pre-tokenized prompt.
 //
 //   nslm-mova-bench --model DIR [--res out/res] (--ids FILE | --text FILE --ctx N) [--bucket NAME] [--decode 256]
-//                   [--repeats 5] [--warmup 1] [--kv bf16|q8] [--timing]
+//                   [--repeats 5] [--warmup 1] [--kv bf16|q8|fp8|fp4] [--timing]
 //
 // --ids: int32 prompt ids (tools/mova_export.py bench).  --text FILE --ctx N builds the same matched-bench prompt
 // here: BOS + the text's tokens + one chat question, exactly N tokens.  One sequence slot, KV sized for prompt +
@@ -84,7 +84,8 @@ int main(int argc, char** argv) {
     o.model_dir = model;
     o.resource_dir = opt(argc, argv, "--res", "out/res");
     o.max_seqs = 1;
-    o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
+    o.kv_format = eng_kv_parse(opt(argc, argv, "--kv", "bf16"));
+    if (o.kv_format < 0) { fprintf(stderr, "%s: --kv: bf16, q8, fp8 or fp4\n", argv[0]); return 2; }
     o.kv_tokens = n + ndec + 64;
     MachineState ms0 = machine_state();
     print_machine_state("start_", ms0);

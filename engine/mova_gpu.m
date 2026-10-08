@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include "engine_api.h"
+#include "kvq.h"
 #include "model_st.h"
 #include "kernels_moe.metal"   // argument structs and constants only
 #include "lfsr.h"
@@ -72,6 +73,7 @@ struct Eng {
     id<MTLBuffer> __strong* Ks;           // 8-bit KV cache (kv_q8): one f32 scale per (position, KV head); Kc / Vc are int8
     id<MTLBuffer> __strong* Vs;
     int kv_q8;
+    int kv_fmt;                           // ENG_KV_*: MLA caches in FP8 / FP4 (nslm/kvq.h) have codes in Kc / Vc, scales in Ks / Vs
     int64_t kv_cap;
     // scratch (MAX_ROWS rows)
     id<MTLBuffer> x, xn, q, k, v, gq, ao, ga, ua, aa, G, U, A, D, V, sh, logits, ids, ri, inv, part, inds, wts, vinds, vwts, am;
@@ -302,9 +304,18 @@ static void make_resident(Eng* e) {
     [e->residency requestResidency];
 }
 
+// MLA cache bytes a position (nslm/kvq.h): the latent's n values (FP8; FP4: the first MLA_FP4_LEAD in FP8) and the
+// RoPE key's (FP8 in both), codes then block scales
+_Static_assert(MLA_FP4_LEAD == KVQ_FP4_LEAD, "the Metal FP4 cache layout is nslm/kvq.h's");
+static int kv_lead(const Eng* e, int n) { return e->kv_fmt == ENG_KV_FP4 ? (n < MLA_FP4_LEAD ? n : MLA_FP4_LEAD) : n; }
+static uint64_t kv_row(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) (kv_lead(e, n) + (n - kv_lead(e, n)) / 2) : 2 * (uint64_t) n; }
+static uint64_t kv_srow(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) (kv_lead(e, n) / 32 + (n - kv_lead(e, n)) / 16) : 0; }
+static uint64_t kv_rowk(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) n : 2 * (uint64_t) n; }
+static uint64_t kv_srowk(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) n / 32 : 0; }
+
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     @autoreleasepool {
-        if (o->kv_format != ENG_KV_BF16 && o->kv_format != ENG_KV_Q8) {   // engine_api.h: never ignore a format
+        if (o->kv_format < ENG_KV_BF16 || o->kv_format > ENG_KV_FP4) {   // engine_api.h: never ignore a format
             snprintf(err, (size_t) errlen, "KV format %d not supported by the Metal engine", o->kv_format);
             return NULL;
         }
@@ -313,8 +324,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->pipes = [NSMutableDictionary new];
         if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
         const MovaCfg* c = &e->c;
-        if (c->mla && o->kv_format != ENG_KV_BF16) {   // engine_api.h: never ignore a format
-            snprintf(err, (size_t) errlen, "MLA models: only the BF16 KV cache is supported so far");
+        int kvq_ok = !c->mla || o->kv_format != ENG_KV_Q8;   // engine_api.h: never ignore a format
+        for (int l = 0; l < c->n_layer && c->mla; ++l) kvq_ok &= o->kv_format < ENG_KV_FP8 || c->mla_rank[l] % 32 == 0;
+        if (!kvq_ok || (!c->mla && o->kv_format >= ENG_KV_FP8)) {
+            snprintf(err, (size_t) errlen, c->mla ? "MLA models: KV formats bf16, fp8 and fp4 (latent ranks a multiple of 32)"
+                                                  : "GQA models: KV formats bf16 and q8");
             free(e);
             return NULL;
         }
@@ -405,17 +419,23 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             return NULL;
         }
         e->kv_q8 = o->kv_format == ENG_KV_Q8;   // int8 values (half of BF16's bytes) and a scale per (position, head)
+        e->kv_fmt = o->kv_format;
         e->Kc = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Vc = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Ks = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Vs = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         int rmax = 0;
         for (int l = 0; l < c->n_layer; ++l) {
-            if (c->mla) {   // MLA: the RoPE key [cap][128] and the latent [cap][r] (BF16)
+            if (c->mla) {   // MLA: the RoPE key [cap][128] and the latent [cap][r] (BF16, or FP8 / FP4 codes + block scales)
                 if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
-                e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * c->mla_rope * 2, "K rope", &e->mem.kv);
-                e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * e->L[l].mla_r * 2, "latent", &e->mem.kv);
-                if (!e->Kc[l] || !e->Vc[l]) {
+                const int q = e->kv_fmt >= ENG_KV_FP8;
+                e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_rowk(e, c->mla_rope), "K rope", &e->mem.kv);
+                e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_row(e, e->L[l].mla_r), "latent", &e->mem.kv);
+                if (q) {
+                    e->Ks[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_srowk(e, c->mla_rope), "K rope scales", &e->mem.kv);
+                    e->Vs[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_srow(e, e->L[l].mla_r), "latent scales", &e->mem.kv);
+                }
+                if (!e->Kc[l] || !e->Vc[l] || (q && (!e->Ks[l] || !e->Vs[l]))) {
                     snprintf(err, (size_t) errlen, "KV cache: out of memory");
                     eng_close(e);
                     return NULL;
@@ -512,7 +532,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         if (c->mla) snprintf(mla, sizeof mla, ", MLA latent %d (+%d RoPE)", rmax, c->mla_rope);
         snprintf(e->desc, sizeof e->desc, "mova engine: experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s%s",
                  fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
-                 fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->kv_q8 ? ", KV q8" : "", mla);
+                 fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->kv_q8 ? ", KV q8" : e->kv_fmt == ENG_KV_FP8 ? ", KV fp8" : e->kv_fmt == ENG_KV_FP4 ? ", KV fp4" : "", mla);
         return e;
     }
 }
@@ -760,16 +780,18 @@ static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
         const int kb1 = kb0 + MLP_KB < nk ? kb0 + MLP_KB : nk;
         const uint32_t n = (uint32_t) ((kb1 - kb0) * r);
         cmd_group(c, MOVA_TG_ATTN_PROJ);
-        cpipe(c, pipe_(e, "k_bf16_f32", 0, 0));
-        cbuf(c, 0, e->Vc[l], (kv0 + (uint64_t) kb0) * r * 2);
+        const uint32_t len = (uint32_t) r;
+        cpipe(c, e->kv_fmt >= ENG_KV_FP8 ? pipe_(e, "k_kv_f32", e->kv_fmt, 0) : pipe_(e, "k_bf16_f32", 0, 0));
+        cbuf(c, 0, e->Vc[l], (kv0 + (uint64_t) kb0) * kv_row(e, r));
         cbuf(c, 1, e->latf, 0);
         cbytes(c, 2, &n, 4);
+        if (e->kv_fmt >= ENG_KV_FP8) { cbuf(c, 3, e->Vs[l], (kv0 + (uint64_t) kb0) * kv_srow(e, r)); cbytes(c, 4, &len, 4); }
         [c->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         enc_heads_gemm(c, &L->ql, e->latf, r, 0, nil, e->kn, kb1 - kb0, 1);
         enc_heads_mm(c, &L->vu, e->latf, r, 0, nil, e->vn, kb1 - kb0);
         cmd_group(c, MOVA_TG_ATTN);
         const MlpArgs a = {H, kb0, kb1, kb0 == 0, kb1 == nk, 1.0f / sqrtf((float) g->head_dim), T, 0};
-        cpipe(c, pipe_(e, "k_mla_prefill", 0, 0));
+        cpipe(c, pipe_(e, "k_mla_prefill", e->kv_fmt, 0));
         cbytes(c, 0, &a, sizeof a);
         cbuf(c, 1, e->q, 0);
         cbuf(c, 2, e->qrp, 0);
@@ -782,6 +804,7 @@ static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
         cbuf(c, 9, e->ost, 0);
         cbuf(c, 10, e->gq, 0);
         cbuf(c, 11, e->ao, 0);
+        cbuf(c, 12, e->Ks[l] ? e->Ks[l] : e->Kc[l], 0);
         crun(c, (uint64_t) (T + 8 * MLPF_R - 1) / (8 * MLPF_R), (uint64_t) H, 1, 32 * MLPF_R);
     }
 }
@@ -803,7 +826,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     if (!xp) heads(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);   // expanded: the keys instead
     cmd_group(c, MOVA_TG_ATTN);
     const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
-    cpipe(c, pipe_(e, "k_mla_rope", 0, 0));
+    cpipe(c, pipe_(e, "k_mla_rope", e->kv_fmt, 0));
     cbytes(c, 0, &ma, sizeof ma);
     cbuf(c, 1, e->qrp, 0);
     cbuf(c, 2, e->k, 0);
@@ -812,10 +835,12 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     cbuf(c, 5, e->Vc[l], 0);
     cbuf(c, 6, e->ri, 0);
     cbuf(c, 7, e->inv, 0);
+    cbuf(c, 8, e->Ks[l] ? e->Ks[l] : e->Kc[l], 0);
+    cbuf(c, 9, e->Vs[l] ? e->Vs[l] : e->Vc[l], 0);
     const int nx = (H + 1) * 64 > r ? (H + 1) * 64 : r;
     [c->enc dispatchThreads:MTLSizeMake((NSUInteger) nx, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     if (xp) { encode_mla_prefill(e, c, l, T); return; }
-    cpipe(c, pipe_(e, "k_mla_attn", 0, (r + MLAF_DC - 1) / MLAF_DC));
+    cpipe(c, pipe_(e, "k_mla_attn", e->kv_fmt, (r + MLAF_DC - 1) / MLAF_DC));
     cbytes(c, 0, &ma, sizeof ma);
     cbuf(c, 1, e->qlat, 0);
     cbuf(c, 2, e->qrp, 0);
@@ -823,6 +848,8 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     cbuf(c, 4, e->Vc[l], 0);
     cbuf(c, 5, e->ri, 0);
     cbuf(c, 6, nsp > 1 ? e->part : e->olat, 0);
+    cbuf(c, 7, e->Ks[l] ? e->Ks[l] : e->Kc[l], 0);
+    cbuf(c, 8, e->Vs[l] ? e->Vs[l] : e->Vc[l], 0);
     crun(c, (uint64_t) nsp, (uint64_t) ((H + MLAF_Q - 1) / MLAF_Q), (uint64_t) T, 32 * MLAF_SG);
     if (nsp > 1) {
         cpipe(c, pipe_(e, "k_mla_reduce", 0, 0));
@@ -1122,15 +1149,16 @@ int eng_fork(Eng* e, int dst, int src) { (void) e; return dst == src ? 0 : -1; }
 void eng_free(Eng* e, int seq) { Seq* s = seq_of(e, seq); if (s) s->len = s->done = 0; }
 int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len : 0; }
 
-// A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (8-bit cache) their scales.
+// A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (8-bit, FP8, FP4 caches) their
+// scales.
 static void kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
     const MovaCfg* c = &e->c;
     const uint64_t r0 = (uint64_t) (seq * e->slot_cap + p0), n = (uint64_t) (p1 - p0);
     for (int l = 0; l < c->n_layer; ++l) {
-        const uint64_t kr = c->mla ? (uint64_t) c->mla_rope * 2 : (uint64_t) c->n_kv * c->head_dim * (e->kv_q8 ? 1 : 2);
-        const uint64_t vr = c->mla ? (uint64_t) e->L[l].mla_r * 2 : kr, sr = e->kv_q8 ? (uint64_t) c->n_kv * 4 : 0;
+        const uint64_t kr = c->mla ? kv_rowk(e, c->mla_rope) : (uint64_t) c->n_kv * c->head_dim * (e->kv_q8 ? 1 : 2);
+        const uint64_t vr = c->mla ? kv_row(e, e->L[l].mla_r) : kr, sr = e->kv_q8 ? (uint64_t) c->n_kv * 4 : 0;
         id<MTLBuffer> b[4] = {e->Kc[l], e->Vc[l], e->Ks[l], e->Vs[l]};
-        const uint64_t rb[4] = {kr, vr, sr, sr};
+        const uint64_t rb[4] = {kr, vr, c->mla ? kv_srowk(e, c->mla_rope) : sr, c->mla ? kv_srow(e, e->L[l].mla_r) : sr};
         for (int i = 0; i < 4; ++i) {
             if (!rb[i]) continue;
             uint8_t* d = (uint8_t*) b[i].contents + r0 * rb[i];
@@ -1143,7 +1171,8 @@ int64_t eng_kv_bytes(Eng* e) {
     const MovaCfg* c = &e->c;
     int64_t b = 0;
     for (int l = 0; l < c->n_layer; ++l)
-        b += c->mla ? 2 * (int64_t) (c->mla_rope + e->L[l].mla_r) : 2 * (int64_t) c->n_kv * (e->kv_q8 ? c->head_dim + 4 : 2 * c->head_dim);
+        b += c->mla ? (int64_t) (kv_rowk(e, c->mla_rope) + kv_srowk(e, c->mla_rope) + kv_row(e, e->L[l].mla_r) + kv_srow(e, e->L[l].mla_r))
+                    : 2 * (int64_t) c->n_kv * (e->kv_q8 ? c->head_dim + 4 : 2 * c->head_dim);
     return b;
 }
 int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst) {

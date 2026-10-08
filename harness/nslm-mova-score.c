@@ -2,7 +2,7 @@
 // windows; with --routes, also the agreement of our expert routing with the reference's.
 //
 //   nslm-mova-score --model DIR [--res out/res] --windows PRE --ref PRE [--routes] [--max-windows N]
-//                   [--kv bf16|q8] [--name NAME] [--out FILE.kv]
+//                   [--kv bf16|q8|fp8|fp4] [--name NAME] [--out FILE.kv]
 //
 // Windows (WINDOWS.ids/.refnll/.reftop) and reference log-probs (REF.f16.npy) come from tools/mova_export.py and
 // tools/mova_score.py.  Each window is BOS + 2047 tokens (CTX); rows FIRST..CTX-2 (1024..2046) predict tokens
@@ -100,7 +100,8 @@ int main(int argc, char** argv) {
     o.resource_dir = opt(argc, argv, "--res", "out/res");
     o.max_seqs = 1;
     o.kv_tokens = CTX;
-    o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
+    o.kv_format = eng_kv_parse(opt(argc, argv, "--kv", "bf16"));
+    if (o.kv_format < 0) { fprintf(stderr, "%s: --kv: bf16, q8, fp8 or fp4\n", argv[0]); return 2; }
     if (!o.model_dir || !wpre || !rpre) { fprintf(stderr, "usage: nslm-mova-score --model DIR --windows PRE --ref PRE [--routes]\n"); return 2; }
     size_t nids = 0, nref = 0, nnll = 0, ntop = 0;
     const int32_t* wins = (const int32_t*) slurp_any(wpre, ".ids", &nids);

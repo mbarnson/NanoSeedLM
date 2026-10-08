@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 
 #include "engine_api.h"
+#include "kvq.h"
 #include "lfsr.h"
 #include "model_st.h"
 #include "mova_cfg.h"
@@ -199,7 +200,7 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
 // every row must agree bit for bit (a dense matvec adds each row's products in the same order for any row count), and
 // prompt caches must not depend on the prefill chunks either (a server's chunks start wherever a slot's cache reuse
 // ends).  Route flips are still counted and bounded, and argmax checked, so a failure says how far apart the rows are.
-static void test_batch(const char* dir, const char* what, int expand_min) {
+static void test_batch(const char* dir, const char* what, int expand_min, int kv_format) {
     enum { NB = 11, STEPS = 4, CAP = 256, CH = 50, NSP = 4, TK = 4, TKV = 2 };
     EngOpts o;
     memset(&o, 0, sizeof o);
@@ -208,6 +209,7 @@ static void test_batch(const char* dir, const char* what, int expand_min) {
     o.max_seqs = 1;
     o.kv_tokens = CAP;
     o.mla_expand_min = expand_min;
+    o.kv_format = kv_format;
     char err[512] = "";
     Eng* e1 = eng_open(&o, err, sizeof err);
     o.max_seqs = NB + 1;
@@ -317,11 +319,11 @@ static void test_batch(const char* dir, const char* what, int expand_min) {
     free(lb);
 }
 
-// 8. MLA (a TransMLA conversion): the same random model with latent attention (ranks 64..128, one 128-dim RoPE key),
+// 8. MLA (a TransMLA conversion): the same random model with latent attention (ranks 64..320, one 128-dim RoPE key),
 // against the C reference: prompt scoring (one-pass latent attention) and decode (split-key + reduce), the cache size.
 static void test_mla(void) {
     const char* dir = "out/test/engine_model_mla";
-    static const int ranks[5] = {64, 96, 64, 128, 96};
+    static const int ranks[5] = {64, 96, 64, 320, 96};   // 320: the fp4 cache's FP4 latent dims (past KVQ_FP4_LEAD)
     char* config = (char*) malloc(strlen(CONFIG) + 128);
     sprintf(config, "{\"mla_ranks\": [%d, %d, %d, %d, %d], \"mla_rope_dim\": 128,%s", ranks[0], ranks[1], ranks[2], ranks[3],
             ranks[4], CONFIG + 1);
@@ -383,6 +385,7 @@ static void test_mla(void) {
     Eng* e8 = eng_open(&o, err, sizeof err);
     CHECK(!e8 && strstr(err, "MLA"), "MLA with the 8-bit cache must be refused (not ignored): %s", e8 ? "opened" : err);
     if (e8) eng_close(e8);
+    o.kv_format = ENG_KV_BF16;
     const int V = eng_vocab(e), N = 48, NS = 4, TK = 4, TKV = 2;
     uint64_t st = 11;
     int32_t ids[64];
@@ -463,6 +466,43 @@ static void test_mla(void) {
         CHECK(dmean < 0.05 && dworst < 0.25, "MLA decode: logit error mean %.3e, max %.3e", dmean, dworst);
     }
     if (ex) eng_close(ex);
+    // the FP8 / FP4 caches (nslm/kvq.h): their size, and decode after a 30-row prompt against the reference (BF16 cache)
+    for (int f = ENG_KV_FP8; f <= ENG_KV_FP4; ++f) {
+        EngOpts oq = o;
+        oq.kv_format = f;
+        Eng* eq = eng_open(&oq, err, sizeof err);
+        const char* fn = f == ENG_KV_FP8 ? "fp8" : "fp4";
+        if (!eq && strstr(err, "not supported by the CUDA")) { printf("MLA %s cache: not in this engine\n", fn); continue; }
+        CHECK(eq != NULL, "MLA eng_open (%s cache): %s", fn, err);
+        if (!eq) continue;
+        int64_t want = 0;
+        for (int l = 0; l < 5; ++l) {   // the RoPE key FP8; the latent FP8, or (fp4) FP8 for its first KVQ_FP4_LEAD values
+            const int lead = f == ENG_KV_FP8 || ranks[l] < KVQ_FP4_LEAD ? ranks[l] : KVQ_FP4_LEAD;
+            want += oq.kv_tokens * (128 + 4 + kvq_row_bytes(lead, ranks[l]) + kvq_row_scales(lead, ranks[l]));
+        }
+        EngMem mq;
+        eng_mem(eq, &mq);
+        CHECK(mq.kv == want, "MLA %s KV cache %lld bytes, want %lld", fn, (long long) mq.kv, (long long) want);
+        const int P0 = 30;
+        CHECK(eng_prefill(eq, 0, ids, P0) == 0, "MLA prefill (%s)", fn);
+        double dworst = 0, dmean = 0;
+        int dsame = 0;
+        for (int t = P0 - 1; t < N - 1; ++t) {
+            CHECK(eng_step(eq, 0, lg) == 0, "MLA step (%s)", fn);
+            const double re = row_err(lg, rl + (size_t) t * V, V);
+            dworst = fmax(dworst, re);
+            dmean += re / (N - P0);
+            dsame += argmax(lg, V) == argmax(rl + (size_t) t * V, V);
+            eng_push(eq, 0, ids[t + 1]);
+        }
+        printf("MLA decode, %s cache (%lld bytes, BF16 %lld): %d steps, logit error mean %.2e max %.2e, argmax equal %d\n", fn,
+               (long long) mq.kv, (long long) want_kv, N - P0, dmean, dworst, dsame);
+        // This random model's latents are uniform (no outliers), so these bounds only guard the wiring (measured: fp8 mean
+        // 8.3e-2, fp4 2.2e-1); quality is the real model's KL divergence (nslm-mova-score --kv).
+        CHECK(dmean < (f == ENG_KV_FP8 ? 0.12 : 0.3) && dsame >= (N - P0) * 2 / 3, "MLA decode (%s cache): logit error mean %.3e, "
+              "argmax equal %d of %d", fn, dmean, dsame, N - P0);
+        eng_close(eq);
+    }
     // prompt lookup (multi-row verify forwards: split-key latent attention over several rows) must commit the tokens of
     // plain greedy decode
     {
@@ -505,9 +545,11 @@ static void test_mla(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
-    test_batch(dir, "MLA", 0);                // these prompts (< 256 rows): attention in latent space
-    test_batch(dir, "MLA expanded", 1);       // every prompt with the latent expanded per head
-    test_batch(dir, "MLA blocks of 16", 16);  // expanded up to the last multiple of 16 (the copied cache: 128 positions)
+    test_batch(dir, "MLA", 0, ENG_KV_BF16);                // these prompts (< 256 rows): attention in latent space
+    test_batch(dir, "MLA expanded", 1, ENG_KV_BF16);       // every prompt with the latent expanded per head
+    test_batch(dir, "MLA blocks of 16", 16, ENG_KV_BF16);  // expanded up to the last multiple of 16 (the copied cache: 128)
+    test_batch(dir, "MLA fp8", 16, ENG_KV_FP8);
+    test_batch(dir, "MLA fp4", 16, ENG_KV_FP4);
 }
 
 int main(void) {
@@ -716,7 +758,7 @@ int main(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
-    test_batch(dir, "GQA", 0);
+    test_batch(dir, "GQA", 0, ENG_KV_BF16);
     test_mla();
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
