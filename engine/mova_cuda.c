@@ -55,7 +55,8 @@ typedef struct {
     MW vr, vb, vx;                        // value router, bias, experts (sparse layers)
     MW mg, mu, md;                        // dense MLP
     MW r, rb, eg, eu, ed, sg, su, sd;     // MoE router, bias, experts, shared expert
-    int sparse;
+    MW ka_x, ka_v, kr, qm, ql, vu;        // MLA: kv_a_x, kv_a_v (MoVA layers), k_rope_proj, q_rope_mix, q_lat, v_up
+    int sparse, mla_r;                    // mla_r: MLA latent rank (0 for GQA)
 } Layer;
 
 typedef struct {
@@ -78,12 +79,14 @@ struct Eng {
     // prompt stages the host rows of the layer it computes in kv_stage
     int kv_fmt;
     int64_t kv_cap, kv_nv;
-    uint64_t kv_row, kv_srow;   // bytes per position and layer: values (K or V), scales (K or V; Q8)
+    uint64_t kv_row, kv_srow;   // bytes per position and layer: K values (MLA: the RoPE key), scales (K or V; Q8)
+    uint64_t *kv_vrow, *kv_voff, kv_vsum, kv_vmax;   // V (MLA: the latent) bytes per position: layer l's, before layer l, all, max
     uint8_t *kv_vk, *kv_vv, *kv_hk, *kv_hv, *kv_sk, *kv_sv;   // VRAM, host (device addresses), staging: values
     float *kv_vks, *kv_vvs, *kv_hks, *kv_hvs, *kv_sks, *kv_svs;   // ... scales (Q8)
     int kv_staged;   // the layer whose host rows kv_stage holds for the running prompt pass, or -1
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
+    float *lat, *qrp, *qlat, *olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     int32_t *ids, *inds, *vinds, *am, *perm, *vperm, *ntiles, *vntiles;
     RowInfo* ri;
     MmTile *tiles, *vtiles;
@@ -191,7 +194,8 @@ static int upload_dense(Eng* e, const NsTensor* t, MW* w, char* err, int errlen)
     return 0;
 }
 
-// BF16 from the original checkpoint (slices > 1: stacked experts), as dense VRAM tensors.
+// BF16 from the original checkpoint (slices > 1: stacked experts; MLA's per-head maps are one 3-D tensor), as dense
+// VRAM tensors.
 static int upload_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen) {
     if (!e->ck && !(e->ck = mova_ckpt_open(e->model_dir, err, errlen))) return -1;
     memset(w, 0, sizeof *w);
@@ -204,12 +208,16 @@ static int upload_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen
     const uint64_t one = (uint64_t) t->rows * t->cols * 2;
     uint8_t* d = (uint8_t*) dalloc(e, one * (uint64_t) t->slices, &e->mem.weights);
     if (!d) { snprintf(err, (size_t) errlen, "%s: out of GPU memory", t->name); return -1; }
+    w->w0.p[0] = d;
+    if (t->kind == MOVA_K_HEADS) {   // MLA's per-head maps: one 3-D tensor
+        const uint16_t* src = mova_ckpt_bf16_3d(e->ck, t->name, t->slices, t->rows, t->cols, err, errlen);
+        return src && CK(cudaMemcpy(d, src, one * (uint64_t) t->slices, cudaMemcpyHostToDevice)) ? 0 : -1;
+    }
     char nm[128];
     for (int s = 0; s < t->slices; ++s) {
         const uint16_t* src = mova_ckpt_bf16(e->ck, mova_slice_name(t, s, nm, sizeof nm), t->rows, t->cols, err, errlen);
         if (!src || !CK(cudaMemcpy(d + one * (uint64_t) s, src, one, cudaMemcpyHostToDevice))) return -1;
     }
-    w->w0.p[0] = d;
     return 0;
 }
 
@@ -360,9 +368,12 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
     return 0;
 }
 
+// KV bytes per position: of every layer (all), of one layer's staging (per: the widest layer).
+static uint64_t kv_all(const Eng* e) { return (e->kv_row + 2 * e->kv_srow) * (uint64_t) e->c.n_layer + e->kv_vsum; }
+static uint64_t kv_per(const Eng* e) { return e->kv_row + e->kv_vmax + 2 * e->kv_srow; }
 // Whether place_kv will keep part of the KV cache in host memory (its budget, before the prefill buffers exist).
 static int kv_spills(Eng* e) {
-    const uint64_t all = (e->kv_row + e->kv_srow) * 2 * (uint64_t) e->c.n_layer;
+    const uint64_t all = kv_all(e);
     if (getenv("NSLM_KV_VRAM_MB")) return (int64_t) ((uint64_t) (atof(getenv("NSLM_KV_VRAM_MB")) * 1048576.0) / all) < e->kv_cap;
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
@@ -377,8 +388,7 @@ static int kv_spills(Eng* e) {
 // pinned host memory, plus one layer's staging for prompts.  NSLM_KV_VRAM_MB sets the VRAM share explicitly.
 static int place_kv(Eng* e, char* err, int errlen) {
     const MovaCfg* c = &e->c;
-    const uint64_t per = (e->kv_row + e->kv_srow) * 2;   // K and V, one layer, one position
-    const uint64_t all = per * (uint64_t) c->n_layer;
+    const uint64_t per = kv_per(e), all = kv_all(e);   // one layer's staging, every layer: one position
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
     const char* rs = getenv("NSLM_VRAM_RESERVE_MB");
@@ -400,7 +410,7 @@ static int place_kv(Eng* e, char* err, int errlen) {
     const uint64_t nh = (uint64_t) (e->kv_cap - nv), L = (uint64_t) c->n_layer;
     if (nv) {
         e->kv_vk = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_row * L, &e->mem.kv);
-        e->kv_vv = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_row * L, &e->mem.kv);
+        e->kv_vv = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_vsum, &e->mem.kv);
         if (e->kv_srow) {
             e->kv_vks = (float*) dalloc(e, (uint64_t) nv * e->kv_srow * L, &e->mem.kv);
             e->kv_vvs = (float*) dalloc(e, (uint64_t) nv * e->kv_srow * L, &e->mem.kv);
@@ -413,7 +423,7 @@ static int place_kv(Eng* e, char* err, int errlen) {
     if (nh) {
         void* dp = NULL;
         uint8_t* h[4] = {NULL, NULL, NULL, NULL};
-        const uint64_t sz[4] = {nh * e->kv_row * L, nh * e->kv_row * L, nh * e->kv_srow * L, nh * e->kv_srow * L};
+        const uint64_t sz[4] = {nh * e->kv_row * L, nh * e->kv_vsum, nh * e->kv_srow * L, nh * e->kv_srow * L};
         for (int i = 0; i < 4; ++i) {
             if (!sz[i]) continue;
             h[i] = (uint8_t*) halloc(e, sz[i]);
@@ -426,7 +436,7 @@ static int place_kv(Eng* e, char* err, int errlen) {
         }
         e->kv_hk = h[0]; e->kv_hv = h[1]; e->kv_hks = (float*) h[2]; e->kv_hvs = (float*) h[3];
         e->kv_sk = (uint8_t*) dalloc(e, nh * e->kv_row, &e->mem.kv);
-        e->kv_sv = (uint8_t*) dalloc(e, nh * e->kv_row, &e->mem.kv);
+        e->kv_sv = (uint8_t*) dalloc(e, nh * e->kv_vmax, &e->mem.kv);
         if (e->kv_srow) {
             e->kv_sks = (float*) dalloc(e, nh * e->kv_srow, &e->mem.kv);
             e->kv_svs = (float*) dalloc(e, nh * e->kv_srow, &e->mem.kv);
@@ -485,7 +495,8 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
     }
     const int f = nt->enc;
     const int ok = t->kind == MOVA_K_EXPERTS ? 1
-                   : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS) ? f == MF_BF16
+                   : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
+                      t->kind == MOVA_K_HEADS) ? f == MF_BF16
                    : t->kind == MOVA_K_EMBED ? (f == MF_BF16 || f == MF_Q8)
                    : f != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
     if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, f); return -1; }
@@ -499,12 +510,12 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Eng* e = (Eng*) calloc(1, sizeof *e);
     if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
     const MovaCfg* c = &e->c;
-    if (c->mla) {   // MLA (TransMLA) latent attention has Metal kernels only so far
-        snprintf(err, (size_t) errlen, "MLA models are not supported by the CUDA engine yet (Metal only)");
+    if (c->mla && o->kv_format != ENG_KV_BF16) {   // engine_api.h: never ignore a format
+        snprintf(err, (size_t) errlen, "MLA models: only the BF16 KV cache is supported so far");
         free(e);
         return NULL;
     }
-    if (c->n_head != ATTF_G * c->n_kv) {
+    if (!c->mla && c->n_head != ATTF_G * c->n_kv) {
         snprintf(err, (size_t) errlen, "attention: %d query heads per KV head, the prefill kernel is built for %d", c->n_head / c->n_kv, ATTF_G);
         free(e);
         return NULL;
@@ -537,11 +548,20 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         LOAD(&L->ln1, "model.layers.%d.input_layernorm.weight", l);
         LOAD(&L->ln2, "model.layers.%d.post_attention_layernorm.weight", l);
         LOAD(&L->q, "model.layers.%d.self_attn.q_proj.weight", l);
-        LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
+        if (!c->mla) LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
         LOAD(&L->o, "model.layers.%d.self_attn.o_proj.weight", l);
         LOAD(&L->g, "model.layers.%d.self_attn.gate_proj.weight", l);
+        if (c->mla) {
+            L->mla_r = c->mla_rank[l];
+            LOAD(&L->ka_x, "model.layers.%d.self_attn.mla.kv_a_x", l);
+            if (L->sparse) LOAD(&L->ka_v, "model.layers.%d.self_attn.mla.kv_a_v", l);
+            LOAD(&L->kr, "model.layers.%d.self_attn.mla.k_rope_proj", l);
+            LOAD(&L->qm, "model.layers.%d.self_attn.mla.q_rope_mix", l);
+            LOAD(&L->ql, "model.layers.%d.self_attn.mla.q_lat", l);
+            LOAD(&L->vu, "model.layers.%d.self_attn.mla.v_up", l);
+        }
         if (!L->sparse) {
-            LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
+            if (!c->mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);   // MLA: folded into kv_a_x
             LOAD(&L->mg, "model.layers.%d.mlp.gate_proj.weight", l);
             LOAD(&L->mu, "model.layers.%d.mlp.up_proj.weight", l);
             LOAD(&L->md, "model.layers.%d.mlp.down_proj.weight", l);
@@ -585,6 +605,18 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->kv_fmt = o->kv_format == ENG_KV_Q8 ? KV_Q8 : KV_BF16;
     e->kv_row = (uint64_t) kvd * (e->kv_fmt == KV_Q8 ? 1 : 2);
     e->kv_srow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
+    // V rows per layer: as K's, or MLA's latent of the layer's rank (K: the 128-dim RoPE key; BF16)
+    e->kv_vrow = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
+    e->kv_voff = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
+    if (c->mla) e->kv_row = (uint64_t) c->mla_rope * 2;
+    int rmax = 0;
+    for (int l = 0; l < c->n_layer; ++l) {
+        if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+        e->kv_vrow[l] = c->mla ? (uint64_t) e->L[l].mla_r * 2 : e->kv_row;
+        e->kv_voff[l] = e->kv_vsum;
+        e->kv_vsum += e->kv_vrow[l];
+        if (e->kv_vrow[l] > e->kv_vmax) e->kv_vmax = e->kv_vrow[l];
+    }
     // scratch
     const int T = MAX_ROWS, d = c->d, qd = c->n_head * c->head_dim, ffmax = c->ff_dense > c->ff_exp ? c->ff_dense : c->ff_exp;
     e->x = (float*) scratch(e, (uint64_t) T * d * 4);
@@ -613,7 +645,20 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->ids = (int32_t*) scratch(e, (uint64_t) T * 4);
     e->ri = (RowInfo*) scratch(e, (uint64_t) T * sizeof(RowInfo));
     e->inv = (float*) scratch(e, 64 * 4);
-    e->part = (float*) scratch(e, (uint64_t) 1024 * c->n_head * (ATT_HD + 2) * 4);
+    // rows x splits <= 1024 (attn_splits); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
+    e->part = (float*) scratch(e, c->mla ? (uint64_t) MV_MAXT * MAX_SPLITS * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4
+                                         : (uint64_t) 1024 * c->n_head * (ATT_HD + 2) * 4);
+    if (c->mla) {
+        e->lat = (float*) scratch(e, (uint64_t) T * rmax * 4);
+        e->qrp = (float*) scratch(e, (uint64_t) T * qd * 4);
+        e->qlat = (float*) scratch(e, (uint64_t) T * c->n_head * rmax * 4);
+        e->olat = (float*) scratch(e, (uint64_t) T * c->n_head * rmax * 4);
+        if (!e->lat || !e->qrp || !e->qlat || !e->olat) {
+            snprintf(err, (size_t) errlen, "MLA scratch: out of GPU memory");
+            eng_close(e);
+            return NULL;
+        }
+    }
     e->inds = (int32_t*) scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4);
     e->wts = (float*) scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4);
     e->vinds = (int32_t*) scratch(e, (uint64_t) c->n_layer * T * c->top_kv * 4);
@@ -713,12 +758,14 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     struct cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
+    char mla[48] = "";
+    if (c->mla) snprintf(mla, sizeof mla, ", MLA latent %d (+%d RoPE)", rmax, c->mla_rope);
     snprintf(e->desc, sizeof e->desc,
-             "mova engine (CUDA, %s): experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s; "
+             "mova engine (CUDA, %s): experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s%s; "
              "expert cache %d + %d of %d + %d experts in VRAM",
              prop.name, fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
              fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt],
-             e->kv_fmt == KV_Q8 ? ", KV q8" : "", e->pm.slots, e->pv.slots, (c->n_layer - c->first_sparse) * c->n_exp,
+             e->kv_fmt == KV_Q8 ? ", KV q8" : "", mla, e->pm.slots, e->pv.slots, (c->n_layer - c->first_sparse) * c->n_exp,
              (c->n_layer - c->first_sparse) * c->n_vexp);
     return e;
 }
@@ -755,6 +802,7 @@ void eng_close(Eng* e) {
     ns_close(&e->nm);
     if (e->ck) mova_ckpt_close(e->ck);
     free(e->seq.hist);
+    free(e->kv_vrow); free(e->kv_voff);
     free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
     free(e);
 }
@@ -824,7 +872,7 @@ static KvView kv_view(Eng* e, int l) {
     v.nv = (int32_t) e->kv_nv;
     const uint64_t nv = (uint64_t) e->kv_nv, nh = (uint64_t) (e->kv_cap - e->kv_nv);
     v.a.k = e->kv_vk + nv * e->kv_row * (uint64_t) l;
-    v.a.v = e->kv_vv + nv * e->kv_row * (uint64_t) l;
+    v.a.v = e->kv_vv + nv * e->kv_voff[l];
     if (e->kv_fmt == KV_Q8) {
         v.a.ks = (float*) ((uint8_t*) e->kv_vks + nv * e->kv_srow * (uint64_t) l);
         v.a.vs = (float*) ((uint8_t*) e->kv_vvs + nv * e->kv_srow * (uint64_t) l);
@@ -835,7 +883,7 @@ static KvView kv_view(Eng* e, int l) {
         return v;
     }
     v.b.k = e->kv_hk + nh * e->kv_row * (uint64_t) l;
-    v.b.v = e->kv_hv + nh * e->kv_row * (uint64_t) l;
+    v.b.v = e->kv_hv + nh * e->kv_voff[l];
     if (e->kv_fmt == KV_Q8) {
         v.b.ks = (float*) ((uint8_t*) e->kv_hks + nh * e->kv_srow * (uint64_t) l);
         v.b.vs = (float*) ((uint8_t*) e->kv_hvs + nh * e->kv_srow * (uint64_t) l);
@@ -847,16 +895,45 @@ static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
     if (r1 <= r0) return 0;
     const uint64_t nh = (uint64_t) (e->kv_cap - e->kv_nv);
     const enum cudaMemcpyKind kd = cudaMemcpyDeviceToDevice;   // the host rows are mapped: device addresses
-    uint8_t* hs[4] = {e->kv_hk + nh * e->kv_row * (uint64_t) l, e->kv_hv + nh * e->kv_row * (uint64_t) l,
+    uint8_t* hs[4] = {e->kv_hk + nh * e->kv_row * (uint64_t) l, e->kv_hv + nh * e->kv_voff[l],
                       e->kv_srow ? (uint8_t*) e->kv_hks + nh * e->kv_srow * (uint64_t) l : NULL,
                       e->kv_srow ? (uint8_t*) e->kv_hvs + nh * e->kv_srow * (uint64_t) l : NULL};
     uint8_t* ss[4] = {e->kv_sk, e->kv_sv, (uint8_t*) e->kv_sks, (uint8_t*) e->kv_svs};
     for (int i = 0; i < 4; ++i) {
         if (!hs[i]) continue;
-        const uint64_t rb = i < 2 ? e->kv_row : e->kv_srow, off = (uint64_t) r0 * rb, len = (uint64_t) (r1 - r0) * rb;
+        const uint64_t rb = i == 0 ? e->kv_row : i == 1 ? e->kv_vrow[l] : e->kv_srow, off = (uint64_t) r0 * rb,
+                       len = (uint64_t) (r1 - r0) * rb;
         if (!CK(cudaMemcpyAsync(in ? ss[i] + off : hs[i] + off, in ? hs[i] + off : ss[i] + off, len, kd, e->st))) return -1;
     }
     return 0;
+}
+
+// MLA per-head maps (kc_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by G (y's layout)
+static void enc_heads_mv(Eng* e, const MW* W, const float* X, int xs, int hs, const float* G, float* Y, int T) {
+    const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != NULL, {0}};
+    kc_heads_mv(e->st, a, (const uint16_t*) W->w0.p[0], X, G, Y, T);
+}
+
+// MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v), as Metal's
+// encode_mla_attn: the latent c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write,
+// latent attention (split-key + reduce for <= MV_MAXT rows, one pass for prompt chunks), then v_up with the gate into ao.
+static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns) {
+    const MovaCfg* g = &e->c;
+    const Layer* L = &e->L[l];
+    const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim, r = L->mla_r, H = g->n_head;
+    tgroup(e, MOVA_TG_ATTN_PROJ);
+    enc_dense(e, &L->ka_x, e->xn, d, e->lat, r, T, 0);
+    if (L->sparse) enc_dense(e, &L->ka_v, e->v, kvd, e->lat, r, T, 1);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
+    enc_dense(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0);
+    enc_heads_mv(e, &L->qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
+    enc_heads_mv(e, &L->ql, e->q, qd, g->head_dim, NULL, e->qlat, T);
+    tgroup(e, MOVA_TG_ATTN);
+    const MlaArgs ma = {H, r, 128, T > MV_MAXT ? 1 : ns, 1.0f / sqrtf((float) g->head_dim), {0}};
+    const KvView kv = kv_view(e, l);
+    kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
+    kc_mla_attn(e->st, ma, e->qlat, e->qrp, kv, RI, e->part, e->olat, T);
+    tgroup(e, MOVA_TG_ATTN_PROJ);
+    enc_heads_mv(e, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
 }
 
 // Layer l for T rows: hidden states X [T][d] (updated in place), rows RI (positions), keys up to max_ctx.
@@ -870,11 +947,12 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
     kc_gnorm(e->st, d, g->eps, X, (const uint16_t*) L->ln1.w0.p[0], e->xn, T);
     tgroup(e, MOVA_TG_ATTN_PROJ);
     enc_dense(e, &L->q, e->xn, d, e->q, qd, T, 0);
-    enc_dense(e, &L->k, e->xn, d, e->k, kvd, T, 0);
+    if (!g->mla) enc_dense(e, &L->k, e->xn, d, e->k, kvd, T, 0);
     enc_dense(e, &L->g, e->xn, d, e->gq, qd, T, 0);
     tgroup(e, MOVA_TG_VALUES);
-    if (!L->sparse) enc_dense(e, &L->v, e->xn, d, e->v, kvd, T, 0);
-    else {
+    if (!L->sparse) {
+        if (!g->mla) enc_dense(e, &L->v, e->xn, d, e->v, kvd, T, 0);   // MLA: v_proj is folded into kv_a_x
+    } else {
         int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
         float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
         enc_router(e, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, vi, vw, e->vsel + (size_t) l * MAX_ROWS * g->n_vexp, T);
@@ -889,11 +967,14 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         }
         kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
     }
-    tgroup(e, MOVA_TG_ATTN);
-    const KvView kv = kv_view(e, l);
-    kc_rope_kv(e->st, e->q, e->k, e->v, kv, RI, e->inv, g->n_head, g->n_kv, T);
-    if (big) kc_attn_prefill(e->st, aa, e->q, kv, RI, e->gq, e->ao, T);
-    else kc_attn(e->st, aa, e->q, kv, RI, e->part, e->gq, e->ao, T);
+    if (g->mla) encode_mla_attn(e, l, T, RI, aa.n_splits);
+    else {
+        tgroup(e, MOVA_TG_ATTN);
+        const KvView kv = kv_view(e, l);
+        kc_rope_kv(e->st, e->q, e->k, e->v, kv, RI, e->inv, g->n_head, g->n_kv, T);
+        if (big) kc_attn_prefill(e->st, aa, e->q, kv, RI, e->gq, e->ao, T);
+        else kc_attn(e->st, aa, e->q, kv, RI, e->part, e->gq, e->ao, T);
+    }
     tgroup(e, MOVA_TG_ATTN_PROJ);
     enc_dense(e, &L->o, e->ao, qd, X, d, T, 1);
     tgroup(e, MOVA_TG_EMBED_NORM);

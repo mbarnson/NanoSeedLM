@@ -692,7 +692,6 @@ static void test_attn_prefill(int q8) {
 
 // ---- MLA (TransMLA conversion): per-head maps (+ gate), RoPE + latent cache write, latent attention ------------------
 static void test_mla(void) {
-    if (!strcmp(kt_name(), "CUDA")) { printf("MLA kernels: Metal only so far, skipped on CUDA\n"); return; }
     unsigned sd = 31;
     {   // per-head maps: q_lat-like (H 4, O 96, I 128, q's [T][H*128] layout) and v_up-like with the gate (O 128, I 96)
         enum { H = 4, T = 3 };

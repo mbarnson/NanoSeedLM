@@ -239,11 +239,6 @@ static void test_mla(void) {
     o.max_seqs = 1;
     o.kv_tokens = 1024;
     Eng* e = eng_open(&o, err, sizeof err);
-    if (!e && strstr(err, "not supported by the CUDA engine")) {   // MLA is Metal only so far: a refusal, not a failure
-        printf("MLA engine: %s: skipped\n", err);
-        mova_ref_close(ref);
-        return;
-    }
     if (!e) { ++fails; printf("FAIL: MLA eng_open: %s\n", err); mova_ref_close(ref); return; }
     printf("%s\n", eng_describe(e));
     if (bad_ok) {
@@ -321,10 +316,34 @@ static void test_mla(void) {
         memset(&sp, 0, sizeof sp);
         CHECK(eng_prefill(e, 0, rep, 40) == 0 && eng_generate(e, &seq, 1, 24, ENG_MODE_AR, ar, NULL) == 0, "MLA AR generate");
         CHECK(eng_prefill(e, 0, rep, 40) == 0 && eng_generate(e, &seq, 1, 24, ENG_MODE_PL, pl, &sp) == 0, "MLA PL generate");
-        CHECK(!memcmp(ar, pl, sizeof ar), "MLA: prompt lookup committed different tokens than greedy decode");
+        // The CUDA engine's one-row and multi-row forwards differ by an ulp here and there (its matvec sums one row in
+        // another order than several), so a verify forward may break a near-tie the other way: tokens up to the first
+        // difference must match, and there greedy decode's choice may lead the verify's by at most that noise (the
+        // logits of one and several rows differ by < 2e-2 on this model).
+        int k = 0;
+        while (k < 24 && ar[k] == pl[k]) ++k;
+        if (k < 24) {
+            float* lk = (float*) malloc(sizeof(float) * (size_t) V);
+            CHECK(eng_prefill(e, 0, rep, 40) == 0, "MLA AR replay");
+            for (int j = 0; j <= k; ++j) {
+                CHECK(eng_step(e, 0, lk) == 0, "MLA AR replay step");
+                eng_push(e, 0, ar[j]);
+            }
+            const double gap = (double) lk[ar[k]] - lk[pl[k]];
+            printf("MLA prompt lookup: differs from greedy decode at token %d, a near-tie (logit gap %.4f)\n", k, gap);
+            CHECK(gap >= 0 && gap < 0.04, "MLA: prompt lookup committed different tokens than greedy decode (token %d, logit gap %.4f)", k, gap);
+            free(lk);
+        }
         printf("MLA prompt lookup: %lld forwards for 24 tokens, %lld of %lld proposals accepted\n", (long long) sp.forwards,
                (long long) sp.accepted, (long long) sp.proposals);
         CHECK(sp.accepted > 0, "MLA prompt lookup: no proposal accepted, so no multi-row verify was tested");
+    }
+    {   // placement: with the cache mostly in host memory (the latents of every width staged per layer for prompts) the
+        // engine scores and decodes exactly as with all of it in fast memory (engines with unified memory ignore this)
+        double rel;
+        const int diff = compare_engines(e, &o, ENG_KV_BF16, "NSLM_KV_VRAM_MB", "0.2", &st, V, &rel, "MLA KV mostly in host memory");
+        printf("MLA KV mostly in host memory: %d differences\n", diff);
+        CHECK(diff == 0, "MLA: KV placement changed the results");
     }
     eng_close(e);
     mova_ref_close(ref);
