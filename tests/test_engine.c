@@ -9,6 +9,7 @@
 //   prompt-lookup decode (ENG_MODE_PL) committing exactly the tokens of plain greedy decode.
 // Logits agree to the engines' f32 accumulation (relative error well under a BF16 step of the logit scale) wherever
 // the router choices agree; a choice can flip on a near tie, which the test counts and bounds.
+#define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c11 (macOS declares them anyway; Windows: _putenv_s)
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

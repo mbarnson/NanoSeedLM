@@ -99,7 +99,10 @@ struct Eng {
     int nhalloc, caphalloc;
     CachePool pm, pv;   // expert caches: MLP experts, value experts
     // prompt prefetch: the next layer's experts come over PCIe on a second stream while a layer computes
-    CachePool pm_pre, pv_pre;   // the pools with their own job lists
+    // Views of pm / pv (the same slots, tables and LRU ticks) with their own job lists, one pair per producer: a view's
+    // copy reads its job list after the admit that wrote it, so two producers must never share one.  pm_pre / pv_pre:
+    // decode's next-layer prediction; pm_pf / pv_pf: a prompt's whole-layer prefetch.
+    CachePool pm_pre, pv_pre, pm_pf, pv_pf;
     cudaStream_t cst;
     cudaEvent_t ev_admit, *ev_ready;   // admitted (main stream), a layer's experts in VRAM (copy stream)
     int32_t* all_ids;                  // 0 .. 127
@@ -112,7 +115,7 @@ struct Eng {
     cudaEvent_t *ev_pred, *ev_predv;   // a layer's predicted MLP / value experts in VRAM
     int pred_pending;   // the layer whose prediction the main stream must join first, or -1
     int seed_f32;       // NSLM_SEED_GEMM_F32: the prefill GEMM's seed weights exact (kc_seed_gemm_f32)
-    int in_lm;          // forward_lm's layer-major pass: no prediction (its admits would race the prefetch's job lists)
+    int in_lm;          // forward_lm's layer-major pass: no prediction (it could replace a slot a pending prefetch copy fills)
     // layer-major prefill: the hidden states, tokens and rows of up to xmax prompt rows
     float* x_all;
     int32_t *ids_all, *h_ids_all;
@@ -355,6 +358,18 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
     for (int sl = 0; sl < nsl; ++sl)
         for (int i = 0; i < ntens; ++i) ws[sl * ntens + i]->d = p->tab + ((size_t) sl * ntens + i) * per_layer;
     return 0;
+}
+
+// Whether place_kv will keep part of the KV cache in host memory (its budget, before the prefill buffers exist).
+static int kv_spills(Eng* e) {
+    const uint64_t all = (e->kv_row + e->kv_srow) * 2 * (uint64_t) e->c.n_layer;
+    if (getenv("NSLM_KV_VRAM_MB")) return (int64_t) ((uint64_t) (atof(getenv("NSLM_KV_VRAM_MB")) * 1048576.0) / all) < e->kv_cap;
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    const char* rs = getenv("NSLM_VRAM_RESERVE_MB");
+    const char* em = getenv("NSLM_EXPERT_MIN_MB");
+    const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 512) << 20, emin = (uint64_t) (em ? atoll(em) : 6144) << 20;
+    return all * (uint64_t) e->kv_cap > (fr > reserve + emin ? fr - reserve - emin : 0);
 }
 
 // The KV cache: as many positions of every layer in VRAM as the budget allows (every token reads all of its context,
@@ -619,7 +634,14 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->h_tiles = (MmTile*) halloc(e, (uint64_t) MAX_TILES * sizeof(MmTile));
     e->h_am = (int32_t*) halloc(e, (uint64_t) T * 4);
     e->h_logits = (float*) halloc(e, (uint64_t) MAX_LOGIT_ROWS * c->vocab * 4);
-    e->xmax = e->kv_cap < 8192 ? (int) e->kv_cap : 8192;
+    // Rows per layer-major range.  When KV spills to host memory, every range stages each layer's earlier host rows
+    // into VRAM (PCIe traffic ~ prompt^2 / range): a larger range when the KV will not fit (NSLM_PREFILL_RANGE sets it).
+    {
+        const char* pr = getenv("NSLM_PREFILL_RANGE");
+        int64_t xm = pr ? atoll(pr) : kv_spills(e) ? 32768 : 8192;
+        if (xm < MAX_ROWS) xm = MAX_ROWS;
+        e->xmax = (int) (e->kv_cap < xm ? e->kv_cap : xm);
+    }
     e->x_all = (float*) scratch(e, (uint64_t) e->xmax * d * 4);
     e->ids_all = (int32_t*) scratch(e, (uint64_t) e->xmax * 4);
     e->ri_all = (RowInfo*) scratch(e, (uint64_t) e->xmax * sizeof(RowInfo));
@@ -653,6 +675,12 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->pv_pre.stats = (uint32_t*) scratch(e, 16);
         if (e->pm_pre.stats) cudaMemset(e->pm_pre.stats, 0, 16);
         if (e->pv_pre.stats) cudaMemset(e->pv_pre.stats, 0, 16);
+        e->pm_pf = e->pm_pre;   // the prefetch's own job lists; statistics shared with the prediction's
+        e->pv_pf = e->pv_pre;
+        e->pm_pf.jobs = (int32_t*) scratch(e, 8 * (uint64_t) c->n_exp);
+        e->pv_pf.jobs = (int32_t*) scratch(e, 8 * (uint64_t) c->n_vexp);
+        e->pm_pf.njobs = (int32_t*) scratch(e, 16);
+        e->pv_pf.njobs = (int32_t*) scratch(e, 16);
         e->ev_ready = (cudaEvent_t*) calloc((size_t) c->n_layer, sizeof(cudaEvent_t));
         e->ev_pred = (cudaEvent_t*) calloc((size_t) c->n_layer, sizeof(cudaEvent_t));
         e->ev_predv = (cudaEvent_t*) calloc((size_t) c->n_layer, sizeof(cudaEvent_t));
@@ -662,7 +690,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->pred_vinds = (int32_t*) scratch(e, (uint64_t) MV_MAXT * 16 * 4);
         e->pred_w = (float*) scratch(e, (uint64_t) MV_MAXT * 16 * 4);
         e->pred_sel = (float*) scratch(e, (uint64_t) MV_MAXT * 128 * 4);
-        int ok = e->all_ids && e->pm_pre.jobs && e->pv_pre.jobs && e->pm_pre.njobs && e->pv_pre.njobs &&
+        int ok = e->all_ids && e->pm_pre.jobs && e->pv_pre.jobs && e->pm_pre.njobs && e->pv_pre.njobs && e->pm_pf.jobs &&
+                 e->pv_pf.jobs && e->pm_pf.njobs && e->pv_pf.njobs &&
                  CK(cudaMemcpy(e->all_ids, ids128, sizeof ids128, cudaMemcpyHostToDevice)) &&
                  CK(cudaDeviceGetStreamPriorityRange(&lo_prio, &hi_prio)) && CK(cudaStreamCreateWithPriority(&e->cst, cudaStreamNonBlocking, hi_prio)) &&
                  CK(cudaEventCreateWithFlags(&e->ev_admit, cudaEventDisableTiming));
@@ -1016,12 +1045,12 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
 // Admit every expert of sparse layer l (main stream) and copy the misses on the copy stream; ev_ready[l] when done.
 static void prefetch_layer(Eng* e, int l) {
     const int sl = l - e->c.first_sparse;
-    kc_cache_admit(e->st, &e->pv_pre, sl, e->all_ids, e->c.n_vexp, 0);
-    kc_cache_admit(e->st, &e->pm_pre, sl, e->all_ids, e->c.n_exp, 0);
+    kc_cache_admit(e->st, &e->pv_pf, sl, e->all_ids, e->c.n_vexp, 0);
+    kc_cache_admit(e->st, &e->pm_pf, sl, e->all_ids, e->c.n_exp, 0);
     cudaEventRecord(e->ev_admit, e->st);
     cudaStreamWaitEvent(e->cst, e->ev_admit, 0);
-    kc_cache_copy(e->cst, &e->pv_pre, 8);
-    kc_cache_copy(e->cst, &e->pm_pre, 8);
+    kc_cache_copy(e->cst, &e->pv_pf, 8);
+    kc_cache_copy(e->cst, &e->pm_pf, 8);
     cudaEventRecord(e->ev_ready[l], e->cst);
 }
 
@@ -1031,8 +1060,8 @@ static void prefetch_layer(Eng* e, int l) {
 static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out);
 static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
     if (e->route_on || n <= MV_MAXT) return forward_lm_body(e, ids, n, pos0, h0, logits_out);
-    // a sub-chunk of 1 .. MV_MAXT rows takes the decode path, whose next-layer prediction would admit into the
-    // prefetch's views while their copy is pending (that copy would then see no jobs)
+    // a sub-chunk of 1 .. MV_MAXT rows takes the decode path, whose next-layer prediction could replace a slot the
+    // pending prefetch copy is filling
     e->in_lm = 1;
     const int rc = forward_lm_body(e, ids, n, pos0, h0, logits_out);
     e->in_lm = 0;

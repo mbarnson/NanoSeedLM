@@ -151,7 +151,9 @@ when the KV cache is large, default 6144), `NSLM_KV_VRAM_MB`, `NSLM_EXPERT_VRAM_
 `NSLM_CACHE_STATS=1` (expert cache hits at exit), `NSLM_NO_GRAPH=1`, `NSLM_NO_PREDICT=1` (no next-layer expert
 prediction in decode), `NSLM_SEED_GEMM_F32=1`. By default the prefill GEMM rounds seed weights to BF16 for the tensor
 cores. `NSLM_SEED_GEMM_F32=1` keeps them exact in f32, as the decode matvec and the Metal engine do. Against the BF16
-reference this changed neither KLD (held-out 0.0261 vs 0.0260) nor NLL, and it costs about 15% of 4k prefill.
+reference this changed neither KLD (held-out 0.0261 vs 0.0260) nor NLL, and it costs about 30% of 4k prefill (the
+tensor cores do three times the work). `NSLM_PREFILL_RANGE` sets the prompt rows computed layer by layer at a time
+(default 8192, or 32768 when the KV cache spills to host memory: each range re-stages the earlier host rows).
 
 ## MLX and oMLX
 

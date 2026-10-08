@@ -326,12 +326,14 @@ static __device__ __forceinline__ void tile_weights(int fmt, const WSlice* w, co
     for (int i = 0; i < 8; ++i) dst[i] = o[i];
 }
 
-// Tensor-core GEMM (prefill): Y[n][r] = sum_k W[r][k] X[n][k] for a 64-row x 64-column tile.  BF16 mma.sync with f32
+// Tensor-core GEMM (prefill): Y[n][r] = sum_k W[r][k] X[n][k] for a 64-row x MMT_BN-column tile (128: each
+// reconstructed seed weight tile serves twice the tokens of 64, 3% faster at 4k).  BF16 mma.sync with f32
 // accumulation: the activations are BF16 values (exact).  BF16 / Q8 / Q4 weights dequantize to BF16 values (exact).
 // Seed weights (f32 in the matvec and in the Metal GEMM) are rounded to BF16 here (NT = 1), or, in the k_mm3 kernels
 // (NSLM_SEED_GEMM_F32), carried as NT = 3 BF16 terms hi + mid + lo whose sum is the f32 value exactly.  Measured on the
 // real model against BF16 reference log-probs, the exact weights change neither KLD (held-out 0.0261 vs 0.0260, standard
-// error 0.0005) nor NLL, and cost 15% of 4k prefill, so BF16 is the default.  Four warps, each a 32 x 32 sub-tile.
+// error 0.0005) nor NLL, and cost 15% (64-wide tiles) to 30% (128) of 4k prefill: the tensor cores do three times the
+// work.  BF16 is the default.  MMT_THREADS / 32 warps, each a 32 x 32 sub-tile.
 // Dense: tile (row block, token block).  Grouped: (row block, tile table entry); the entry's pairs are
 // perm[start .. start + count), reading input row pair / xdiv, writing row pair.  ntiles (device) bounds grouped grids.
 #define SLD (MMT_BK + 8)   // shared row stride, BF16 elements (conflict-free fragment loads)
@@ -363,15 +365,15 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
         drow[tid] = !ok ? -1 : grouped ? perm[start + tid] : start + tid;
     }
     __syncthreads();
-    const int wm = (w >> 1) * 32, wn = (w & 1) * 32;
+    const int wm = (w / (MMT_BN / 32)) * 32, wn = (w % (MMT_BN / 32)) * 32;
     float acc[2][4][4];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0;
     for (int k0 = 0; k0 < a.K; k0 += MMT_BK) {
-        // weights: 64 rows x 4 blocks of 8, two blocks per thread
-        for (int b = tid; b < MMT_BM * 4; b += 128) {
+        // weights: 64 rows x 4 blocks of 8
+        for (int b = tid; b < MMT_BM * 4; b += MMT_THREADS) {
             const int rr = b >> 2, jb = b & 3, row = r0 + rr;
             float f[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             if (row < a.R) tile_weights(fmt, &wt, G, row, a.K, k0 / 8 + jb, f);
@@ -383,7 +385,7 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
                                                           h[4] | (uint32_t) h[5] << 16, h[6] | (uint32_t) h[7] << 16);
             }
         }
-        // inputs: 64 columns x 32 k, 16 per thread
+        // inputs: MMT_BN columns x 32 k, 16 per thread
         {
             const int n = tid >> 1, h = (tid & 1) * 16, src = srow[n];
             uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0;
@@ -493,7 +495,7 @@ __global__ void __launch_bounds__(1024) k_bucket_place(const int32_t* inds, int 
                                                                   const uint32_t* G) {                                   \
         mv_gu_body(F, a, wg, wu, x, y, sel, G);                                                                          \
     }                                                                                                                    \
-    __global__ void __launch_bounds__(128) k_mm_##SUF(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,  \
+    __global__ void __launch_bounds__(MMT_THREADS) k_mm_##SUF(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,  \
                                                       const int32_t* perm, const MmTile* tiles, const int32_t* ntiles,   \
                                                       const uint32_t* G) {                                               \
         mm_body<1>(F, a, wd, ws, X, Y, perm, tiles, ntiles, G);                                                          \
@@ -512,7 +514,7 @@ static const MvKernel MV_K[5] = {k_mv_bf16, k_mv_seed4, k_mv_q8, k_mv_q4, k_mv_s
 static const MvGuKernel MVGU_K[5] = {k_mv_gu_bf16, k_mv_gu_seed4, k_mv_gu_q8, k_mv_gu_q4, k_mv_gu_seed4p4};
 static const MmKernel MM_K[5] = {k_mm_bf16, k_mm_seed4, k_mm_q8, k_mm_q4, k_mm_seed4p4};
 template <int F>   // the seed formats with exact (three-term) weights
-__global__ void __launch_bounds__(128) k_mm3(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
+__global__ void __launch_bounds__(MMT_THREADS) k_mm3(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
                                              const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, const uint32_t* G) {
     mm_body<3>(F, a, wd, ws, X, Y, perm, tiles, ntiles, G);
 }
@@ -1079,7 +1081,7 @@ static MmKernel mm_kernel(int fmt) { return (g_seed_exact ? MM3_K : MM_K)[fmt]; 
 void kc_mm(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int xs, float* y, int ys, int T, int add,
            const uint32_t* G) {
     MmArgs a = {K, R, T, xs, ys, 1, add, 0};
-    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), 128, 0, s>>>(a, w, NULL, x, y, NULL, NULL, NULL, G);
+    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), MMT_THREADS, 0, s>>>(a, w, NULL, x, y, NULL, NULL, NULL, G);
 }
 void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                    int xdiv, const int32_t* perm, const MmTile* tiles, int ntiles, const uint32_t* G) {
@@ -1087,7 +1089,7 @@ void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, cons
     MmArgs a = {K, R, 0, xs, ys, xdiv, 0, 0};
     WSlice none;
     memset(&none, 0, sizeof none);
-    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) ntiles), 128, 0, s>>>(a, none, ws, x, y, perm, tiles, NULL, G);
+    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) ntiles), MMT_THREADS, 0, s>>>(a, none, ws, x, y, perm, tiles, NULL, G);
 }
 void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                        int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, int max_tiles,
@@ -1095,7 +1097,7 @@ void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, 
     MmArgs a = {K, R, 0, xs, ys, xdiv, 0, 0};
     WSlice none;
     memset(&none, 0, sizeof none);
-    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), 128, 0, s>>>(a, none, ws, x, y, perm, tiles, ntiles, G);
+    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), MMT_THREADS, 0, s>>>(a, none, ws, x, y, perm, tiles, ntiles, G);
 }
 void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* perm, MmTile* tiles, int32_t* ntiles) {
     k_bucket_count<<<1, 1024, 0, s>>>(inds, count, n, ntiles);

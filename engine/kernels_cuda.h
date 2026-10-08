@@ -95,7 +95,8 @@ void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, 
                        int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, int max_tiles,
                        const uint32_t* G);
 #define MMT_BM 64   // tensor-core GEMM: weight rows per block
-#define MMT_BN 64   // tokens (or pairs) per block
+#define MMT_BN 128   // tokens (or pairs) per block
+#define MMT_THREADS (2 * MMT_BN)   // threads per block: (BM / 32) x (BN / 32) warps of 32 x 32
 #define MMT_BK 32
 // Router: sigmoid scores, selection scores (score + bias), top-k ids and weights
 void kc_router(cudaStream_t s, RouterArgs a, const uint16_t* W, const uint16_t* bias, const float* x, float* score,
