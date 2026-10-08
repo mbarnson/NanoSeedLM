@@ -61,7 +61,7 @@ static int32_t* bench_prompt(const char* model, const char* text_path, int n, ch
 
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
-    setvbuf(stdout, NULL, _IOFBF, 1 << 16);
+    setvbuf(stdout, NULL, _IONBF, 0);   // every line out at once (a crash loses nothing)
     const int reps = atoi(opt(argc, argv, "--repeats", "5")), ndec = atoi(opt(argc, argv, "--decode", "256"));
     const char* model = opt(argc, argv, "--model", NULL);
     char err[512] = "";

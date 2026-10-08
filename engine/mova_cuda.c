@@ -31,7 +31,7 @@
 #define MAX_SPLITS 32            // decode attention: at most this many key splits
 #endif
 #define MAX_LOGIT_ROWS 64        // LM head rows per pass
-#define MAX_TILES (MAXP / MM_BN + 128)
+#define MAX_TILES (MAXP / MMT_BN + 128)
 
 static int cuda_ok(cudaError_t r, const char* what, const char* file, int line) {
     if (r == cudaSuccess) return 1;
@@ -78,7 +78,7 @@ struct Eng {
     int64_t kv_cap;
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
-    int32_t *ids, *inds, *vinds, *am, *perm, *vperm;
+    int32_t *ids, *inds, *vinds, *am, *perm, *vperm, *ntiles, *vntiles;
     RowInfo* ri;
     MmTile *tiles, *vtiles;
     // pinned host staging
@@ -92,6 +92,11 @@ struct Eng {
     void** hallocs;   // pinned host allocations
     int nhalloc, caphalloc;
     CachePool pm, pv;   // expert caches: MLP experts, value experts
+    // layer-major prefill: the hidden states, tokens and rows of up to xmax prompt rows
+    float* x_all;
+    int32_t *ids_all, *h_ids_all;
+    RowInfo *ri_all, *h_ri_all;
+    int xmax;
     cudaGraphExec_t graphs[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 2];   // small forwards, by (rows, splits, head)
     int no_graph;
     EngMem mem;
@@ -479,6 +484,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->tiles = (MmTile*) scratch(e, (uint64_t) MAX_TILES * sizeof(MmTile));
     e->vperm = (int32_t*) scratch(e, (uint64_t) MAXP * 4);
     e->vtiles = (MmTile*) scratch(e, (uint64_t) MAX_TILES * sizeof(MmTile));
+    e->ntiles = (int32_t*) scratch(e, 260 * 4);
+    e->vntiles = (int32_t*) scratch(e, 260 * 4);
     e->ids = (int32_t*) scratch(e, (uint64_t) T * 4);
     e->ri = (RowInfo*) scratch(e, (uint64_t) T * sizeof(RowInfo));
     e->inv = (float*) scratch(e, 64 * 4);
@@ -508,6 +515,17 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->h_tiles = (MmTile*) halloc(e, (uint64_t) MAX_TILES * sizeof(MmTile));
     e->h_am = (int32_t*) halloc(e, (uint64_t) T * 4);
     e->h_logits = (float*) halloc(e, (uint64_t) MAX_LOGIT_ROWS * c->vocab * 4);
+    e->xmax = e->kv_cap < 8192 ? (int) e->kv_cap : 8192;
+    e->x_all = (float*) scratch(e, (uint64_t) e->xmax * d * 4);
+    e->ids_all = (int32_t*) scratch(e, (uint64_t) e->xmax * 4);
+    e->ri_all = (RowInfo*) scratch(e, (uint64_t) e->xmax * sizeof(RowInfo));
+    e->h_ids_all = (int32_t*) halloc(e, (uint64_t) e->xmax * 4);
+    e->h_ri_all = (RowInfo*) halloc(e, (uint64_t) e->xmax * sizeof(RowInfo));
+    if (!e->x_all || !e->ids_all || !e->ri_all || !e->h_ids_all || !e->h_ri_all) {
+        snprintf(err, (size_t) errlen, "prefill buffers: out of memory");
+        eng_close(e);
+        return NULL;
+    }
     if (!e->h_ids || !e->h_ri || !e->h_inds || !e->h_perm || !e->h_tiles || !e->h_am || !e->h_logits) {
         snprintf(err, (size_t) errlen, "pinned host staging: out of memory");
         eng_close(e);
@@ -607,30 +625,6 @@ static void enc_router(Eng* e, const MW* W, const MW* bias, const float* X, int 
     RouterArgs a = {e->c.d, n, k, e->c.d / e->c.router_parts, e->c.route_scale};
     kc_router(e->st, a, (const uint16_t*) W->w0.p[0], (const uint16_t*) bias->w0.p[0], X, e->rscore, sel, inds, wts, T);
 }
-// Host bucketing of T x k selections by expert: perm = pair ids grouped by expert (ascending within an expert),
-// tiles = runs of <= MM_BN pairs.  Reads the selections from the device (a sync point), uploads perm and tiles.
-static int bucket(Eng* e, const int32_t* d_inds, int T, int k, int n, int32_t* d_perm, MmTile* d_tiles) {
-    const int P = T * k;
-    if (!CK(cudaMemcpyAsync(e->h_inds, d_inds, (size_t) P * 4, cudaMemcpyDeviceToHost, e->st)) || sync_stream(e)) return -1;
-    int cnt[128] = {0}, off[129], pos[128];
-    for (int p = 0; p < P; ++p) cnt[e->h_inds[p]]++;
-    off[0] = 0;
-    for (int x = 0; x < n; ++x) off[x + 1] = off[x] + cnt[x];
-    memcpy(pos, off, sizeof(int) * (size_t) n);
-    for (int p = 0; p < P; ++p) e->h_perm[pos[e->h_inds[p]]++] = p;
-    int nt = 0;
-    for (int x = 0; x < n; ++x)
-        for (int s = off[x]; s < off[x + 1]; s += MM_BN) {
-            MmTile t = {x, s, off[x + 1] - s < MM_BN ? off[x + 1] - s : MM_BN, 0};
-            e->h_tiles[nt++] = t;
-        }
-    if (!CK(cudaMemcpyAsync(d_perm, e->h_perm, (size_t) P * 4, cudaMemcpyHostToDevice, e->st)) ||
-        !CK(cudaMemcpyAsync(d_tiles, e->h_tiles, (size_t) nt * sizeof(MmTile), cudaMemcpyHostToDevice, e->st)))
-        return -1;
-    // the staging is reused by the next bucket(): wait for these copies
-    return sync_stream(e) ? -1 : nt;
-}
-
 // Decode attention: each row splits its keys in up to MAX_SPLITS parts of >= 128 (rows x splits <= 1024).
 static int attn_splits(int T, int max_ctx) {
     int ns = (max_ctx + 127) / 128;
@@ -639,103 +633,112 @@ static int attn_splits(int T, int max_ctx) {
     return ns < 1 ? 1 : ns;
 }
 
-static int encode_forward(Eng* e, int T, int max_ctx, int h0) {
+// Layer l for T rows: hidden states X [T][d] (updated in place), rows RI (positions), keys up to max_ctx.
+static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int max_ctx) {
     const MovaCfg* g = &e->c;
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim;
     const int big = T > MV_MAXT;
-    tgroup(e, MOVA_TG_EMBED_NORM);
-    kc_embed(e->st, e->embed.fmt, e->embed.w0, d, e->ids, e->x, T);
-    const int ns = attn_splits(T, max_ctx);
-    AttnArgs aa = {g->n_head, g->n_kv, 128, ns, 1.0f / sqrtf((float) g->head_dim)};
+    AttnArgs aa = {g->n_head, g->n_kv, 128, attn_splits(T, max_ctx), 1.0f / sqrtf((float) g->head_dim)};
     const uint64_t kvl = (uint64_t) e->kv_cap * kvd;
-    const char* dump = getenv("MOVA_DUMP");   // debugging: append x (T x d f32) at every layer start and at the end
-    for (int l = 0; l <= g->n_layer; ++l) {
-        if (dump) {
-            float* hx = (float*) malloc(sizeof(float) * (size_t) T * d);
-            cudaMemcpyAsync(hx, e->x, sizeof(float) * (size_t) T * d, cudaMemcpyDeviceToHost, e->st);
-            cudaStreamSynchronize(e->st);
-            FILE* f = fopen(dump, "ab");
-            if (f) { fwrite(hx, 4, (size_t) T * d, f); fclose(f); }
-            free(hx);
-        }
-        if (l == g->n_layer) break;
-        Layer* L = &e->L[l];
-        tgroup(e, MOVA_TG_EMBED_NORM);
-        kc_gnorm(e->st, d, g->eps, e->x, (const uint16_t*) L->ln1.w0.p[0], e->xn, T);
-        tgroup(e, MOVA_TG_ATTN_PROJ);
-        enc_dense(e, &L->q, e->xn, d, e->q, qd, T, 0);
-        enc_dense(e, &L->k, e->xn, d, e->k, kvd, T, 0);
-        enc_dense(e, &L->g, e->xn, d, e->gq, qd, T, 0);
-        tgroup(e, MOVA_TG_VALUES);
-        if (!L->sparse) enc_dense(e, &L->v, e->xn, d, e->v, kvd, T, 0);
+    Layer* L = &e->L[l];
+    tgroup(e, MOVA_TG_EMBED_NORM);
+    kc_gnorm(e->st, d, g->eps, X, (const uint16_t*) L->ln1.w0.p[0], e->xn, T);
+    tgroup(e, MOVA_TG_ATTN_PROJ);
+    enc_dense(e, &L->q, e->xn, d, e->q, qd, T, 0);
+    enc_dense(e, &L->k, e->xn, d, e->k, kvd, T, 0);
+    enc_dense(e, &L->g, e->xn, d, e->gq, qd, T, 0);
+    tgroup(e, MOVA_TG_VALUES);
+    if (!L->sparse) enc_dense(e, &L->v, e->xn, d, e->v, kvd, T, 0);
+    else {
+        int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
+        float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
+        enc_router(e, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, vi, vw, e->vsel + (size_t) l * MAX_ROWS * g->n_vexp, T);
+        kc_cache_admit(e->st, &e->pv, l - g->first_sparse, vi, T * g->top_kv);
+        kc_cache_copy(e->st, &e->pv);
+        if (!big) kc_mv_sel(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, vi, T * g->top_kv, g->top_kv, stab_for(e, &L->vx));
         else {
-            int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
-            float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
-            enc_router(e, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, vi, vw, e->vsel + (size_t) l * MAX_ROWS * g->n_vexp, T);
-            kc_cache_admit(e->st, &e->pv, l - g->first_sparse, vi, T * g->top_kv);
-            kc_cache_copy(e->st, &e->pv);
-            if (!big) kc_mv_sel(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, vi, T * g->top_kv, g->top_kv, stab_for(e, &L->vx));
-            else {
-                const int nt = bucket(e, vi, T, g->top_kv, g->n_vexp, e->vperm, e->vtiles);
-                if (nt < 0) return -1;
-                kc_mm_grouped(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, g->top_kv, e->vperm, e->vtiles, nt, stab_for(e, &L->vx));
-            }
-            kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
+            kc_bucket(e->st, vi, T * g->top_kv, g->n_vexp, e->vperm, e->vtiles, e->vntiles);
+            kc_mm_grouped_dev(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, g->top_kv, e->vperm, e->vtiles,
+                              e->vntiles, T * g->top_kv / MMT_BN + g->n_vexp, stab_for(e, &L->vx));
         }
-        tgroup(e, MOVA_TG_ATTN);
-        uint16_t* Kl = e->Kc + kvl * (uint64_t) l;
-        uint16_t* Vl = e->Vc + kvl * (uint64_t) l;
-        kc_rope_kv(e->st, e->q, e->k, e->v, Kl, Vl, e->ri, e->inv, g->n_head, g->n_kv, T);
-        if (big) kc_attn_prefill(e->st, aa, e->q, Kl, Vl, e->ri, e->gq, e->ao, T);
-        else kc_attn(e->st, aa, e->q, Kl, Vl, e->ri, e->part, e->gq, e->ao, T);
-        tgroup(e, MOVA_TG_ATTN_PROJ);
-        enc_dense(e, &L->o, e->ao, qd, e->x, d, T, 1);
-        tgroup(e, MOVA_TG_EMBED_NORM);
-        kc_gnorm(e->st, d, g->eps, e->x, (const uint16_t*) L->ln2.w0.p[0], e->xn, T);
-        if (!L->sparse) {
-            tgroup(e, MOVA_TG_SHARED);
-            enc_dense(e, &L->mg, e->xn, d, e->ga, g->ff_dense, T, 0);
-            enc_dense(e, &L->mu, e->xn, d, e->ua, g->ff_dense, T, 0);
-            kc_swiglu(e->st, e->ga, e->ua, e->aa, T * g->ff_dense);
-            enc_dense(e, &L->md, e->aa, g->ff_dense, e->x, d, T, 1);
-            continue;
-        }
-        tgroup(e, MOVA_TG_ROUTER);
-        int32_t* ri = e->inds + (size_t) l * MAX_ROWS * g->top_k;
-        float* rw = e->wts + (size_t) l * MAX_ROWS * g->top_k;
-        enc_router(e, &L->r, &L->rb, e->xn, g->n_exp, g->top_k, ri, rw, e->rsel + (size_t) l * MAX_ROWS * g->n_exp, T);
-        kc_cache_admit(e->st, &e->pm, l - g->first_sparse, ri, T * g->top_k);
-        kc_cache_copy(e->st, &e->pm);
-        tgroup(e, MOVA_TG_EXPERTS);
-        const int P = T * g->top_k;
-        if (!big) {
-            if (L->eg.fmt == L->eu.fmt)
-                kc_mv_gu(e->st, L->eg.fmt, L->eg.d, L->eu.d, L->eg.cols, L->eg.rows, e->xn, d, e->A, g->ff_exp, ri, P, g->top_k, stab_for(e, &L->eg));
-            else {
-                kc_mv_sel(e->st, L->eg.fmt, L->eg.d, L->eg.cols, L->eg.rows, e->xn, d, e->G, g->ff_exp, ri, P, g->top_k, stab_for(e, &L->eg));
-                kc_mv_sel(e->st, L->eu.fmt, L->eu.d, L->eu.cols, L->eu.rows, e->xn, d, e->U, g->ff_exp, ri, P, g->top_k, stab_for(e, &L->eu));
-                kc_swiglu(e->st, e->G, e->U, e->A, P * g->ff_exp);
-            }
-            kc_mv_sel(e->st, L->ed.fmt, L->ed.d, L->ed.cols, L->ed.rows, e->A, g->ff_exp, e->D, d, ri, P, 1, stab_for(e, &L->ed));
-        } else {
-            const int nt = bucket(e, ri, T, g->top_k, g->n_exp, e->perm, e->tiles);
-            if (nt < 0) return -1;
-            kc_mm_grouped(e->st, L->eg.fmt, L->eg.d, L->eg.cols, L->eg.rows, e->xn, d, e->G, g->ff_exp, g->top_k, e->perm, e->tiles, nt, stab_for(e, &L->eg));
-            kc_mm_grouped(e->st, L->eu.fmt, L->eu.d, L->eu.cols, L->eu.rows, e->xn, d, e->U, g->ff_exp, g->top_k, e->perm, e->tiles, nt, stab_for(e, &L->eu));
-            kc_swiglu(e->st, e->G, e->U, e->A, P * g->ff_exp);
-            kc_mm_grouped(e->st, L->ed.fmt, L->ed.d, L->ed.cols, L->ed.rows, e->A, g->ff_exp, e->D, d, 1, e->perm, e->tiles, nt, stab_for(e, &L->ed));
-        }
-        tgroup(e, MOVA_TG_SHARED);
-        enc_dense(e, &L->sg, e->xn, d, e->ga, g->ff_exp, T, 0);
-        enc_dense(e, &L->su, e->xn, d, e->ua, g->ff_exp, T, 0);
-        kc_swiglu(e->st, e->ga, e->ua, e->aa, T * g->ff_exp);
-        enc_dense(e, &L->sd, e->aa, g->ff_exp, e->sh, d, T, 0);
-        tgroup(e, MOVA_TG_EXPERTS);
-        kc_moe_combine(e->st, e->D, rw, e->sh, e->x, d, g->top_k, T);
+        kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
     }
+    tgroup(e, MOVA_TG_ATTN);
+    uint16_t* Kl = e->Kc + kvl * (uint64_t) l;
+    uint16_t* Vl = e->Vc + kvl * (uint64_t) l;
+    kc_rope_kv(e->st, e->q, e->k, e->v, Kl, Vl, RI, e->inv, g->n_head, g->n_kv, T);
+    if (big) kc_attn_prefill(e->st, aa, e->q, Kl, Vl, RI, e->gq, e->ao, T);
+    else kc_attn(e->st, aa, e->q, Kl, Vl, RI, e->part, e->gq, e->ao, T);
+    tgroup(e, MOVA_TG_ATTN_PROJ);
+    enc_dense(e, &L->o, e->ao, qd, X, d, T, 1);
+    tgroup(e, MOVA_TG_EMBED_NORM);
+    kc_gnorm(e->st, d, g->eps, X, (const uint16_t*) L->ln2.w0.p[0], e->xn, T);
+    if (!L->sparse) {
+        tgroup(e, MOVA_TG_SHARED);
+        enc_dense(e, &L->mg, e->xn, d, e->ga, g->ff_dense, T, 0);
+        enc_dense(e, &L->mu, e->xn, d, e->ua, g->ff_dense, T, 0);
+        kc_swiglu(e->st, e->ga, e->ua, e->aa, T * g->ff_dense);
+        enc_dense(e, &L->md, e->aa, g->ff_dense, X, d, T, 1);
+        return 0;
+    }
+    tgroup(e, MOVA_TG_ROUTER);
+    int32_t* ri = e->inds + (size_t) l * MAX_ROWS * g->top_k;
+    float* rw = e->wts + (size_t) l * MAX_ROWS * g->top_k;
+    enc_router(e, &L->r, &L->rb, e->xn, g->n_exp, g->top_k, ri, rw, e->rsel + (size_t) l * MAX_ROWS * g->n_exp, T);
+    kc_cache_admit(e->st, &e->pm, l - g->first_sparse, ri, T * g->top_k);
+    kc_cache_copy(e->st, &e->pm);
+    tgroup(e, MOVA_TG_EXPERTS);
+    const int P = T * g->top_k;
+    if (!big) {
+        if (L->eg.fmt == L->eu.fmt)
+            kc_mv_gu(e->st, L->eg.fmt, L->eg.d, L->eu.d, L->eg.cols, L->eg.rows, e->xn, d, e->A, g->ff_exp, ri, P, g->top_k, stab_for(e, &L->eg));
+        else {
+            kc_mv_sel(e->st, L->eg.fmt, L->eg.d, L->eg.cols, L->eg.rows, e->xn, d, e->G, g->ff_exp, ri, P, g->top_k, stab_for(e, &L->eg));
+            kc_mv_sel(e->st, L->eu.fmt, L->eu.d, L->eu.cols, L->eu.rows, e->xn, d, e->U, g->ff_exp, ri, P, g->top_k, stab_for(e, &L->eu));
+            kc_swiglu(e->st, e->G, e->U, e->A, P * g->ff_exp);
+        }
+        kc_mv_sel(e->st, L->ed.fmt, L->ed.d, L->ed.cols, L->ed.rows, e->A, g->ff_exp, e->D, d, ri, P, 1, stab_for(e, &L->ed));
+    } else {
+        const int mt = P / MMT_BN + g->n_exp;
+        kc_bucket(e->st, ri, P, g->n_exp, e->perm, e->tiles, e->ntiles);
+        kc_mm_grouped_dev(e->st, L->eg.fmt, L->eg.d, L->eg.cols, L->eg.rows, e->xn, d, e->G, g->ff_exp, g->top_k, e->perm, e->tiles, e->ntiles, mt, stab_for(e, &L->eg));
+        kc_mm_grouped_dev(e->st, L->eu.fmt, L->eu.d, L->eu.cols, L->eu.rows, e->xn, d, e->U, g->ff_exp, g->top_k, e->perm, e->tiles, e->ntiles, mt, stab_for(e, &L->eu));
+        kc_swiglu(e->st, e->G, e->U, e->A, P * g->ff_exp);
+        kc_mm_grouped_dev(e->st, L->ed.fmt, L->ed.d, L->ed.cols, L->ed.rows, e->A, g->ff_exp, e->D, d, 1, e->perm, e->tiles, e->ntiles, mt, stab_for(e, &L->ed));
+    }
+    tgroup(e, MOVA_TG_SHARED);
+    enc_dense(e, &L->sg, e->xn, d, e->ga, g->ff_exp, T, 0);
+    enc_dense(e, &L->su, e->xn, d, e->ua, g->ff_exp, T, 0);
+    kc_swiglu(e->st, e->ga, e->ua, e->aa, T * g->ff_exp);
+    enc_dense(e, &L->sd, e->aa, g->ff_exp, e->sh, d, T, 0);
+    tgroup(e, MOVA_TG_EXPERTS);
+    kc_moe_combine(e->st, e->D, rw, e->sh, X, d, g->top_k, T);
+    return 0;
+}
+
+// Embedding, every layer and the final norm for T rows at e->ids / e->ri (one chunk; decode and verification).
+static void dump_x(Eng* e, const float* X, int T) {   // debugging (MOVA_DUMP): append X (T x d f32)
+    const char* dump = getenv("MOVA_DUMP");
+    if (!dump) return;
+    float* hx = (float*) malloc(sizeof(float) * (size_t) T * e->c.d);
+    cudaMemcpyAsync(hx, X, sizeof(float) * (size_t) T * e->c.d, cudaMemcpyDeviceToHost, e->st);
+    cudaStreamSynchronize(e->st);
+    FILE* f = fopen(dump, "ab");
+    if (f) { fwrite(hx, 4, (size_t) T * e->c.d, f); fclose(f); }
+    free(hx);
+}
+static int encode_forward(Eng* e, int T, int max_ctx, int h0) {
+    const MovaCfg* g = &e->c;
+    tgroup(e, MOVA_TG_EMBED_NORM);
+    kc_embed(e->st, e->embed.fmt, e->embed.w0, g->d, e->ids, e->x, T);
+    for (int l = 0; l < g->n_layer; ++l) {
+        dump_x(e, e->x, T);
+        if (encode_layer(e, l, T, e->x, e->ri, max_ctx)) return -1;
+    }
+    dump_x(e, e->x, T);
     if (h0 < T) {
         tgroup(e, MOVA_TG_HEAD);
-        kc_gnorm(e->st, d, g->eps, e->x, (const uint16_t*) e->norm.w0.p[0], e->xn, T);
+        kc_gnorm(e->st, g->d, g->eps, e->x, (const uint16_t*) e->norm.w0.p[0], e->xn, T);
     }
     return 0;
 }
@@ -791,6 +794,52 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
     return 0;
 }
 
+// Rows ids[0..n) at positions pos0.., layer by layer over up to xmax rows at a time (sub-chunks of MAX_ROWS): every
+// layer's experts come to VRAM once per xmax rows, not once per chunk.  Rows [h0, n) get logits (into logits_out,
+// (n - h0) x vocab, may be NULL).  Route capture takes the chunked forward (its records are per forward).
+static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
+    if (e->route_on || n <= MV_MAXT) {
+        for (int p = 0; p < n; p += MAX_ROWS) {
+            const int T = n - p < MAX_ROWS ? n - p : MAX_ROWS;
+            int hh = h0 - p;
+            if (hh < 0) hh = 0;
+            if (hh > T) hh = T;
+            if (forward(e, ids + p, T, pos0 + p, hh, hh < T && logits_out ? logits_out + (size_t) (p + hh - h0) * e->c.vocab : NULL, NULL)) return -1;
+        }
+        return 0;
+    }
+    const MovaCfg* g = &e->c;
+    const int d = g->d;
+    if (pos0 + n > e->kv_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->kv_cap); return -1; }
+    for (int s0 = 0; s0 < n; s0 += e->xmax) {
+        const int N = n - s0 < e->xmax ? n - s0 : e->xmax;
+        memcpy(e->h_ids_all, ids + s0, sizeof(int32_t) * (size_t) N);
+        for (int i = 0; i < N; ++i) { memset(&e->h_ri_all[i], 0, sizeof(RowInfo)); e->h_ri_all[i].pos = pos0 + s0 + i; }
+        if (!CK(cudaMemcpyAsync(e->ids_all, e->h_ids_all, sizeof(int32_t) * (size_t) N, cudaMemcpyHostToDevice, e->st)) ||
+            !CK(cudaMemcpyAsync(e->ri_all, e->h_ri_all, sizeof(RowInfo) * (size_t) N, cudaMemcpyHostToDevice, e->st)))
+            return -1;
+        tgroup(e, MOVA_TG_EMBED_NORM);
+        kc_embed(e->st, e->embed.fmt, e->embed.w0, d, e->ids_all, e->x_all, N);
+        for (int l = 0; l < g->n_layer; ++l)
+            for (int c0 = 0; c0 < N; c0 += MAX_ROWS) {
+                const int T = N - c0 < MAX_ROWS ? N - c0 : MAX_ROWS;
+                if (encode_layer(e, l, T, e->x_all + (size_t) c0 * d, e->ri_all + c0, pos0 + s0 + c0 + T)) return -1;
+            }
+        // the head for this range's rows at or after h0
+        for (int r = h0 > s0 ? h0 - s0 : 0; r < N; r += MAX_LOGIT_ROWS) {
+            const int m = N - r < MAX_LOGIT_ROWS ? N - r : MAX_LOGIT_ROWS;
+            tgroup(e, MOVA_TG_HEAD);
+            kc_gnorm(e->st, d, g->eps, e->x_all + (size_t) r * d, (const uint16_t*) e->norm.w0.p[0], e->xn, m);
+            enc_dense(e, &e->head, e->xn, d, e->logits, g->vocab, m, 0);
+            if (logits_out && !CK(cudaMemcpyAsync(e->h_logits, e->logits, (size_t) m * g->vocab * 4, cudaMemcpyDeviceToHost, e->st))) return -1;
+            if (sync_stream(e)) return -1;
+            if (logits_out) memcpy(logits_out + (size_t) (s0 + r - h0) * g->vocab, e->h_logits, (size_t) m * g->vocab * 4);
+        }
+    }
+    if (sync_stream(e) || !CK(cudaGetLastError())) return -1;
+    return 0;
+}
+
 // ---- sequences (one slot) -------------------------------------------------------------------------------------------
 
 static void hist_push(Seq* s, int32_t t) {
@@ -802,11 +851,7 @@ int eng_prefill(Eng* e, int seq, const int32_t* ids, int n) {
     if (seq != 0 || n < 1 || n > e->kv_cap) return -1;
     e->seq.len = 0;
     for (int i = 0; i < n; ++i) hist_push(&e->seq, ids[i]);
-    for (int p = 0; p < n - 1; p += MAX_ROWS) {
-        const int T = n - 1 - p < MAX_ROWS ? n - 1 - p : MAX_ROWS;
-        if (forward(e, ids + p, T, p, T, NULL, NULL)) return -1;
-    }
-    return 0;
+    return n > 1 ? forward_lm(e, ids, n - 1, 0, n - 1, NULL) : 0;
 }
 int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     if (seq != 0 || n < 1 || n > e->kv_cap) return -1;
@@ -814,10 +859,7 @@ int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) 
     while (c < e->seq.len - 1 && c < n - 1 && e->seq.hist[c] == ids[c]) ++c;   // KV is valid for hist[0 .. len-2]
     e->seq.len = c;
     for (int i = c; i < n; ++i) hist_push(&e->seq, ids[i]);
-    for (int p = c; p < n - 1; p += MAX_ROWS) {
-        const int T = n - 1 - p < MAX_ROWS ? n - 1 - p : MAX_ROWS;
-        if (forward(e, ids + p, T, p, T, NULL, NULL)) return -1;
-    }
+    if (n - 1 > c && forward_lm(e, ids + c, n - 1 - c, c, n - 1 - c, NULL)) return -1;
     if (reused) *reused = c;
     return 0;
 }
@@ -899,14 +941,7 @@ int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t
 int eng_score(Eng* e, int seq, const int32_t* ids, int from, int count, float* logits) {
     if (seq != 0 || from < 1 || count < 1) return -1;
     const int last = from + count - 2;
-    for (int p = 0; p <= last; p += MAX_ROWS) {
-        const int T = last + 1 - p < MAX_ROWS ? last + 1 - p : MAX_ROWS;
-        int h0 = from - 1 - p;
-        if (h0 < 0) h0 = 0;
-        if (h0 > T) h0 = T;
-        float* dst = h0 < T ? logits + (size_t) (p + h0 - (from - 1)) * e->c.vocab : NULL;
-        if (forward(e, ids + p, T, p, h0, dst, NULL)) return -1;
-    }
+    if (forward_lm(e, ids, last + 1, 0, from - 1, logits)) return -1;
     e->seq.len = 0;
     return 0;
 }

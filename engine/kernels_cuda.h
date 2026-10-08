@@ -65,6 +65,16 @@ void kc_mm(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int 
            const uint32_t* G);
 void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                    int xdiv, const int32_t* perm, const MmTile* tiles, int ntiles, const uint32_t* G);
+// Grouping on the GPU: the count = rows x k selections inds[] (n experts) -> perm (pair ids by expert, ascending within
+// an expert), tiles (runs of <= MMT_BN pairs of one expert) and *ntiles.  kc_mm_grouped_dev takes the tile count from
+// the device (grid = the upper bound, extra blocks exit).
+void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* perm, MmTile* tiles, int32_t* ntiles);
+void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
+                       int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, int max_tiles,
+                       const uint32_t* G);
+#define MMT_BM 64   // tensor-core GEMM: weight rows per block
+#define MMT_BN 64   // tokens (or pairs) per block
+#define MMT_BK 32
 // Router: sigmoid scores, selection scores (score + bias), top-k ids and weights
 void kc_router(cudaStream_t s, RouterArgs a, const uint16_t* W, const uint16_t* bias, const float* x, float* score,
                float* sel, int32_t* inds, float* wts, int T);

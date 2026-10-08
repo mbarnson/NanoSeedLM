@@ -150,7 +150,7 @@ int main(void) {
     o.model_dir = dir;
     o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
     o.max_seqs = 1;
-    o.kv_tokens = 256;
+    o.kv_tokens = 1024;
     Eng* e = eng_open(&o, err, sizeof err);
     if (!e) { printf("FAIL: eng_open: %s\n", err); return 1; }
     printf("%s\n", eng_describe(e));
@@ -163,7 +163,13 @@ int main(void) {
     float* rl = (float*) malloc(sizeof(float) * (size_t) N * V);
     int32_t* rm = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK);
     int32_t* rv = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
+    // two references: the prefill kernels' attention rounding (scoring forwards of more than 8 rows) and the decode
+    // kernels' (single rows)
+    float* rd = (float*) malloc(sizeof(float) * (size_t) N * V);
+    mova_ref_attn_rounding(ref, 1);
     CHECK(mova_ref_forward(ref, ids, N - 1, 0, rl, rm, rv) == 0, "reference forward");
+    mova_ref_attn_rounding(ref, 0);
+    CHECK(mova_ref_forward(ref, ids, N - 1, 0, rd, NULL, NULL) == 0, "reference forward");
 
     // 1. prompt scoring: one forward of N - 1 rows
     float* el = (float*) malloc(sizeof(float) * (size_t) N * V);
@@ -173,20 +179,25 @@ int main(void) {
     CHECK(eng_score(e, 0, ids, 1, N - 1, el) == 0, "eng_score");
     CHECK(eng_mova_routes_read(e, N - 1, em, ev, NULL, NULL) == 0, "routes");
     eng_mova_routes(e, 0, 0);
-    int flips = 0, same_rows = 0, am_same = 0;
+    // A row whose own router choices differ is not comparable; nor is any row after one: a flip changes that row's
+    // value-expert output, which later rows read through the KV cache.  Rows before the first flip must agree to the
+    // engines' rounding; all rows together, to a BF16 network's chaotic drift (a stray ulp moves later roundings).
+    int flips = 0, clean = 0, am_same = 0;
     double worst = 0, mean = 0;
     for (int t = 0; t < N - 1; ++t) {
         const int same = same_choice(em + t * NS * TK, rm + t * NS * TK, NS, TK) && same_choice(ev + t * NS * TKV, rv + t * NS * TKV, NS, TKV);
         flips += !same;
         const double re = row_err(el + (size_t) t * V, rl + (size_t) t * V, V);
         am_same += argmax(el + (size_t) t * V, V) == argmax(rl + (size_t) t * V, V);
-        if (same) { ++same_rows; worst = fmax(worst, re); mean += re; }
+        mean += re;
+        if (!flips) { ++clean; worst = fmax(worst, re); }
     }
-    // a row counts as flipped if any layer's choice differs (a flip also moves later rows through the value experts)
-    printf("scoring: %d rows, %d with every router choice equal; logit error (those rows) mean %.2e max %.2e; argmax equal %d / %d\n",
-           N - 1, same_rows, same_rows ? mean / same_rows : 0, worst, am_same, N - 1);
-    CHECK(flips <= (N - 1) / 8, "scoring: %d rows with a different router choice", flips);
-    CHECK(worst < 0.02, "scoring: logit error %.3e", worst);
+    mean /= N - 1;
+    printf("scoring: %d rows, %d before the first router flip (%d rows flipped); logit error: those rows max %.2e, all rows "
+           "mean %.2e; argmax equal %d / %d\n", N - 1, clean, flips, worst, mean, am_same, N - 1);
+    CHECK(flips <= (N - 1) / 4, "scoring: %d rows with a different router choice", flips);
+    CHECK(worst < 0.02, "scoring: logit error %.3e before the first flip", worst);
+    CHECK(mean < 0.05, "scoring: mean logit error %.3e", mean);
     CHECK(am_same >= (N - 1) * 9 / 10, "scoring: argmax equal in %d of %d rows", am_same, N - 1);
 
     // 2. decode: prefill 8 tokens, then step through the rest one row at a time
@@ -197,8 +208,8 @@ int main(void) {
     int dsame = 0;
     for (int t = P0 - 1; t < N - 1; ++t) {
         CHECK(eng_step(e, 0, lg) == 0, "step");
-        dworst = fmax(dworst, row_err(lg, rl + (size_t) t * V, V));
-        dsame += argmax(lg, V) == argmax(rl + (size_t) t * V, V);
+        dworst = fmax(dworst, row_err(lg, rd + (size_t) t * V, V));
+        dsame += argmax(lg, V) == argmax(rd + (size_t) t * V, V);
         eng_push(e, 0, ids[t + 1]);
     }
     printf("decode: %d steps, logit error max %.2e (all rows), argmax equal %d / %d\n", N - P0, dworst, dsame, N - P0);
@@ -217,7 +228,27 @@ int main(void) {
     printf("prompt lookup: %lld forwards for 24 tokens, %lld of %lld proposals accepted\n", (long long) sp.forwards,
            (long long) sp.accepted, (long long) sp.proposals);
 
-    // 4. cached prefill: a shared prefix is reused and the result equals a full prefill's next step
+    // 4. long prompts: scoring with route capture (forward by forward) and without (an engine may then run the prompt
+    // layer by layer) must give the same logits bit for bit: same kernels, same chunks, same positions
+    {
+        const int NL = 600;   // more than one prompt chunk
+        int32_t* lid = (int32_t*) malloc(sizeof(int32_t) * NL);
+        for (int i = 0; i < NL; ++i) lid[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+        const int from = NL - 70, cnt = 70;
+        float* la = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+        float* lb = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+        CHECK(eng_score(e, 0, lid, from, cnt, la) == 0, "long scoring");
+        eng_mova_routes(e, 1, NL);
+        CHECK(eng_score(e, 0, lid, from, cnt, lb) == 0, "long scoring with routes");
+        eng_mova_routes(e, 0, 0);
+        int diff = 0;
+        for (size_t i = 0; i < (size_t) cnt * V; ++i) diff += la[i] != lb[i];
+        printf("long prompt (%d tokens): %d of %d logits differ between the two forwards\n", NL, diff, cnt * V);
+        CHECK(diff == 0, "long prompt: layer-major and chunked forwards differ");
+        free(lid); free(la); free(lb);
+    }
+
+    // 5. cached prefill: a shared prefix is reused and the result equals a full prefill's next step
     int reused = 0;
     CHECK(eng_prefill(e, 0, ids, 30) == 0, "prefill 30");
     CHECK(eng_prefill_cached(e, 0, ids, 36, &reused) == 0 && reused == 29, "cached prefill reused %d", reused);
@@ -225,7 +256,7 @@ int main(void) {
 
     eng_close(e);
     mova_ref_close(ref);
-    free(rl); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
+    free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

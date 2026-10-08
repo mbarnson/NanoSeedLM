@@ -7,15 +7,16 @@
 # Binaries land in build/bin.  Every C translation unit is compiled without FMA contraction: the scalar, vector and
 # GPU paths of the seed search must agree bit for bit (as -ffp-contract=off in the Makefile).
 cmake_minimum_required(VERSION 3.24)
+# GPUs: Ampere (sm_80, 86), Ada (sm_89), Blackwell (sm_120); BF16 tensor cores need sm_80 or newer
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 120)
+endif()
 project(NanoSeedLM LANGUAGES C CXX CUDA)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86 89)
-endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
