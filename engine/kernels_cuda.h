@@ -22,6 +22,31 @@ typedef struct {
     int32_t pad[3];
 } WSlice;
 
+// ---- the expert cache: a pool of fixed-size VRAM slots over a host arena that holds every expert ----------------------
+// Unit u (an MLP expert's gate, up and down slices, or one value expert) occupies bytes [u * unit_bytes, + unit_bytes)
+// of the host arena and, when resident, the same layout in slot unit_slot[u] of the VRAM pool.  The admit kernel runs
+// after a router: it marks the selected units used, gives every missing one the least recently used slot that this
+// call does not need, points the unit's slice tables (tab) at the slot, and queues a copy job; the copy kernel then
+// brings the queued units over PCIe.  The kernels that follow read only VRAM.
+typedef struct {
+    int32_t* unit_slot;     // [units]: slot, or -1
+    int32_t* slot_unit;     // [slots]: unit, or -1
+    uint32_t* slot_last;    // [slots]: the admit tick of the last use
+    uint32_t* tick;         // [3]: the admit tick, hits, misses
+    int32_t* jobs;          // [2 * per_layer]: (unit, slot) pairs queued by the last admit
+    int32_t* njobs;         // [1]
+    uint8_t* vram;          // the pool
+    const uint8_t* host;    // device address of the host arena
+    uint64_t unit_bytes;
+    int32_t slots, per_layer, ntens;
+    WSlice* tab;            // [sparse layer][ntens][per_layer]
+    uint32_t off[3][4];     // byte offset of tensor i's stream s in a unit (0xFFFFFFFF: no stream)
+    uint64_t hits, misses;  // host-side statistics (not used by the kernels)
+} CachePool;
+// rows x k selections inds[] of sparse layer sl
+void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count);
+void kc_cache_copy(cudaStream_t s, const CachePool* p);
+
 // x[t][:] = the embedding row of ids[t] (BF16 or Q8)
 void kc_embed(cudaStream_t s, int fmt, WSlice w, int d, const int32_t* ids, float* x, int T);
 // grouped RMSNorm (2 groups)

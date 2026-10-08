@@ -74,7 +74,8 @@ target_link_libraries(nslm_engine PUBLIC nslm CUDA::cudart_static)
 set_target_properties(nslm_engine PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 # ---- the tools ------------------------------------------------------------------------------------------------------
-add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c)
+add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c
+            $<IF:$<BOOL:${APPLE}>,harness/telemetry.m,harness/telemetry_nvml.c>)
 target_include_directories(nslm_harness PUBLIC harness)
 if(WIN32)
   target_link_libraries(nslm_harness PUBLIC nslm icu shell32)
@@ -84,7 +85,7 @@ else()
   target_link_libraries(nslm_harness PUBLIC nslm icuuc icui18n)
 endif()
 
-foreach(t nslm-chat nslm-mova-refcheck)
+foreach(t nslm-chat nslm-mova-refcheck nslm-mova-bench nslm-mova-routes)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()

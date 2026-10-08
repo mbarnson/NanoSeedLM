@@ -13,6 +13,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <pthread.h>
+
 #include <cuda_runtime_api.h>
 
 #include "engine_api.h"
@@ -41,8 +43,10 @@ static int cuda_ok(cudaError_t r, const char* what, const char* file, int line) 
 typedef struct {
     int fmt, slices, rows, cols;
     WSlice w0;      // slice 0: dense tensors
-    WSlice* d;      // device table [slices] (stacked experts)
-    WSlice* h;      // its host copy
+    WSlice* d;      // device table [slices] (stacked experts: inside the expert cache's table)
+    WSlice* h;      // host copy of the slices' exponent biases (stacked experts)
+    const NsTensor* nt;   // stacked experts: the folder's tensor, or NULL (BF16 from the original checkpoint, mt)
+    MovaTensor mt;
 } MW;
 
 typedef struct {
@@ -58,11 +62,6 @@ typedef struct {
     int len, cap;
 } Seq;
 
-typedef struct {   // a sub-allocated arena (VRAM or mapped host memory)
-    uint8_t* base;   // device address
-    uint8_t* host;   // host address (host arenas)
-    uint64_t size, used;
-} Arena;
 
 struct Eng {
     MovaCfg c;
@@ -92,8 +91,9 @@ struct Eng {
     int nalloc, capalloc;
     void** hallocs;   // pinned host allocations
     int nhalloc, caphalloc;
-    Arena vram, host;
-    int64_t experts_vram, experts_host;   // expert units by placement
+    CachePool pm, pv;   // expert caches: MLP experts, value experts
+    cudaGraphExec_t graphs[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 2];   // small forwards, by (rows, splits, head)
+    int no_graph;
     EngMem mem;
     Seq seq;
     char desc[320];
@@ -135,14 +135,6 @@ static void* halloc(Eng* e, uint64_t bytes) {
     e->hallocs[e->nhalloc++] = p;
     return p;
 }
-static void* arena_take(Arena* a, uint64_t bytes, uint8_t** host) {
-    const uint64_t at = (a->used + 255) & ~255ull;
-    if (at + bytes > a->size) return NULL;
-    a->used = at + bytes;
-    if (host) *host = a->host ? a->host + at : NULL;
-    return a->base + at;
-}
-
 // ---- weights --------------------------------------------------------------------------------------------------------
 
 static uint64_t stream_slice_len(const MW* w, int s) {   // bytes of one slice of stream s (0: unused)
@@ -173,6 +165,11 @@ static int upload_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen
     if (!e->ck && !(e->ck = mova_ckpt_open(e->model_dir, err, errlen))) return -1;
     memset(w, 0, sizeof *w);
     w->fmt = MF_BF16; w->slices = t->slices; w->rows = t->rows; w->cols = t->cols;
+    if (t->kind == MOVA_K_EXPERTS || t->kind == MOVA_K_VEXPERTS) {   // to the expert cache
+        w->mt = *t;
+        w->h = (WSlice*) calloc((size_t) t->slices, sizeof(WSlice));
+        return 0;
+    }
     const uint64_t one = (uint64_t) t->rows * t->cols * 2;
     uint8_t* d = (uint8_t*) dalloc(e, one * (uint64_t) t->slices, &e->mem.weights);
     if (!d) { snprintf(err, (size_t) errlen, "%s: out of GPU memory", t->name); return -1; }
@@ -182,21 +179,181 @@ static int upload_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen
         if (!src || !CK(cudaMemcpy(d + one * (uint64_t) s, src, one, cudaMemcpyHostToDevice))) return -1;
     }
     w->w0.p[0] = d;
-    if (t->slices > 1) {
-        w->h = (WSlice*) calloc((size_t) t->slices, sizeof(WSlice));
-        for (int s = 0; s < t->slices; ++s) w->h[s].p[0] = d + one * (uint64_t) s;
-    }
     return 0;
 }
 
-// Stacked experts: shape only (placement and upload come later, in place_experts).
+// Stacked experts: shape and source only; their bytes go to the expert cache (build_pools).
 static int describe_stacked(const NsTensor* t, MW* w) {
     memset(w, 0, sizeof *w);
     w->fmt = t->enc; w->slices = t->slices; w->rows = t->rows; w->cols = t->cols;
+    w->nt = t;
     w->h = (WSlice*) calloc((size_t) t->slices, sizeof(WSlice));
     if (t->enc == MF_SEED4 || t->enc == MF_SEED4P4)
         for (int s = 0; s < t->slices; ++s) memcpy(&w->h[s].eb, t->s[2].p + 4 * (size_t) s, 4);
     return 0;
+}
+
+// ---- the expert cache (kernels_cuda.h CachePool) --------------------------------------------------------------------
+
+// The bytes of slice x of stream s of a stacked tensor: from the model folder, or BF16 from the original checkpoint.
+static const uint8_t* slice_src(Eng* e, const MW* w, int s, int x, char* err, int errlen) {
+    const uint64_t len = stream_slice_len(w, s);
+    if (w->nt) return w->nt->s[s].p + len * (uint64_t) x;
+    char nm[160];
+    return (const uint8_t*) mova_ckpt_bf16(e->ck, mova_slice_name(&w->mt, x, nm, sizeof nm), w->rows, w->cols, err, errlen);
+}
+
+typedef struct {
+    Eng* e;
+    CachePool* p;
+    MW* const* ws;     // [sparse layer][ntens]
+    uint8_t* host;
+    int units, next, fail;
+    pthread_mutex_t mu;
+} Fill;
+static void* fill_worker(void* arg) {   // host arena: every unit, in unit order
+    Fill* f = (Fill*) arg;
+    char err[256];
+    for (;;) {
+        pthread_mutex_lock(&f->mu);
+        const int u = f->next++;
+        pthread_mutex_unlock(&f->mu);
+        if (u >= f->units) return NULL;
+        const int sl = u / f->p->per_layer, x = u % f->p->per_layer;
+        for (int i = 0; i < f->p->ntens; ++i) {
+            const MW* w = f->ws[sl * f->p->ntens + i];
+            for (int s = 0; s < 4; ++s) {
+                if (f->p->off[i][s] == 0xFFFFFFFFu) continue;
+                const uint8_t* src = slice_src(f->e, w, s, x, err, sizeof err);
+                if (!src) { f->fail = 1; return NULL; }
+                memcpy(f->host + (uint64_t) u * f->p->unit_bytes + f->p->off[i][s], src, stream_slice_len(w, s));
+            }
+        }
+    }
+}
+
+// One pool over the stacked tensors ws[sparse layer][ntens] (MLP experts: gate, up, down; value experts: one) with
+// `slots` VRAM slots.  The first slots are filled round-robin over the layers (expert-major), so every layer starts
+// with the same share; the cache adapts from there.
+static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_layer, uint64_t vram_bytes, char* err, int errlen) {
+    const MovaCfg* c = &e->c;
+    const int nsl = c->n_layer - c->first_sparse, units = nsl * per_layer;
+    memset(p, 0, sizeof *p);
+    p->per_layer = per_layer;
+    p->ntens = ntens;
+    uint64_t cur = 0;
+    for (int i = 0; i < 3; ++i) for (int s = 0; s < 4; ++s) p->off[i][s] = 0xFFFFFFFFu;
+    for (int i = 0; i < ntens; ++i)
+        for (int s = 0; s < 4; ++s) {
+            const uint64_t len = stream_slice_len(ws[i], s);
+            if (!len) continue;
+            p->off[i][s] = (uint32_t) cur;
+            cur += (len + 255) & ~255ull;
+        }
+    p->unit_bytes = cur;
+    p->slots = (int) (vram_bytes / cur);
+    if (p->slots > units) p->slots = units;
+    if (p->slots < per_layer) {
+        snprintf(err, (size_t) errlen, "expert cache: room for %d experts, a layer needs %d (free GPU memory or a smaller --ctx)", p->slots, per_layer);
+        return -1;
+    }
+    // the host arena, filled by threads (the folder's pages come from disk or the page cache)
+    uint8_t* host = (uint8_t*) halloc(e, cur * (uint64_t) units);
+    if (!host) { snprintf(err, (size_t) errlen, "cannot pin %.2f GB of host memory for the experts", cur * (double) units / 1e9); return -1; }
+    e->mem.staging += (int64_t) (cur * (uint64_t) units);
+    {
+        Fill f;
+        memset(&f, 0, sizeof f);
+        f.e = e; f.p = p; f.ws = ws; f.host = host; f.units = units;
+        pthread_mutex_init(&f.mu, NULL);
+        pthread_t th[8];
+        for (int i = 0; i < 8; ++i) pthread_create(&th[i], NULL, fill_worker, &f);
+        for (int i = 0; i < 8; ++i) pthread_join(th[i], NULL);
+        pthread_mutex_destroy(&f.mu);
+        if (f.fail) { snprintf(err, (size_t) errlen, "expert cache: cannot read the experts"); return -1; }
+    }
+    void* dh = NULL;
+    if (!CK(cudaHostGetDevicePointer(&dh, host, 0))) return -1;
+    p->host = (const uint8_t*) dh;
+    p->vram = (uint8_t*) dalloc(e, cur * (uint64_t) p->slots, &e->mem.weights);
+    p->unit_slot = (int32_t*) dalloc(e, 4 * (uint64_t) units, &e->mem.scratch);
+    p->slot_unit = (int32_t*) dalloc(e, 4 * (uint64_t) p->slots, &e->mem.scratch);
+    p->slot_last = (uint32_t*) dalloc(e, 4 * (uint64_t) p->slots, &e->mem.scratch);
+    p->tick = (uint32_t*) dalloc(e, 16, &e->mem.scratch);
+    p->jobs = (int32_t*) dalloc(e, 8 * (uint64_t) per_layer, &e->mem.scratch);
+    p->njobs = (int32_t*) dalloc(e, 16, &e->mem.scratch);
+    p->tab = (WSlice*) dalloc(e, sizeof(WSlice) * (uint64_t) units * (uint64_t) ntens, &e->mem.scratch);
+    if (!p->vram || !p->unit_slot || !p->slot_unit || !p->slot_last || !p->tick || !p->jobs || !p->njobs || !p->tab) {
+        snprintf(err, (size_t) errlen, "expert cache: out of GPU memory");
+        return -1;
+    }
+    // initial residency and the slice tables
+    int32_t* us = (int32_t*) malloc(4 * (size_t) units);
+    int32_t* su = (int32_t*) malloc(4 * (size_t) p->slots);
+    WSlice* tab = (WSlice*) calloc((size_t) units * (size_t) ntens, sizeof(WSlice));
+    for (int u = 0; u < units; ++u) us[u] = -1;
+    int s = 0;
+    for (int x = 0; x < per_layer && s < p->slots; ++x)
+        for (int sl = 0; sl < nsl && s < p->slots; ++sl, ++s) {
+            const int u = sl * per_layer + x;
+            us[u] = s;
+            su[s] = u;
+            if (!CK(cudaMemcpy(p->vram + (uint64_t) s * cur, host + (uint64_t) u * cur, cur, cudaMemcpyHostToDevice))) return -1;
+        }
+    for (int sl = 0; sl < nsl; ++sl)
+        for (int i = 0; i < ntens; ++i)
+            for (int x = 0; x < per_layer; ++x) {
+                WSlice* t = &tab[((size_t) sl * ntens + i) * per_layer + x];
+                const int u = sl * per_layer + x;
+                t->eb = ws[sl * ntens + i]->h[x].eb;
+                if (us[u] < 0) continue;
+                for (int st = 0; st < 4; ++st)
+                    if (p->off[i][st] != 0xFFFFFFFFu) t->p[st] = p->vram + (uint64_t) us[u] * cur + p->off[i][st];
+            }
+    int ok = CK(cudaMemcpy(p->unit_slot, us, 4 * (size_t) units, cudaMemcpyHostToDevice)) &&
+             CK(cudaMemcpy(p->slot_unit, su, 4 * (size_t) p->slots, cudaMemcpyHostToDevice)) &&
+             CK(cudaMemset(p->slot_last, 0, 4 * (size_t) p->slots)) && CK(cudaMemset(p->tick, 0, 16)) &&
+             CK(cudaMemset(p->njobs, 0, 16)) &&
+             CK(cudaMemcpy(p->tab, tab, sizeof(WSlice) * (size_t) units * ntens, cudaMemcpyHostToDevice));
+    free(us); free(su); free(tab);
+    if (!ok) return -1;
+    for (int sl = 0; sl < nsl; ++sl)
+        for (int i = 0; i < ntens; ++i) ws[sl * ntens + i]->d = p->tab + ((size_t) sl * ntens + i) * per_layer;
+    return 0;
+}
+
+// The two pools share the VRAM left after everything else (NSLM_VRAM_RESERVE_MB stays free; NSLM_EXPERT_VRAM_MB caps
+// it), split by the pools' byte totals.
+static int build_pools(Eng* e, char* err, int errlen) {
+    const MovaCfg* c = &e->c;
+    const int nsl = c->n_layer - c->first_sparse;
+    MW** wm = (MW**) malloc(sizeof(MW*) * (size_t) nsl * 3);
+    MW** wv = (MW**) malloc(sizeof(MW*) * (size_t) nsl);
+    for (int sl = 0; sl < nsl; ++sl) {
+        Layer* L = &e->L[c->first_sparse + sl];
+        wm[sl * 3] = &L->eg; wm[sl * 3 + 1] = &L->eu; wm[sl * 3 + 2] = &L->ed;
+        wv[sl] = &L->vx;
+    }
+    uint64_t bm = 0, bv = 0;
+    for (int s = 0; s < 4; ++s) {
+        for (int i = 0; i < 3; ++i) bm += (stream_slice_len(wm[i], s) + 255) & ~255ull;
+        bv += (stream_slice_len(wv[0], s) + 255) & ~255ull;
+    }
+    bm *= (uint64_t) nsl * (uint64_t) c->n_exp;
+    bv *= (uint64_t) nsl * (uint64_t) c->n_vexp;
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    const char* rs = getenv("NSLM_VRAM_RESERVE_MB");
+    const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 512) << 20;
+    uint64_t budget = fr > reserve ? fr - reserve : 0;
+    const char* cap = getenv("NSLM_EXPERT_VRAM_MB");
+    if (cap && ((uint64_t) atoll(cap) << 20) < budget) budget = (uint64_t) atoll(cap) << 20;
+    if (budget > bm + bv) budget = bm + bv;
+    const uint64_t vm = (uint64_t) ((double) budget * (double) bm / (double) (bm + bv));
+    const int rc = build_pool(e, &e->pm, wm, 3, c->n_exp, vm, err, errlen) || build_pool(e, &e->pv, wv, 1, c->n_vexp, budget - vm, err, errlen);
+    free(wm);
+    free(wv);
+    return rc ? -1 : 0;
 }
 
 static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, MW* w, char* err, int errlen) {
@@ -217,119 +374,6 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
     if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, f); return -1; }
     if (t->kind == MOVA_K_EXPERTS || t->kind == MOVA_K_VEXPERTS) return describe_stacked(nt, w);
     return upload_dense(e, nt, w, err, errlen);
-}
-
-// One expert unit: an MLP expert (gate, up, down slice) or a value expert (one slice of vx).
-typedef struct {
-    MW* w[3];
-    const NsTensor* t[3];
-    int nw, slice;
-    uint64_t bytes;
-} Unit;
-
-static uint64_t unit_bytes(const Unit* u) {
-    uint64_t b = 0;
-    for (int i = 0; i < u->nw; ++i)
-        for (int s = 0; s < 4; ++s) b += (stream_slice_len(u->w[i], s) + 255) & ~255ull;
-    return b;
-}
-// Copy a unit's slices into an arena and point the tables at them.
-static int put_unit(Eng* e, Unit* u, Arena* a) {
-    for (int i = 0; i < u->nw; ++i) {
-        MW* w = u->w[i];
-        for (int s = 0; s < 4; ++s) {
-            const uint64_t len = stream_slice_len(w, s);
-            if (!len) continue;
-            uint8_t* host = NULL;
-            uint8_t* d = (uint8_t*) arena_take(a, len, &host);
-            if (!d) return -1;
-            const uint8_t* src = u->t[i]->s[s].p + len * (uint64_t) u->slice;
-            if (host) memcpy(host, src, len);
-            else if (!CK(cudaMemcpy(d, src, len, cudaMemcpyHostToDevice))) return -1;
-            w->h[u->slice].p[s] = d;
-        }
-    }
-    return 0;
-}
-
-// Placement: units round-robin over layers so every layer gets the same share of VRAM, value experts and MLP experts
-// interleaved by their byte share; the rest go to host memory.
-static int place_experts(Eng* e, char* err, int errlen) {
-    const MovaCfg* c = &e->c;
-    const int nl = c->n_layer - c->first_sparse;
-    Unit* units = (Unit*) calloc((size_t) nl * (size_t) (c->n_exp + c->n_vexp), sizeof(Unit));
-    int nu = 0;
-    uint64_t total = 0;
-    // order: expert index major, layer minor, so a prefix of the list is an even share of every layer
-    const int emax = c->n_exp > c->n_vexp ? c->n_exp : c->n_vexp;
-    for (int x = 0; x < emax; ++x)
-        for (int l = c->first_sparse; l < c->n_layer; ++l) {
-            Layer* L = &e->L[l];
-            char nm[160];
-            if (x < c->n_vexp && L->vx.h && !L->vx.w0.p[0]) {
-                Unit* u = &units[nu++];
-                u->nw = 1; u->slice = x; u->w[0] = &L->vx;
-                snprintf(nm, sizeof nm, "model.layers.%d.self_attn.v_experts.weight", l);
-                u->t[0] = ns_find(&e->nm, nm);
-                u->bytes = unit_bytes(u);
-                total += u->bytes;
-            }
-            if (x < c->n_exp && L->eg.h && !L->eg.w0.p[0]) {
-                Unit* u = &units[nu++];
-                u->nw = 3; u->slice = x; u->w[0] = &L->eg; u->w[1] = &L->eu; u->w[2] = &L->ed;
-                const char* pr[3] = {"gate_proj", "up_proj", "down_proj"};
-                for (int i = 0; i < 3; ++i) {
-                    snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%s.weight", l, pr[i]);
-                    u->t[i] = ns_find(&e->nm, nm);
-                }
-                u->bytes = unit_bytes(u);
-                total += u->bytes;
-            }
-        }
-    size_t fr = 0, tot = 0;
-    cudaMemGetInfo(&fr, &tot);
-    const char* rs = getenv("NSLM_VRAM_RESERVE_MB");
-    const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 768) << 20;
-    uint64_t budget = fr > reserve ? fr - reserve : 0;
-    const char* cap = getenv("NSLM_EXPERT_VRAM_MB");   // testing: cap the experts' VRAM
-    if (cap && ((uint64_t) atoll(cap) << 20) < budget) budget = (uint64_t) atoll(cap) << 20;
-    if (budget > total) budget = total;
-    // VRAM arena
-    while (budget > 0 && !(e->vram.base = (uint8_t*) dalloc(e, budget, NULL))) budget -= 256ull << 20;
-    e->vram.size = e->vram.base ? budget : 0;
-    e->mem.weights += (int64_t) e->vram.size;
-    int i = 0;
-    for (; i < nu; ++i) {
-        const uint64_t at = e->vram.used;
-        if (put_unit(e, &units[i], &e->vram)) { e->vram.used = at; break; }
-        e->experts_vram++;
-    }
-    // host arena for the rest
-    uint64_t rest = 0;
-    for (int j = i; j < nu; ++j) rest += units[j].bytes + 4 * 256;
-    if (rest) {
-        uint8_t* h = (uint8_t*) halloc(e, rest);
-        if (!h) { snprintf(err, (size_t) errlen, "cannot pin %.2f GB of host memory for the experts", rest / 1e9); free(units); return -1; }
-        void* dp = NULL;
-        if (!CK(cudaHostGetDevicePointer(&dp, h, 0))) { free(units); return -1; }
-        e->host.base = (uint8_t*) dp;
-        e->host.host = h;
-        e->host.size = rest;
-        e->mem.staging += (int64_t) rest;
-        for (; i < nu; ++i) {
-            if (put_unit(e, &units[i], &e->host)) { snprintf(err, (size_t) errlen, "host expert arena overflow"); free(units); return -1; }
-            e->experts_host++;
-        }
-    }
-    free(units);
-    return 0;
-}
-
-// Device copies of the slice tables of every stacked tensor.
-static int upload_tables(Eng* e, MW* w) {
-    if (!w->h) return 0;
-    w->d = (WSlice*) dalloc(e, sizeof(WSlice) * (size_t) w->slices, &e->mem.scratch);
-    return w->d && CK(cudaMemcpy(w->d, w->h, sizeof(WSlice) * (size_t) w->slices, cudaMemcpyHostToDevice)) ? 0 : -1;
 }
 
 // ---- open / close ---------------------------------------------------------------------------------------------------
@@ -470,15 +514,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         return NULL;
     }
     // experts last: they take the VRAM that is left
-    if (place_experts(e, err, errlen)) { eng_close(e); return NULL; }
-    for (int l = 0; l < c->n_layer; ++l) {
-        Layer* L = &e->L[l];
-        if (upload_tables(e, &L->vx) || upload_tables(e, &L->eg) || upload_tables(e, &L->eu) || upload_tables(e, &L->ed)) {
-            snprintf(err, (size_t) errlen, "slice tables: out of GPU memory");
-            eng_close(e);
-            return NULL;
-        }
-    }
+    if (build_pools(e, err, errlen)) { eng_close(e); return NULL; }
+    e->no_graph = getenv("NSLM_NO_GRAPH") != NULL || getenv("MOVA_DUMP") != NULL;
     e->seq.cap = 1024;
     e->seq.hist = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->seq.cap);
     struct cudaDeviceProp prop;
@@ -486,16 +523,23 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
     snprintf(e->desc, sizeof e->desc,
              "mova engine (CUDA, %s): experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s; "
-             "expert units %lld in VRAM, %lld in host memory",
+             "expert cache %d + %d of %d + %d experts in VRAM",
              prop.name, fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
-             fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], (long long) e->experts_vram,
-             (long long) e->experts_host);
+             fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->pm.slots, e->pv.slots,
+             (c->n_layer - c->first_sparse) * c->n_exp, (c->n_layer - c->first_sparse) * c->n_vexp);
     return e;
 }
 
 void eng_close(Eng* e) {
     if (!e) return;
     if (e->st) cudaStreamSynchronize(e->st);
+    if (getenv("NSLM_CACHE_STATS") && e->pm.tick) {
+        uint32_t a[3], b[3];
+        cudaMemcpy(a, e->pm.tick, 12, cudaMemcpyDeviceToHost);
+        cudaMemcpy(b, e->pv.tick, 12, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "expert cache: MLP %u hits %u misses (%.1f%%), values %u hits %u misses (%.1f%%)\n", a[1], a[2],
+                100.0 * a[1] / (a[1] + a[2] + 1e-9), b[1], b[2], 100.0 * b[1] / (b[1] + b[2] + 1e-9));
+    }
     for (int i = 0; i < e->nalloc; ++i) cudaFree(e->allocs[i]);
     for (int i = 0; i < e->nhalloc; ++i) cudaFreeHost(e->hallocs[i]);
     free(e->allocs);
@@ -504,7 +548,8 @@ void eng_close(Eng* e) {
         for (int l = 0; l < e->c.n_layer; ++l) { free(e->L[l].vx.h); free(e->L[l].eg.h); free(e->L[l].eu.h); free(e->L[l].ed.h); }
         free(e->L);
     }
-    for (int i = 0; i < e->nev; ++i) cudaEventDestroy(e->ev[i]);
+    for (int i = 0; i < 2048; ++i) if (e->ev[i]) cudaEventDestroy(e->ev[i]);
+    for (size_t i = 0; i < sizeof e->graphs / sizeof e->graphs[0]; ++i) if (e->graphs[i]) cudaGraphExecDestroy(e->graphs[i]);
     if (e->st) cudaStreamDestroy(e->st);
     ns_close(&e->nm);
     if (e->ck) mova_ckpt_close(e->ck);
@@ -586,16 +631,21 @@ static int bucket(Eng* e, const int32_t* d_inds, int T, int k, int n, int32_t* d
     return sync_stream(e) ? -1 : nt;
 }
 
+// Decode attention: each row splits its keys in up to MAX_SPLITS parts of >= 128 (rows x splits <= 1024).
+static int attn_splits(int T, int max_ctx) {
+    int ns = (max_ctx + 127) / 128;
+    if (ns > MAX_SPLITS) ns = MAX_SPLITS;
+    while (ns > 1 && T * ns > 1024) --ns;
+    return ns < 1 ? 1 : ns;
+}
+
 static int encode_forward(Eng* e, int T, int max_ctx, int h0) {
     const MovaCfg* g = &e->c;
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim;
     const int big = T > MV_MAXT;
     tgroup(e, MOVA_TG_EMBED_NORM);
     kc_embed(e->st, e->embed.fmt, e->embed.w0, d, e->ids, e->x, T);
-    int ns = (max_ctx + 127) / 128;
-    if (ns > MAX_SPLITS) ns = MAX_SPLITS;
-    while (ns > 1 && T * ns > 1024) --ns;
-    if (ns < 1) ns = 1;
+    const int ns = attn_splits(T, max_ctx);
     AttnArgs aa = {g->n_head, g->n_kv, 128, ns, 1.0f / sqrtf((float) g->head_dim)};
     const uint64_t kvl = (uint64_t) e->kv_cap * kvd;
     const char* dump = getenv("MOVA_DUMP");   // debugging: append x (T x d f32) at every layer start and at the end
@@ -622,6 +672,8 @@ static int encode_forward(Eng* e, int T, int max_ctx, int h0) {
             int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
             float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
             enc_router(e, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, vi, vw, e->vsel + (size_t) l * MAX_ROWS * g->n_vexp, T);
+            kc_cache_admit(e->st, &e->pv, l - g->first_sparse, vi, T * g->top_kv);
+            kc_cache_copy(e->st, &e->pv);
             if (!big) kc_mv_sel(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, vi, T * g->top_kv, g->top_kv, stab_for(e, &L->vx));
             else {
                 const int nt = bucket(e, vi, T, g->top_kv, g->n_vexp, e->vperm, e->vtiles);
@@ -652,6 +704,8 @@ static int encode_forward(Eng* e, int T, int max_ctx, int h0) {
         int32_t* ri = e->inds + (size_t) l * MAX_ROWS * g->top_k;
         float* rw = e->wts + (size_t) l * MAX_ROWS * g->top_k;
         enc_router(e, &L->r, &L->rb, e->xn, g->n_exp, g->top_k, ri, rw, e->rsel + (size_t) l * MAX_ROWS * g->n_exp, T);
+        kc_cache_admit(e->st, &e->pm, l - g->first_sparse, ri, T * g->top_k);
+        kc_cache_copy(e->st, &e->pm);
         tgroup(e, MOVA_TG_EXPERTS);
         const int P = T * g->top_k;
         if (!big) {
@@ -706,10 +760,25 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
     if (!CK(cudaMemcpyAsync(e->ids, e->h_ids, (size_t) T * 4, cudaMemcpyHostToDevice, e->st)) ||
         !CK(cudaMemcpyAsync(e->ri, e->h_ri, (size_t) T * sizeof(RowInfo), cudaMemcpyHostToDevice, e->st)))
         return -1;
-    if (encode_forward(e, T, pos0 + T, h0)) return -1;
+    // Forwards of up to MV_MAXT rows (decode, prompt-lookup verification) have no host round trip: they run as a CUDA
+    // graph, captured once per (rows, attention splits, head) and launched as one unit.
+    const int graph = T <= MV_MAXT && !e->timing_on && !e->no_graph;
+    if (graph) {
+        const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, pos0 + T)) * 2 + (h0 < T));
+        if (!e->graphs[key]) {
+            cudaGraph_t gr;
+            if (!CK(cudaStreamBeginCapture(e->st, cudaStreamCaptureModeThreadLocal))) return -1;
+            const int rc = encode_forward(e, T, pos0 + T, h0);
+            if (h0 < T) encode_head(e, h0, T - h0);
+            if (!CK(cudaStreamEndCapture(e->st, &gr)) || rc) return -1;
+            if (!CK(cudaGraphInstantiate(&e->graphs[key], gr, 0))) return -1;
+            cudaGraphDestroy(gr);
+        }
+        if (!CK(cudaGraphLaunch(e->graphs[key], e->st))) return -1;
+    } else if (encode_forward(e, T, pos0 + T, h0)) return -1;
     for (int r = h0; r < T; r += MAX_LOGIT_ROWS) {
         const int n = T - r < MAX_LOGIT_ROWS ? T - r : MAX_LOGIT_ROWS;
-        encode_head(e, r, n);
+        if (!graph) encode_head(e, r, n);
         if (logits_out && !CK(cudaMemcpyAsync(e->h_logits, e->logits, (size_t) n * e->c.vocab * 4, cudaMemcpyDeviceToHost, e->st))) return -1;
         if (am && !CK(cudaMemcpyAsync(e->h_am, e->am, (size_t) n * 4, cudaMemcpyDeviceToHost, e->st))) return -1;
         if (sync_stream(e)) return -1;

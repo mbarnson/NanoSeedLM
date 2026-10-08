@@ -709,6 +709,81 @@ __global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill(AttnArgs a, const 
     }
 }
 
+// ---- expert cache ------------------------------------------------------------------------------------------------------
+#define ADMIT_THREADS 1024
+__global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count) {
+    __shared__ int need[128];
+    __shared__ int miss[128];
+    __shared__ int nmiss;
+    __shared__ uint32_t bv[32];
+    __shared__ int bi[32];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    if (tid < 128) need[tid] = 0;
+    if (tid == 0) nmiss = 0;
+    __syncthreads();
+    for (int i = tid; i < count; i += ADMIT_THREADS) need[inds[i]] = 1;
+    __syncthreads();
+    const uint32_t now = *p.tick + 1;
+    // hits: touch; misses: listed in expert order
+    if (tid == 0) {
+        for (int x = 0; x < p.per_layer; ++x) {
+            if (!need[x]) continue;
+            const int u = sl * p.per_layer + x, s = p.unit_slot[u];
+            if (s >= 0) p.slot_last[s] = now;
+            else miss[nmiss++] = x;
+        }
+        p.tick[0] = now;
+        p.tick[2] += (uint32_t) nmiss;   // tick[1], tick[2]: hit and miss counts
+        int nneed = 0;
+        for (int x = 0; x < p.per_layer; ++x) nneed += need[x];
+        p.tick[1] += (uint32_t) (nneed - nmiss);
+        *p.njobs = nmiss;
+    }
+    __syncthreads();
+    for (int m = 0; m < nmiss; ++m) {
+        // victim: the least recently used slot (ties: lowest index) not touched by this call
+        uint32_t best = 0xFFFFFFFFu;
+        int bs = 0x7FFFFFFF;
+        for (int s = tid; s < p.slots; s += ADMIT_THREADS) {
+            const uint32_t l = p.slot_last[s];
+            if (l != now && l < best) { best = l; bs = s; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const uint32_t b2 = __shfl_xor_sync(FULL, best, o);
+            const int s2 = __shfl_xor_sync(FULL, bs, o);
+            if (b2 < best || (b2 == best && s2 < bs)) { best = b2; bs = s2; }
+        }
+        if (lane == 0) { bv[w] = best; bi[w] = bs; }
+        __syncthreads();
+        if (tid == 0) {
+            for (int i = 1; i < ADMIT_THREADS / 32; ++i) if (bv[i] < best || (bv[i] == best && bi[i] < bs)) { best = bv[i]; bs = bi[i]; }
+            const int x = miss[m], u = sl * p.per_layer + x, old = p.slot_unit[bs];
+            if (old >= 0) p.unit_slot[old] = -1;
+            p.slot_unit[bs] = u;
+            p.unit_slot[u] = bs;
+            p.slot_last[bs] = now;
+            p.jobs[2 * m] = u;
+            p.jobs[2 * m + 1] = bs;
+            uint8_t* base = p.vram + (uint64_t) bs * p.unit_bytes;
+            for (int i = 0; i < p.ntens; ++i) {
+                WSlice* t = p.tab + ((size_t) sl * p.ntens + i) * p.per_layer + x;
+                for (int st = 0; st < 4; ++st) if (p.off[i][st] != 0xFFFFFFFFu) t->p[st] = base + p.off[i][st];
+            }
+        }
+        __syncthreads();
+    }
+}
+// The queued units, host arena -> VRAM slots, 16 bytes per thread per step.
+__global__ void __launch_bounds__(512) k_cache_copy(CachePool p) {
+    const int nj = *p.njobs;
+    const uint64_t words = p.unit_bytes / 16, stride = (uint64_t) gridDim.x * blockDim.x;
+    for (int j = 0; j < nj; ++j) {
+        const uint4* src = (const uint4*) (p.host + (uint64_t) p.jobs[2 * j] * p.unit_bytes);
+        uint4* dst = (uint4*) (p.vram + (uint64_t) p.jobs[2 * j + 1] * p.unit_bytes);
+        for (uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; i < words; i += stride) dst[i] = src[i];
+    }
+}
+
 // Greedy argmax over the vocabulary (ties: the lowest id); one block of 1024 per row.
 __global__ void __launch_bounds__(1024) k_argmax(const float* logits, int32_t* out, int V) {
     __shared__ float bv[32];
@@ -799,6 +874,10 @@ void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, const uint16_t*
                      const RowInfo* ri, const float* g, float* o, int T) {
     k_attn_prefill<<<dim3((unsigned) (T + PF_ROWS - 1) / PF_ROWS, (unsigned) a.n_kv), 32 * ATTF_G, 0, s>>>(a, q, Kc, Vc, ri, g, o, T);
 }
+void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count) {
+    k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count);
+}
+void kc_cache_copy(cudaStream_t s, const CachePool* p) { k_cache_copy<<<256, 512, 0, s>>>(*p); }
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n) {
     k_argmax<<<(unsigned) n, 1024, 0, s>>>(logits, out, V);
 }
