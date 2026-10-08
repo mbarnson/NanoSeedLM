@@ -31,7 +31,7 @@ static const char* CONFIG =
     "  \"intermediate_size\": 1024,\n  \"layernorm_num_groups\": 2,\n  \"mlp_only_layers\": [0],\n"
     "  \"model_type\": \"k2_horizon\",\n  \"moe_gate_bias\": true,\n  \"moe_intermediate_size\": 256,\n"
     "  \"mova_num_experts\": 8,\n  \"mova_num_experts_per_tok\": 2,\n  \"norm_topk_prob\": true,\n"
-    "  \"num_attention_heads\": 8,\n  \"num_experts\": 16,\n  \"num_experts_per_tok\": 4,\n  \"num_hidden_layers\": 3,\n"
+    "  \"num_attention_heads\": 8,\n  \"num_experts\": 16,\n  \"num_experts_per_tok\": 4,\n  \"num_hidden_layers\": 5,\n"
     "  \"num_key_value_heads\": 2,\n  \"num_shared_experts\": 1,\n  \"query_key_norm\": false,\n  \"rms_norm_eps\": 1e-06,\n"
     "  \"rope_head_dim\": 128,\n  \"rope_parameters\": {\"rope_theta\": 10000000.0, \"rope_type\": \"default\"},\n"
     "  \"router_scaling_factor\": 2.5,\n  \"router_score_func\": \"sigmoid\",\n  \"tie_word_embeddings\": false,\n"
@@ -60,7 +60,7 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
         for (uint64_t i = 0; i < len / 2; ++i) {
             const double u = rng_unit(&st) * 2 - 1;
             const float v = mt->kind == MOVA_K_NORM ? (float) (1.0 + 0.1 * u)
-                          : mt->kind == MOVA_K_ROUTER_BIAS ? (float) (0.02 * u) : (float) (0.3 * u);   // routers: well-separated scores
+                          : mt->kind == MOVA_K_ROUTER_BIAS ? (float) (0.02 * u) : (float) (1.0 * u);   // routers: well-separated scores
             o[i] = f2bf(v);
         }
         return 0;
@@ -154,7 +154,7 @@ int main(void) {
     Eng* e = eng_open(&o, err, sizeof err);
     if (!e) { printf("FAIL: eng_open: %s\n", err); return 1; }
     printf("%s\n", eng_describe(e));
-    const int V = eng_vocab(e), N = 48, NS = 2, TK = 4, TKV = 2;
+    const int V = eng_vocab(e), N = 48, NS = 4, TK = 4, TKV = 2;
     uint64_t st = 7;
     int32_t ids[64];
     for (int i = 0; i < N; ++i) ids[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
@@ -253,6 +253,44 @@ int main(void) {
     CHECK(eng_prefill(e, 0, ids, 30) == 0, "prefill 30");
     CHECK(eng_prefill_cached(e, 0, ids, 36, &reused) == 0 && reused == 29, "cached prefill reused %d", reused);
     CHECK(eng_len(e, 0) == 36, "length after cached prefill");
+
+    // 6. weight placement must not change results: an engine allowed to keep only part of the experts in fast memory
+    // (NSLM_EXPERT_VRAM_MB; engines with unified memory ignore it) scores and decodes exactly as this one does
+    {
+#ifdef _WIN32
+        _putenv_s("NSLM_EXPERT_VRAM_MB", "13");
+#else
+        setenv("NSLM_EXPERT_VRAM_MB", "13", 1);
+#endif
+        Eng* e2 = eng_open(&o, err, sizeof err);
+#ifdef _WIN32
+        _putenv_s("NSLM_EXPERT_VRAM_MB", "");
+#else
+        unsetenv("NSLM_EXPERT_VRAM_MB");
+#endif
+        CHECK(e2 != NULL, "eng_open (small expert cache): %s", err);
+        if (e2) {
+            printf("%s\n", eng_describe(e2));
+            const int NP = 300, cnt = 40;
+            int32_t* pid = (int32_t*) malloc(sizeof(int32_t) * NP);
+            for (int i = 0; i < NP; ++i) pid[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+            float* la = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+            float* lb = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+            int32_t ga[32], gb[32];
+            int diff = 0;
+            for (int round = 0; round < 2; ++round) {   // twice: the second time the small cache starts warm, differently
+                CHECK(eng_score(e, 0, pid, NP - cnt, cnt, la) == 0 && eng_score(e2, 0, pid, NP - cnt, cnt, lb) == 0, "scoring");
+                for (size_t i = 0; i < (size_t) cnt * V; ++i) diff += la[i] != lb[i];
+                CHECK(eng_prefill(e, 0, pid, NP / 2) == 0 && eng_generate(e, &seq, 1, 32, ENG_MODE_AR, ga, NULL) == 0, "decode");
+                CHECK(eng_prefill(e2, 0, pid, NP / 2) == 0 && eng_generate(e2, &seq, 1, 32, ENG_MODE_AR, gb, NULL) == 0, "decode");
+                diff += memcmp(ga, gb, sizeof ga) != 0;
+            }
+            printf("small expert cache: %d differences from the full one\n", diff);
+            CHECK(diff == 0, "a smaller expert cache changed the results");
+            free(pid); free(la); free(lb);
+            eng_close(e2);
+        }
+    }
 
     eng_close(e);
     mova_ref_close(ref);

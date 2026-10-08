@@ -32,7 +32,7 @@ typedef struct {
     int32_t* unit_slot;     // [units]: slot, or -1
     int32_t* slot_unit;     // [slots]: unit, or -1
     uint32_t* slot_last;    // [slots]: the admit tick of the last use
-    uint32_t* tick;         // [3]: the admit tick, hits, misses
+    uint32_t* tick;         // [4]: the admit tick (from CACHE_TICK_BASE), hits, misses, the stream tick
     int32_t* jobs;          // [2 * per_layer]: (unit, slot) pairs queued by the last admit
     int32_t* njobs;         // [1]
     uint8_t* vram;          // the pool
@@ -43,9 +43,11 @@ typedef struct {
     uint32_t off[3][4];     // byte offset of tensor i's stream s in a unit (0xFFFFFFFF: no stream)
     uint64_t hits, misses;  // host-side statistics (not used by the kernels)
 } CachePool;
-// rows x k selections inds[] of sparse layer sl
-void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count);
-void kc_cache_copy(cudaStream_t s, const CachePool* p);
+#define CACHE_TICK_BASE 0x40000000u
+// rows x k selections inds[] of sparse layer sl; stream = 1 for a prompt's pass over the layers (its misses are cold)
+void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int stream);
+// blocks: the copy's grid (fewer leave SMs to kernels running beside it on another stream)
+void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks);
 
 // x[t][:] = the embedding row of ids[t] (BF16 or Q8)
 void kc_embed(cudaStream_t s, int fmt, WSlice w, int d, const int32_t* ids, float* x, int T);

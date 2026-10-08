@@ -92,6 +92,11 @@ struct Eng {
     void** hallocs;   // pinned host allocations
     int nhalloc, caphalloc;
     CachePool pm, pv;   // expert caches: MLP experts, value experts
+    // prompt prefetch: the next layer's experts come over PCIe on a second stream while a layer computes
+    CachePool pm_pre, pv_pre;   // the pools with their own job lists
+    cudaStream_t cst;
+    cudaEvent_t ev_admit, *ev_ready;   // admitted (main stream), a layer's experts in VRAM (copy stream)
+    int32_t* all_ids;                  // 0 .. 127
     // layer-major prefill: the hidden states, tokens and rows of up to xmax prompt rows
     float* x_all;
     int32_t *ids_all, *h_ids_all;
@@ -258,7 +263,7 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
     p->unit_bytes = cur;
     p->slots = (int) (vram_bytes / cur);
     if (p->slots > units) p->slots = units;
-    if (p->slots < per_layer) {
+    if (p->slots < units && p->slots < 3 * per_layer) {   // a prompt keeps two layers' streamed experts while it brings a third
         snprintf(err, (size_t) errlen, "expert cache: room for %d experts, a layer needs %d (free GPU memory or a smaller --ctx)", p->slots, per_layer);
         return -1;
     }
@@ -293,6 +298,7 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
         return -1;
     }
     // initial residency and the slice tables
+    const uint32_t tick0[4] = {CACHE_TICK_BASE, 0, 0, 2};   // stream ticks from 3: never-used slots (0) qualify at once
     int32_t* us = (int32_t*) malloc(4 * (size_t) units);
     int32_t* su = (int32_t*) malloc(4 * (size_t) p->slots);
     WSlice* tab = (WSlice*) calloc((size_t) units * (size_t) ntens, sizeof(WSlice));
@@ -317,7 +323,7 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
             }
     int ok = CK(cudaMemcpy(p->unit_slot, us, 4 * (size_t) units, cudaMemcpyHostToDevice)) &&
              CK(cudaMemcpy(p->slot_unit, su, 4 * (size_t) p->slots, cudaMemcpyHostToDevice)) &&
-             CK(cudaMemset(p->slot_last, 0, 4 * (size_t) p->slots)) && CK(cudaMemset(p->tick, 0, 16)) &&
+             CK(cudaMemset(p->slot_last, 0, 4 * (size_t) p->slots)) && CK(cudaMemcpy(p->tick, tick0, 16, cudaMemcpyHostToDevice)) &&
              CK(cudaMemset(p->njobs, 0, 16)) &&
              CK(cudaMemcpy(p->tab, tab, sizeof(WSlice) * (size_t) units * ntens, cudaMemcpyHostToDevice));
     free(us); free(su); free(tab);
@@ -352,7 +358,7 @@ static int build_pools(Eng* e, char* err, int errlen) {
     const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 512) << 20;
     uint64_t budget = fr > reserve ? fr - reserve : 0;
     const char* cap = getenv("NSLM_EXPERT_VRAM_MB");
-    if (cap && ((uint64_t) atoll(cap) << 20) < budget) budget = (uint64_t) atoll(cap) << 20;
+    if (cap && (uint64_t) (atof(cap) * 1048576.0) < budget) budget = (uint64_t) (atof(cap) * 1048576.0);   // MB, fractions allowed
     if (budget > bm + bv) budget = bm + bv;
     const uint64_t vm = (uint64_t) ((double) budget * (double) bm / (double) (bm + bv));
     const int rc = build_pool(e, &e->pm, wm, 3, c->n_exp, vm, err, errlen) || build_pool(e, &e->pv, wv, 1, c->n_vexp, budget - vm, err, errlen);
@@ -533,6 +539,25 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     }
     // experts last: they take the VRAM that is left
     if (build_pools(e, err, errlen)) { eng_close(e); return NULL; }
+    {
+        int32_t ids128[128];
+        int lo_prio = 0, hi_prio = 0;   // the copy stream first: its blocks take SMs ahead of the prompt's GEMMs
+        for (int i = 0; i < 128; ++i) ids128[i] = i;
+        e->all_ids = (int32_t*) scratch(e, sizeof ids128);
+        e->pm_pre = e->pm;
+        e->pv_pre = e->pv;
+        e->pm_pre.jobs = (int32_t*) scratch(e, 8 * (uint64_t) c->n_exp);
+        e->pv_pre.jobs = (int32_t*) scratch(e, 8 * (uint64_t) c->n_vexp);
+        e->pm_pre.njobs = (int32_t*) scratch(e, 16);
+        e->pv_pre.njobs = (int32_t*) scratch(e, 16);
+        e->ev_ready = (cudaEvent_t*) calloc((size_t) c->n_layer, sizeof(cudaEvent_t));
+        int ok = e->all_ids && e->pm_pre.jobs && e->pv_pre.jobs && e->pm_pre.njobs && e->pv_pre.njobs &&
+                 CK(cudaMemcpy(e->all_ids, ids128, sizeof ids128, cudaMemcpyHostToDevice)) &&
+                 CK(cudaDeviceGetStreamPriorityRange(&lo_prio, &hi_prio)) && CK(cudaStreamCreateWithPriority(&e->cst, cudaStreamNonBlocking, hi_prio)) &&
+                 CK(cudaEventCreateWithFlags(&e->ev_admit, cudaEventDisableTiming));
+        for (int l = 0; ok && l < c->n_layer; ++l) ok = CK(cudaEventCreateWithFlags(&e->ev_ready[l], cudaEventDisableTiming));
+        if (!ok) { snprintf(err, (size_t) errlen, "prefetch: CUDA setup failed"); eng_close(e); return NULL; }
+    }
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL || getenv("MOVA_DUMP") != NULL;
     e->seq.cap = 1024;
     e->seq.hist = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->seq.cap);
@@ -568,6 +593,9 @@ void eng_close(Eng* e) {
     }
     for (int i = 0; i < 16384; ++i) if (e->ev[i]) cudaEventDestroy(e->ev[i]);
     for (size_t i = 0; i < sizeof e->graphs / sizeof e->graphs[0]; ++i) if (e->graphs[i]) cudaGraphExecDestroy(e->graphs[i]);
+    if (e->ev_ready) { for (int l = 0; l < e->c.n_layer; ++l) if (e->ev_ready[l]) cudaEventDestroy(e->ev_ready[l]); free(e->ev_ready); }
+    if (e->ev_admit) cudaEventDestroy(e->ev_admit);
+    if (e->cst) { cudaStreamSynchronize(e->cst); cudaStreamDestroy(e->cst); }
     if (e->st) cudaStreamDestroy(e->st);
     ns_close(&e->nm);
     if (e->ck) mova_ckpt_close(e->ck);
@@ -653,8 +681,8 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
         float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
         enc_router(e, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, vi, vw, e->vsel + (size_t) l * MAX_ROWS * g->n_vexp, T);
-        kc_cache_admit(e->st, &e->pv, l - g->first_sparse, vi, T * g->top_kv);
-        kc_cache_copy(e->st, &e->pv);
+        kc_cache_admit(e->st, &e->pv, l - g->first_sparse, vi, T * g->top_kv, 0);
+        kc_cache_copy(e->st, &e->pv, 256);
         if (!big) kc_mv_sel(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, vi, T * g->top_kv, g->top_kv, stab_for(e, &L->vx));
         else {
             kc_bucket(e->st, vi, T * g->top_kv, g->n_vexp, e->vperm, e->vtiles, e->vntiles);
@@ -685,8 +713,8 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
     int32_t* ri = e->inds + (size_t) l * MAX_ROWS * g->top_k;
     float* rw = e->wts + (size_t) l * MAX_ROWS * g->top_k;
     enc_router(e, &L->r, &L->rb, e->xn, g->n_exp, g->top_k, ri, rw, e->rsel + (size_t) l * MAX_ROWS * g->n_exp, T);
-    kc_cache_admit(e->st, &e->pm, l - g->first_sparse, ri, T * g->top_k);
-    kc_cache_copy(e->st, &e->pm);
+    kc_cache_admit(e->st, &e->pm, l - g->first_sparse, ri, T * g->top_k, 0);
+    kc_cache_copy(e->st, &e->pm, 256);
     tgroup(e, MOVA_TG_EXPERTS);
     const int P = T * g->top_k;
     if (!big) {
@@ -794,6 +822,19 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
     return 0;
 }
 
+#define PREFETCH_ROWS 64
+// Admit every expert of sparse layer l (main stream) and copy the misses on the copy stream; ev_ready[l] when done.
+static void prefetch_layer(Eng* e, int l) {
+    const int sl = l - e->c.first_sparse;
+    kc_cache_admit(e->st, &e->pv_pre, sl, e->all_ids, e->c.n_vexp, 0);
+    kc_cache_admit(e->st, &e->pm_pre, sl, e->all_ids, e->c.n_exp, 0);
+    cudaEventRecord(e->ev_admit, e->st);
+    cudaStreamWaitEvent(e->cst, e->ev_admit, 0);
+    kc_cache_copy(e->cst, &e->pv_pre, 64);
+    kc_cache_copy(e->cst, &e->pm_pre, 64);
+    cudaEventRecord(e->ev_ready[l], e->cst);
+}
+
 // Rows ids[0..n) at positions pos0.., layer by layer over up to xmax rows at a time (sub-chunks of MAX_ROWS): every
 // layer's experts come to VRAM once per xmax rows, not once per chunk.  Rows [h0, n) get logits (into logits_out,
 // (n - h0) x vocab, may be NULL).  Route capture takes the chunked forward (its records are per forward).
@@ -820,11 +861,22 @@ static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float
             return -1;
         tgroup(e, MOVA_TG_EMBED_NORM);
         kc_embed(e->st, e->embed.fmt, e->embed.w0, d, e->ids_all, e->x_all, N);
-        for (int l = 0; l < g->n_layer; ++l)
+        // Prefetch (prompts of more than PREFETCH_ROWS rows use nearly every expert of every layer): every expert of
+        // sparse layer l + 1 is admitted in stream order on the main stream when layer l starts, and copied on the
+        // copy stream, which first waits for that point (layer l - 1, the last reader of the slots it may replace, is
+        // done); layer l + 1 waits for the copy.  The layer's own admits then find their experts resident.
+        const int pre = N > PREFETCH_ROWS;
+        for (int l = 0; l < g->n_layer; ++l) {
+            if (pre) {
+                if (l == 0 || l == g->first_sparse) prefetch_layer(e, g->first_sparse > l ? g->first_sparse : l);
+                if (l >= g->first_sparse) CK(cudaStreamWaitEvent(e->st, e->ev_ready[l], 0));
+                if (l + 1 < g->n_layer && l + 1 > g->first_sparse) prefetch_layer(e, l + 1);
+            }
             for (int c0 = 0; c0 < N; c0 += MAX_ROWS) {
                 const int T = N - c0 < MAX_ROWS ? N - c0 : MAX_ROWS;
                 if (encode_layer(e, l, T, e->x_all + (size_t) c0 * d, e->ri_all + c0, pos0 + s0 + c0 + T)) return -1;
             }
+        }
         // the head for this range's rows at or after h0
         for (int r = h0 > s0 ? h0 - s0 : 0; r < N; r += MAX_LOGIT_ROWS) {
             const int m = N - r < MAX_LOGIT_ROWS ? N - r : MAX_LOGIT_ROWS;
