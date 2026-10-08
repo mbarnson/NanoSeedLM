@@ -105,7 +105,9 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   tokens (default: as many as half of the memory left after the weights holds, up to 16); more requests wait in line.
   Prompts are computed in chunks of 256 tokens between decode steps, so a new prompt does not stall the others. A
   request's tokens do not depend on what else runs: with a `seed` (or greedy) it gets the same answer alone or among
-  others (on Metal, bit for bit).
+  others (on Metal, bit for bit). Decode steps run in forwards of up to 8 slots. Experimental (Metal):
+  `NSLM_BATCH_GEMM=32` runs steps of 32 or more slots through the prompt GEMMs instead, which is faster at large batches
+  (M4 Max, q8mx: 171 tok/s at 64 streams against about 112) but gives up the bit-for-bit equality.
 - Prefix reuse: a request takes the free slot whose cache shares the longest prefix with its prompt. Repeated system
   prompts, tools and earlier turns are not computed again.
 - Cold cache: a request that ends with at least `--kv-disk-min` (2048) cached tokens has its cache saved to disk in
