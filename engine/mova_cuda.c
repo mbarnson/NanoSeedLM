@@ -110,8 +110,8 @@ struct Eng {
     // timing
     int timing_on;
     double tg_sec[MOVA_TG_N];
-    cudaEvent_t ev[2048];
-    short ev_group[2048];
+    cudaEvent_t ev[16384];
+    short ev_group[16384];
     int nev, cur_group;
 };
 
@@ -566,7 +566,7 @@ void eng_close(Eng* e) {
         for (int l = 0; l < e->c.n_layer; ++l) { free(e->L[l].vx.h); free(e->L[l].eg.h); free(e->L[l].eu.h); free(e->L[l].ed.h); }
         free(e->L);
     }
-    for (int i = 0; i < 2048; ++i) if (e->ev[i]) cudaEventDestroy(e->ev[i]);
+    for (int i = 0; i < 16384; ++i) if (e->ev[i]) cudaEventDestroy(e->ev[i]);
     for (size_t i = 0; i < sizeof e->graphs / sizeof e->graphs[0]; ++i) if (e->graphs[i]) cudaGraphExecDestroy(e->graphs[i]);
     if (e->st) cudaStreamDestroy(e->st);
     ns_close(&e->nm);
@@ -588,7 +588,7 @@ void eng_mem(Eng* e, EngMem* m) {
 // ---- timing: an event at every kernel-group change; a group is charged the time to the next event ------------------
 
 static void tgroup(Eng* e, int group) {
-    if (!e->timing_on || group == e->cur_group || e->nev >= 2048) return;
+    if (!e->timing_on || group == e->cur_group || e->nev >= 16384) return;
     if (!e->ev[e->nev]) cudaEventCreate(&e->ev[e->nev]);
     cudaEventRecord(e->ev[e->nev], e->st);
     e->ev_group[e->nev++] = (short) group;

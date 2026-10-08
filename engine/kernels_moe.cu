@@ -706,104 +706,136 @@ __global__ void k_attn_reduce(AttnArgs a, const float* part, const float* g, flo
     o[i] = bfr(att * softplus_gate(g[i]));
 }
 
-// Prefill attention: block (16 rows, KV head), one warp per query head of the group (ATTF_G); each lane owns 4 dims.
-// Keys stream in tiles of 32 through shared memory, shared by the group's query heads and the block's rows.  MLX's
-// prefill rounding points: S = bf16(q * scale) K^T, O += bf16(P) V, f32 products and sums; online softmax per row in
-// f32 (causal: key <= the row's position; P rounded against the running max; the row sum from the unrounded P); then
-// the softplus gate as k_attn_reduce.
-#define PF_ROWS 16
-#define PF_BK 32
-__global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill(AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
-                                                              const RowInfo* ri, const float* g, float* o, int T) {
-    __shared__ uint16_t Ks[PF_BK][ATT_HD];
-    __shared__ uint16_t Vs[PF_BK][ATT_HD];
-    __shared__ float Ss[ATTF_G][PF_ROWS][PF_BK + 1];
-    const int kvh = (int) blockIdx.y, lane = threadIdx.x & 31, hq = threadIdx.x >> 5, h = kvh * ATTF_G + hq;
-    const int t0 = (int) blockIdx.x * PF_ROWS, nrows = min(PF_ROWS, T - t0);
+// Prefill attention on tensor cores: block (16 rows, KV head), one warp per query head of the group (ATTF_G); keys in
+// tiles of FA_BK through shared memory, shared by the group's heads.  MLX's prefill rounding points as mma operands:
+// S = bf16(q * scale) K^T (BF16 products, f32 sums); online softmax per row in f32 (causal: key <= the row's
+// position); P = bf16(exp(S - running max)) is the A operand of O += P V; the row sum from the unrounded P; then the
+// softplus gate as k_attn_reduce.  Fragments follow mma.m16n8k16: the S accumulator of key tiles 2j, 2j + 1 is the A
+// fragment of P for key step j.
+#define FA_ROWS 16
+#define FA_BK 64
+#define FA_KLD (ATT_HD + 8)    // Ks [key][dim] row stride (BF16)
+#define FA_VLD (FA_BK + 8)     // Vt [dim][key] row stride
+__global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
+                                                                 const RowInfo* ri, const float* g, float* o, int T) {
+    __shared__ __align__(16) uint16_t Ks[FA_BK * FA_KLD];
+    __shared__ __align__(16) uint16_t Vt[ATT_HD * FA_VLD];
+    const int kvh = (int) blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, h = kvh * ATTF_G + w;
+    const int gq = lane >> 2, t4 = lane & 3;
+    const int t0 = (int) blockIdx.x * FA_ROWS, nrows = min(FA_ROWS, T - t0);
     const int kend = ri[t0 + nrows - 1].pos + 1;
     const int stride = a.n_kv * ATT_HD;
-    // q rows of this head: bf16(q * scale), lane dims lane*4 .. +3
-    float4 qv[PF_ROWS];
-    float m[PF_ROWS], l[PF_ROWS];
-    float4 acc[PF_ROWS];
-    int mypos[PF_ROWS];
+    // this thread's two rows (gq, gq + 8) and their positions; rows past T repeat the last
+    const int ra = t0 + min(gq, nrows - 1), rb = t0 + min(gq + 8, nrows - 1);
+    const int pa = ri[ra].pos, pb = ri[rb].pos;
+    // Q fragments: 8 steps of 16 dims, bf16(q * scale)
+    uint32_t qf[8][4];
+    {
+        const float* qa = q + ((size_t) ra * a.n_head + h) * ATT_HD;
+        const float* qb = q + ((size_t) rb * a.n_head + h) * ATT_HD;
 #pragma unroll
-    for (int r = 0; r < PF_ROWS; ++r) {
-        const int t = t0 + min(r, nrows - 1);
-        const float* qr = q + ((size_t) t * a.n_head + h) * ATT_HD + lane * 4;
-        qv[r] = make_float4(bfr(qr[0] * a.scale), bfr(qr[1] * a.scale), bfr(qr[2] * a.scale), bfr(qr[3] * a.scale));
-        m[r] = -INFINITY;
-        l[r] = 0;
-        acc[r] = make_float4(0, 0, 0, 0);
-        mypos[r] = ri[t].pos;
+        for (int s = 0; s < 8; ++s) {
+            const int c = s * 16 + t4 * 2;
+            qf[s][0] = pack_bf2(qa[c] * a.scale, qa[c + 1] * a.scale);
+            qf[s][1] = pack_bf2(qb[c] * a.scale, qb[c + 1] * a.scale);
+            qf[s][2] = pack_bf2(qa[c + 8] * a.scale, qa[c + 9] * a.scale);
+            qf[s][3] = pack_bf2(qb[c + 8] * a.scale, qb[c + 9] * a.scale);
+        }
     }
-    for (int k0 = 0; k0 < kend; k0 += PF_BK) {
-        for (int e = threadIdx.x; e < PF_BK * ATT_HD / 8; e += 32 * ATTF_G) {
+    float O[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) O[j][0] = O[j][1] = O[j][2] = O[j][3] = 0;
+    float ma = -INFINITY, mb = -INFINITY, la = 0, lb = 0;
+    for (int k0 = 0; k0 < kend; k0 += FA_BK) {
+        // K tile [key][dim] and V tile transposed [dim][key], 8 dims per load
+        for (int e = threadIdx.x; e < FA_BK * ATT_HD / 8; e += 32 * ATTF_G) {
             const int key = e / (ATT_HD / 8), d8 = (e % (ATT_HD / 8)) * 8, p = k0 + key;
-            uint4 kk = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
             if (p < kend) {
                 kk = *(const uint4*) (Kc + (size_t) p * stride + kvh * ATT_HD + d8);
                 vv = *(const uint4*) (Vc + (size_t) p * stride + kvh * ATT_HD + d8);
             }
-            *(uint4*) &Ks[key][d8] = kk;
-            *(uint4*) &Vs[key][d8] = vv;
+            *(uint4*) &Ks[key * FA_KLD + d8] = kk;
+            const uint32_t vw[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                Vt[(d8 + 2 * u) * FA_VLD + key] = (uint16_t) (vw[u] & 0xFFFFu);
+                Vt[(d8 + 2 * u + 1) * FA_VLD + key] = (uint16_t) (vw[u] >> 16);
+            }
         }
         __syncthreads();
-        // scores: lane = key within the tile, for every row of this head
-        {
-            float sc[PF_ROWS];
+        if (k0 <= max(pa, pb)) {
+            // S = Q K^T: 8 key tiles of 8
+            float S[8][4];
 #pragma unroll
-            for (int r = 0; r < PF_ROWS; ++r) sc[r] = 0;
-            for (int d4 = 0; d4 < ATT_HD / 4; ++d4) {
-                // lane `lane` scores key `lane`: it needs all 128 dims of its key and each row's q; q dims are spread
-                // over lanes, so broadcast them with shuffles (lane d4 holds dims 4 d4 .. 4 d4 + 3)
-                const uint2 kk = *(const uint2*) &Ks[lane][d4 * 4];
-                const float4 kv = make_float4(__uint_as_float(kk.x << 16), __uint_as_float(kk.x & 0xFFFF0000u),
-                                              __uint_as_float(kk.y << 16), __uint_as_float(kk.y & 0xFFFF0000u));
+            for (int j = 0; j < 8; ++j) {
+                S[j][0] = S[j][1] = S[j][2] = S[j][3] = 0;
 #pragma unroll
-                for (int r = 0; r < PF_ROWS; ++r) {
-                    const float4 qd = make_float4(__shfl_sync(FULL, qv[r].x, d4), __shfl_sync(FULL, qv[r].y, d4),
-                                                  __shfl_sync(FULL, qv[r].z, d4), __shfl_sync(FULL, qv[r].w, d4));
-                    sc[r] += dot4(qd, kv);
+                for (int s = 0; s < 8; ++s) {
+                    const uint16_t* kr = &Ks[(j * 8 + gq) * FA_KLD + s * 16 + t4 * 2];
+                    const uint32_t b[2] = {*(const uint32_t*) kr, *(const uint32_t*) (kr + 8)};
+                    mma_bf16(S[j], qf[s], b);
                 }
             }
+            // mask, row maxima (rows gq: elements 0, 1; gq + 8: 2, 3; a row lives on the 4 lanes of a quad)
+            float mxa = -INFINITY, mxb = -INFINITY;
 #pragma unroll
-            for (int r = 0; r < PF_ROWS; ++r) Ss[hq][r][lane] = k0 + lane > mypos[r] ? -INFINITY : sc[r];
-        }
-        __syncwarp();
-        // online softmax per row (every lane computes the row's stats redundantly), then O += bf16(P) V
-#pragma unroll
-        for (int r = 0; r < PF_ROWS; ++r) {
-            if (k0 > mypos[r]) continue;
-            const float sv = Ss[hq][r][lane];
-            const float rmax = warp_max(sv);
-            const float mn = fmaxf(m[r], rmax);
-            const float cor = mn == -INFINITY ? 1.0f : expf(m[r] - mn);
-            const float pv = sv == -INFINITY ? 0.0f : expf(sv - mn);
-            const float rs = warp_sum(pv);
-            l[r] = l[r] * cor + rs;
-            m[r] = mn;
-            acc[r].x *= cor; acc[r].y *= cor; acc[r].z *= cor; acc[r].w *= cor;
-            const float pb = bfr(pv);
-            for (int kk = 0; kk < PF_BK; ++kk) {
-                const float pk = __shfl_sync(FULL, pb, kk);
-                if (pk == 0.0f) continue;
-                const uint2 vv = *(const uint2*) &Vs[kk][lane * 4];
-                acc[r].x += pk * __uint_as_float(vv.x << 16);
-                acc[r].y += pk * __uint_as_float(vv.x & 0xFFFF0000u);
-                acc[r].z += pk * __uint_as_float(vv.y << 16);
-                acc[r].w += pk * __uint_as_float(vv.y & 0xFFFF0000u);
+            for (int j = 0; j < 8; ++j) {
+                const int key = k0 + j * 8 + t4 * 2;
+                if (key > pa) S[j][0] = -INFINITY;
+                if (key + 1 > pa) S[j][1] = -INFINITY;
+                if (key > pb) S[j][2] = -INFINITY;
+                if (key + 1 > pb) S[j][3] = -INFINITY;
+                mxa = fmaxf(mxa, fmaxf(S[j][0], S[j][1]));
+                mxb = fmaxf(mxb, fmaxf(S[j][2], S[j][3]));
             }
+            mxa = fmaxf(mxa, __shfl_xor_sync(FULL, mxa, 1)); mxa = fmaxf(mxa, __shfl_xor_sync(FULL, mxa, 2));
+            mxb = fmaxf(mxb, __shfl_xor_sync(FULL, mxb, 1)); mxb = fmaxf(mxb, __shfl_xor_sync(FULL, mxb, 2));
+            const float na = fmaxf(ma, mxa), nb = fmaxf(mb, mxb);
+            const float ca = na == -INFINITY ? 1.0f : expf(ma - na), cb = nb == -INFINITY ? 1.0f : expf(mb - nb);
+            float sa = 0, sb = 0;
+            uint32_t pf[4][4];   // P as A fragments, 4 key steps of 16
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float p0 = S[j][0] == -INFINITY ? 0.0f : expf(S[j][0] - na);
+                const float p1 = S[j][1] == -INFINITY ? 0.0f : expf(S[j][1] - na);
+                const float p2 = S[j][2] == -INFINITY ? 0.0f : expf(S[j][2] - nb);
+                const float p3 = S[j][3] == -INFINITY ? 0.0f : expf(S[j][3] - nb);
+                sa += p0 + p1;
+                sb += p2 + p3;
+                pf[j >> 1][(j & 1) * 2] = pack_bf2(p0, p1);
+                pf[j >> 1][(j & 1) * 2 + 1] = pack_bf2(p2, p3);
+            }
+            sa += __shfl_xor_sync(FULL, sa, 1); sa += __shfl_xor_sync(FULL, sa, 2);
+            sb += __shfl_xor_sync(FULL, sb, 1); sb += __shfl_xor_sync(FULL, sb, 2);
+            la = la * ca + sa;
+            lb = lb * cb + sb;
+            ma = na;
+            mb = nb;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) { O[j][0] *= ca; O[j][1] *= ca; O[j][2] *= cb; O[j][3] *= cb; }
+            // O += P V: 16 dim tiles of 8, 4 key steps of 16
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const uint16_t* vr = &Vt[(j * 8 + gq) * FA_VLD + s * 16 + t4 * 2];
+                    const uint32_t b[2] = {*(const uint32_t*) vr, *(const uint32_t*) (vr + 8)};
+                    mma_bf16(O[j], pf[s], b);
+                }
         }
         __syncthreads();
     }
+    // out: rows gq (elements 0, 1) and gq + 8 (2, 3), dims j * 8 + t4 * 2 + {0, 1}
 #pragma unroll
-    for (int r = 0; r < PF_ROWS; ++r) {
-        if (r >= nrows) break;
-        const size_t i = ((size_t) (t0 + r) * a.n_head + h) * ATT_HD + lane * 4;
-        const float av[4] = {acc[r].x, acc[r].y, acc[r].z, acc[r].w};
-        for (int u = 0; u < 4; ++u) o[i + u] = bfr(bfr(av[u] / l[r]) * softplus_gate(g[i + u]));
-    }
+    for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int q2 = 0; q2 < 4; ++q2) {
+            const int r = (q2 >> 1) ? gq + 8 : gq;
+            if (r >= nrows) continue;
+            const size_t i = ((size_t) (t0 + r) * a.n_head + h) * ATT_HD + j * 8 + t4 * 2 + (q2 & 1);
+            o[i] = bfr(bfr(O[j][q2] / ((q2 >> 1) ? lb : la)) * softplus_gate(g[i]));
+        }
 }
 
 // ---- expert cache ------------------------------------------------------------------------------------------------------
@@ -981,7 +1013,7 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, const uint16_t* Kc, con
 }
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
                      const RowInfo* ri, const float* g, float* o, int T) {
-    k_attn_prefill<<<dim3((unsigned) (T + PF_ROWS - 1) / PF_ROWS, (unsigned) a.n_kv), 32 * ATTF_G, 0, s>>>(a, q, Kc, Vc, ri, g, o, T);
+    k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS - 1) / FA_ROWS, (unsigned) a.n_kv), 32 * ATTF_G, 0, s>>>(a, q, Kc, Vc, ri, g, o, T);
 }
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count) {
     k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count);
