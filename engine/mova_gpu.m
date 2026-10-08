@@ -5,6 +5,7 @@
 // reference implementation's BF16 rounding points.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <IOKit/IOKitLib.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -82,6 +83,7 @@ struct Eng {
     id<MTLBuffer> latf, kn, vn, mst, lst, ost;   // MLA prompt rows: latent rows (f32), expanded keys / values, softmax state
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
     int expand, expand_min;               // MLA prompt rows: the latent expanded per head (Seq.xend)
+    int gpu_cores;                        // the GPU's cores (IORegistry gpu-core-count; 0: unknown)
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
@@ -306,6 +308,21 @@ static void make_resident(Eng* e) {
 
 // MLA cache bytes a position (nslm/kvq.h): the latent's n values (FP8; FP4: the first MLA_FP4_LEAD in FP8) and the
 // RoPE key's (FP8 in both), codes then block scales
+// The GPU's core count (IORegistry: AGXAccelerator gpu-core-count), 0 when not found
+static int gpu_core_count(void) {
+    int n = 0;
+    io_iterator_t it;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"), &it) != KERN_SUCCESS) return 0;
+    for (io_object_t s; !n && (s = IOIteratorNext(it));) {
+        CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+        if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef) v, kCFNumberIntType, &n);
+        if (v) CFRelease(v);
+        IOObjectRelease(s);
+    }
+    IOObjectRelease(it);
+    return n;
+}
+
 _Static_assert(MLA_FP4_LEAD == KVQ_FP4_LEAD, "the Metal FP4 cache layout is nslm/kvq.h's");
 static int kv_lead(const Eng* e, int n) { return e->kv_fmt == ENG_KV_FP4 ? (n < MLA_FP4_LEAD ? n : MLA_FP4_LEAD) : n; }
 static uint64_t kv_row(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) (kv_lead(e, n) + (n - kv_lead(e, n)) / 2) : 2 * (uint64_t) n; }
@@ -484,6 +501,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         const uint64_t prow = c->mla && !getenv("NSLM_BATCH_GEMM") ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
         e->batch_gemm = getenv("NSLM_BATCH_GEMM") ? atoi(getenv("NSLM_BATCH_GEMM")) : 0;
         e->expand = 1;
+        e->gpu_cores = gpu_core_count();
         e->expand_min = o->mla_expand_min > 0 ? o->mla_expand_min : 256;
         if (e->batch_gemm && e->batch_gemm <= MV_MAXT) e->batch_gemm = MV_MAXT + 1;
         e->part = scratch(e, prow * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");
@@ -882,6 +900,11 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
     }
     int ns = (max_ctx + 127) / 128;
     if (ns > MAX_SPLITS) ns = MAX_SPLITS;
+    if (g->mla && e->gpu_cores > 0) {   // k_mla_attn runs one threadgroup per GPU core at a time (threadgroup memory): the
+        // splits that make each row's (split, head block) threadgroups one wave (M4 Max, 8k context: 32 -> 20, +16%)
+        const int w = e->gpu_cores / ((g->n_head + MLAF_Q - 1) / MLAF_Q), nk = (max_ctx + 63) / 64;
+        if (w >= 1) ns = (w < nk ? w : nk) < MAX_SPLITS ? (w < nk ? w : nk) : MAX_SPLITS;
+    }
     while (ns > 1 && T * ns > 1024) --ns;
     if (ns < 1) ns = 1;
     AttnArgs aa = {g->n_head, g->n_kv, 128, ns, 1.0f / sqrtf((float) g->head_dim)};   // per-row splits (k_attn)
