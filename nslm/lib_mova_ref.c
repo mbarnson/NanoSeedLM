@@ -308,6 +308,71 @@ static void* att_worker(void* arg) {
     return NULL;
 }
 
+// ---- MLA latent attention (one layer, all rows): scores = scale (ql . c_p + qr . k_p), causal; olat = bf16(sum p c / l);
+// then o_h = bf16(bf16(v_up_h . olat_h) * softplus_gate(g)).  Sums in double (the kernels: f32).
+typedef struct {
+    const MovaRef* r;
+    const float *ql, *qr, *lat, *kr, *g;   // [n][H][rk], [n][H][128] (roped), [n][rk], [n][128] (roped), [n][H*128]
+    const uint16_t* vu;                    // v_up BF16 [H][128][rk]
+    float* o;
+    int n, rk, next;
+    pthread_mutex_t mu;
+} MlaAtt;
+static void* mla_worker(void* arg) {
+    MlaAtt* a = (MlaAtt*) arg;
+    const MovaCfg* c = &a->r->c;
+    const int H = c->n_head, rk = a->rk;
+    const double scale = 1.0 / sqrt((double) c->head_dim);
+    double* s = (double*) malloc(sizeof(double) * (size_t) a->n);
+    double* acc = (double*) malloc(sizeof(double) * (size_t) rk);
+    float* olat = (float*) malloc(sizeof(float) * (size_t) rk);
+    for (;;) {
+        pthread_mutex_lock(&a->mu);
+        const int it = a->next++;
+        pthread_mutex_unlock(&a->mu);
+        if (it >= a->n * H) break;
+        const int t = it / H, h = it % H;
+        const float* ql = a->ql + ((size_t) t * H + h) * rk;
+        const float* qr = a->qr + ((size_t) t * H + h) * 128;
+        double m = -INFINITY;
+        for (int p = 0; p <= t; ++p) {
+            double v = 0;
+            for (int i = 0; i < rk; ++i) v += (double) ql[i] * a->lat[(size_t) p * rk + i];
+            for (int i = 0; i < 128; ++i) v += (double) qr[i] * a->kr[(size_t) p * 128 + i];
+            s[p] = v * scale;
+            if (s[p] > m) m = s[p];
+        }
+        double l = 0;
+        for (int i = 0; i < rk; ++i) acc[i] = 0;
+        for (int p = 0; p <= t; ++p) {
+            const double e = exp(s[p] - m);
+            l += e;
+            for (int i = 0; i < rk; ++i) acc[i] += e * a->lat[(size_t) p * rk + i];
+        }
+        for (int i = 0; i < rk; ++i) olat[i] = bfr((float) (acc[i] / l));
+        for (int dd = 0; dd < 128; ++dd) {
+            const uint16_t* w = a->vu + ((size_t) h * 128 + dd) * rk;
+            double v = 0;
+            for (int i = 0; i < rk; ++i) v += (double) bf2f(w[i]) * olat[i];
+            const size_t oi = (size_t) t * H * 128 + h * 128 + dd;
+            a->o[oi] = bfr(bfr((float) v) * softplus_gate(a->g[oi]));
+        }
+    }
+    free(s); free(acc); free(olat);
+    return NULL;
+}
+// y[t][h][o] = bf16(W_h[o] . x[t][h]) for the BF16 per-head maps [H][O][I] (x: [n][H*I] with I = 128)
+static void heads_map(const NsTensor* W, const float* x, int n, int H, int O, int I, float* y) {
+    const uint16_t* w = (const uint16_t*) W->s[0].p;
+    for (int t = 0; t < n; ++t)
+        for (int h = 0; h < H; ++h)
+            for (int o = 0; o < O; ++o) {
+                double v = 0;
+                for (int i = 0; i < I; ++i) v += (double) bf2f(w[((size_t) h * O + o) * I + i]) * x[(size_t) t * H * I + h * I + i];
+                y[((size_t) t * H + h) * O + o] = bfr((float) v);
+            }
+}
+
 // ---- forward ----------------------------------------------------------------------------------------------------------
 
 int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logits, int32_t* mlp_sel, int32_t* val_sel) {
@@ -333,6 +398,12 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
     float* V = (float*) calloc((size_t) PK * kvd, 4);
     int32_t* inds = (int32_t*) calloc((size_t) PK, 4);
     float* wts = (float*) calloc((size_t) PK, 4);
+    int rmax = 0;
+    for (int l = 0; c->mla && l < c->n_layer; ++l) if (c->mla_rank[l] > rmax) rmax = c->mla_rank[l];
+    float* lat = c->mla ? (float*) calloc((size_t) n * rmax, 4) : NULL;
+    float* krp = c->mla ? (float*) calloc((size_t) n * 128, 4) : NULL;
+    float* qrp = c->mla ? (float*) calloc((size_t) n * qd, 4) : NULL;
+    float* qlt = c->mla ? (float*) calloc((size_t) n * c->n_head * rmax, 4) : NULL;
     // embedding
     {
         const NsTensor* E = ns_find(&r->nm, "model.embed_tokens.weight");
@@ -349,7 +420,14 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
         if (l == c->n_layer) break;
         const int sparse = l >= c->first_sparse;
         gnorm(r, x, T_(r, "model.layers.%d.input_layernorm.weight", l), xn, n);
-        {
+        if (c->mla) {
+            const int rk = c->mla_rank[l];
+            Lin L[4] = {{T_(r, "model.layers.%d.self_attn.q_proj.weight", l), 0, xn, n, q, qd, 0},
+                        {T_(r, "model.layers.%d.self_attn.gate_proj.weight", l), 0, xn, n, g, qd, 0},
+                        {T_(r, "model.layers.%d.self_attn.mla.kv_a_x", l), 0, xn, n, lat, rk, 0},
+                        {T_(r, "model.layers.%d.self_attn.mla.k_rope_proj", l), 0, xn, n, krp, 128, 0}};
+            run_lins(r, L, 4);
+        } else {
             Lin L[4] = {{T_(r, "model.layers.%d.self_attn.q_proj.weight", l), 0, xn, n, q, qd, 0},
                         {T_(r, "model.layers.%d.self_attn.k_proj.weight", l), 0, xn, n, k, kvd, 0},
                         {T_(r, "model.layers.%d.self_attn.gate_proj.weight", l), 0, xn, n, g, qd, 0},
@@ -370,6 +448,34 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
                         s += bfr(silu_bf(V[((size_t) t * c->top_kv + j) * kvd + ci]) * bfr(wts[t * c->top_kv + j]));
                     v[(size_t) t * kvd + ci] = bfr(s);
                 }
+        }
+        if (c->mla) {
+            const int rk = c->mla_rank[l], H = c->n_head;
+            if (sparse) lin1(r, T_(r, "model.layers.%d.self_attn.mla.kv_a_v", l), 0, v, n, lat, rk, 1);   // c += kv_a_v v
+            heads_map(T_(r, "model.layers.%d.self_attn.mla.q_rope_mix", l), q, n, H, 128, 128, qrp);
+            heads_map(T_(r, "model.layers.%d.self_attn.mla.q_lat", l), q, n, H, rk, 128, qlt);
+            for (int t = 0; t < n; ++t)   // RoPE on the query RoPE parts and the RoPE key (BF16)
+                for (int p = 0; p < 64; ++p) {
+                    const float th = (float) t * r->inv[p];
+                    const float cs = (float) cos((double) th), sn = (float) sin((double) th);
+                    for (int h = 0; h <= H; ++h) {
+                        float* xh = h < H ? qrp + ((size_t) t * H + h) * 128 : krp + (size_t) t * 128;
+                        const float a = xh[p], b = xh[p + 64];
+                        xh[p] = bfr(a * cs - b * sn);
+                        xh[p + 64] = bfr(b * cs + a * sn);
+                    }
+                }
+            MlaAtt at;
+            memset(&at, 0, sizeof at);
+            at.r = r; at.ql = qlt; at.qr = qrp; at.lat = lat; at.kr = krp; at.g = g; at.o = o; at.n = n; at.rk = rk;
+            at.vu = (const uint16_t*) T_(r, "model.layers.%d.self_attn.mla.v_up", l)->s[0].p;
+            pthread_mutex_init(&at.mu, NULL);
+            const int nt = r->threads < 64 ? r->threads : 64;
+            pthread_t th[64];
+            for (int i = 0; i < nt; ++i) pthread_create(&th[i], NULL, mla_worker, &at);
+            for (int i = 0; i < nt; ++i) pthread_join(th[i], NULL);
+            pthread_mutex_destroy(&at.mu);
+            goto attn_done;
         }
         // RoPE: q in place (BF16), k and v as the cache stores them (BF16)
         for (int t = 0; t < n; ++t)
@@ -401,6 +507,7 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
             for (int i = 0; i < nt; ++i) pthread_join(th[i], NULL);
             pthread_mutex_destroy(&at.mu);
         }
+    attn_done:
         lin1(r, T_(r, "model.layers.%d.self_attn.o_proj.weight", l), 0, o, n, x, d, 1);
         gnorm(r, x, T_(r, "model.layers.%d.post_attention_layernorm.weight", l), xn, n);
         if (!sparse) {
@@ -441,5 +548,6 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
     }
     free(x); free(xn); free(q); free(g); free(o); free(k); free(v); free(ga); free(ua); free(aa); free(sh);
     free(G); free(U); free(A); free(D); free(V); free(inds); free(wts);
+    free(lat); free(krp); free(qrp); free(qlt);
     return 0;
 }

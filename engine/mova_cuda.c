@@ -499,6 +499,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Eng* e = (Eng*) calloc(1, sizeof *e);
     if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
     const MovaCfg* c = &e->c;
+    if (c->mla) {   // MLA (TransMLA) latent attention has Metal kernels only so far
+        snprintf(err, (size_t) errlen, "MLA models are not supported by the CUDA engine yet (Metal only)");
+        free(e);
+        return NULL;
+    }
     if (c->n_head != ATTF_G * c->n_kv) {
         snprintf(err, (size_t) errlen, "attention: %d query heads per KV head, the prefill kernel is built for %d", c->n_head / c->n_kv, ATTF_G);
         free(e);

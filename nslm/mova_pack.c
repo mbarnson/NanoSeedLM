@@ -238,7 +238,7 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     return 0;
 }
 
-int g_enc[1024];
+int g_enc[2048];
 
 static int copy_file(const char* from, const char* to) {
     FILE* a = fopen(from, "rb");
@@ -322,8 +322,8 @@ int main(int argc, char** argv) {
     if (!ck) { fprintf(stderr, "%s\n", err); return 2; }
     MovaTensor* all = NULL;
     const int na = mova_tensors(&cfg, &all);
-    static MovaTensor sel[1024];
-    static NsSpec spec[1024];
+    static MovaTensor sel[2048];
+    static NsSpec spec[2048];
     int n = 0, seeds = 0;
     double params = 0, bytes = 0;
     for (int i = 0; i < na; ++i) {

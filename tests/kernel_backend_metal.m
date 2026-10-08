@@ -369,6 +369,75 @@ int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const Ro
     memcpy(o, ob.contents, qn);
     return 0;
 }
+// ---- MLA -------------------------------------------------------------------------------------------------------------
+int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
+    id<MTLBuffer> wb = buf(W, 2 * (size_t) H * O * I), xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
+    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+    id<MTLComputePipelineState> pp = pipe_("k_heads_mv", 0, 0);
+    if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
+            [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
+            [e setBuffer:wb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
+            [e setBuffer:yb offset:0 atIndex:4];
+            [e dispatchThreads:MTLSizeMake((size_t) O * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }))
+        return -1;
+    memcpy(y, yb.contents, yn);
+    return 0;
+}
+int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
+                const RowInfo* ri, const float* inv, int T) {
+    const size_t qn = 4 * (size_t) T * a.n_head * 128;
+    id<MTLBuffer> qb = buf(qr, qn), kb = buf(kr, 4 * (size_t) T * 128), cb = buf(c, 4 * (size_t) T * a.r),
+                  Kb = buf(Kc, 2 * (size_t) npos * 128), Vb = buf(Vc, 2 * (size_t) npos * a.r),
+                  rb = buf(ri, sizeof(RowInfo) * (size_t) T), ib = buf(inv, 4 * 64);
+    id<MTLComputePipelineState> pp = pipe_("k_mla_rope", 0, 0);
+    const int nx = (a.n_head + 1) * 64 > a.r ? (a.n_head + 1) * 64 : a.r;
+    if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
+            [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
+            [e setBuffer:qb offset:0 atIndex:1]; [e setBuffer:kb offset:0 atIndex:2]; [e setBuffer:cb offset:0 atIndex:3];
+            [e setBuffer:Kb offset:0 atIndex:4]; [e setBuffer:Vb offset:0 atIndex:5]; [e setBuffer:rb offset:0 atIndex:6];
+            [e setBuffer:ib offset:0 atIndex:7];
+            [e dispatchThreads:MTLSizeMake(nx, T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }))
+        return -1;
+    memcpy(qr, qb.contents, qn);
+    memcpy(Kc, Kb.contents, 2 * (size_t) npos * 128);
+    memcpy(Vc, Vb.contents, 2 * (size_t) npos * a.r);
+    return 0;
+}
+// The latent attention's head group: as many query heads per threadgroup as the pipeline allows (32 lanes each)
+static int mla_heads_per_group(id<MTLComputePipelineState> p, int n_head) {
+    int hg = (int) (p.maxTotalThreadsPerThreadgroup / 32);
+    return hg < n_head ? hg : n_head;
+}
+int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
+                const RowInfo* ri, float* olat, int T) {
+    const size_t on = 4 * (size_t) T * a.n_head * a.r;
+    id<MTLBuffer> lb = buf(ql, on), qb = buf(qr, 4 * (size_t) T * a.n_head * 128), Kb = buf(Kc, 2 * (size_t) npos * 128),
+                  Vb = buf(Vc, 2 * (size_t) npos * a.r), rb = buf(ri, sizeof(RowInfo) * (size_t) T), ob = buf(NULL, on),
+                  pb = buf(NULL, 4 * (size_t) T * a.n_head * a.n_splits * (a.r + 2));
+    id<MTLComputePipelineState> pa = pipe_("k_mla_attn", 0, 0), pd = pipe_("k_mla_reduce", 0, 0);
+    if (!pa || !pd) return -1;
+    const int hg = mla_heads_per_group(pa, a.n_head), ng = (a.n_head + hg - 1) / hg;
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            [e setComputePipelineState:pa]; [e setBytes:&a length:sizeof a atIndex:0];
+            [e setBuffer:lb offset:0 atIndex:1]; [e setBuffer:qb offset:0 atIndex:2]; [e setBuffer:Kb offset:0 atIndex:3];
+            [e setBuffer:Vb offset:0 atIndex:4]; [e setBuffer:rb offset:0 atIndex:5];
+            [e setBuffer:(a.n_splits > 1 ? pb : ob) offset:0 atIndex:6];
+            [e setThreadgroupMemoryLength:(NSUInteger) (2 * MLA_KU * (a.r + 128) + 15) / 16 * 16 atIndex:0];
+            [e dispatchThreadgroups:MTLSizeMake(a.n_splits, ng, T) threadsPerThreadgroup:MTLSizeMake(32 * hg, 1, 1)];
+            if (a.n_splits > 1) {
+                [e setComputePipelineState:pd]; [e setBytes:&a length:sizeof a atIndex:0];
+                [e setBuffer:pb offset:0 atIndex:1]; [e setBuffer:ob offset:0 atIndex:2];
+                [e dispatchThreadgroups:MTLSizeMake(a.n_head, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+        }))
+        return -1;
+    memcpy(olat, ob.contents, on);
+    return 0;
+}
+
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {
     id<MTLBuffer> Eb = buf(E, 2 * (size_t) V * d), Qb = buf(q8, (size_t) V * d), Sb = buf(s8, 2 * (size_t) V * d / 64),

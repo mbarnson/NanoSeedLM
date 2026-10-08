@@ -10,10 +10,14 @@
 #pragma once
 #include <stdint.h>
 
+#define MOVA_MAX_LAYERS 128
+
 typedef struct {
     int n_layer, d, n_head, n_kv, head_dim, ff_dense, ff_exp, n_exp, top_k, n_vexp, top_kv, vocab, first_sparse;
     int norm_groups, router_parts;
     float rope_theta, eps, route_scale;
+    int mla, mla_rope;                    // MLA: 1, the RoPE key width (128); 0 for the GQA original
+    int mla_rank[MOVA_MAX_LAYERS];        // the latent rank per layer (a multiple of 32, at most 1024)
 } MovaCfg;
 
 int mova_cfg_load(MovaCfg* c, const char* model_dir, char* err, int errlen);
@@ -28,6 +32,7 @@ enum {
     MOVA_K_VEXPERTS,     // MoVA value experts, stacked [n_vexp][kv_dim][d]
     MOVA_K_EMBED,        // [vocab][d]
     MOVA_K_HEAD,         // lm_head [vocab][d]
+    MOVA_K_HEADS,        // MLA per-head maps, stacked [n_head][rows][cols]; BF16 from the model folder
 };
 
 typedef struct {

@@ -61,7 +61,10 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
         for (uint64_t i = 0; i < len / 2; ++i) {
             const double u = rng_unit(&st) * 2 - 1;
             const float v = mt->kind == MOVA_K_NORM ? (float) (1.0 + 0.1 * u)
-                          : mt->kind == MOVA_K_ROUTER_BIAS ? (float) (0.02 * u) : (float) (1.0 * u);   // routers: well-separated scores
+                          : mt->kind == MOVA_K_ROUTER_BIAS ? (float) (0.02 * u)
+                          : mt->kind == MOVA_K_HEADS ? (float) (0.08 * u)
+                          : strstr(mt->name, ".mla.") ? (float) (0.04 * u)      // MLA projections: BF16, Q8's magnitude
+                          : (float) (1.0 * u);                                   // routers: well-separated scores
             o[i] = f2bf(v);
         }
         return 0;
@@ -85,7 +88,7 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     return 0;
 }
 
-static int write_model(const char* dir, char* err, int errlen) {
+static int write_model(const char* dir, const char* config, char* err, int errlen) {
     mkdir("out", 0755);
     mkdir("out/test", 0755);
     mkdir(dir, 0755);
@@ -93,10 +96,10 @@ static int write_model(const char* dir, char* err, int errlen) {
     snprintf(path, sizeof path, "%s/config.json", dir);
     FILE* f = fopen(path, "wb");
     if (!f) { snprintf(err, (size_t) errlen, "cannot write %.400s", path); return -1; }
-    fputs(CONFIG, f);
+    fputs(config, f);
     fclose(f);
     MovaCfg c;
-    if (mova_cfg_parse(&c, CONFIG, err, errlen)) return -1;
+    if (mova_cfg_parse(&c, config, err, errlen)) return -1;
     MovaTensor* mt = NULL;
     const int n = mova_tensors(&c, &mt);
     NsSpec* sp = (NsSpec*) calloc((size_t) n, sizeof(NsSpec));
@@ -104,7 +107,8 @@ static int write_model(const char* dir, char* err, int errlen) {
         const int k = mt[i].kind;
         sp[i].name = mt[i].name;
         sp[i].enc = k == MOVA_K_EXPERTS ? NS_SEED4P4 : k == MOVA_K_VEXPERTS ? NS_Q4
-                  : (k == MOVA_K_NORM || k == MOVA_K_ROUTER || k == MOVA_K_ROUTER_BIAS) ? NS_BF16 : NS_Q8;
+                  : (k == MOVA_K_NORM || k == MOVA_K_ROUTER || k == MOVA_K_ROUTER_BIAS || k == MOVA_K_HEADS) ? NS_BF16
+                  : strstr(mt[i].name, ".mla.") ? NS_BF16 : NS_Q8;   // MLA tensors: BF16, as exported (no *.weight name)
         sp[i].slices = mt[i].slices;
         sp[i].rows = mt[i].rows;
         sp[i].cols = mt[i].cols;
@@ -182,10 +186,94 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
     return diff;
 }
 
+// 8. MLA (a TransMLA conversion): the same random model with latent attention (ranks 64..128, one 128-dim RoPE key),
+// against the C reference: prompt scoring (one-pass latent attention) and decode (split-key + reduce), the cache size.
+static void test_mla(void) {
+    const char* dir = "out/test/engine_model_mla";
+    static const int ranks[5] = {64, 96, 64, 128, 96};
+    char* config = (char*) malloc(strlen(CONFIG) + 128);
+    sprintf(config, "{\"mla_ranks\": [%d, %d, %d, %d, %d], \"mla_rope_dim\": 128,%s", ranks[0], ranks[1], ranks[2], ranks[3],
+            ranks[4], CONFIG + 1);
+    char err[512] = "";
+    if (write_model(dir, config, err, sizeof err)) { ++fails; printf("FAIL: MLA model folder: %s\n", err); free(config); return; }
+    free(config);
+    MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
+    if (!ref) { ++fails; printf("FAIL: MLA reference: %s\n", err); return; }
+    EngOpts o;
+    memset(&o, 0, sizeof o);
+    o.model_dir = dir;
+    o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
+    o.max_seqs = 1;
+    o.kv_tokens = 1024;
+    Eng* e = eng_open(&o, err, sizeof err);
+    if (!e) { ++fails; printf("FAIL: MLA eng_open: %s\n", err); mova_ref_close(ref); return; }
+    printf("%s\n", eng_describe(e));
+    int64_t want_kv = 0;
+    for (int l = 0; l < 5; ++l) want_kv += (int64_t) o.kv_tokens * (128 + ranks[l]) * 2;
+    EngMem mem;
+    eng_mem(e, &mem);
+    CHECK(mem.kv == want_kv, "MLA KV cache %lld bytes, want %lld", (long long) mem.kv, (long long) want_kv);
+    o.kv_format = ENG_KV_Q8;
+    Eng* e8 = eng_open(&o, err, sizeof err);
+    CHECK(!e8 && strstr(err, "MLA"), "MLA with the 8-bit cache must be refused (not ignored): %s", e8 ? "opened" : err);
+    if (e8) eng_close(e8);
+    const int V = eng_vocab(e), N = 48, NS = 4, TK = 4, TKV = 2;
+    uint64_t st = 11;
+    int32_t ids[64];
+    for (int i = 0; i < N; ++i) ids[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+    float* rl = (float*) malloc(sizeof(float) * (size_t) N * V), *el = (float*) malloc(sizeof(float) * (size_t) N * V);
+    int32_t* rm = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *rv = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
+    int32_t* em = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *ev = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
+    CHECK(mova_ref_forward(ref, ids, N - 1, 0, rl, rm, rv) == 0, "MLA reference forward");
+    eng_mova_routes(e, 1, N);
+    CHECK(eng_score(e, 0, ids, 1, N - 1, el) == 0, "MLA eng_score");
+    CHECK(eng_mova_routes_read(e, N - 1, em, ev, NULL, NULL) == 0, "MLA routes");
+    eng_mova_routes(e, 0, 0);
+    int flips = 0, clean = 0, am_same = 0;
+    double worst = 0, mean = 0;
+    for (int t = 0; t < N - 1; ++t) {
+        const int same = same_choice(em + t * NS * TK, rm + t * NS * TK, NS, TK) && same_choice(ev + t * NS * TKV, rv + t * NS * TKV, NS, TKV);
+        flips += !same;
+        const double re = row_err(el + (size_t) t * V, rl + (size_t) t * V, V);
+        am_same += argmax(el + (size_t) t * V, V) == argmax(rl + (size_t) t * V, V);
+        mean += re;
+        if (!flips) { ++clean; worst = fmax(worst, re); }
+    }
+    mean /= N - 1;
+    printf("MLA scoring: %d rows, %d before the first router flip (%d flipped); logit error max %.2e (clean rows), mean "
+           "%.2e; argmax equal %d / %d\n", N - 1, clean, flips, worst, mean, am_same, N - 1);
+    // The latent attention computes in f32 against the reference's double (GQA's prefill kernel instead reproduces MLX's
+    // rounding points, which the reference mirrors), so 1-ulp differences in its BF16 outputs start at row 0 and tip a
+    // near-tie route earlier: over four token sequences the first flip came at rows 5-11 (GQA here: 18), with clean-row
+    // errors of 7e-3 to 9e-3.  The kernels themselves are pinned to one BF16 ulp by tests/test_mova_kernels.c; this test
+    // checks the wiring, which a few clean rows at this error already rule out.
+    CHECK(flips <= (N - 1) / 4 && clean >= 4, "MLA scoring: %d flips, %d clean rows", flips, clean);
+    CHECK(worst < 0.02 && mean < 0.05, "MLA scoring: logit error max %.3e, mean %.3e", worst, mean);
+    CHECK(am_same >= (N - 1) * 9 / 10, "MLA scoring: argmax equal in %d of %d rows", am_same, N - 1);
+    const int P0 = 8;   // decode: prefill 8 rows (the split-key path), then one row at a time
+    CHECK(eng_prefill(e, 0, ids, P0) == 0, "MLA prefill");
+    float* lg = (float*) malloc(sizeof(float) * (size_t) V);
+    double dworst = 0, dmean = 0;
+    int dsame = 0;
+    for (int t = P0 - 1; t < N - 1; ++t) {
+        CHECK(eng_step(e, 0, lg) == 0, "MLA step");
+        const double re = row_err(lg, rl + (size_t) t * V, V);
+        dworst = fmax(dworst, re);
+        dmean += re / (N - P0);
+        dsame += argmax(lg, V) == argmax(rl + (size_t) t * V, V);
+        eng_push(e, 0, ids[t + 1]);
+    }
+    printf("MLA decode: %d steps, logit error mean %.2e max %.2e, argmax equal %d\n", N - P0, dmean, dworst, dsame);
+    CHECK(dmean < 0.05 && dworst < 0.25, "MLA decode: logit error mean %.3e, max %.3e", dmean, dworst);
+    eng_close(e);
+    mova_ref_close(ref);
+    free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
+}
+
 int main(void) {
     const char* dir = "out/test/engine_model";
     char err[512] = "";
-    if (write_model(dir, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
+    if (write_model(dir, CONFIG, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
     MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
     if (!ref) { printf("FAIL: reference: %s\n", err); return 1; }
     EngOpts o;
@@ -377,6 +465,7 @@ int main(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
+    test_mla();
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

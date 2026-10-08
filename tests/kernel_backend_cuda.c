@@ -269,6 +269,25 @@ int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const Ro
                     (const float*) dev(g, qn), dout, T);
     return done("kc_attn_prefill (Q8)", o, dout, qn);
 }
+// MLA (TransMLA) kernels are Metal-only for now: the CUDA backend reports them as not implemented.
+int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    (void) H; (void) O; (void) I; (void) W; (void) x; (void) xs; (void) hs; (void) g; (void) y; (void) T;
+    printf("FAIL: kt_heads_mv: MLA kernels are not implemented on CUDA yet\n");
+    return -1;
+}
+int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
+                const RowInfo* ri, const float* inv, int T) {
+    (void) a; (void) qr; (void) kr; (void) c; (void) Kc; (void) Vc; (void) npos; (void) ri; (void) inv; (void) T;
+    printf("FAIL: kt_mla_rope: MLA kernels are not implemented on CUDA yet\n");
+    return -1;
+}
+int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
+                const RowInfo* ri, float* olat, int T) {
+    (void) a; (void) ql; (void) qr; (void) Kc; (void) Vc; (void) npos; (void) ri; (void) olat; (void) T;
+    printf("FAIL: kt_mla_attn: MLA kernels are not implemented on CUDA yet\n");
+    return -1;
+}
+
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {
     WSlice w;
