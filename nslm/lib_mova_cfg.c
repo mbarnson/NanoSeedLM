@@ -81,6 +81,28 @@ int mova_cfg_parse(MovaCfg* c, const char* js, char* err, int errlen) {
     NEED(c->n_vexp > 0 && c->top_kv > 0, "not a MoVA config (no value experts)");
     NEED(c->d % c->norm_groups == 0 && c->d % (64 * c->norm_groups) == 0, "norm groups");
     NEED(c->n_head % c->n_kv == 0 && c->head_dim == 128, "attention layout (head_dim 128)");
+    const char* mr = jval(js, "mla_ranks");
+    if (mr) {
+        NEED(*mr == '[', "mla_ranks must be an array");
+        NEED(c->n_layer <= MOVA_MAX_LAYERS, "too many layers for MLA");
+        int nr = 0;
+        for (const char* p = mr + 1; *p && *p != ']'; ++p)
+            if (*p >= '0' && *p <= '9') {
+                NEED(nr < c->n_layer, "mla_ranks has more entries than layers");
+                c->mla_rank[nr] = atoi(p);
+                NEED(c->mla_rank[nr] >= 32 && c->mla_rank[nr] <= 1024 && c->mla_rank[nr] % 32 == 0,
+                     "mla_ranks: %d is not a multiple of 32 in [32, 1024]", c->mla_rank[nr]);
+                ++nr;
+                while (*p >= '0' && *p <= '9') ++p;
+                --p;
+            }
+        NEED(nr == c->n_layer, "mla_ranks has %d entries for %d layers", nr, c->n_layer);
+        c->mla_rope = c->head_dim;
+        jint(js, "mla_rope_dim", &c->mla_rope);
+        NEED(c->mla_rope == c->head_dim, "mla_rope_dim must equal head_dim (128)");
+        NEED(c->n_head <= 32, "MLA attention runs one simdgroup per query head (at most 32)");
+        c->mla = 1;
+    }
     c->router_parts = 2;   // router GEMM partitions: the MLX reference implementation's rounding contract
 #undef NEED
     return 0;
@@ -115,7 +137,7 @@ static void add(MovaTensor* t, int* n, int kind, int layer, int slices, int rows
 }
 
 int mova_tensors(const MovaCfg* c, MovaTensor** out) {
-    MovaTensor* t = (MovaTensor*) calloc((size_t) c->n_layer * 20 + 8, sizeof *t);
+    MovaTensor* t = (MovaTensor*) calloc((size_t) c->n_layer * 24 + 8, sizeof *t);
     int n = 0;
     const int d = c->d, q = c->n_head * c->head_dim, kv = c->n_kv * c->head_dim;
     add(t, &n, MOVA_K_EMBED, -1, 1, c->vocab, d, NULL, "model.embed_tokens.weight");
@@ -124,11 +146,20 @@ int mova_tensors(const MovaCfg* c, MovaTensor** out) {
         add(t, &n, MOVA_K_NORM, l, 1, 1, d, NULL, "model.layers.%d.input_layernorm.weight", l);
         add(t, &n, MOVA_K_NORM, l, 1, 1, d, NULL, "model.layers.%d.post_attention_layernorm.weight", l);
         add(t, &n, MOVA_K_LINEAR, l, 1, q, d, NULL, "model.layers.%d.self_attn.q_proj.weight", l);
-        add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.k_proj.weight", l);
+        if (!c->mla) add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.k_proj.weight", l);
         add(t, &n, MOVA_K_LINEAR, l, 1, d, q, NULL, "model.layers.%d.self_attn.o_proj.weight", l);
         add(t, &n, MOVA_K_LINEAR, l, 1, q, d, NULL, "model.layers.%d.self_attn.gate_proj.weight", l);
+        if (c->mla) {
+            const int r = c->mla_rank[l], hd = c->head_dim, rd = c->mla_rope;
+            add(t, &n, MOVA_K_LINEAR, l, 1, r, d, NULL, "model.layers.%d.self_attn.mla.kv_a_x", l);
+            if (sparse) add(t, &n, MOVA_K_LINEAR, l, 1, r, kv, NULL, "model.layers.%d.self_attn.mla.kv_a_v", l);
+            add(t, &n, MOVA_K_LINEAR, l, 1, rd, d, NULL, "model.layers.%d.self_attn.mla.k_rope_proj", l);
+            add(t, &n, MOVA_K_HEADS, l, c->n_head, rd, hd, NULL, "model.layers.%d.self_attn.mla.q_rope_mix", l);
+            add(t, &n, MOVA_K_HEADS, l, c->n_head, r, hd, NULL, "model.layers.%d.self_attn.mla.q_lat", l);
+            add(t, &n, MOVA_K_HEADS, l, c->n_head, hd, r, NULL, "model.layers.%d.self_attn.mla.v_up", l);
+        }
         if (!sparse) {
-            add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.v_proj.weight", l);
+            if (!c->mla) add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.v_proj.weight", l);
             add(t, &n, MOVA_K_LINEAR, l, 1, c->ff_dense, d, NULL, "model.layers.%d.mlp.gate_proj.weight", l);
             add(t, &n, MOVA_K_LINEAR, l, 1, c->ff_dense, d, NULL, "model.layers.%d.mlp.up_proj.weight", l);
             add(t, &n, MOVA_K_LINEAR, l, 1, d, c->ff_dense, NULL, "model.layers.%d.mlp.down_proj.weight", l);

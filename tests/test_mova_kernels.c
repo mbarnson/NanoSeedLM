@@ -690,6 +690,118 @@ static void test_attn_prefill(int q8) {
     free(q); free(g); free(o); free(Kc); free(Vc); free(ri);
 }
 
+// ---- MLA (TransMLA conversion): per-head maps (+ gate), RoPE + latent cache write, latent attention ------------------
+static void test_mla(void) {
+    unsigned sd = 31;
+    {   // per-head maps: q_lat-like (H 4, O 96, I 128, q's [T][H*128] layout) and v_up-like with the gate (O 128, I 96)
+        enum { H = 4, T = 3 };
+        const int shapes[2][2] = {{96, 128}, {128, 96}};
+        for (int c = 0; c < 2; ++c) {
+            const int O = shapes[c][0], I = shapes[c][1], gate = c == 1;
+            uint16_t* W = malloc(2 * (size_t) H * O * I);
+            float* x = malloc(4 * (size_t) T * H * I), *g = malloc(4 * (size_t) T * H * O), *y = malloc(4 * (size_t) T * H * O);
+            for (int i = 0; i < H * O * I; ++i) W[i] = f2bf((float) (frand(&sd) * 0.1));
+            for (int i = 0; i < T * H * I; ++i) x[i] = bfr(frand(&sd) * 2);
+            for (int i = 0; i < T * H * O; ++i) g[i] = bfr(frand(&sd) * 3);
+            int bad = 0;
+            if (kt_heads_mv(H, O, I, W, x, H * I, I, gate ? g : NULL, y, T)) ++fails;
+            else
+                for (int t = 0; t < T; ++t)
+                    for (int h = 0; h < H; ++h)
+                        for (int o = 0; o < O; ++o) {
+                            double s = 0;
+                            for (int i = 0; i < I; ++i) s += bf2f(W[((size_t) h * O + o) * I + i]) * (double) x[(size_t) t * H * I + h * I + i];
+                            const size_t yi = ((size_t) t * H + h) * O + o;
+                            const double want = gate ? gated(s, g[yi]) : bfr(s);
+                            bad += !close_bf(y[yi], want, 2e-6);
+                        }
+            CHECK(!bad, "per-head maps (O %d, I %d%s): %d mismatches", O, I, gate ? ", gate" : "", bad);
+            free(W); free(x); free(g); free(y);
+        }
+    }
+    {   // RoPE + latent cache write: 4 heads, r 96, rows at positions 3 and 4 of a 5-position cache
+        enum { nh = 4, r = 96, P = 5, T = 2 };
+        float qr[T * nh * 128], kr[T * 128], c[T * r], q0[T * nh * 128];
+        for (int i = 0; i < T * nh * 128; ++i) qr[i] = bfr(frand(&sd));
+        for (int i = 0; i < T * 128; ++i) kr[i] = bfr(frand(&sd));
+        for (int i = 0; i < T * r; ++i) c[i] = bfr(frand(&sd));
+        memcpy(q0, qr, sizeof qr);
+        uint16_t Kc[P * 128], Vc[P * r];
+        memset(Kc, 0, sizeof Kc);
+        memset(Vc, 0, sizeof Vc);
+        float inv[64];
+        for (int p = 0; p < 64; ++p) inv[p] = (float) pow(1e7, -2.0 * p / 128);
+        const RowInfo ri[2] = {{3, {0}}, {4, {0}}};
+        const MlaArgs a = {nh, r, 128, 1, (float) (1 / sqrt(128.0)), {0}};
+        int bad = 0;
+        if (kt_mla_rope(a, qr, kr, c, Kc, Vc, P, ri, inv, T)) ++fails;
+        else
+            for (int t = 0; t < T; ++t) {
+                const int pos = ri[t].pos;
+                for (int i = 0; i < 64; ++i) {
+                    const double th = (double) (float) ((float) pos * inv[i]), cs = cos(th), sn = sin(th);
+                    for (int h = 0; h < nh; ++h) {
+                        const double x0 = q0[t * nh * 128 + h * 128 + i], x1 = q0[t * nh * 128 + h * 128 + i + 64];
+                        bad += !close_bf(qr[t * nh * 128 + h * 128 + i], bfr(x0 * cs - x1 * sn), 1e-6);
+                        bad += !close_bf(qr[t * nh * 128 + h * 128 + i + 64], bfr(x1 * cs + x0 * sn), 1e-6);
+                    }
+                    const double k0 = kr[t * 128 + i], k1 = kr[t * 128 + i + 64];
+                    bad += !close_bf(bf2f(Kc[pos * 128 + i]), bfr(k0 * cs - k1 * sn), 1e-6);
+                    bad += !close_bf(bf2f(Kc[pos * 128 + i + 64]), bfr(k1 * cs + k0 * sn), 1e-6);
+                }
+                for (int e = 0; e < r; ++e) bad += bf2f(Vc[pos * r + e]) != c[t * r + e];
+            }
+        CHECK(!bad, "MLA rope + latent cache write: %d mismatches", bad);
+    }
+    for (int split = 0; split < 2; ++split) {   // latent attention: 32 heads, r 768; 1 split or 5
+        const int nh = 32, r = 768, NP = 301, T = 3, ns = split ? 5 : 1;
+        const int pos[3] = {300, 299, 37};
+        float* ql = malloc(4 * (size_t) T * nh * r), *qr = malloc(4 * (size_t) T * nh * 128), *ol = malloc(4 * (size_t) T * nh * r);
+        uint16_t* Kc = malloc(2 * (size_t) NP * 128), *Vc = malloc(2 * (size_t) NP * r);
+        for (int i = 0; i < T * nh * r; ++i) ql[i] = bfr(frand(&sd) * 0.3);
+        for (int i = 0; i < T * nh * 128; ++i) qr[i] = bfr(frand(&sd));
+        for (int i = 0; i < NP * 128; ++i) Kc[i] = f2bf((float) frand(&sd));
+        for (int i = 0; i < NP * r; ++i) Vc[i] = f2bf((float) frand(&sd));
+        RowInfo ri[3];
+        memset(ri, 0, sizeof ri);
+        for (int t = 0; t < T; ++t) ri[t].pos = pos[t];
+        const MlaArgs a = {nh, r, (NP + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
+        int bad = 0;
+        if (kt_mla_attn(a, ql, qr, Kc, Vc, NP, ri, ol, T)) ++fails;
+        else {
+            double* s = malloc(sizeof(double) * NP), *acc = malloc(sizeof(double) * r);
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < nh; ++h) {
+                    double mx = -1e300, l = 0;
+                    for (int p = 0; p <= pos[t]; ++p) {
+                        double d = 0;
+                        for (int e = 0; e < r; ++e) d += (double) ql[((size_t) t * nh + h) * r + e] * bf2f(Vc[(size_t) p * r + e]);
+                        for (int e = 0; e < 128; ++e) d += (double) qr[((size_t) t * nh + h) * 128 + e] * bf2f(Kc[(size_t) p * 128 + e]);
+                        s[p] = d * a.scale;
+                        mx = fmax(mx, s[p]);
+                    }
+                    memset(acc, 0, sizeof(double) * r);
+                    for (int p = 0; p <= pos[t]; ++p) {
+                        const double e = exp(s[p] - mx);
+                        l += e;
+                        for (int k = 0; k < r; ++k) acc[k] += e * bf2f(Vc[(size_t) p * r + k]);
+                    }
+                    for (int k = 0; k < r; ++k) {
+                        const size_t i = ((size_t) t * nh + h) * r + k;
+                        if (!close_bf(ol[i], bfr(acc[k] / l), 2e-6)) {
+                            if (bad < 3) printf("  mla attn t %d h %d d %d: %.8g vs %.8g\n", t, h, k, ol[i], bfr(acc[k] / l));
+                            ++bad;
+                        }
+                    }
+                }
+            free(s); free(acc);
+        }
+        CHECK(!bad, "MLA latent attention (%d split%s): %d mismatches of %d", ns, ns > 1 ? "s" : "", bad, T * nh * r);
+        printf("MLA latent attention: %d rows x %d heads, r %d, %d split(s), %d mismatches\n", T, nh, r, ns, bad);
+        free(ql); free(qr); free(ol); free(Kc); free(Vc);
+    }
+}
+
 int main(void) {
     char err[256] = "";
     if (kt_open(err, sizeof err)) {
@@ -707,6 +819,7 @@ int main(void) {
     test_rope_kv_q8();
     test_attn_prefill(1);
     test_attn_decode(1);
+    test_mla();
     kt_close();
     printf("test_mova_kernels: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

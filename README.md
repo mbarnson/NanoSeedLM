@@ -175,6 +175,23 @@ Other tools:
 | `nslm-mova-refcheck` | The GPU engine against a C reference forward on the CPU (KL, argmax, router choices) |
 | `nslm-mova-routes` | Router choices of a prompt and a generation (expert-cache studies) |
 
+## MLA models (experimental)
+
+The engine also runs K2-Horizon-MoVA converted from grouped-query attention to multi-head latent attention
+(MLA, after [TransMLA](https://arxiv.org/abs/2502.07864)), for example
+[K2-Horizon-MoVA-36B-A4B-MLA](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA). `config.json` carries
+`mla_ranks` (the latent rank per layer, a multiple of 32, at most 1024) and `mla_rope_dim` (128); the folder adds
+`model-mla-delta.safetensors` with each layer's BF16 tensors `self_attn.mla.{kv_a_x, kv_a_v, k_rope_proj, q_rope_mix,
+q_lat, v_up}`. `k_proj` is unused, and the dense layers fold `v_proj` into `kv_a_x`.
+
+Per layer the cache holds the latent `c = kv_a_x x (+ kv_a_v v)` and one 128-dim RoPE key per token: at rank 768,
+84 KiB per token instead of 192 KiB. Attention is computed absorbed, as multi-query attention over the latent
+(`k_mla_attn`: one simdgroup per query head, each key loaded once per threadgroup), then the per-head `v_up` and the
+gate (`k_heads_mv`). The CUDA engine runs the same kernels (8 query heads per block there); its KV cache places MLA's
+per-layer latent widths in VRAM and host memory as it does GQA's rows. Not yet: the 8-bit cache for MLA (`--kv q8` is
+refused), packed (Q8 / seed) MLA tensors, and a fast prefill kernel (prompt chunks use the one-pass latent kernel,
+about 6x the attention arithmetic of GQA).
+
 ## Make a model folder
 
 1. Collect activation statistics (approximately 160k tokens of plain text):

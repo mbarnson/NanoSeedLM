@@ -20,6 +20,7 @@
 #include "lfsr.h"
 #include "model_st.h"
 #include "mova_cfg.h"
+#include "mova_ckpt.h"
 #include "mova_ext.h"
 #include "mova_ref.h"
 
@@ -61,7 +62,10 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
         for (uint64_t i = 0; i < len / 2; ++i) {
             const double u = rng_unit(&st) * 2 - 1;
             const float v = mt->kind == MOVA_K_NORM ? (float) (1.0 + 0.1 * u)
-                          : mt->kind == MOVA_K_ROUTER_BIAS ? (float) (0.02 * u) : (float) (1.0 * u);   // routers: well-separated scores
+                          : mt->kind == MOVA_K_ROUTER_BIAS ? (float) (0.02 * u)
+                          : mt->kind == MOVA_K_HEADS ? (float) (0.08 * u)
+                          : strstr(mt->name, ".mla.") ? (float) (0.04 * u)      // MLA projections: BF16, Q8's magnitude
+                          : (float) (1.0 * u);                                   // routers: well-separated scores
             o[i] = f2bf(v);
         }
         return 0;
@@ -85,7 +89,8 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     return 0;
 }
 
-static int write_model(const char* dir, char* err, int errlen) {
+// skip: leave out the tensors whose names contain it (NULL: none)
+static int write_model(const char* dir, const char* config, const char* skip, char* err, int errlen) {
     mkdir("out", 0755);
     mkdir("out/test", 0755);
     mkdir(dir, 0755);
@@ -93,24 +98,29 @@ static int write_model(const char* dir, char* err, int errlen) {
     snprintf(path, sizeof path, "%s/config.json", dir);
     FILE* f = fopen(path, "wb");
     if (!f) { snprintf(err, (size_t) errlen, "cannot write %.400s", path); return -1; }
-    fputs(CONFIG, f);
+    fputs(config, f);
     fclose(f);
     MovaCfg c;
-    if (mova_cfg_parse(&c, CONFIG, err, errlen)) return -1;
+    if (mova_cfg_parse(&c, config, err, errlen)) return -1;
     MovaTensor* mt = NULL;
     const int n = mova_tensors(&c, &mt);
     NsSpec* sp = (NsSpec*) calloc((size_t) n, sizeof(NsSpec));
+    int m = 0;
     for (int i = 0; i < n; ++i) {
-        const int k = mt[i].kind;
-        sp[i].name = mt[i].name;
-        sp[i].enc = k == MOVA_K_EXPERTS ? NS_SEED4P4 : k == MOVA_K_VEXPERTS ? NS_Q4
-                  : (k == MOVA_K_NORM || k == MOVA_K_ROUTER || k == MOVA_K_ROUTER_BIAS) ? NS_BF16 : NS_Q8;
-        sp[i].slices = mt[i].slices;
-        sp[i].rows = mt[i].rows;
-        sp[i].cols = mt[i].cols;
+        if (skip && strstr(mt[i].name, skip)) continue;
+        mt[m] = mt[i];
+        const int k = mt[m].kind;
+        sp[m].name = mt[m].name;
+        sp[m].enc = k == MOVA_K_EXPERTS ? NS_SEED4P4 : k == MOVA_K_VEXPERTS ? NS_Q4
+                  : (k == MOVA_K_NORM || k == MOVA_K_ROUTER || k == MOVA_K_ROUTER_BIAS || k == MOVA_K_HEADS) ? NS_BF16
+                  : strstr(mt[m].name, ".mla.") ? NS_BF16 : NS_Q8;   // MLA tensors: BF16, as exported (no *.weight name)
+        sp[m].slices = mt[m].slices;
+        sp[m].rows = mt[m].rows;
+        sp[m].cols = mt[m].cols;
+        ++m;
     }
     Gen g = {sp, mt};
-    const int rc = ns_write(dir, sp, n, 64ull << 20, NULL, fill, &g, err, errlen);
+    const int rc = ns_write(dir, sp, m, 64ull << 20, NULL, fill, &g, err, errlen);
     free(sp);
     free(mt);
     return rc;
@@ -182,12 +192,181 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
     return diff;
 }
 
+// 8. MLA (a TransMLA conversion): the same random model with latent attention (ranks 64..128, one 128-dim RoPE key),
+// against the C reference: prompt scoring (one-pass latent attention) and decode (split-key + reduce), the cache size.
+static void test_mla(void) {
+    const char* dir = "out/test/engine_model_mla";
+    static const int ranks[5] = {64, 96, 64, 128, 96};
+    char* config = (char*) malloc(strlen(CONFIG) + 128);
+    sprintf(config, "{\"mla_ranks\": [%d, %d, %d, %d, %d], \"mla_rope_dim\": 128,%s", ranks[0], ranks[1], ranks[2], ranks[3],
+            ranks[4], CONFIG + 1);
+    char err[512] = "";
+    if (write_model(dir, config, NULL, err, sizeof err)) { ++fails; printf("FAIL: MLA model folder: %s\n", err); free(config); return; }
+    // A folder without one layer's per-head query map: the reference (and below, the engine) must refuse it, naming
+    // the tensor
+    const char* bad = "out/test/engine_model_mla_missing";
+    const int bad_ok = write_model(bad, config, "layers.2.self_attn.mla.q_lat", err, sizeof err) == 0;
+    CHECK(bad_ok, "MLA folder without q_lat: %s", err);
+    if (bad_ok) {
+        MovaRef* rb = mova_ref_open(bad, 1, err, sizeof err);
+        CHECK(!rb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA reference without q_lat: %s", rb ? "opened" : err);
+        if (rb) mova_ref_close(rb);
+    }
+    free(config);
+    // The per-head maps are stacked 3-D BF16 tensors [n_head][rows][cols], as the conversion exports them: the engine
+    // maps them from the folder (as from the real converted model's model-mla-delta.safetensors), and the checkpoint
+    // reader (the packer's, and the engine's fallback) reads them whole
+    {
+        MovaCkpt* ck = mova_ckpt_open(dir, err, sizeof err);
+        NsModel nm;
+        CHECK(ck && ns_open(&nm, dir, err, sizeof err) == 0, "MLA folder as a checkpoint: %s", err);
+        if (ck) {
+            const char* nm1 = "model.layers.1.self_attn.mla.q_lat";
+            const uint16_t* w3 = mova_ckpt_bf16_3d(ck, nm1, 8, ranks[1], 128, err, sizeof err);
+            const NsTensor* t = ns_find(&nm, nm1);
+            CHECK(w3 && t && t->slices == 8 && !memcmp(w3, t->s[0].p, (size_t) 8 * ranks[1] * 128 * 2), "3-D read of %s: %s", nm1, err);
+            CHECK(!mova_ckpt_bf16(ck, nm1, ranks[1], 128, err, sizeof err), "a 3-D tensor read as 2-D");
+            ns_close(&nm);
+            mova_ckpt_close(ck);
+        }
+    }
+    MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
+    if (!ref) { ++fails; printf("FAIL: MLA reference: %s\n", err); return; }
+    EngOpts o;
+    memset(&o, 0, sizeof o);
+    o.model_dir = dir;
+    o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
+    o.max_seqs = 1;
+    o.kv_tokens = 1024;
+    Eng* e = eng_open(&o, err, sizeof err);
+    if (!e) { ++fails; printf("FAIL: MLA eng_open: %s\n", err); mova_ref_close(ref); return; }
+    printf("%s\n", eng_describe(e));
+    if (bad_ok) {
+        EngOpts ob = o;
+        ob.model_dir = bad;
+        ob.kv_tokens = 64;
+        Eng* eb = eng_open(&ob, err, sizeof err);
+        CHECK(!eb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA engine without q_lat: %s", eb ? "opened" : err);
+        if (eb) eng_close(eb);
+    }
+    int64_t want_kv = 0;
+    for (int l = 0; l < 5; ++l) want_kv += (int64_t) o.kv_tokens * (128 + ranks[l]) * 2;
+    EngMem mem;
+    eng_mem(e, &mem);
+    CHECK(mem.kv == want_kv, "MLA KV cache %lld bytes, want %lld", (long long) mem.kv, (long long) want_kv);
+    o.kv_format = ENG_KV_Q8;
+    Eng* e8 = eng_open(&o, err, sizeof err);
+    CHECK(!e8 && strstr(err, "MLA"), "MLA with the 8-bit cache must be refused (not ignored): %s", e8 ? "opened" : err);
+    if (e8) eng_close(e8);
+    const int V = eng_vocab(e), N = 48, NS = 4, TK = 4, TKV = 2;
+    uint64_t st = 11;
+    int32_t ids[64];
+    for (int i = 0; i < N; ++i) ids[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+    float* rl = (float*) malloc(sizeof(float) * (size_t) N * V), *el = (float*) malloc(sizeof(float) * (size_t) N * V);
+    int32_t* rm = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *rv = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
+    int32_t* em = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *ev = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
+    CHECK(mova_ref_forward(ref, ids, N - 1, 0, rl, rm, rv) == 0, "MLA reference forward");
+    eng_mova_routes(e, 1, N);
+    CHECK(eng_score(e, 0, ids, 1, N - 1, el) == 0, "MLA eng_score");
+    CHECK(eng_mova_routes_read(e, N - 1, em, ev, NULL, NULL) == 0, "MLA routes");
+    eng_mova_routes(e, 0, 0);
+    int flips = 0, clean = 0, am_same = 0;
+    double worst = 0, mean = 0;
+    for (int t = 0; t < N - 1; ++t) {
+        const int same = same_choice(em + t * NS * TK, rm + t * NS * TK, NS, TK) && same_choice(ev + t * NS * TKV, rv + t * NS * TKV, NS, TKV);
+        flips += !same;
+        const double re = row_err(el + (size_t) t * V, rl + (size_t) t * V, V);
+        am_same += argmax(el + (size_t) t * V, V) == argmax(rl + (size_t) t * V, V);
+        mean += re;
+        if (!flips) { ++clean; worst = fmax(worst, re); }
+    }
+    mean /= N - 1;
+    printf("MLA scoring: %d rows, %d before the first router flip (%d flipped); logit error max %.2e (clean rows), mean "
+           "%.2e; argmax equal %d / %d\n", N - 1, clean, flips, worst, mean, am_same, N - 1);
+    // The latent attention computes in f32 against the reference's double (GQA's prefill kernel instead reproduces MLX's
+    // rounding points, which the reference mirrors), so 1-ulp differences in its BF16 outputs start at row 0 and tip a
+    // near-tie route earlier: over four token sequences the first flip came at rows 5-11 (GQA here: 18), with clean-row
+    // errors of 7e-3 to 9e-3.  The kernels themselves are pinned to one BF16 ulp by tests/test_mova_kernels.c; this test
+    // checks the wiring, which a few clean rows at this error already rule out.
+    CHECK(flips <= (N - 1) / 4 && clean >= 4, "MLA scoring: %d flips, %d clean rows", flips, clean);
+    CHECK(worst < 0.02 && mean < 0.05, "MLA scoring: logit error max %.3e, mean %.3e", worst, mean);
+    CHECK(am_same >= (N - 1) * 9 / 10, "MLA scoring: argmax equal in %d of %d rows", am_same, N - 1);
+    const int P0 = 8;   // decode: prefill 8 rows (the split-key path), then one row at a time
+    CHECK(eng_prefill(e, 0, ids, P0) == 0, "MLA prefill");
+    float* lg = (float*) malloc(sizeof(float) * (size_t) V);
+    double dworst = 0, dmean = 0;
+    int dsame = 0;
+    for (int t = P0 - 1; t < N - 1; ++t) {
+        CHECK(eng_step(e, 0, lg) == 0, "MLA step");
+        const double re = row_err(lg, rl + (size_t) t * V, V);
+        dworst = fmax(dworst, re);
+        dmean += re / (N - P0);
+        dsame += argmax(lg, V) == argmax(rl + (size_t) t * V, V);
+        eng_push(e, 0, ids[t + 1]);
+    }
+    printf("MLA decode: %d steps, logit error mean %.2e max %.2e, argmax equal %d\n", N - P0, dmean, dworst, dsame);
+    CHECK(dmean < 0.05 && dworst < 0.25, "MLA decode: logit error mean %.3e, max %.3e", dmean, dworst);
+    // prompt lookup (multi-row verify forwards: split-key latent attention over several rows) must commit the tokens of
+    // plain greedy decode
+    {
+        int32_t rep[40], ar[24], pl[24];
+        for (int i = 0; i < 40; ++i) rep[i] = ids[i % 10];
+        const int seq = 0;
+        EngStats sp;
+        memset(&sp, 0, sizeof sp);
+        CHECK(eng_prefill(e, 0, rep, 40) == 0 && eng_generate(e, &seq, 1, 24, ENG_MODE_AR, ar, NULL) == 0, "MLA AR generate");
+        CHECK(eng_prefill(e, 0, rep, 40) == 0 && eng_generate(e, &seq, 1, 24, ENG_MODE_PL, pl, &sp) == 0, "MLA PL generate");
+        // The CUDA engine's one-row and multi-row forwards differ by an ulp here and there (its matvec sums one row in
+        // another order than several), so a verify forward may break a near-tie the other way: tokens up to the first
+        // difference must match, and there greedy decode's choice may lead the verify's by at most that noise (the
+        // logits of one and several rows differ by < 2e-2 on this model).
+        int k = 0;
+        while (k < 24 && ar[k] == pl[k]) ++k;
+        if (k < 24) {
+            float* lk = (float*) malloc(sizeof(float) * (size_t) V);
+            CHECK(eng_prefill(e, 0, rep, 40) == 0, "MLA AR replay");
+            for (int j = 0; j <= k; ++j) {
+                CHECK(eng_step(e, 0, lk) == 0, "MLA AR replay step");
+                eng_push(e, 0, ar[j]);
+            }
+            const double gap = (double) lk[ar[k]] - lk[pl[k]];
+            printf("MLA prompt lookup: differs from greedy decode at token %d, a near-tie (logit gap %.4f)\n", k, gap);
+            CHECK(gap >= 0 && gap < 0.04, "MLA: prompt lookup committed different tokens than greedy decode (token %d, logit gap %.4f)", k, gap);
+            free(lk);
+        }
+        printf("MLA prompt lookup: %lld forwards for 24 tokens, %lld of %lld proposals accepted\n", (long long) sp.forwards,
+               (long long) sp.accepted, (long long) sp.proposals);
+        CHECK(sp.accepted > 0, "MLA prompt lookup: no proposal accepted, so no multi-row verify was tested");
+    }
+    {   // placement: with the cache mostly in host memory (the latents of every width staged per layer for prompts) the
+        // engine scores and decodes exactly as with all of it in fast memory (engines with unified memory ignore this)
+        double rel;
+        const int diff = compare_engines(e, &o, ENG_KV_BF16, "NSLM_KV_VRAM_MB", "0.2", &st, V, &rel, "MLA KV mostly in host memory");
+        printf("MLA KV mostly in host memory: %d differences\n", diff);
+        CHECK(diff == 0, "MLA: KV placement changed the results");
+    }
+    eng_close(e);
+    mova_ref_close(ref);
+    free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
+}
+
 int main(void) {
     const char* dir = "out/test/engine_model";
     char err[512] = "";
-    if (write_model(dir, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
+    if (write_model(dir, CONFIG, NULL, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
     MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
     if (!ref) { printf("FAIL: reference: %s\n", err); return 1; }
+    {   // a folder without one layer's stacked experts (as an original checkpoint, which stores them per expert): the
+        // reference refuses it, naming the tensor (was a NULL dereference in forward)
+        const char* nx = "out/test/engine_model_no_experts";
+        char e2[512] = "";
+        const int ok = write_model(nx, CONFIG, "layers.2.mlp.experts.up_proj", e2, sizeof e2) == 0;
+        CHECK(ok, "folder without experts: %s", e2);
+        MovaRef* rx = ok ? mova_ref_open(nx, 1, e2, sizeof e2) : NULL;
+        CHECK(ok && !rx && strstr(e2, "layers.2.mlp.experts.up_proj") && strstr(e2, "packed"), "reference without experts: %s",
+              rx ? "opened" : e2);
+        if (rx) mova_ref_close(rx);
+    }
     EngOpts o;
     memset(&o, 0, sizeof o);
     o.model_dir = dir;
@@ -377,6 +556,7 @@ int main(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
+    test_mla();
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

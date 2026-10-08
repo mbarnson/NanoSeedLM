@@ -42,7 +42,7 @@ void mova_ckpt_close(MovaCkpt* k) {
     free(k);
 }
 
-const uint16_t* mova_ckpt_bf16(MovaCkpt* k, const char* name, int rows, int cols, char* err, int errlen) {
+const uint16_t* mova_ckpt_bf16_3d(MovaCkpt* k, const char* name, int slices, int rows, int cols, char* err, int errlen) {
     char file[128], path[1200];
     if (nslm_moe_index_lookup(k->index, name, file, sizeof file)) { snprintf(err, (size_t) errlen, "%s: not in the index", name); return NULL; }
     pthread_mutex_lock(&k->mu);
@@ -57,10 +57,16 @@ const uint16_t* mova_ckpt_bf16(MovaCkpt* k, const char* name, int rows, int cols
     const StFile* st = &k->shard[i].st;
     pthread_mutex_unlock(&k->mu);
     const StEntry* e = st_find(st, name);
-    const int64_t r = e ? (e->ndim == 1 ? 1 : e->shape[0]) : 0, c = e ? (e->ndim == 1 ? e->shape[0] : e->shape[1]) : 0;
-    if (!e || strcmp(e->dtype, "BF16") || e->ndim > 2 || r != rows || c != cols) {
-        snprintf(err, (size_t) errlen, "%s: missing, not BF16, or not %d x %d", name, rows, cols);
+    const int nd = e ? e->ndim : 0, lead = nd == 3;   // [S][R][C], or [R][C] / [C] with S = 1
+    const int64_t s = lead ? e->shape[0] : 1, r = nd == 1 ? 1 : nd ? e->shape[lead] : 0, c = nd ? e->shape[nd - 1] : 0;
+    if (!e || strcmp(e->dtype, "BF16") || nd > 3 || s != slices || r != rows || c != cols) {
+        if (slices > 1) snprintf(err, (size_t) errlen, "%s: missing, not BF16, or not %d x %d x %d", name, slices, rows, cols);
+        else snprintf(err, (size_t) errlen, "%s: missing, not BF16, or not %d x %d", name, rows, cols);
         return NULL;
     }
     return (const uint16_t*) st_data(st, e);
+}
+
+const uint16_t* mova_ckpt_bf16(MovaCkpt* k, const char* name, int rows, int cols, char* err, int errlen) {
+    return mova_ckpt_bf16_3d(k, name, 1, rows, cols, err, errlen);
 }

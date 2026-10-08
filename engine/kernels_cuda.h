@@ -115,6 +115,18 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
 // tile, so the tile size is a rounding point: tests/test_mova_kernels.c), the gate fused
 #define FA_BK 64
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T);
+// MLA (TransMLA; kernels_moe.metal MlaArgs, HmvArgs).  The KvView of an MLA layer (BF16): k the RoPE key (128 per
+// position), v the latent (a.r per position).
+// per-head maps: y[t][h][o] = bf16(W_h[o] . x[t * a.xs + h * a.hs ..]) (W BF16 [H][O][I], I a multiple of 32); with g
+// (y's layout): bf16(that * bf16(softplus_ln2(g)))
+void kc_heads_mv(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T);
+// RoPE of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into kv.k; the latent c [T][r] into kv.v
+void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const float* c, KvView kv, const RowInfo* ri,
+                 const float* inv, int T);
+// latent attention into olat [T][n_head][r]: a.n_splits > 1 splits the keys (partials in part: T x n_head x n_splits x
+// (r + 2) floats) and reduces; 1 is one pass
+void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, KvView kv, const RowInfo* ri, float* part,
+                 float* olat, int T);
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n);
 
 #ifdef __cplusplus

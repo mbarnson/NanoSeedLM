@@ -72,6 +72,19 @@ typedef struct {
 } AttnArgs;
 
 typedef struct { int pos; int pad[3]; } RowInfo;
+// MLA (a TransMLA conversion, nslm/mova_cfg.h): latent attention over one shared latent c (rank r) and one 128-dim RoPE
+// key per position.  chunk / n_splits as AttnArgs (n_splits 1: one pass that writes the output, the prefill path).
+#define MLA_KU 4           // latent attention: keys per step (staged in threadgroup memory for all heads)
+#define MLA_MAXL 32        // latent dims per lane (r <= 1024)
+typedef struct {
+    int n_head, r, chunk, n_splits;
+    float scale;
+    int pad[3];
+} MlaArgs;
+typedef struct {           // per-head maps: y[t][h][o] = W_h[o] . x[t * xs + h * hs ..]
+    int H, O, I, xs, hs, gate;
+    int pad[2];
+} HmvArgs;
 
 #define MM_BM 32           // GEMM: weight rows per threadgroup
 #define MM_BN 32           // GEMM: tokens (or pairs) per threadgroup
@@ -841,6 +854,148 @@ kernel void k_attn_reduce(constant AttnArgs& a [[buffer(0)]], device const float
     const float gx = g[i] * 0.69314718055994531f;   // softplus(x, beta = ln 2) = logaddexp(x ln2, 0) / ln2, in f32
     const float sp = bfr((max(gx, 0.0f) + log(1.0f + exp(-fabs(gx)))) / 0.69314718055994531f);
     o[i] = bfr(att * sp);
+}
+
+// ---- MLA (TransMLA): per-head maps, RoPE + latent cache write, latent attention ---------------------------------------
+static inline float softplus_ln2_bf(float g) {   // bf16(softplus(g, beta = ln 2)), in f32 as k_attn_reduce
+    const float gx = g * 0.69314718055994531f;
+    return bfr((max(gx, 0.0f) + log(1.0f + exp(-fabs(gx)))) / 0.69314718055994531f);
+}
+
+// Per-head maps (q_rope_mix, q_lat, v_up): simdgroup = (output row o, head h, token t); lanes stride the input; f32 sums.
+// y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] . x) * bf16(softplus_ln2(g[t][h][o]))).
+// Grid (O * 32, H, T), threadgroups of 256.
+kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const ushort* W [[buffer(1)]], device const float* x [[buffer(2)]],
+                       device const float* g [[buffer(3)]], device float* y [[buffer(4)]], uint3 gid [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    const int o = (int) gid.x / 32, h = (int) gid.y, t = (int) gid.z;
+    if (o >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
+    device const ushort* w = W + ((ulong) h * a.O + o) * a.I;
+    device const float* xv = x + (ulong) t * a.xs + (ulong) h * a.hs;
+    float s = 0;
+    for (int i = (int) lane; i < a.I; i += 32) s += bf(w[i]) * xv[i];
+    s = simd_sum(s);
+    if (lane == 0) {
+        const ulong yi = ((ulong) t * a.H + h) * a.O + o;
+        float v = bfr(s);
+        if (a.gate) v = bfr(v * softplus_ln2_bf(g[yi]));
+        y[yi] = v;
+    }
+}
+
+// RoPE (as k_rope_kv) on the query RoPE parts qr [T][n_head][128] in place and on the RoPE key kr [T][128] into
+// Kc [cap][128]; the latent c [T][r] into Vc [cap][r].  BF16 caches.  Grid (max((n_head + 1) * 64, r), T).
+kernel void k_mla_rope(constant MlaArgs& a [[buffer(0)]], device float* qr [[buffer(1)]], device const float* kr [[buffer(2)]],
+                       device const float* c [[buffer(3)]], device ushort* Kc [[buffer(4)]], device ushort* Vc [[buffer(5)]],
+                       device const RowInfo* ri [[buffer(6)]], device const float* inv [[buffer(7)]],
+                       uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y, pos = ri[t].pos;
+    if (i < a.r) Vc[(ulong) pos * a.r + i] = tobf(c[(ulong) t * a.r + i]);
+    const int head = i / 64, p = i % 64;
+    if (head > a.n_head) return;
+    const float th = (float) pos * inv[p];
+    const float cs = cos(th), sn = sin(th);
+    if (head < a.n_head) {
+        device float* qh = qr + ((ulong) t * a.n_head + head) * ATT_HD;
+        const float x0 = qh[p], x1 = qh[p + 64];
+        qh[p] = bfr(x0 * cs - x1 * sn);
+        qh[p + 64] = bfr(x1 * cs + x0 * sn);
+    } else {
+        device const float* kh = kr + (ulong) t * ATT_HD;
+        const float x0 = kh[p], x1 = kh[p + 64];
+        Kc[(ulong) pos * ATT_HD + p] = tobf(x0 * cs - x1 * sn);
+        Kc[(ulong) pos * ATT_HD + p + 64] = tobf(x1 * cs + x0 * sn);
+    }
+}
+
+// Latent attention (absorbed MLA: multi-query over the shared latent).  Threadgroup (split, head group, row) of hg
+// simdgroups (hg = threads / 32); simdgroup = query head tg.y * hg + sgi; lane l holds latent dims l, l + 32, .. and
+// RoPE dims l, l + 32, l + 64, l + 96.  Each step stages MLA_KU keys (latent, then RoPE key: BF16) in threadgroup memory
+// once for the group's heads.  Score = scale (ql . c + qr . k), online softmax, sums: f32.  n_splits > 1: partials
+// [row][head][split] = (m, l, acc[r]) for k_mla_reduce; n_splits == 1: olat[row][head] = bf16(acc / l).
+kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql [[buffer(1)]], device const float* qr [[buffer(2)]],
+                       device const ushort* Kc [[buffer(3)]], device const ushort* Vc [[buffer(4)]],
+                       device const RowInfo* ri [[buffer(5)]], device float* out [[buffer(6)]],
+                       threadgroup ushort* sh [[threadgroup(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]],
+                       uint tid [[thread_index_in_threadgroup]], uint3 ntg3 [[threads_per_threadgroup]]) {
+    const uint ntg = ntg3.x;
+    const int split = (int) tg.x, t = (int) tg.z, r = a.r, nl = r / 32, kw = r + ATT_HD;
+    const int h = (int) tg.y * (int) (ntg / 32) + (int) sgi;
+    const int pos = ri[t].pos;
+    const int nsr = min(a.n_splits, (pos + a.chunk) / a.chunk);
+    const int chunk = (pos + nsr) / nsr;
+    const int p0 = split * chunk, p1 = min(pos + 1, p0 + chunk);
+    const bool live = h < a.n_head;
+    float q[MLA_MAXL], acc[MLA_MAXL], qp[4];
+    device const float* qlh = ql + ((ulong) t * a.n_head + (live ? h : 0)) * r;
+    device const float* qrh = qr + ((ulong) t * a.n_head + (live ? h : 0)) * ATT_HD;
+    for (int j = 0; j < nl; ++j) { q[j] = qlh[lane + 32 * j] * a.scale; acc[j] = 0; }
+    for (int j = 0; j < 4; ++j) qp[j] = qrh[lane + 32 * j] * a.scale;
+    float m = -INFINITY, l = 0;
+    for (int p = p0; p < p1; p += MLA_KU) {
+        const int nk = min(MLA_KU, p1 - p);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = (int) tid; e < nk * kw; e += (int) ntg) {
+            const int u = e / kw, d = e - u * kw;
+            sh[e] = d < r ? Vc[(ulong) (p + u) * r + d] : Kc[(ulong) (p + u) * ATT_HD + d - r];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s[MLA_KU];
+        float mx = m;
+        for (int u = 0; u < MLA_KU; ++u) {
+            float d = 0;
+            if (u < nk) {
+                threadgroup const ushort* kk = sh + u * kw;
+                for (int j = 0; j < nl; ++j) d += q[j] * bf(kk[lane + 32 * j]);
+                for (int j = 0; j < 4; ++j) d += qp[j] * bf(kk[r + lane + 32 * j]);
+            }
+            d = simd_sum(d);
+            s[u] = u < nk ? d : -INFINITY;
+            mx = max(mx, s[u]);
+        }
+        const float cor = exp(m - mx);
+        l *= cor;
+        for (int j = 0; j < nl; ++j) acc[j] *= cor;
+        for (int u = 0; u < nk; ++u) {
+            const float e = exp(s[u] - mx);
+            l += e;
+            threadgroup const ushort* kk = sh + u * kw;
+            for (int j = 0; j < nl; ++j) acc[j] += e * bf(kk[lane + 32 * j]);
+        }
+        m = mx;
+    }
+    if (!live) return;
+    if (a.n_splits == 1) {
+        device float* o = out + ((ulong) t * a.n_head + h) * r;
+        for (int j = 0; j < nl; ++j) o[lane + 32 * j] = bfr(acc[j] / l);
+    } else {
+        device float* pp = out + (((ulong) t * a.n_head + h) * a.n_splits + split) * (r + 2);
+        if (lane == 0) { pp[0] = m; pp[1] = l; }
+        for (int j = 0; j < nl; ++j) pp[2 + lane + 32 * j] = acc[j];
+    }
+}
+
+// Reduce the latent attention's splits: olat[t][h][d] = bf16(acc / l).  Threadgroup (head, row); threads stride d.
+kernel void k_mla_reduce(constant MlaArgs& a [[buffer(0)]], device const float* part [[buffer(1)]], device float* olat [[buffer(2)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint d0 [[thread_index_in_threadgroup]],
+                         uint2 nt2 [[threads_per_threadgroup]]) {
+    const uint nt = nt2.x;
+    const int h = (int) tg.x, t = (int) tg.y, r = a.r, w = r + 2;
+    device const float* pp = part + ((ulong) t * a.n_head + h) * a.n_splits * w;
+    float m = -INFINITY;
+    for (int s = 0; s < a.n_splits; ++s) m = max(m, pp[s * w]);
+    for (int d = (int) d0; d < r; d += (int) nt) {
+        float l = 0, acc = 0;
+        for (int s = 0; s < a.n_splits; ++s) {
+            const float ms = pp[s * w];
+            if (ms == -INFINITY) continue;
+            const float c = exp(ms - m);
+            l += pp[s * w + 1] * c;
+            acc += pp[s * w + 2 + d] * c;
+        }
+        olat[((ulong) t * a.n_head + h) * r + d] = bfr(acc / l);
+    }
 }
 
 // Prefill attention (rows > MV_MAXT): threadgroup (block of 8 x ATTF_RS rows, KV head) with one simdgroup per (query head

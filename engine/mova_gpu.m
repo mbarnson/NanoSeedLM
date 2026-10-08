@@ -40,7 +40,8 @@ typedef struct {
     MW vr, vb, vx;                        // value router, bias, experts (sparse layers)
     MW mg, mu, md;                        // dense MLP
     MW r, rb, eg, eu, ed, sg, su, sd;     // MoE router, bias, experts, shared expert
-    int sparse;
+    MW ka_x, ka_v, kr, qm, ql, vu;        // MLA: kv_a_x, kv_a_v (MoVA layers), k_rope_proj, q_rope_mix, q_lat, v_up
+    int sparse, mla_r;                    // mla_r: MLA latent rank (0 for GQA)
 } Layer;
 
 typedef struct {
@@ -72,6 +73,8 @@ struct Eng {
     // scratch (MAX_ROWS rows)
     id<MTLBuffer> x, xn, q, k, v, gq, ao, ga, ua, aa, G, U, A, D, V, sh, logits, ids, ri, inv, part, inds, wts, vinds, vwts, am;
     id<MTLBuffer> perm, tiles, vperm, vtiles;   // grouped GEMM: pairs sorted by expert, tile tables (prompt chunks)
+    id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
+    int mla_hg;                           // MLA: query heads per latent-attention threadgroup (pipeline limit)
     EngMem mem;
     Seq seq;
     char desc[256];
@@ -232,7 +235,8 @@ static int from_model(Eng* e, const char* name, MW* w, char* err, int errlen) {
     return 0;
 }
 
-// BF16 from the checkpoint (slices > 1: the stacked experts, slice names from mova_slice_name).
+// BF16 from the checkpoint (slices > 1: the stacked experts, slice names from mova_slice_name; MLA's per-head maps are
+// one 3-D tensor).
 static int from_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen) {
     if (!e->ck && !(e->ck = mova_ckpt_open(e->model_dir, err, errlen))) return -1;
     *w = (MW){0};
@@ -240,6 +244,13 @@ static int from_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen) 
     const uint64_t one = (uint64_t) t->rows * t->cols * 2;
     id<MTLBuffer> b = alloc_k(e, one * (uint64_t) t->slices, t->name, &e->mem.weights);
     if (!b) { snprintf(err, (size_t) errlen, "%s: out of memory", t->name); return -1; }
+    if (t->kind == MOVA_K_HEADS) {
+        const uint16_t* src = mova_ckpt_bf16_3d(e->ck, t->name, t->slices, t->rows, t->cols, err, errlen);
+        if (!src) return -1;
+        memcpy(b.contents, src, one * (uint64_t) t->slices);
+        w->b[0] = b;
+        return 0;
+    }
     char nm[128];
     for (int s = 0; s < t->slices; ++s) {
         const uint16_t* src = mova_ckpt_bf16(e->ck, mova_slice_name(t, s, nm, sizeof nm), t->rows, t->cols, err, errlen);
@@ -262,7 +273,8 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
             return -1;
         }
         const int ok = t->kind == MOVA_K_EXPERTS ? 1
-                       : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS) ? w->fmt == MF_BF16
+                       : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
+                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16
                        : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8)
                        : w->fmt != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
         if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, w->fmt); return -1; }
@@ -291,7 +303,12 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->pipes = [NSMutableDictionary new];
         if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
         const MovaCfg* c = &e->c;
-        if (c->n_head != ATTF_G * c->n_kv) {   // k_attn_prefill shares each K/V tile among ATTF_G query heads
+        if (c->mla && o->kv_format != ENG_KV_BF16) {   // engine_api.h: never ignore a format
+            snprintf(err, (size_t) errlen, "MLA models: only the BF16 KV cache is supported so far");
+            free(e);
+            return NULL;
+        }
+        if (!c->mla && c->n_head != ATTF_G * c->n_kv) {   // k_attn_prefill shares each K/V tile among ATTF_G query heads
             snprintf(err, (size_t) errlen, "attention: %d query heads per KV head, the prefill kernel is built for %d", c->n_head / c->n_kv, ATTF_G);
             free(e);
             return NULL;
@@ -321,11 +338,20 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             LOAD(&L->ln1, "model.layers.%d.input_layernorm.weight", l);
             LOAD(&L->ln2, "model.layers.%d.post_attention_layernorm.weight", l);
             LOAD(&L->q, "model.layers.%d.self_attn.q_proj.weight", l);
-            LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
+            if (!c->mla) LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
             LOAD(&L->o, "model.layers.%d.self_attn.o_proj.weight", l);
             LOAD(&L->g, "model.layers.%d.self_attn.gate_proj.weight", l);
+            if (c->mla) {
+                L->mla_r = c->mla_rank[l];
+                LOAD(&L->ka_x, "model.layers.%d.self_attn.mla.kv_a_x", l);
+                if (L->sparse) LOAD(&L->ka_v, "model.layers.%d.self_attn.mla.kv_a_v", l);
+                LOAD(&L->kr, "model.layers.%d.self_attn.mla.k_rope_proj", l);
+                LOAD(&L->qm, "model.layers.%d.self_attn.mla.q_rope_mix", l);
+                LOAD(&L->ql, "model.layers.%d.self_attn.mla.q_lat", l);
+                LOAD(&L->vu, "model.layers.%d.self_attn.mla.v_up", l);
+            }
             if (!L->sparse) {
-                LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
+                if (!c->mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
                 LOAD(&L->mg, "model.layers.%d.mlp.gate_proj.weight", l);
                 LOAD(&L->mu, "model.layers.%d.mlp.up_proj.weight", l);
                 LOAD(&L->md, "model.layers.%d.mlp.down_proj.weight", l);
@@ -366,7 +392,19 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->Vc = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Ks = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Vs = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
+        int rmax = 0;
         for (int l = 0; l < c->n_layer; ++l) {
+            if (c->mla) {   // MLA: the RoPE key [cap][128] and the latent [cap][r] (BF16)
+                if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+                e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * c->mla_rope * 2, "K rope", &e->mem.kv);
+                e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * e->L[l].mla_r * 2, "latent", &e->mem.kv);
+                if (!e->Kc[l] || !e->Vc[l]) {
+                    snprintf(err, (size_t) errlen, "KV cache: out of memory");
+                    eng_close(e);
+                    return NULL;
+                }
+                continue;
+            }
             e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * (e->kv_q8 ? 1 : 2), "K", &e->mem.kv);
             e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * (e->kv_q8 ? 1 : 2), "V", &e->mem.kv);
             if (e->kv_q8) {
@@ -405,7 +443,17 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->ids = scratch(e, (uint64_t) T * 4, "ids");
         e->ri = scratch(e, (uint64_t) T * sizeof(RowInfo), "rowinfo");
         e->inv = scratch(e, 64 * 4, "invfreq");
-        e->part = scratch(e, (uint64_t) 1024 * c->n_head * (ATT_HD + 2) * 4, "attn partials");   // rows x splits<=1024
+        // rows x splits <= 1024 (encode_forward); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
+        const uint64_t prow = c->mla ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
+        e->part = scratch(e, prow * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");
+        if (c->mla) {
+            e->lat = scratch(e, (uint64_t) T * rmax * 4, "MLA latent");
+            e->qrp = scratch(e, (uint64_t) T * qd * 4, "MLA query RoPE parts");
+            e->qlat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA absorbed queries");
+            e->olat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA latent outputs");
+            const int hg = (int) pipe_(e, "k_mla_attn", 0, 0).maxTotalThreadsPerThreadgroup / 32;
+            e->mla_hg = hg < c->n_head ? hg : c->n_head;
+        }
         e->inds = scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4, "inds");       // per layer (route capture)
         e->wts = scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4, "wts");
         e->vinds = scratch(e, (uint64_t) c->n_layer * T * c->top_kv * 4, "vinds");
@@ -425,9 +473,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->seq.cap = 1024;
         e->seq.hist = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->seq.cap);
         const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
-        snprintf(e->desc, sizeof e->desc, "mova engine: experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s",
+        char mla[48] = "";
+        if (c->mla) snprintf(mla, sizeof mla, ", MLA latent %d (+%d RoPE)", rmax, c->mla_rope);
+        snprintf(e->desc, sizeof e->desc, "mova engine: experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s%s",
                  fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
-                 fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->kv_q8 ? ", KV q8" : "");
+                 fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->kv_q8 ? ", KV q8" : "", mla);
         return e;
     }
 }
@@ -619,6 +669,68 @@ static int sync_cmd(Cmd* c) {
 
 // One forward of T rows (T <= MAX_ROWS): tokens at e->ids, rows at e->ri.  Head rows [h0, T) get logits (h0 = T: none);
 // with T - h0 <= MAX_LOGIT_ROWS the head runs here (the caller copies e->logits and e->am), else the caller runs it.
+// MLA per-head maps (k_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by g (same layout as y)
+static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
+    const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != nil, {0}};
+    cpipe(c, pipe_(c->e, "k_heads_mv", 0, 0));
+    cbytes(c, 0, &a, sizeof a);
+    cbuf(c, 1, W->b[0], W->o[0]);
+    cbuf(c, 2, X, 0);
+    cbuf(c, 3, G ? G : X, 0);
+    cbuf(c, 4, Y, 0);
+    [c->enc dispatchThreads:MTLSizeMake((NSUInteger) W->rows * 32, (NSUInteger) W->slices, (NSUInteger) T)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+// MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v): the latent
+// c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write, latent attention (split-key +
+// reduce for decode, one pass for prompt chunks), then v_up with the gate into ao.
+static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
+    const MovaCfg* g = &e->c;
+    Layer* L = &e->L[l];
+    const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim, r = L->mla_r, H = g->n_head;
+    cmd_group(c, MOVA_TG_ATTN_PROJ);
+    enc_dense(c, &L->ka_x, e->xn, d, e->lat, r, T, false);
+    if (L->sparse) enc_dense(c, &L->ka_v, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
+    enc_dense(c, &L->kr, e->xn, d, e->k, g->mla_rope, T, false);
+    enc_heads_mv(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);
+    enc_heads_mv(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);
+    cmd_group(c, MOVA_TG_ATTN);
+    const int big = T > MV_MAXT, nsp = big ? 1 : ns;
+    const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
+    cpipe(c, pipe_(e, "k_mla_rope", 0, 0));
+    cbytes(c, 0, &ma, sizeof ma);
+    cbuf(c, 1, e->qrp, 0);
+    cbuf(c, 2, e->k, 0);
+    cbuf(c, 3, e->lat, 0);
+    cbuf(c, 4, e->Kc[l], 0);
+    cbuf(c, 5, e->Vc[l], 0);
+    cbuf(c, 6, e->ri, 0);
+    cbuf(c, 7, e->inv, 0);
+    const int nx = (H + 1) * 64 > r ? (H + 1) * 64 : r;
+    [c->enc dispatchThreads:MTLSizeMake((NSUInteger) nx, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    cpipe(c, pipe_(e, "k_mla_attn", 0, 0));
+    cbytes(c, 0, &ma, sizeof ma);
+    cbuf(c, 1, e->qlat, 0);
+    cbuf(c, 2, e->qrp, 0);
+    cbuf(c, 3, e->Kc[l], 0);
+    cbuf(c, 4, e->Vc[l], 0);
+    cbuf(c, 5, e->ri, 0);
+    cbuf(c, 6, nsp > 1 ? e->part : e->olat, 0);
+    [c->enc setThreadgroupMemoryLength:(NSUInteger) (2 * MLA_KU * (r + g->mla_rope) + 15) / 16 * 16 atIndex:0];
+    crun(c, (uint64_t) nsp, (uint64_t) ((H + e->mla_hg - 1) / e->mla_hg), (uint64_t) T, (uint64_t) 32 * e->mla_hg);
+    if (nsp > 1) {
+        cpipe(c, pipe_(e, "k_mla_reduce", 0, 0));
+        cbytes(c, 0, &ma, sizeof ma);
+        cbuf(c, 1, e->part, 0);
+        cbuf(c, 2, e->olat, 0);
+        crun(c, (uint64_t) H, (uint64_t) T, 1, 256);
+    }
+    cmd_group(c, MOVA_TG_ATTN_PROJ);
+    enc_heads_mv(c, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
+    (void) kvd;
+}
+
 static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
     const MovaCfg* g = &e->c;
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim;
@@ -650,11 +762,12 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
         enc_norm(c, e->x, &L->ln1, e->xn, T);
         cmd_group(c, MOVA_TG_ATTN_PROJ);
         enc_dense(c, &L->q, e->xn, d, e->q, qd, T, false);
-        enc_dense(c, &L->k, e->xn, d, e->k, kvd, T, false);
+        if (!g->mla) enc_dense(c, &L->k, e->xn, d, e->k, kvd, T, false);
         enc_dense(c, &L->g, e->xn, d, e->gq, qd, T, false);
         cmd_group(c, MOVA_TG_VALUES);
-        if (!L->sparse) enc_dense(c, &L->v, e->xn, d, e->v, kvd, T, false);
-        else {
+        if (!L->sparse) {
+            if (!g->mla) enc_dense(c, &L->v, e->xn, d, e->v, kvd, T, false);   // MLA: v_proj is folded into kv_a_x
+        } else {
             const uint64_t ik = (uint64_t) l * MAX_ROWS * g->top_kv * 4, so = (uint64_t) l * MAX_ROWS * g->n_vexp * 4;
             enc_router(c, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, e->vinds, e->vwts, e->vsel, ik, so, T);
             if (!big) enc_mv_sel(c, &L->vx, e->xn, d, e->V, kvd, e->vinds, ik, T * g->top_kv, g->top_kv);
@@ -671,8 +784,9 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
             cbytes(c, 3, dk, 8);
             [c->enc dispatchThreads:MTLSizeMake((NSUInteger) kvd, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
-        cmd_group(c, MOVA_TG_ATTN);
-        {
+        if (g->mla) encode_mla_attn(e, c, l, T, ns);
+        else {
+            cmd_group(c, MOVA_TG_ATTN);
             const int32_t hk[2] = {g->n_head, g->n_kv};
             const int q8 = e->kv_q8;   // the 8-bit cache: the _q8 kernels, scales at buffers 8, 9 (rope, prefill) / 6, 7 (decode)
             cpipe(c, pipe_(e, q8 ? "k_rope_kv_q8" : "k_rope_kv", 0, 0));

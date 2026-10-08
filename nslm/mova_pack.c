@@ -16,6 +16,8 @@
 // Value experts, attention, shared / dense MLPs, embedding and LM head are Q8, or Q4 for the parts named in --q4
 // (v value experts, a attention, m shared / dense MLPs, h LM head; --rest4 = vamh; the embedding is always Q8);
 // routers are BF16 holding their Q8 round trip (the router needs BF16 operands); norms and router biases are BF16.
+// MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported; such a folder is
+// for the NanoSeedLM engine (no MLX loader reads MLA yet, so config.json gets no "model_file").
 // Q8/Q4 are MLX's affine g64 (affine.h).  The folder also gets config.json (with MLX's "quantization" and, for seeds,
 // "model_file": the MLX loader), the tokenizer and template files of DIR, and the loader.
 #include <pthread.h>
@@ -198,7 +200,13 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     }
     if (enc == NS_BF16 && t->kind == MOVA_K_EXPERTS) return decode_blk4(c, t, dst, len);
     if (enc == NS_SEED4P4) return streams_blk4(c, t, s, dst, len);
-    if (enc == NS_BF16) {   // a router: its Q8 round trip as BF16; norms and router biases verbatim
+    if (enc == NS_BF16 && t->kind == MOVA_K_HEADS) {   // MLA's per-head maps: one stacked 3-D tensor
+        const uint16_t* w = mova_ckpt_bf16_3d(c->ck, t->name, t->slices, t->rows, t->cols, err, sizeof err);
+        if (!w) { fprintf(stderr, "%s\n", err); return -1; }
+        memcpy(dst, w, len);
+        return 0;
+    }
+    if (enc == NS_BF16) {   // a router: its Q8 round trip as BF16; norms, router biases and MLA projections verbatim
         const uint16_t* w = mova_ckpt_bf16(c->ck, t->name, t->rows, t->cols, err, sizeof err);
         if (!w) { fprintf(stderr, "%s\n", err); return -1; }
         if (t->kind != MOVA_K_ROUTER) { memcpy(dst, w, len); return 0; }
@@ -238,7 +246,7 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     return 0;
 }
 
-int g_enc[1024];
+int g_enc[2048];
 
 static int copy_file(const char* from, const char* to) {
     FILE* a = fopen(from, "rb");
@@ -252,7 +260,7 @@ static int copy_file(const char* from, const char* to) {
 }
 
 // config.json of the source with MLX's quantization block and, for seeds, the loader.
-static int write_config(const char* model, const char* out, const NsSpec* t, int n, int seeds, const char* loader_name) {
+static int write_config(const char* model, const char* out, const NsSpec* t, int n, int seeds, int mla, const char* loader_name) {
     char path[2048];
     snprintf(path, sizeof path, "%s/config.json", model);
     FILE* f = fopen(path, "rb");
@@ -268,7 +276,8 @@ static int write_config(const char* model, const char* out, const NsSpec* t, int
     free(s);
     if (!c || c->t != J_OBJ) return -1;
     Json* keep = json_new(J_OBJ);   // auto_map names PyTorch files this folder does not ship
-    for (int i = 0; i < c->n; ++i) if (strcmp(c->k[i], "auto_map")) json_set(keep, c->k[i], json_copy(c->v[i]));
+    for (int i = 0; i < c->n; ++i)   // MLA: the source's MLX model file reads BF16 weights only
+        if (strcmp(c->k[i], "auto_map") && !(mla && !strcmp(c->k[i], "model_file"))) json_set(keep, c->k[i], json_copy(c->v[i]));
     json_free(c);
     c = keep;
     Json* q = json_new(J_OBJ);
@@ -285,7 +294,7 @@ static int write_config(const char* model, const char* out, const NsSpec* t, int
         json_set(q, key, e);
     }
     json_set(c, "quantization", q);
-    if (seeds) json_set(c, "model_file", json_str(loader_name));
+    if (seeds && !mla) json_set(c, "model_file", json_str(loader_name));
     Buf b = {0};
     json_dump_indent(&b, c, 0);
     buf_puts(&b, "\n");
@@ -322,8 +331,8 @@ int main(int argc, char** argv) {
     if (!ck) { fprintf(stderr, "%s\n", err); return 2; }
     MovaTensor* all = NULL;
     const int na = mova_tensors(&cfg, &all);
-    static MovaTensor sel[1024];
-    static NsSpec spec[1024];
+    static MovaTensor sel[2048];
+    static NsSpec spec[2048];
     int n = 0, seeds = 0;
     double params = 0, bytes = 0;
     for (int i = 0; i < na; ++i) {
@@ -338,8 +347,9 @@ int main(int argc, char** argv) {
             else if (gup4d && !strcmp(t->proj, "down_proj")) enc = NS_BF16;   // decoded from the P = 4 blocks
             else if (mx || strcmp(t->proj, "down_proj")) enc = NS_SEED4;
             break;
-        case MOVA_K_ROUTER: case MOVA_K_NORM: case MOVA_K_ROUTER_BIAS: enc = NS_BF16; break;
+        case MOVA_K_ROUTER: case MOVA_K_NORM: case MOVA_K_ROUTER_BIAS: case MOVA_K_HEADS: enc = NS_BF16; break;
         case MOVA_K_VEXPERTS: case MOVA_K_LINEAR: case MOVA_K_EMBED: case MOVA_K_HEAD: {
+            if (strstr(t->name, ".mla.")) { enc = NS_BF16; break; }   // MLA projections (no *.weight name to quantize)
             // --q4 PARTS: v value experts, a attention, m shared / dense MLPs, h LM head (--rest4 = vamh)
             const int part = t->kind == MOVA_K_VEXPERTS ? 'v' : t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 0
                            : strstr(t->name, "self_attn") ? 'a' : 'm';
@@ -348,7 +358,7 @@ int main(int argc, char** argv) {
         }
         default: break;
         }
-        if (enc < 0) continue;
+        if (enc < 0) { fprintf(stderr, "%s: no encoding for tensor kind %d\n", t->name, t->kind); return 2; }
         sel[n] = *t;
         g_enc[n] = enc;
         spec[n] = (NsSpec) {sel[n].name, enc, t->slices, t->rows, t->cols};
@@ -373,7 +383,7 @@ int main(int argc, char** argv) {
 
     const char* sl = strrchr(loader, '/');
     const char* loader_name = sl ? sl + 1 : loader;
-    if (write_config(model, out, spec, n, seeds, loader_name)) { fprintf(stderr, "%s/config.json: cannot write\n", out); return 1; }
+    if (write_config(model, out, spec, n, seeds, cfg.mla, loader_name)) { fprintf(stderr, "%s/config.json: cannot write\n", out); return 1; }
     static const char* files[] = {"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
                                   "generation_config.json"};
     char from[2048], to[2048];
@@ -383,7 +393,7 @@ int main(int argc, char** argv) {
         copy_file(from, to);   // optional files
     }
     snprintf(to, sizeof to, "%s/%s", out, loader_name);
-    if (seeds && copy_file(loader, to)) { fprintf(stderr, "%s: cannot copy the MLX loader\n", loader); return 1; }
+    if (seeds && !cfg.mla && copy_file(loader, to)) { fprintf(stderr, "%s: cannot copy the MLX loader\n", loader); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     printf("wrote %s in %.1f s\n", out, (double) ts1.tv_sec + 1e-9 * (double) ts1.tv_nsec - t0);
     free(c.words); free(c.scales); free(c.biases); free(c.blkbuf); free(all);

@@ -269,6 +269,49 @@ int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const Ro
                     (const float*) dev(g, qn), dout, T);
     return done("kc_attn_prefill (Q8)", o, dout, qn);
 }
+// ---- MLA ---------------------------------------------------------------------------------------------------------------
+int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
+    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+    float* dy = (float*) dev(NULL, yn);
+    kc_heads_mv(0, a, (const uint16_t*) dev(W, 2 * (size_t) H * O * I), (const float*) dev(x, xn), g ? (const float*) dev(g, yn) : NULL,
+                dy, T);
+    return done("kc_heads_mv", y, dy, yn);
+}
+// The MLA cache (RoPE keys [npos][128], latents [npos][r]) split in two segments at npos / 2, as the engine's VRAM and
+// host rows
+static KvView mla_kv(void* K, void* V, int npos, int r) {
+    KvView kv;
+    memset(&kv, 0, sizeof kv);
+    kv.nv = npos / 2;
+    kv.a.k = K;
+    kv.a.v = V;
+    kv.b.k = (uint16_t*) K + (size_t) kv.nv * 128;
+    kv.b.v = (uint16_t*) V + (size_t) kv.nv * r;
+    kv.fmt = KV_BF16;
+    return kv;
+}
+int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
+                const RowInfo* ri, const float* inv, int T) {
+    const size_t qn = 4 * (size_t) T * a.n_head * 128, kn = 2 * (size_t) npos * 128, vn = 2 * (size_t) npos * a.r;
+    float* dq = (float*) dev(qr, qn);
+    void *dK = dev(Kc, kn), *dV = dev(Vc, vn);
+    kc_mla_rope(0, a, dq, (const float*) dev(kr, 4 * (size_t) T * 128), (const float*) dev(c, 4 * (size_t) T * a.r),
+                mla_kv(dK, dV, npos, a.r), (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T), (const float*) dev(inv, 4 * 64), T);
+    if (fetch("kc_mla_rope", qr, dq, qn) || fetch("kc_mla_rope", Kc, dK, kn)) return -1;
+    return done("kc_mla_rope", Vc, dV, vn);
+}
+int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
+                const RowInfo* ri, float* olat, int T) {
+    const size_t on = 4 * (size_t) T * a.n_head * a.r;
+    float* dout = (float*) dev(NULL, on);
+    kc_mla_attn(0, a, (const float*) dev(ql, on), (const float*) dev(qr, 4 * (size_t) T * a.n_head * 128),
+                mla_kv(dev(Kc, 2 * (size_t) npos * 128), dev(Vc, 2 * (size_t) npos * a.r), npos, a.r),
+                (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T), (float*) dev(NULL, 4 * (size_t) T * a.n_head * a.n_splits * (a.r + 2)),
+                dout, T);
+    return done("kc_mla_attn", olat, dout, on);
+}
+
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {
     WSlice w;
