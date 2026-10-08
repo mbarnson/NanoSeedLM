@@ -78,11 +78,12 @@ typedef struct { int pos, kv0; int pad[2]; } RowInfo;   // kv0: the KV cache row
 #define MLA_MAXL 32        // latent dims per lane (r <= 1024)
 #define MLAF_Q 16          // Metal k_mla_attn: query heads per threadgroup
 #define MLAF_K 64          // keys per tile
-#define MLAF_SG 16         // simdgroups (MLAF_Q / 8 head blocks x 2 halves of the dims x key groups)
-#define MLAF_QB (MLAF_Q / 8)
-#define MLAF_KU (MLAF_K / 8 * MLAF_QB * 2 / MLAF_SG)   // 8-key blocks per simdgroup in the scores
+#define MLAF_SG 16         // simdgroups: one 8x8 score block each (MLAF_K / 8 x MLAF_Q / 8), one 8-dim output column
+#define MLAF_DC 128        // dims per staged chunk
+#define MLAF_KLD (MLAF_DC + 2)               // staged keys [key][dim] row stride (BF16; padded against bank conflicts)
+#define MLAF_QLD (MLAF_Q + 2)                // staged queries [dim][head] row stride
 #define MLAF_TH (32 * MLAF_SG / MLAF_Q)      // softmax: threads per head (<= 32: one simdgroup)
-#define MLAF_J (MLA_MAXL * 32 / 8 / MLAF_SG)   // latent 8-dim blocks per simdgroup (r <= 1024)
+#define MLAF_OC (MLA_MAXL * 32 / MLAF_DC)    // latent chunks (r <= 1024)
 typedef struct {
     int n_head, r, chunk, n_splits;
     float scale;
@@ -921,83 +922,76 @@ kernel void k_mla_rope(constant MlaArgs& a [[buffer(0)]], device float* qr [[buf
 
 // Latent attention (absorbed MLA: multi-query over the shared latent), flash style.  Threadgroup (split, block of
 // MLAF_Q query heads, row) of MLAF_SG simdgroups; per tile of MLAF_K keys:
-//   scores: S^T [keys][heads] = [c, k] . [ql, qr]^T on f32 simdgroup matrices; simdgroup (key group, half of the
-//     r + 128 dims, 8 heads) accumulates MLAF_KU 8x8 blocks, reusing each query fragment; the halves are summed in
-//     threadgroup memory, times the scale;
+//   scores: S^T [keys][heads] = [c, k] . [ql, qr]^T, MLAF_DC dims at a time: the tile's keys and the heads' queries are
+//     staged in threadgroup memory (BF16: the cache's and the queries' values, exact) with wide loads, then each
+//     simdgroup accumulates its 8x8 block on f32 simdgroup matrices; times the scale;
 //   online softmax per head (max, rescale, row sums) in threadgroup memory;
-//   O [heads][r] += P c: each simdgroup every MLAF_SG-th 8-dim block of the latent, each c fragment loaded once.
-// Keys past the row's split are zero / -inf.  All sums f32 (BF16 cache values are exact in f32).  n_splits > 1:
-// partials [row][head][split] = (m, l, acc[r]) for k_mla_reduce; n_splits == 1: olat[row][head] = bf16(acc / l).
+//   O [heads][r] += P c, MLAF_DC latent dims at a time (staged as the keys): each simdgroup one 8-dim column, both
+//     head blocks.
+// Keys past the row's split are zero / -inf.  Sums f32.  n_splits > 1: partials [row][head][split] = (m, l, acc[r])
+// for k_mla_reduce; n_splits == 1: olat[row][head] = bf16(acc / l).
 static inline float2 bf2(uint w) { return float2(as_type<float>(w << 16), as_type<float>(w & 0xFFFF0000u)); }
 kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql [[buffer(1)]], device const float* qr [[buffer(2)]],
                        device const ushort* Kc [[buffer(3)]], device const ushort* Vc [[buffer(4)]],
                        device const RowInfo* ri [[buffer(5)]], device float* out [[buffer(6)]],
                        uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float Sp[2][MLAF_K][MLAF_Q];   // partial scores of the two halves of the dims
-    threadgroup float P[MLAF_Q][MLAF_K];       // probabilities (against the running max)
+    threadgroup ushort Kt[MLAF_K * MLAF_KLD];          // staged keys (or latent values) [key][dim]
+    threadgroup ushort Qt[MLAF_DC * MLAF_QLD];         // staged queries [dim][head]
+    threadgroup float St[MLAF_K][MLAF_Q];              // scores
+    threadgroup float P[MLAF_Q][MLAF_K];               // probabilities (against the running max)
     threadgroup float ms[MLAF_Q], ls[MLAF_Q], cs[MLAF_Q];   // running max, row sum, this tile's rescale
-    const int split = (int) tg.x, h0 = (int) tg.y * MLAF_Q, t = (int) tg.z, r = a.r, H = a.n_head, nst = (r + ATT_HD) / 8;
+    const int split = (int) tg.x, h0 = (int) tg.y * MLAF_Q, t = (int) tg.z, r = a.r, H = a.n_head, D = r + ATT_HD;
     const int pos = ri[t].pos;
     const ulong kv0 = (ulong) ri[t].kv0;
     const int nsr = min(a.n_splits, (pos + a.chunk) / a.chunk);   // this row's split count, as a single AR step's
     const int chunk = (pos + nsr) / nsr;
     const int p0 = split * chunk, p1 = min(pos + 1, p0 + chunk);
     const int qid = (int) lane / 4, fm = (qid & 4) + ((int) lane / 2) % 4, fn = (qid & 2) * 2 + ((int) lane % 2) * 2;
-    const int qb = (int) sgi % MLAF_QB, dh = ((int) sgi / MLAF_QB) & 1, kg = (int) sgi / MLAF_QB / 2;   // heads qb*8.., dims half dh, keys
-    const int ha = h0 + qb * 8 + fn, hb = ha + 1;   // the query fragments' columns (heads past n_head: zero)
-    device const float* qla = ql + ((ulong) t * H + min(ha, H - 1)) * r;
-    device const float* qlb = ql + ((ulong) t * H + min(hb, H - 1)) * r;
-    device const float* qra = qr + ((ulong) t * H + min(ha, H - 1)) * ATT_HD;
-    device const float* qrb = qr + ((ulong) t * H + min(hb, H - 1)) * ATT_HD;
-    const float za = ha < H ? 1.0f : 0.0f, zb = hb < H ? 1.0f : 0.0f;
-    const int i0 = dh * (nst / 2), i1 = i0 + nst / 2;   // nst is even (r: a multiple of 32)
-    const int nj = (r / 8 - (int) sgi + MLAF_SG - 1) / MLAF_SG;   // this simdgroup's latent blocks
-    simdgroup_float8x8 O[MLAF_QB][MLAF_J];
+    const int kb = (int) sgi >> 1, qb = (int) sgi & 1;   // this simdgroup's score block: keys kb*8.., heads qb*8..
+    const int nc = (r + MLAF_DC - 1) / MLAF_DC;         // latent chunks
+    simdgroup_float8x8 O[MLAF_OC][2];                   // column sgi*8 of each latent chunk, both head blocks
 #pragma unroll
-    for (int i = 0; i < MLAF_QB; ++i)
-#pragma unroll
-        for (int j = 0; j < MLAF_J; ++j) O[i][j] = simdgroup_float8x8(0.0f);
+    for (int i = 0; i < MLAF_OC; ++i) { O[i][0] = simdgroup_float8x8(0.0f); O[i][1] = simdgroup_float8x8(0.0f); }
     if (tid < MLAF_Q) { ms[tid] = -INFINITY; ls[tid] = 0; }
     for (int k0 = p0; k0 < p1; k0 += MLAF_K) {
-        {   // scores of keys k0 + kg*8*MLAF_KU .. (MLAF_KU blocks: rows) for heads qb*8 .. + 7 (columns), dims half dh
-            simdgroup_float8x8 S[MLAF_KU];
-            ulong at[MLAF_KU];
-            bool live[MLAF_KU];
-#pragma unroll
-            for (int u = 0; u < MLAF_KU; ++u) {
-                S[u] = simdgroup_float8x8(0.0f);
-                const int p = k0 + (kg * MLAF_KU + u) * 8 + fm;
-                live[u] = p < p1;
-                at[u] = kv0 + (ulong) (live[u] ? p : k0);
+        simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
+        for (int dc = 0; dc < D; dc += MLAF_DC) {
+            const int cw = min(MLAF_DC, D - dc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous chunk's (or phase's) readers are done
+            for (int e = (int) tid; e < MLAF_K * cw / 8; e += 32 * MLAF_SG) {   // keys: 8 dims per load
+                const int key = e / (cw / 8), d = dc + (e % (cw / 8)) * 8, p = k0 + key;
+                uint4 w = 0;
+                if (p < p1) w = *(device const uint4*) (d < r ? Vc + (kv0 + (ulong) p) * r + d : Kc + (kv0 + (ulong) p) * ATT_HD + d - r);
+                threadgroup uint* kt = (threadgroup uint*) (Kt + key * MLAF_KLD + d - dc);
+                kt[0] = w.x; kt[1] = w.y; kt[2] = w.z; kt[3] = w.w;
             }
-            for (int i = i0; i < i1; ++i) {
-                simdgroup_float8x8 B;   // queries: rows = dims i*8 + fm, columns = heads
+            for (int e = (int) tid; e < MLAF_Q * cw / 4; e += 32 * MLAF_SG) {   // queries: 4 dims per load, transposed
+                const int q = e / (cw / 4), d = dc + (e % (cw / 4)) * 4, h = h0 + q;
+                float4 v = 0;
+                if (h < H) v = *(device const float4*) (d < r ? ql + ((ulong) t * H + h) * r + d : qr + ((ulong) t * H + h) * ATT_HD + d - r);
+                for (int j = 0; j < 4; ++j) Qt[(d - dc + j) * MLAF_QLD + q] = tobf(v[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < cw / 8; ++i) {
+                simdgroup_float8x8 A, B;   // A: keys kb*8 + fm, dims i*8 + fn, +1; B: dims i*8 + fm, heads qb*8 + fn, +1
+                thread auto& ae = A.thread_elements();
                 thread auto& be = B.thread_elements();
-                const int dq = i * 8 + fm;
-                be[0] = (dq < r ? qla[dq] : qra[dq - r]) * za;
-                be[1] = (dq < r ? qlb[dq] : qrb[dq - r]) * zb;
-                const int d = i * 8 + fn;   // keys: this lane's dims d, d + 1
-#pragma unroll
-                for (int u = 0; u < MLAF_KU; ++u) {
-                    simdgroup_float8x8 A;
-                    thread auto& ae = A.thread_elements();
-                    const float2 kv = bf2(*(device const uint*) (d < r ? Vc + at[u] * r + d : Kc + at[u] * ATT_HD + d - r));
-                    ae[0] = live[u] ? kv.x : 0.0f;
-                    ae[1] = live[u] ? kv.y : 0.0f;
-                    simdgroup_multiply_accumulate(S[u], A, B, S[u]);
-                }
+                const float2 kv = bf2(*(threadgroup const uint*) (Kt + (kb * 8 + fm) * MLAF_KLD + i * 8 + fn));
+                const float2 qv = bf2(*(threadgroup const uint*) (Qt + (i * 8 + fm) * MLAF_QLD + qb * 8 + fn));
+                ae[0] = kv.x; ae[1] = kv.y;
+                be[0] = qv.x; be[1] = qv.y;
+                simdgroup_multiply_accumulate(S, A, B, S);
             }
-#pragma unroll
-            for (int u = 0; u < MLAF_KU; ++u) simdgroup_store(S[u], &Sp[dh][(kg * MLAF_KU + u) * 8][qb * 8], MLAF_Q);
         }
+        simdgroup_store(S, &St[kb * 8][qb * 8], MLAF_Q);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {   // online softmax: thread (head q, keys k + MLAF_TH u); a head's threads are adjacent lanes
             const int q = (int) tid / MLAF_TH, k = (int) tid % MLAF_TH;
             float s[MLAF_K / MLAF_TH], mx = -INFINITY;
             for (int u = 0; u < MLAF_K / MLAF_TH; ++u) {
                 const int kk = k + MLAF_TH * u;
-                s[u] = k0 + kk < p1 ? (Sp[0][kk][q] + Sp[1][kk][q]) * a.scale : -INFINITY;
+                s[u] = k0 + kk < p1 ? St[kk][q] * a.scale : -INFINITY;
                 mx = max(mx, s[u]);
             }
             for (ushort o = 1; o < MLAF_TH; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, o));
@@ -1017,53 +1011,55 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {   // O = O * rescale + P c over this simdgroup's latent blocks
+        {   // O = O * rescale + P c, a latent chunk at a time
+            const float c0 = cs[fm], c1 = cs[8 + fm];
 #pragma unroll
-            for (int qi = 0; qi < MLAF_QB; ++qi) {
-                const float c = cs[qi * 8 + fm];
-#pragma unroll
-                for (int jj = 0; jj < MLAF_J; ++jj) {
-                    if (jj >= nj) continue;   // unrolled with constant indices: O stays in registers
-                    thread auto& oe = O[qi][jj].thread_elements();
-                    oe[0] *= c;
-                    oe[1] *= c;
-                }
+            for (int ci = 0; ci < MLAF_OC; ++ci) {
+                thread auto& o0 = O[ci][0].thread_elements();
+                thread auto& o1 = O[ci][1].thread_elements();
+                o0[0] *= c0; o0[1] *= c0; o1[0] *= c1; o1[1] *= c1;
             }
-            for (int kb = 0; kb < MLAF_K / 8 && k0 + kb * 8 < p1; ++kb) {
-                simdgroup_float8x8 Pa[MLAF_QB];
+            const int nkb = min(MLAF_K / 8, (p1 - k0 + 7) / 8);
 #pragma unroll
-                for (int qi = 0; qi < MLAF_QB; ++qi) simdgroup_load(Pa[qi], &P[qi * 8][kb * 8], MLAF_K);
-                const int p = k0 + kb * 8 + fm;
-                const bool live = p < p1;
-                device const ushort* vr = Vc + (kv0 + (ulong) (live ? p : k0)) * r + fn;
-#pragma unroll
-                for (int jj = 0; jj < MLAF_J; ++jj) {
-                    if (jj >= nj) continue;
-                    simdgroup_float8x8 B;   // rows = keys, columns = latent dims
+            for (int ci = 0; ci < MLAF_OC; ++ci) {
+                if (ci >= nc) continue;   // unrolled with constant indices: O stays in registers
+                const int dc = ci * MLAF_DC, cw = min(MLAF_DC, r - dc);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int e = (int) tid; e < MLAF_K * cw / 8; e += 32 * MLAF_SG) {   // latent values: 8 dims per load
+                    const int key = e / (cw / 8), d = dc + (e % (cw / 8)) * 8, p = k0 + key;
+                    const uint4 w = p < p1 ? *(device const uint4*) (Vc + (kv0 + (ulong) p) * r + d) : uint4(0);
+                    threadgroup uint* kt = (threadgroup uint*) (Kt + key * MLAF_KLD + d - dc);
+                    kt[0] = w.x; kt[1] = w.y; kt[2] = w.z; kt[3] = w.w;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if ((int) sgi * 8 >= cw) continue;
+                for (int j = 0; j < nkb; ++j) {
+                    simdgroup_float8x8 A0, A1, B;   // P: heads x keys j*8..; B: keys j*8 + fm, dims sgi*8 + fn, +1
+                    simdgroup_load(A0, &P[0][j * 8], MLAF_K);
+                    simdgroup_load(A1, &P[8][j * 8], MLAF_K);
                     thread auto& be = B.thread_elements();
-                    const float2 v = bf2(*(device const uint*) (vr + ((int) sgi + jj * MLAF_SG) * 8));
-                    be[0] = live ? v.x : 0.0f;
-                    be[1] = live ? v.y : 0.0f;
-#pragma unroll
-                    for (int qi = 0; qi < MLAF_QB; ++qi) simdgroup_multiply_accumulate(O[qi][jj], Pa[qi], B, O[qi][jj]);
+                    const float2 v = bf2(*(threadgroup const uint*) (Kt + (j * 8 + fm) * MLAF_KLD + (int) sgi * 8 + fn));
+                    be[0] = v.x; be[1] = v.y;
+                    simdgroup_multiply_accumulate(O[ci][0], A0, B, O[ci][0]);
+                    simdgroup_multiply_accumulate(O[ci][1], A1, B, O[ci][1]);
                 }
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-    for (int qi = 0; qi < MLAF_QB; ++qi) {
-        const int q = qi * 8 + fm, h = h0 + q;
-        const float l = ls[q];
+    for (int ci = 0; ci < MLAF_OC; ++ci) {
+        const int d = ci * MLAF_DC + (int) sgi * 8 + fn;
+        if (ci >= nc || d >= r) continue;
 #pragma unroll
-        for (int jj = 0; jj < MLAF_J; ++jj) {
-            if (jj >= nj || h >= H) continue;
-            const int d = ((int) sgi + jj * MLAF_SG) * 8 + fn;
-            thread auto& oe = O[qi][jj].thread_elements();
+        for (int qi = 0; qi < 2; ++qi) {
+            const int q = qi * 8 + fm, h = h0 + q;
+            if (h >= H) continue;
+            thread auto& oe = O[ci][qi].thread_elements();
             if (a.n_splits == 1) {
                 device float* o = out + ((ulong) t * H + h) * r + d;
-                o[0] = bfr(oe[0] / l);
-                o[1] = bfr(oe[1] / l);
+                o[0] = bfr(oe[0] / ls[q]);
+                o[1] = bfr(oe[1] / ls[q]);
             } else {
                 device float* pp = out + (((ulong) t * H + h) * a.n_splits + split) * (r + 2);
                 pp[2 + d] = oe[0];

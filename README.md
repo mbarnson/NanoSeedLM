@@ -197,12 +197,14 @@ The engine also runs K2-Horizon-MoVA converted from grouped-query attention to m
 q_lat, v_up}`. `k_proj` is unused, and the dense layers fold `v_proj` into `kv_a_x`.
 
 Per layer the cache holds the latent `c = kv_a_x x (+ kv_a_v v)` and one 128-dim RoPE key per token: at rank 768,
-84 KiB per token instead of 192 KiB. Attention is computed absorbed, as multi-query attention over the latent
-(`k_mla_attn`: one simdgroup per query head, each key loaded once per threadgroup), then the per-head `v_up` and the
-gate (`k_heads_mv`). The CUDA engine runs the same kernels (8 query heads per block there); its KV cache places MLA's
-per-layer latent widths in VRAM and host memory as it does GQA's rows. Not yet: the 8-bit cache for MLA (`--kv q8` is
-refused), packed (Q8 / seed) MLA tensors, and a fast prefill kernel (prompt chunks use the one-pass latent kernel,
-about 6x the attention arithmetic of GQA).
+84 KiB per token instead of 192 KiB. Attention is computed absorbed, as multi-query attention over the latent, then
+the per-head `v_up` and the gate. On Metal, `k_mla_attn` is flash style: 16 query heads per threadgroup, 64-key tiles
+staged in threadgroup memory, scores and `P c` on simdgroup matrices, online softmax, for prompts and (split-key)
+decode alike; prompt rows run the per-head maps as GEMMs. On an M4 Max (q8mx) that took prefill of 2048 tokens from
+21.3 s to 6.6 s (GQA: 3.2 s) and of 8192 tokens from 272 s to 64 s (GQA: 15 s); absorbed attention still does about
+6x the arithmetic of GQA's. The CUDA engine keeps its one-pass latent kernel (8 query heads per block); its KV cache
+places MLA's per-layer latent widths in VRAM and host memory as it does GQA's rows. Not yet: the 8-bit cache for MLA
+(`--kv q8` is refused), packed (Q8 / seed) MLA tensors (the MLA projections stay BF16), and the flash kernel on CUDA.
 
 ## Make a model folder
 
