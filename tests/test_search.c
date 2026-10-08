@@ -2,6 +2,7 @@
 //   1. synthetic recovery: blocks generated from a known (seed, e, q) decode back exactly (zero error)
 //   2. the Clang-vector search returns the identical (seed, nibble) as the scalar reference, on Gaussian blocks of
 //      several scales and on heavy-tailed blocks, with a reduced budget (many blocks) and the full budget (fewer)
+#undef NDEBUG   // the checks are asserts: they must run in Release builds (CMake defines NDEBUG)
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>

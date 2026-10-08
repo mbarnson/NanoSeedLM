@@ -21,12 +21,19 @@ K2-Horizon-MoVA is an atypical MoE. Between mixture of values, gated attention, 
 **macOS:** Apple Silicon, Xcode command-line tools with the Metal compiler.
 
 **Windows / Linux:** an NVIDIA GPU of the Ampere generation or newer (RTX 30, 40, 50 series; sm_80+) with 12 GB or
-more of VRAM, 48 GB or more of RAM (64 GB for long contexts), the CUDA Toolkit 12.4 or newer and CMake 3.24 or newer
-with Ninja (`pip install cmake ninja`).
+more of VRAM, 48 GB or more of RAM (64 GB for long contexts), the CUDA Toolkit 12.4 or newer (12.8 or newer for the
+RTX 50 series) and CMake 3.24 or newer with Ninja (`pip install cmake ninja`).  The build compiles for sm_80, 86, 89 and,
+with CUDA 12.8 or newer, sm_120; other GPUs (Hopper, datacenter Blackwell) run the compute_89 PTX, which the driver
+compiles on first use.  `-DCMAKE_CUDA_ARCHITECTURES=native` builds for the installed GPU only.
 - Windows: Visual Studio 2022 Build Tools (C++). ICU comes with Windows 10 1903 and later.
 - Linux: GCC or Clang, and ICU (`libicu-dev`).
 
-Either platform, for the MLX tools: Python 3 with `mlx`, `mlx-lm` and `huggingface_hub` (macOS only).
+Python tools (optional; Python 3):
+- Any platform, with `tokenizers` and `numpy`: `tools/tokenizer_golden.py` (regenerates `tests/data/tokenizer_golden.json`
+  from a model's `tokenizer.json`) and `tools/mova_export.py windows | prompts | bench` (inputs for `nslm-mova-score`,
+  `nslm-mova-gen` and `nslm-mova-bench`); `tools/template_golden.py` needs `transformers`.
+- macOS only, with `mlx`, `mlx-lm` and `huggingface_hub`: the MLX loader and the tools that run the model in MLX
+  (`mova_capture.py`, `mova_score.py`, `mova_affine_golden.py`, `mova_export.py routes`).
 
 ## Build and test
 
@@ -52,8 +59,10 @@ cmake --build build && ctest --test-dir build
 ```
 
 The binaries are in `out/bin` (macOS) or `build/bin` (Windows, Linux).  Both builds run the same tests from the same
-C sources; `test_mova_cfg` reads a model folder's `config.json` (macOS: `MOVA_DIR=...`; CMake: runs only with
-`-DNSLM_MODEL_DIR=...`, or set `NSLM_MODEL_DIR` before the first `win\build.bat`).  `make test` builds
+C sources.  `test_mova_kernels` checks every GPU kernel against a C reference, through a small backend per GPU API
+(`tests/kernel_backend_cuda.c`, `tests/kernel_backend_metal.m`).  The tests that read a model folder skip without one:
+`test_mova_cfg` and `test_tokenizer` (`MOVA_DIR=...`, or CMake's `-DNSLM_MODEL_DIR=...`, or set `NSLM_MODEL_DIR` before
+the first `win\build.bat`).  The GPU tests skip on a machine without a GPU.  `make test` builds
 `test_affine`'s MLX goldens; the CMake builds have no MLX and skip it unless the goldens exist.
 
 If you want to test the MLX remote code, use the k2_horizon_model.py script included with the model on HuggingFace.
@@ -139,7 +148,10 @@ reads all of it, and on a 16 GB card most of it then sits behind PCIe.
 
 Environment knobs: `NSLM_VRAM_RESERVE_MB` (VRAM left free, default 512), `NSLM_EXPERT_MIN_MB` (VRAM kept for experts
 when the KV cache is large, default 6144), `NSLM_KV_VRAM_MB`, `NSLM_EXPERT_VRAM_MB` (fix the shares),
-`NSLM_CACHE_STATS=1` (expert cache hits at exit), `NSLM_NO_GRAPH=1`.
+`NSLM_CACHE_STATS=1` (expert cache hits at exit), `NSLM_NO_GRAPH=1`, `NSLM_NO_PREDICT=1` (no next-layer expert
+prediction in decode), `NSLM_SEED_GEMM_F32=1`. By default the prefill GEMM rounds seed weights to BF16 for the tensor
+cores. `NSLM_SEED_GEMM_F32=1` keeps them exact in f32, as the decode matvec and the Metal engine do. Against the BF16
+reference this changed neither KLD (held-out 0.0261 vs 0.0260) nor NLL, and it costs about 15% of 4k prefill.
 
 ## MLX and oMLX
 
@@ -154,7 +166,7 @@ Other tools:
 | `nslm-mova-score` | Logits for KLD against a reference |
 | `nslm-mova-gen` | Greedy and sampled outputs for a prompt set |
 | `nslm-mova-plcheck` | Prompt-lookup decode against plain decode (must be identical) |
-| `nslm-mova-kbench` | Single-kernel speed (Metal) |
+| `nslm-mova-kbench` | Single-kernel speed at MoVA's shapes (one program per GPU API: the Metal one also selects Metal kernel variants) |
 | `nslm-mova-refcheck` | The GPU engine against a C reference forward on the CPU (KL, argmax, router choices) |
 | `nslm-mova-routes` | Router choices of a prompt and a generation (expert-cache studies) |
 
@@ -188,7 +200,7 @@ out/bin/nslm-mova-pack --model SNAPSHOT --config p4mx --blk4 out/blocks --q4 v -
 | `engine/` | Engines: Metal (`mova_gpu.m`, `kernels_moe.metal`) and CUDA (`mova_cuda.c`, `kernels_moe.cu`) |
 | `nslm/` | LFSR, seed search (C, Metal and CUDA), model folder reader and writer, packer, CPU reference forward |
 | `harness/` | Command-line tools, server, tokenizer (ICU), chat template and tool-call parser, platform layer |
-| `tests/` | One test binary for each part; the same tests on both platforms |
+| `tests/` | One test binary for each part; the same tests on every platform (GPU kernels through `kernel_backend.h`) |
 | `win/` | POSIX shims for MSVC and `build.bat` |
 | `tools/` | MLX loader; Python tools for calibration and reference data |
 

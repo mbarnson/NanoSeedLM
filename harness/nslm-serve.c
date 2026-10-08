@@ -51,7 +51,10 @@ typedef int sock_t;
 
 #define CHUNK 16          // tokens per engine call: the streaming granularity
 #define FIRST_CHUNK 4     // a short first call, so the first token arrives early
-#define MAX_BODY (64 << 20)
+#define MAX_BODY (16 << 20)      // a request body (a full 64k-token context is well under 1 MB of text)
+#define MAX_CONNS 64             // connections served at once; more are answered 503 and closed
+#define READ_DEADLINE_S 60.0     // a request must arrive whole within this
+#define IO_TIMEOUT_MS 60000      // one stalled recv / send (a client that stops reading ends its generation)
 #define TOK_EOS 1         // <|ifm|endoftext|>
 #define TOK_IM_END 250019 // <|ifm|im_end|>
 
@@ -84,6 +87,12 @@ static const Json* jfield(const Json* o, const char* k, JType t) {   // member o
     return NULL;
 }
 static double jnumber(const Json* v) { return v->t == J_INT ? (double) v->i : v->d; }
+// An integer field clamped to [lo, hi] (a double is truncated toward zero first; NaN gives lo).
+static int64_t jclamp(const Json* v, int64_t lo, int64_t hi) {
+    if (v->t == J_INT) return v->i < lo ? lo : v->i > hi ? hi : v->i;
+    const double d = v->d;
+    return !(d >= (double) lo) ? lo : d >= (double) hi ? hi : (int64_t) d;
+}
 
 // ---- HTTP ----
 
@@ -110,7 +119,8 @@ static void send_json(Conn* c, int status, Json* obj) {   // consumes obj
     char* body = json_dumps(obj, 1);
     json_free(obj);
     const char* reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 404 ? "Not Found"
-                       : status == 413 ? "Payload Too Large" : "Internal Server Error";
+                       : status == 408 ? "Request Timeout" : status == 413 ? "Payload Too Large"
+                       : status == 503 ? "Service Unavailable" : "Internal Server Error";
     char head[512];
     snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%sConnection: close\r\n\r\n",
              status, reason, strlen(body), kCors);
@@ -151,7 +161,9 @@ static int read_request(Conn* c, Request* r) {
     char tmp[65536];
     char* end = NULL;
     memset(r, 0, sizeof *r);
+    const double t0 = now_s();   // the whole request within READ_DEADLINE_S (each recv also times out: IO_TIMEOUT_MS)
     while (!end) {
+        if (now_s() - t0 > READ_DEADLINE_S) { free(buf.p); return 408; }
         const int n = (int) recv(c->fd, tmp, (int) sizeof tmp, 0);
         if (n <= 0) { free(buf.p); return -1; }
         buf_put(&buf, tmp, (size_t) n);
@@ -165,8 +177,8 @@ static int read_request(Conn* c, Request* r) {
     if (sscanf(line, "%15s %511s", r->method, r->path) != 2) { free(buf.p); return 400; }
     char* q = strchr(r->path, '?');
     if (q) *q = 0;
-    long len = 0;
-    bool expect = false;
+    long long len = 0;
+    bool expect = false, bad_len = false;
     for (char* l = eol + 2; l < buf.p + hlen;) {
         char* e = strstr(l, "\r\n");
         if (!e || e > buf.p + hlen) e = buf.p + hlen;
@@ -177,7 +189,12 @@ static int read_request(Conn* c, Request* r) {
             char* v = colon + 1;
             while (*v == ' ' || *v == '\t') ++v;
             for (char* k = l; *k; ++k) if (*k >= 'A' && *k <= 'Z') *k = (char) (*k + 32);
-            if (!strcmp(l, "content-length")) len = atol(v);
+            if (!strcmp(l, "content-length")) {
+                char* ve = NULL;
+                len = strtoll(v, &ve, 10);
+                while (ve && (*ve == ' ' || *ve == '\t')) ++ve;
+                bad_len = ve == v || (ve && *ve) || len < 0;
+            }
             if (!strcmp(l, "expect")) {
                 char lv[32];
                 snprintf(lv, sizeof lv, "%s", v);
@@ -187,17 +204,19 @@ static int read_request(Conn* c, Request* r) {
         }
         l = e + 2;
     }
-    if (len < 0 || len > MAX_BODY) { free(buf.p); return 413; }
+    if (bad_len) { free(buf.p); return 400; }
+    if (len > MAX_BODY) { free(buf.p); return 413; }
     Buf b = {0};
     buf_put(&b, end + 4, buf.n - hlen - 4);
     free(buf.p);
-    if (expect && (long) b.n < len) send_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
-    while ((long) b.n < len) {
+    if (expect && (long long) b.n < len) send_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    while ((long long) b.n < len) {
+        if (now_s() - t0 > READ_DEADLINE_S) { free(b.p); return 408; }
         const int n = (int) recv(c->fd, tmp, (int) sizeof tmp, 0);
         if (n <= 0) { free(b.p); return -1; }
         buf_put(&b, tmp, (size_t) n);
     }
-    if ((long) b.n > len) b.n = (size_t) len;
+    if ((long long) b.n > len) b.n = (size_t) len;
     if (!b.p) buf_put(&b, "", 0);
     r->body = b.p;
     r->body_len = b.n;
@@ -557,19 +576,19 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     if (nn && jnumber(nn) != 1) { json_free(req); send_error(c, 400, "only n=1 is supported"); return; }
     const Json* mt = jfield(req, "max_completion_tokens", J_NUM);
     if (!mt) mt = jfield(req, "max_tokens", J_NUM);
-    g.max_tokens = mt ? (int) jnumber(mt) : g_ctx;
+    g.max_tokens = mt ? (int) jclamp(mt, 0, INT32_MAX) : g_ctx;
     const Json* v = jfield(req, "temperature", J_NUM);
     g.temperature = v ? jnumber(v) : 1.0;
     v = jfield(req, "top_p", J_NUM);
     g.top_p = v ? jnumber(v) : 0.95;
     if (g.top_p <= 0 || g.top_p > 1) g.top_p = 1;
     v = jfield(req, "top_k", J_NUM);
-    g.top_k = v ? (int) jnumber(v) : 0;
+    g.top_k = v ? (int) jclamp(v, 0, INT32_MAX) : 0;
     v = jfield(req, "seed", J_NUM);
-    g.rng = v ? (uint64_t) (int64_t) jnumber(v) : plat_random_u64();
+    g.rng = !v ? plat_random_u64() : v->t == J_INT ? (uint64_t) v->i : (uint64_t) jclamp(v, INT64_MIN, INT64_MAX);
     if (g.max_tokens < 1) { json_free(req); send_error(c, 400, "max_tokens must be >= 1"); return; }
     const Json* sv = json_get(req, "stream");
-    g.stream = sv && sv->t == J_TRUE;
+    g.stream = json_truthy(sv);   // true, or a nonzero number (as the Objective-C server read it)
     const Json* so = jfield(req, "stream_options", J_OBJ);
     g.include_usage = so && json_truthy(json_get(so, "include_usage"));
     const Json* stop = json_get(req, "stop");
@@ -715,6 +734,9 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     json_free(req);
 }
 
+static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_conns;   // connection threads running
+
 static void* handle_conn(void* arg) {
     Conn c = {(sock_t) (intptr_t) arg, false};
     Request r;
@@ -754,6 +776,13 @@ static void* handle_conn(void* arg) {
     }
     free(r.body);
     sock_close(c.fd);
+    return NULL;
+}
+static void* conn_thread(void* arg) {
+    handle_conn(arg);
+    pthread_mutex_lock(&g_conn_lock);
+    --g_conns;
+    pthread_mutex_unlock(&g_conn_lock);
     return NULL;
 }
 
@@ -865,8 +894,30 @@ int main(int argc, char** argv) {
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof one);
+#ifdef _WIN32
+        const DWORD tmo = IO_TIMEOUT_MS;
+#else
+        const struct timeval tmo = {IO_TIMEOUT_MS / 1000, (IO_TIMEOUT_MS % 1000) * 1000};
+#endif
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &tmo, sizeof tmo);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*) &tmo, sizeof tmo);
+        pthread_mutex_lock(&g_conn_lock);
+        const bool full = g_conns >= MAX_CONNS;
+        if (!full) ++g_conns;
+        pthread_mutex_unlock(&g_conn_lock);
+        if (full) {
+            Conn c = {fd, false};
+            send_error(&c, 503, "too many connections");
+            sock_close(fd);
+            continue;
+        }
         pthread_t th;
-        if (pthread_create(&th, NULL, handle_conn, (void*) (intptr_t) fd) == 0) pthread_detach(th);
-        else sock_close(fd);
+        if (pthread_create(&th, NULL, conn_thread, (void*) (intptr_t) fd) == 0) pthread_detach(th);
+        else {
+            sock_close(fd);
+            pthread_mutex_lock(&g_conn_lock);
+            --g_conns;
+            pthread_mutex_unlock(&g_conn_lock);
+        }
     }
 }

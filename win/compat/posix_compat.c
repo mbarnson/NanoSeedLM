@@ -34,9 +34,26 @@ uint64_t nslm_clock_gettime_nsec_np(int clk) {
     return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
 }
 
+// errno for the last Win32 error of a file call
+static int errno_of(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_INVALID_DRIVE: return ENOENT;
+    case ERROR_ACCESS_DENIED: case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: return EACCES;
+    case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: return EEXIST;
+    case ERROR_NOT_SAME_DEVICE: return EXDEV;
+    case ERROR_DISK_FULL: case ERROR_HANDLE_DISK_FULL: return ENOSPC;
+    case ERROR_INVALID_NAME: case ERROR_BAD_PATHNAME: case ERROR_FILENAME_EXCED_RANGE: return EINVAL;
+    default: return EIO;
+    }
+}
+
 #undef rename
+// POSIX rename replaces the target atomically even while another process has it open; Windows cannot replace a file
+// that is open without FILE_SHARE_DELETE (the C runtime's fopen does not share delete): that case fails with EACCES.
 int nslm_rename(const char* from, const char* to) {
-    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) ? 0 : -1;
+    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) return 0;
+    errno = errno_of(GetLastError());
+    return -1;
 }
 
 // ---- files ----------------------------------------------------------------------------------------------------------

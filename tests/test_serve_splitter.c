@@ -1,5 +1,6 @@
-// tests/test_serve_splitter.c - the server's thinking / answer splitter (harness/nslm-serve.c), without a model or a
-// socket: every byte split of each case, and one-byte feeds, must give the same reasoning and content.
+// tests/test_serve_splitter.c - parts of the server (harness/nslm-serve.c) without a model or a socket: the thinking /
+// answer splitter (every byte split of each case, and one-byte feeds, must give the same reasoning and content), JSON
+// output of invalid UTF-8, and the clamping of request numbers.
 #define main nslm_server_main
 #include "../harness/nslm-serve.c"
 #undef main
@@ -52,5 +53,41 @@ int main(void) {
     failed += check("</ifm|think><ifm|think>quoted", "", "<ifm|think>quoted", true);
     failed += check("<ifm|think>raw</ifm|think>", "", "<ifm|think>raw</ifm|think>", false);
     printf("thinking splitter: %s\n", failed ? "FAILED" : "passed (all byte splits and one-byte feeds)");
+
+    // JSON text stays valid UTF-8 whatever bytes the model samples: invalid sequences become U+FFFD, one per byte
+    int jf = 0;
+    static const struct { const char *in, *out; } U[] = {
+        {"ok \xC3\xA9 \xE2\x98\x95 \xF0\x9F\x98\x80", "\"ok \xC3\xA9 \xE2\x98\x95 \xF0\x9F\x98\x80\""},   // valid: unchanged
+        {"a\xE2" "b", "\"a\xEF\xBF\xBD" "b\""},                   // a lead byte followed by ASCII
+        {"\x80", "\"\xEF\xBF\xBD\""},                             // a lone continuation byte
+        {"\xC0\xAF", "\"\xEF\xBF\xBD\xEF\xBF\xBD\""},             // an overlong '/'
+        {"\xED\xA0\x80", "\"\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\""},   // a surrogate
+        {"\xF4\x90\x80\x80", "\"\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\""},   // past U+10FFFF
+        {"end\xF0\x9F", "\"end\xEF\xBF\xBD\xEF\xBF\xBD\""},        // truncated at the end
+    };
+    for (size_t i = 0; i < sizeof U / sizeof *U; ++i) {
+        Json* j = jstrn(U[i].in, strlen(U[i].in));
+        char* d = json_dumps(j, 1);
+        if (strcmp(d, U[i].out)) { ++jf; fprintf(stderr, "UTF-8 case %zu: %s\n", i, d); }
+        free(d);
+        json_free(j);
+    }
+    // request numbers: integers exact, everything else clamped (no undefined casts)
+    const char* nums = "[18446744073709551615, 9007199254740993, 1e10, -5, 1e300, -1e300, 3.9, 1]";
+    Json* a = json_parse(nums, strlen(nums), NULL, 0);
+    jf += !a || a->n != 8;
+    if (a && a->n == 8) {
+        jf += jclamp(a->v[0], 0, INT32_MAX) != INT32_MAX;                  // past int64: a double, clamped
+        jf += a->v[1]->t != J_INT || (uint64_t) a->v[1]->i != 9007199254740993ull;   // 2^53 + 1 stays exact
+        jf += jclamp(a->v[2], 0, INT32_MAX) != INT32_MAX;                  // max_tokens 1e10
+        jf += jclamp(a->v[3], 0, INT32_MAX) != 0;
+        jf += jclamp(a->v[4], INT64_MIN, INT64_MAX) != INT64_MAX;
+        jf += jclamp(a->v[5], INT64_MIN, INT64_MAX) != INT64_MIN;
+        jf += jclamp(a->v[6], 0, 100) != 3;
+        jf += jclamp(a->v[7], 0, 100) != 1;
+    }
+    json_free(a);
+    printf("JSON output and request numbers: %s\n", jf ? "FAILED" : "passed");
+    failed += jf;
     return failed ? 1 : 0;
 }

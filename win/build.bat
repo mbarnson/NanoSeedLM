@@ -8,12 +8,15 @@ rem (no paths inside parenthesised blocks: the ")" of "Program Files (x86)" woul
 set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
 if not defined VSINSTALLDIR call :findvs || exit /b 1
 cd /d "%~dp0.."
-if not exist build\build.ninja (
-  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNSLM_MODEL_DIR=%NSLM_MODEL_DIR%" || exit /b 1
-)
+if not exist build\build.ninja call :configure || exit /b 1
 cmake --build build || exit /b 1
 if /i "%1"=="test" ctest --test-dir build --output-on-failure || exit /b 1
 endlocal
+exit /b 0
+
+:configure
+rem a label, not a parenthesised block: NSLM_MODEL_DIR may contain ")" (C:\Program Files (x86)\...)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNSLM_MODEL_DIR=%NSLM_MODEL_DIR%" || exit /b 1
 exit /b 0
 
 :findvs

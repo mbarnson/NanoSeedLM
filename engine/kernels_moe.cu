@@ -159,7 +159,9 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
         }
         return acc;
     }
-    if (fmt == MF_Q8 && nbk % 64 == 0) {   // two adjacent blocks per lane: one 16-byte load, one group's scale and bias
+    if (fmt == MF_Q8 && nbk % 64 == 0) {   // two adjacent blocks per lane: one 16-byte load, one group's scale and bias.
+        // The products add in a different order than in the generic path and in Metal (whose lane reductions differ from
+        // CUDA's anyway): f32 noise within tests/test_mova_kernels.c's bound; summing per block cost 1% of decode.
         const uint16_t* S = (const uint16_t*) w->p[1];
         const uint16_t* B = (const uint16_t*) w->p[2];
         const uint4* qr = (const uint4*) ((const uint32_t*) w->p[0] + ((size_t) r * K) / 4);
@@ -325,8 +327,11 @@ static __device__ __forceinline__ void tile_weights(int fmt, const WSlice* w, co
 }
 
 // Tensor-core GEMM (prefill): Y[n][r] = sum_k W[r][k] X[n][k] for a 64-row x 64-column tile.  BF16 mma.sync with f32
-// accumulation: the activations are BF16 values (exact), the weights are their BF16 values (BF16 / Q8 / Q4 as
-// dequantized; seed blocks rounded to BF16 as nslm_decode_block does).  Four warps, each a 32 x 32 sub-tile.
+// accumulation: the activations are BF16 values (exact).  BF16 / Q8 / Q4 weights dequantize to BF16 values (exact).
+// Seed weights (f32 in the matvec and in the Metal GEMM) are rounded to BF16 here (NT = 1), or, in the k_mm3 kernels
+// (NSLM_SEED_GEMM_F32), carried as NT = 3 BF16 terms hi + mid + lo whose sum is the f32 value exactly.  Measured on the
+// real model against BF16 reference log-probs, the exact weights change neither KLD (held-out 0.0261 vs 0.0260, standard
+// error 0.0005) nor NLL, and cost 15% of 4k prefill, so BF16 is the default.  Four warps, each a 32 x 32 sub-tile.
 // Dense: tile (row block, token block).  Grouped: (row block, tile table entry); the entry's pairs are
 // perm[start .. start + count), reading input row pair / xdiv, writing row pair.  ntiles (device) bounds grouped grids.
 #define SLD (MMT_BK + 8)   // shared row stride, BF16 elements (conflict-free fragment loads)
@@ -336,14 +341,16 @@ static __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, con
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+template <int NT>   // weight terms (shared memory and MMAs scale with it: a template, so NT = 1 keeps its occupancy)
 static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
                                                const int32_t* perm, const MmTile* tiles, const int32_t* ntiles,
                                                const uint32_t* G) {
-    __shared__ __align__(16) uint16_t Ws[MMT_BM][SLD];
+    __shared__ __align__(16) uint16_t Ws[NT][MMT_BM][SLD];
     __shared__ __align__(16) uint16_t Xs[MMT_BN][SLD];
     __shared__ int srow[MMT_BN], drow[MMT_BN];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int grouped = tiles != NULL;
+    const int nterm = NT;
     if (grouped && ntiles && (int) blockIdx.y >= *ntiles) return;
     const int r0 = (int) blockIdx.x * MMT_BM;
     int start, count;
@@ -366,13 +373,15 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
         // weights: 64 rows x 4 blocks of 8, two blocks per thread
         for (int b = tid; b < MMT_BM * 4; b += 128) {
             const int rr = b >> 2, jb = b & 3, row = r0 + rr;
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (row < a.R) {
-                float f[8];
-                tile_weights(fmt, &wt, G, row, a.K, k0 / 8 + jb, f);
-                v = make_uint4(pack_bf2(f[0], f[1]), pack_bf2(f[2], f[3]), pack_bf2(f[4], f[5]), pack_bf2(f[6], f[7]));
+            float f[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            if (row < a.R) tile_weights(fmt, &wt, G, row, a.K, k0 / 8 + jb, f);
+            for (int q = 0; q < nterm; ++q) {   // f = hi + mid + lo: each term the BF16 value of what remains (exact)
+                uint16_t h[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { h[i] = tobf(f[i]); f[i] -= __uint_as_float((uint32_t) h[i] << 16); }
+                *(uint4*) &Ws[q][rr][jb * 8] = make_uint4(h[0] | (uint32_t) h[1] << 16, h[2] | (uint32_t) h[3] << 16,
+                                                          h[4] | (uint32_t) h[5] << 16, h[6] | (uint32_t) h[7] << 16);
             }
-            *(uint4*) &Ws[rr][jb * 8] = v;
         }
         // inputs: 64 columns x 32 k, 16 per thread
         {
@@ -392,23 +401,25 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
         for (int kk = 0; kk < MMT_BK; kk += 16) {
             uint32_t af[2][4], bfr2[4][2];
 #pragma unroll
-            for (int mt = 0; mt < 2; ++mt) {
-                const int rr = wm + mt * 16 + g;
-                af[mt][0] = *(const uint32_t*) &Ws[rr][kk + t4 * 2];
-                af[mt][1] = *(const uint32_t*) &Ws[rr + 8][kk + t4 * 2];
-                af[mt][2] = *(const uint32_t*) &Ws[rr][kk + t4 * 2 + 8];
-                af[mt][3] = *(const uint32_t*) &Ws[rr + 8][kk + t4 * 2 + 8];
-            }
-#pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
                 const int nn = wn + nt * 8 + g;
                 bfr2[nt][0] = *(const uint32_t*) &Xs[nn][kk + t4 * 2];
                 bfr2[nt][1] = *(const uint32_t*) &Xs[nn][kk + t4 * 2 + 8];
             }
+            for (int q = 0; q < nterm; ++q) {   // the largest term first
 #pragma unroll
-            for (int mt = 0; mt < 2; ++mt)
+                for (int mt = 0; mt < 2; ++mt) {
+                    const int rr = wm + mt * 16 + g;
+                    af[mt][0] = *(const uint32_t*) &Ws[q][rr][kk + t4 * 2];
+                    af[mt][1] = *(const uint32_t*) &Ws[q][rr + 8][kk + t4 * 2];
+                    af[mt][2] = *(const uint32_t*) &Ws[q][rr][kk + t4 * 2 + 8];
+                    af[mt][3] = *(const uint32_t*) &Ws[q][rr + 8][kk + t4 * 2 + 8];
+                }
 #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) mma_bf16(acc[mt][nt], af[mt], bfr2[nt]);
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < 4; ++nt) mma_bf16(acc[mt][nt], af[mt], bfr2[nt]);
+            }
         }
         __syncthreads();
     }
@@ -485,7 +496,7 @@ __global__ void __launch_bounds__(1024) k_bucket_place(const int32_t* inds, int 
     __global__ void __launch_bounds__(128) k_mm_##SUF(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,  \
                                                       const int32_t* perm, const MmTile* tiles, const int32_t* ntiles,   \
                                                       const uint32_t* G) {                                               \
-        mm_body(F, a, wd, ws, X, Y, perm, tiles, ntiles, G);                                                             \
+        mm_body<1>(F, a, wd, ws, X, Y, perm, tiles, ntiles, G);                                                          \
     }
 FMT_KERNELS(MF_BF16, bf16)
 FMT_KERNELS(MF_SEED4, seed4)
@@ -500,6 +511,12 @@ typedef void (*MmKernel)(MmArgs, WSlice, const WSlice*, const float*, float*, co
 static const MvKernel MV_K[5] = {k_mv_bf16, k_mv_seed4, k_mv_q8, k_mv_q4, k_mv_seed4p4};
 static const MvGuKernel MVGU_K[5] = {k_mv_gu_bf16, k_mv_gu_seed4, k_mv_gu_q8, k_mv_gu_q4, k_mv_gu_seed4p4};
 static const MmKernel MM_K[5] = {k_mm_bf16, k_mm_seed4, k_mm_q8, k_mm_q4, k_mm_seed4p4};
+template <int F>   // the seed formats with exact (three-term) weights
+__global__ void __launch_bounds__(128) k_mm3(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
+                                             const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, const uint32_t* G) {
+    mm_body<3>(F, a, wd, ws, X, Y, perm, tiles, ntiles, G);
+}
+static const MmKernel MM3_K[5] = {k_mm_bf16, k_mm3<MF_SEED4>, k_mm_q8, k_mm_q4, k_mm3<MF_SEED4P4>};
 
 // ---- embedding, norm ---------------------------------------------------------------------------------------------------
 __global__ void k_embed(int fmt, WSlice w, int d, const int32_t* ids, float* x) {
@@ -629,17 +646,23 @@ static __device__ __forceinline__ float4 i8x4(uint32_t u, float s) {
     return make_float4((float) (int8_t) (u & 255u) * s, (float) (int8_t) ((u >> 8) & 255u) * s, (float) (int8_t) ((u >> 16) & 255u) * s,
                        (float) (int8_t) (u >> 24) * s);
 }
-// 4 values (dims d0 .. d0 + 3) of K or V at (pos, head)
+// 4 values (dims d0 .. d0 + 3) of K or V at (pos, head).  KVF = KV_Q8: the dequantized value rounded to BF16, as
+// kv_load8_bf reads it for prefill (decode and prefill see the same K and V).  KVF = -1: the format read at run time and
+// Q8 unrounded, the kernel BF16 caches run: its code is 1% faster in decode than a BF16-only instantiation (measured on
+// an RTX 4080), and it never reads a Q8 cache (kc_attn launches KV_Q8 for those).
+template <int KVF>
 static __device__ __forceinline__ float4 kv_load4(const KvView& kv, int is_v, int pos, int kvh, int n_kv, int d0) {
     int row;
     const KvSeg sg = kv_seg(kv, pos, &row);
     const size_t off = ((size_t) row * n_kv + kvh) * ATT_HD + d0;
-    if (kv.fmt == KV_BF16) {
+    if (KVF < 0 && kv.fmt == KV_BF16) {
         const uint2 u = *(const uint2*) ((const uint16_t*) (is_v ? sg.v : sg.k) + off);
         return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000u), __uint_as_float(u.y << 16),
                            __uint_as_float(u.y & 0xFFFF0000u));
     }
-    return i8x4(*(const uint32_t*) ((const int8_t*) (is_v ? sg.v : sg.k) + off), (is_v ? sg.vs : sg.ks)[(size_t) row * n_kv + kvh]);
+    const float4 f = i8x4(*(const uint32_t*) ((const int8_t*) (is_v ? sg.v : sg.k) + off), (is_v ? sg.vs : sg.ks)[(size_t) row * n_kv + kvh]);
+    if (KVF < 0) return f;
+    return make_float4(bfr(f.x), bfr(f.y), bfr(f.z), bfr(f.w));
 }
 // 8 values (dims d8 .. d8 + 7) as BF16 bits (Q8: the dequantized value rounded to BF16)
 static __device__ __forceinline__ uint4 kv_load8_bf(const KvView& kv, int is_v, int pos, int kvh, int n_kv, int d8) {
@@ -654,7 +677,8 @@ static __device__ __forceinline__ uint4 kv_load8_bf(const KvView& kv, int is_v, 
 }
 
 // RoPE (non-traditional halves) on q in place and k into the cache; v into the cache.  Block = one head (64 threads,
-// thread p rotates the pair p, p + 64).  Q8: the row's scale from the block's max |value|.
+// thread p rotates the pair p, p + 64).  Q8: the BF16 K and V (the values the BF16 cache would hold) quantized with the
+// row's scale from the block's max |value|.
 __global__ void __launch_bounds__(64) k_rope_kv(float* q, const float* k, const float* v, KvView kv, const RowInfo* ri,
                                                 const float* inv, int n_head, int n_kv) {
     __shared__ float red[2][2];
@@ -685,7 +709,8 @@ __global__ void __launch_bounds__(64) k_rope_kv(float* q, const float* k, const 
         vc[p + 64] = tobf(v1);
         return;
     }
-    float mk = fmaxf(fabsf(k0), fabsf(k1)), mv = fmaxf(fabsf(v0), fabsf(v1));
+    const float kb0 = bfr(k0), kb1 = bfr(k1), vb0 = bfr(v0), vb1 = bfr(v1);
+    float mk = fmaxf(fabsf(kb0), fabsf(kb1)), mv = fmaxf(fabsf(vb0), fabsf(vb1));
     for (int o = 16; o > 0; o >>= 1) { mk = fmaxf(mk, __shfl_xor_sync(FULL, mk, o)); mv = fmaxf(mv, __shfl_xor_sync(FULL, mv, o)); }
     if ((p & 31) == 0) { red[p >> 5][0] = mk; red[p >> 5][1] = mv; }
     __syncthreads();
@@ -694,16 +719,17 @@ __global__ void __launch_bounds__(64) k_rope_kv(float* q, const float* k, const 
     const float sk = mk > 0 ? mk / 127.0f : 1.0f, sv = mv > 0 ? mv / 127.0f : 1.0f;
     int8_t* kc = (int8_t*) sg.k + off;
     int8_t* vc = (int8_t*) sg.v + off;
-    kc[p] = (int8_t) __float2int_rn(k0 / sk);
-    kc[p + 64] = (int8_t) __float2int_rn(k1 / sk);
-    vc[p] = (int8_t) __float2int_rn(v0 / sv);
-    vc[p + 64] = (int8_t) __float2int_rn(v1 / sv);
+    kc[p] = (int8_t) __float2int_rn(kb0 / sk);
+    kc[p + 64] = (int8_t) __float2int_rn(kb1 / sk);
+    vc[p] = (int8_t) __float2int_rn(vb0 / sv);
+    vc[p + 64] = (int8_t) __float2int_rn(vb1 / sv);
     if (p == 0) { sg.ks[(size_t) row * n_kv + head] = sk; sg.vs[(size_t) row * n_kv + head] = sv; }
 }
 
 // ---- attention ---------------------------------------------------------------------------------------------------------
 // Split-key attention: block (split, kv head, row); warp = one of the ATT_SG query heads of the KV head; lanes hold 4
 // dims each.  Partials [row][head][split] = (m, l, acc[128]).
+template <int KVF>
 __global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q, KvView kv, const RowInfo* ri, float* part) {
     const int split = (int) blockIdx.x, kvh = (int) blockIdx.y, t = (int) blockIdx.z;
     const int lane = threadIdx.x & 31, sgi = threadIdx.x >> 5;
@@ -722,8 +748,8 @@ __global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q
 #pragma unroll
         for (int u = 0; u < ATT_KU; ++u) {
             const int pu = min(p + u, p1 - 1);
-            const float4 kf = kv_load4(kv, 0, pu, kvh, a.n_kv, lane * 4);
-            vf[u] = kv_load4(kv, 1, pu, kvh, a.n_kv, lane * 4);
+            const float4 kf = kv_load4<KVF>(kv, 0, pu, kvh, a.n_kv, lane * 4);
+            vf[u] = kv_load4<KVF>(kv, 1, pu, kvh, a.n_kv, lane * 4);
             s[u] = dot4(qv, kf);
         }
         float mx = m;
@@ -781,7 +807,6 @@ __global__ void k_attn_reduce(AttnArgs a, const float* part, const float* g, flo
 #ifndef FA_RG
 #define FA_RG 2                // row groups per block: each K / V tile serves FA_RG x 16 rows of ATTF_G heads
 #endif
-#define FA_BK 64
 #define FA_KLD (ATT_HD + 8)    // Ks [key][dim] row stride (BF16)
 #define FA_VLD (FA_BK + 8)     // Vt [dim][key] row stride
 __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArgs a, const float* q, KvView kv, const RowInfo* ri,
@@ -1048,10 +1073,13 @@ void kc_mv_gu(cudaStream_t s, int fmt, const WSlice* wg, const WSlice* wu, int K
     MvArgs a = {K, R, P, xdiv, xs, ys, 0, 0};
     MVGU_K[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P), 32 * MV_ROWS, 0, s>>>(a, wg, wu, x, a_, sel, G);
 }
+static int g_seed_exact;
+void kc_seed_gemm_f32(int on) { g_seed_exact = on; }
+static MmKernel mm_kernel(int fmt) { return (g_seed_exact ? MM3_K : MM_K)[fmt]; }
 void kc_mm(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int xs, float* y, int ys, int T, int add,
            const uint32_t* G) {
     MmArgs a = {K, R, T, xs, ys, 1, add, 0};
-    MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), 128, 0, s>>>(a, w, NULL, x, y, NULL, NULL, NULL, G);
+    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), 128, 0, s>>>(a, w, NULL, x, y, NULL, NULL, NULL, G);
 }
 void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                    int xdiv, const int32_t* perm, const MmTile* tiles, int ntiles, const uint32_t* G) {
@@ -1059,7 +1087,7 @@ void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, cons
     MmArgs a = {K, R, 0, xs, ys, xdiv, 0, 0};
     WSlice none;
     memset(&none, 0, sizeof none);
-    MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) ntiles), 128, 0, s>>>(a, none, ws, x, y, perm, tiles, NULL, G);
+    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) ntiles), 128, 0, s>>>(a, none, ws, x, y, perm, tiles, NULL, G);
 }
 void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                        int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, int max_tiles,
@@ -1067,7 +1095,7 @@ void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, 
     MmArgs a = {K, R, 0, xs, ys, xdiv, 0, 0};
     WSlice none;
     memset(&none, 0, sizeof none);
-    MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), 128, 0, s>>>(a, none, ws, x, y, perm, tiles, ntiles, G);
+    mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), 128, 0, s>>>(a, none, ws, x, y, perm, tiles, ntiles, G);
 }
 void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* perm, MmTile* tiles, int32_t* ntiles) {
     k_bucket_count<<<1, 1024, 0, s>>>(inds, count, n, ntiles);
@@ -1076,6 +1104,9 @@ void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* p
 void kc_router(cudaStream_t s, RouterArgs a, const uint16_t* W, const uint16_t* bias, const float* x, float* score,
                float* sel, int32_t* inds, float* wts, int T) {
     k_router_logits<<<dim3((unsigned) (a.n + 7) / 8, (unsigned) T), 256, 0, s>>>(a, W, bias, x, score, sel);
+    k_router_topk<<<(unsigned) T, 32, 0, s>>>(a, score, sel, inds, wts);
+}
+void kc_router_topk(cudaStream_t s, RouterArgs a, const float* score, const float* sel, int32_t* inds, float* wts, int T) {
     k_router_topk<<<(unsigned) T, 32, 0, s>>>(a, score, sel, inds, wts);
 }
 void kc_swiglu(cudaStream_t s, const float* g, const float* u, float* a, int n) {
@@ -1093,7 +1124,8 @@ void kc_rope_kv(cudaStream_t s, float* q, const float* k, const float* v, KvView
 }
 void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, float* part, const float* g, float* o,
              int T) {
-    k_attn<<<dim3((unsigned) a.n_splits, (unsigned) a.n_kv, (unsigned) T), 32 * ATT_SG, 0, s>>>(a, q, kv, ri, part);
+    (kv.fmt == KV_Q8 ? k_attn<KV_Q8> : k_attn<-1>)<<<dim3((unsigned) a.n_splits, (unsigned) a.n_kv, (unsigned) T),
+                                                          32 * ATT_SG, 0, s>>>(a, q, kv, ri, part);
     k_attn_reduce<<<dim3((unsigned) a.n_head, (unsigned) T), ATT_HD, 0, s>>>(a, part, g, o);
 }
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T) {

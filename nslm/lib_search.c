@@ -234,11 +234,87 @@ void nslm_search_vec(const SeedTab* tab, const float* w, int nb, int bias, const
             }
     }
 }
-#else   // no Clang vectors (MSVC): the scalar reference, which the vector version must equal bit for bit
+#else
+// ---- without Clang vectors (MSVC, GCC): the same tiles and the same operations per lane, as loops over 4 lanes that
+// the compiler may vectorize.  It must equal nslm_search_ref bit for bit, as the Clang version does (tests/test_search.c).
+
+#define NG 8   // groups per tile (32 blocks)
+#define LANES for (int l = 0; l < 4; ++l)
+
+static inline float sclampq(float r) { return r < -8.0f ? -8.0f : (r > 7.0f ? 7.0f : r); }
+static inline float spow2(int e) { const uint32_t u = (uint32_t) (e + 127) << 23; float f; memcpy(&f, &u, 4); return f; }
+static inline int fexp(float m) { uint32_t u; memcpy(&u, &m, 4); return (int) ((u >> 23) & 255); }
+
 void nslm_search_vec(const SeedTab* tab, const float* w, int nb, int bias, const SearchOpts* o, uint16_t* seed,
                      uint16_t* nib, float* err, const float* sh) {
-    nslm_search_ref(tab, w, nb, bias, o, seed, nib, err, sh);
+    const int lo = bias, hi = bias + 15;
+    for (int k0 = 0; k0 < nb; k0 += 4 * NG) {
+        float X[NG][NSLM_C][4], WN[NG][4], BEST[NG][4];
+        int BS[NG][4], BE[NG][4];
+        for (int g = 0; g < NG; ++g) {
+            for (int c = 0; c < NSLM_C; ++c)
+                LANES {
+                    const int k = k0 + 4 * g + l;
+                    X[g][c][l] = k < nb ? w[(size_t) k * NSLM_C + c] : 0.0f;
+                }
+            LANES {
+                float wn = 0;
+                for (int c = 0; c < NSLM_C; ++c) wn = wn + X[g][c][l] * X[g][c][l];
+                WN[g][l] = wn;
+                BEST[g][l] = INFINITY;
+                BS[g][l] = 1;
+                BE[g][l] = lo;
+            }
+        }
+        for (int s = 1; s <= o->n_seeds; ++s) {
+            const SeedTab* T = &tab[s];
+            const float* U = T->U;
+            const float r00 = T->R[0], r01 = T->R[1], r02 = T->R[2], r11 = T->R[3], r12 = T->R[4], r22 = T->R[5];
+            const float i00 = T->Gi[0], i01 = T->Gi[1], i02 = T->Gi[2], i11 = T->Gi[3], i12 = T->Gi[4], i22 = T->Gi[5];
+            for (int g = 0; g < NG; ++g) {
+                float b0[4] = {0, 0, 0, 0}, b1[4] = {0, 0, 0, 0}, b2[4] = {0, 0, 0, 0};
+                for (int c = 0; c < NSLM_C; ++c)
+                    LANES {
+                        const float x = X[g][c][l];
+                        b0[l] = b0[l] + U[c * 3] * x;
+                        b1[l] = b1[l] + U[c * 3 + 1] * x;
+                        b2[l] = b2[l] + U[c * 3 + 2] * x;
+                    }
+                LANES {
+                    const float t0 = (i00 * b0[l] + i01 * b1[l]) + i02 * b2[l];
+                    const float t1 = (i01 * b0[l] + i11 * b1[l]) + i12 * b2[l];
+                    const float t2 = (i02 * b0[l] + i12 * b1[l]) + i22 * b2[l];
+                    const float a0 = fabsf(t0), a1 = fabsf(t1), a2 = fabsf(t2);
+                    const float m01 = a0 > a1 ? a0 : a1, m = m01 > a2 ? m01 : a2;
+                    int e0 = fexp(m) - 127 - 2;
+                    e0 = e0 < lo ? lo : (e0 > hi ? hi : e0);
+                    for (int ci = 0; ci < o->n_exp; ++ci) {
+                        int e = e0 + o->exp_delta[ci];
+                        e = e < lo ? lo : (e > hi ? hi : e);
+                        const float inv = spow2(-e), sc = spow2(e);
+                        const float q0 = sclampq((t0 * inv + MAGIC) - MAGIC);
+                        const float q1 = sclampq((t1 * inv + MAGIC) - MAGIC);
+                        const float q2 = sclampq((t2 * inv + MAGIC) - MAGIC);
+                        const float qb = (q0 * b0[l] + q1 * b1[l]) + q2 * b2[l];
+                        const float z0 = (r00 * q0 + r01 * q1) + r02 * q2, z1 = r11 * q1 + r12 * q2, z2 = r22 * q2;
+                        const float qgq = (z0 * z0 + z1 * z1) + z2 * z2;
+                        const float rec = (sc * sc) * qgq;
+                        const float er = rec > 4.0f * WN[g][l] ? INFINITY : (WN[g][l] - (2.0f * sc) * qb) + rec;
+                        if (er < BEST[g][l]) { BEST[g][l] = er; BS[g][l] = s; BE[g][l] = e; }
+                    }
+                }
+            }
+        }
+        for (int g = 0; g < NG; ++g)
+            LANES {
+                const int k = k0 + 4 * g + l;
+                if (k >= nb) continue;
+                seed[k] = (uint16_t) BS[g][l];
+                finish_block(tab, w + (size_t) k * NSLM_C, bias, BS[g][l], BE[g][l], o, &nib[k], err ? &err[k] : NULL, sh);
+            }
+    }
 }
+#undef LANES
 #endif
 
 float nslm_candidate_err(const SeedTab* T, const float* x, float wn, int e) {

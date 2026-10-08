@@ -1,6 +1,7 @@
 // nslm/lib_moe.c - MoVA helpers (nslm/moe.h).
 #include "moe.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -36,9 +37,13 @@ int nslm_st_write_bf16_3d(const char* path, const char* name, int d0, int d1, in
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE* f = fopen(tmp, "wb");
     const uint64_t n = (uint64_t) hn;
-    if (!f || fwrite(&n, 8, 1, f) != 1 || fwrite(hdr, 1, (size_t) hn, f) != (size_t) hn ||
-        fwrite(data, 1, (size_t) bytes, f) != (size_t) bytes || fclose(f) || rename(tmp, path)) {
-        snprintf(err, (size_t) errlen, "cannot write %s", path);
+    int ok = f && fwrite(&n, 8, 1, f) == 1 && fwrite(hdr, 1, (size_t) hn, f) == (size_t) hn &&
+             fwrite(data, 1, (size_t) bytes, f) == (size_t) bytes;
+    if (f && fclose(f)) ok = 0;
+    if (ok && rename(tmp, path)) ok = 0;
+    if (!ok) {
+        snprintf(err, (size_t) errlen, "cannot write %s: %s", path, strerror(errno));
+        remove(tmp);
         return -1;
     }
     return 0;

@@ -81,6 +81,8 @@ void kc_mv_sel(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const fl
 void kc_mv_gu(cudaStream_t s, int fmt, const WSlice* wg, const WSlice* wu, int K, int R, const float* x, int xs, float* a,
               int ys, const int32_t* sel, int P, int xdiv, const uint32_t* G);
 // GEMM: dense (T tokens) or grouped (ntiles entries of the tile table; pairs perm[])
+// prefill GEMM: seed weights exact in f32 (three BF16 terms) instead of rounded to BF16 (see kernels_moe.cu)
+void kc_seed_gemm_f32(int on);
 void kc_mm(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int xs, float* y, int ys, int T, int add,
            const uint32_t* G);
 void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
@@ -98,6 +100,8 @@ void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, 
 // Router: sigmoid scores, selection scores (score + bias), top-k ids and weights
 void kc_router(cudaStream_t s, RouterArgs a, const uint16_t* W, const uint16_t* bias, const float* x, float* score,
                float* sel, int32_t* inds, float* wts, int T);
+// the top-k step alone, from scores and selection scores (tests/test_mova_kernels.c)
+void kc_router_topk(cudaStream_t s, RouterArgs a, const float* score, const float* sel, int32_t* inds, float* wts, int T);
 void kc_swiglu(cudaStream_t s, const float* g, const float* u, float* a, int n);
 void kc_moe_combine(cudaStream_t s, const float* D, const float* w, const float* shared, float* x, int d, int k, int T);
 void kc_vcombine(cudaStream_t s, const float* V, const float* w, float* v, int d, int k, int T);
@@ -106,7 +110,9 @@ void kc_rope_kv(cudaStream_t s, float* q, const float* k, const float* v, KvView
 // split-key attention (rows <= MV_MAXT, or any T) + reduce with the softplus output gate
 void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, float* part, const float* g, float* o,
              int T);
-// prefill attention: causal, tiles of keys shared by a KV head's query heads, the gate fused
+// prefill attention: causal, tiles of FA_BK keys shared by a KV head's query heads (the online softmax rescales per
+// tile, so the tile size is a rounding point: tests/test_mova_kernels.c), the gate fused
+#define FA_BK 64
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T);
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n);
 

@@ -38,6 +38,8 @@ const UNormalizer2* unorm2_getNFCInstance(UErrorCode* e);
 int32_t unorm2_normalize(const UNormalizer2* n, const UChar* src, int32_t len, UChar* dest, int32_t cap, UErrorCode* e);
 URegularExpression* uregex_open(const UChar* pat, int32_t len, uint32_t flags, UParseError* pe, UErrorCode* e);
 void uregex_close(URegularExpression* r);
+URegularExpression* uregex_clone(const URegularExpression* r, UErrorCode* e);
+void uregex_setStackLimit(URegularExpression* r, int32_t limit, UErrorCode* e);
 void uregex_setText(URegularExpression* r, const UChar* text, int32_t len, UErrorCode* e);
 int8_t uregex_findNext(URegularExpression* r, UErrorCode* e);   // UBool
 int32_t uregex_start(URegularExpression* r, int32_t group, UErrorCode* e);
@@ -278,7 +280,7 @@ struct Tok {
     size_t cache_n, cache_cap;
     int bos;
     int err_bad;
-    pthread_mutex_t mu;   // tok_encode: the regex's text and the BPE cache are shared state (a server encodes on many threads)
+    pthread_mutex_t mu;   // the BPE cache (a server encodes on many threads; each call matches with its own regex clone)
 };
 
 typedef struct {
@@ -509,56 +511,97 @@ Tok* tok_open(const char* path, char* err, int errlen) {
 }
 
 int tok_bos(Tok* t) { return t->bos; }
-static int encode_locked(Tok* t, const char* text, int add_bos, int32_t* out, int cap);
-int tok_encode(Tok* t, const char* text, int add_bos, int32_t* out, int cap) {
-    pthread_mutex_lock(&t->mu);
-    const int n = encode_locked(t, text, add_bos, out, cap);
-    pthread_mutex_unlock(&t->mu);
-    return n;
+// BPE work space of one call: symbols (a linked list over the word's bytes) and a min-heap of candidate merges.
+typedef struct { int32_t id, prev, next, alive; } Sym;
+typedef struct { int32_t rank, pos, id; } Cand;
+typedef struct {
+    Sym* sym;
+    Cand* heap;
+    int sym_cap, heap_cap, nheap;
+} Bpe;
+
+static int cand_less(const Cand* a, const Cand* b) { return a->rank < b->rank || (a->rank == b->rank && a->pos < b->pos); }
+static void heap_push(Bpe* w, Cand c) {
+    if (w->nheap == w->heap_cap) { w->heap_cap = 2 * w->heap_cap + 64; w->heap = (Cand*) realloc(w->heap, sizeof(Cand) * (size_t) w->heap_cap); }
+    int i = w->nheap++;
+    while (i > 0 && cand_less(&c, &w->heap[(i - 1) / 2])) { w->heap[i] = w->heap[(i - 1) / 2]; i = (i - 1) / 2; }
+    w->heap[i] = c;
+}
+static Cand heap_pop(Bpe* w) {
+    const Cand top = w->heap[0], last = w->heap[--w->nheap];
+    int i = 0;
+    for (;;) {
+        int c = 2 * i + 1;
+        if (c >= w->nheap) break;
+        if (c + 1 < w->nheap && cand_less(&w->heap[c + 1], &w->heap[c])) ++c;
+        if (!cand_less(&w->heap[c], &last)) break;
+        w->heap[i] = w->heap[c];
+        i = c;
+    }
+    if (w->nheap) w->heap[i] = last;
+    return top;
+}
+static int merge_of(const Tok* t, int32_t a, int32_t b, int32_t* rank, int32_t* id) {
+    return pm_get(&t->merges, ((uint64_t) (a + 1) << 32) | (uint64_t) (b + 1), rank, id);
+}
+static void push_pair(const Tok* t, Bpe* w, int pos) {
+    const int nx = w->sym[pos].next;
+    int32_t r, id;
+    if (nx >= 0 && merge_of(t, w->sym[pos].id, w->sym[nx].id, &r, &id)) heap_push(w, (Cand) {r, pos, id});
 }
 
-// BPE of one pre-token (UTF-8 bytes): ids appended to out.  Merges the lowest-rank adjacent pair, every occurrence
-// left to right, until none applies (as HF).  Returns the count, or -1 if a byte has no symbol.
-static int bpe(Tok* t, const char* w, size_t n, int32_t** ids, int* cap) {
+// BPE of one pre-token (UTF-8 bytes) into *ids.  The lowest-rank adjacent pair is merged first, the leftmost among equal
+// ranks, until none applies: HF's priority-queue merge (O(n log n), so a long run without spaces stays cheap).  Returns
+// the count, or -1 if a byte has no symbol.  The word cache is shared: only it is locked.
+static int bpe(Tok* t, Bpe* w, const char* s, size_t n, int32_t** ids, int* cap) {
     int32_t v;
-    if (map_get(&t->cache, w, n, &v)) {
+    pthread_mutex_lock(&t->mu);
+    if (map_get(&t->cache, s, n, &v)) {
         const int k = t->cache_ids[v];
         if (*cap < k) { *cap = 2 * k; *ids = (int32_t*) realloc(*ids, sizeof(int32_t) * (size_t) *cap); }
         memcpy(*ids, t->cache_ids + v + 1, sizeof(int32_t) * (size_t) k);
+        pthread_mutex_unlock(&t->mu);
         return k;
     }
-    if (*cap < (int) n) { *cap = 2 * (int) n + 16; *ids = (int32_t*) realloc(*ids, sizeof(int32_t) * (size_t) *cap); }
-    int32_t* s = *ids;
-    int k = 0;
+    pthread_mutex_unlock(&t->mu);
+    if (w->sym_cap < (int) n) { w->sym_cap = 2 * (int) n + 16; w->sym = (Sym*) realloc(w->sym, sizeof(Sym) * (size_t) w->sym_cap); }
     for (size_t i = 0; i < n; ++i) {
-        const int32_t id = t->byte_id[(uint8_t) w[i]];
+        const int32_t id = t->byte_id[(uint8_t) s[i]];
         if (id < 0) return -1;
-        s[k++] = id;
+        w->sym[i] = (Sym) {id, (int32_t) i - 1, i + 1 < n ? (int32_t) i + 1 : -1, 1};
     }
-    while (k > 1) {
-        int32_t best = INT32_MAX, bid = -1, r, mid;
-        int32_t ba = -1, bb = -1;
-        for (int i = 0; i + 1 < k; ++i)
-            if (pm_get(&t->merges, ((uint64_t) (s[i] + 1) << 32) | (uint64_t) (s[i + 1] + 1), &r, &mid) && r < best) {
-                best = r; bid = mid; ba = s[i]; bb = s[i + 1];
+    w->nheap = 0;
+    for (size_t i = 0; i + 1 < n; ++i) push_pair(t, w, (int) i);
+    while (w->nheap) {
+        const Cand c = heap_pop(w);
+        Sym* a = &w->sym[c.pos];
+        if (!a->alive || a->next < 0) continue;
+        int32_t r, id;
+        if (!merge_of(t, a->id, w->sym[a->next].id, &r, &id) || r != c.rank || id != c.id) continue;   // stale entry
+        Sym* b = &w->sym[a->next];
+        a->id = c.id;
+        b->alive = 0;
+        a->next = b->next;
+        if (a->next >= 0) w->sym[a->next].prev = c.pos;
+        if (a->prev >= 0) push_pair(t, w, a->prev);
+        push_pair(t, w, c.pos);
+    }
+    if (*cap < (int) n) { *cap = 2 * (int) n + 16; *ids = (int32_t*) realloc(*ids, sizeof(int32_t) * (size_t) *cap); }
+    int k = 0;
+    for (int i = n ? 0 : -1; i >= 0; i = w->sym[i].next) (*ids)[k++] = w->sym[i].id;
+    if (n <= 256) {   // the cache holds ordinary words only (at most 200000 of them)
+        pthread_mutex_lock(&t->mu);
+        if (t->cache.n < 200000 && !map_get(&t->cache, s, n, &v)) {
+            if (t->cache_n + (size_t) k + 1 > t->cache_cap) {
+                t->cache_cap = (t->cache_n + (size_t) k + 1) * 2 + 4096;
+                t->cache_ids = (int32_t*) realloc(t->cache_ids, sizeof(int32_t) * t->cache_cap);
             }
-        if (bid < 0) break;
-        int o = 0;
-        for (int i = 0; i < k;) {
-            if (i + 1 < k && s[i] == ba && s[i + 1] == bb) { s[o++] = bid; i += 2; }
-            else s[o++] = s[i++];
+            *map_slot(&t->cache, s, n, 1) = (int32_t) t->cache_n;
+            t->cache_ids[t->cache_n] = k;
+            memcpy(t->cache_ids + t->cache_n + 1, *ids, sizeof(int32_t) * (size_t) k);
+            t->cache_n += (size_t) k + 1;
         }
-        k = o;
-    }
-    if (t->cache.n < 200000) {
-        if (t->cache_n + (size_t) k + 1 > t->cache_cap) {
-            t->cache_cap = (t->cache_n + (size_t) k + 1) * 2 + 4096;
-            t->cache_ids = (int32_t*) realloc(t->cache_ids, sizeof(int32_t) * t->cache_cap);
-        }
-        *map_slot(&t->cache, w, n, 1) = (int32_t) t->cache_n;
-        t->cache_ids[t->cache_n] = k;
-        memcpy(t->cache_ids + t->cache_n + 1, s, sizeof(int32_t) * (size_t) k);
-        t->cache_n += (size_t) k + 1;
+        pthread_mutex_unlock(&t->mu);
     }
     return k;
 }
@@ -584,14 +627,18 @@ static int encode_plain(Tok* t, const char* seg, size_t len, int32_t* out, int c
     }
     free(u);
     if (U_FAILURE(ue)) { free(nf); return -1; }
-    uregex_setText(t->re, nf, nn, &ue);
+    URegularExpression* re = uregex_clone(t->re, &ue);   // this call's own matcher (the pattern is shared, read-only)
+    if (U_FAILURE(ue)) { free(nf); return -1; }
+    uregex_setStackLimit(re, 0, &ue);   // no backtracking-stack cap: one long word (no spaces) must not end the text
+    uregex_setText(re, nf, nn, &ue);
+    Bpe bw = {0};
     int32_t* ids = NULL;
     int icap = 0;
     char* w = NULL;
     int32_t wcap = 0;
     int k = n;
-    while (!U_FAILURE(ue) && uregex_findNext(t->re, &ue)) {
-        const int32_t a = uregex_start(t->re, 0, &ue), b = uregex_end(t->re, 0, &ue);
+    while (!U_FAILURE(ue) && uregex_findNext(re, &ue)) {
+        const int32_t a = uregex_start(re, 0, &ue), b = uregex_end(re, 0, &ue);
         if (U_FAILURE(ue)) break;
         int32_t n8 = 0;
         UErrorCode e2 = U_ZERO_ERROR;
@@ -599,20 +646,21 @@ static int encode_plain(Tok* t, const char* seg, size_t len, int32_t* out, int c
         if (n8 + 1 > wcap) { wcap = 2 * n8 + 16; w = (char*) realloc(w, (size_t) wcap); }
         e2 = U_ZERO_ERROR;
         u_strToUTF8(w, wcap, &n8, nf + a, b - a, &e2);
-        const int m = bpe(t, w, (size_t) n8, &ids, &icap);
+        const int m = bpe(t, &bw, w, (size_t) n8, &ids, &icap);
         if (m < 0) { k = -1; break; }
         for (int i = 0; i < m; ++i) { if (k < cap) out[k] = ids[i]; ++k; }
     }
-    static const UChar empty[1] = {0};
-    UErrorCode e3 = U_ZERO_ERROR;
-    uregex_setText(t->re, empty, 0, &e3);   // the regex must not keep the freed text (ICU rejects NULL)
+    if (U_FAILURE(ue)) k = -1;   // a regex error is an error, not the end of the text
+    uregex_close(re);
+    free(bw.sym);
+    free(bw.heap);
     free(ids);
     free(w);
     free(nf);
     return k;
 }
 
-static int encode_locked(Tok* t, const char* text, int add_bos, int32_t* out, int cap) {
+int tok_encode(Tok* t, const char* text, int add_bos, int32_t* out, int cap) {
     const size_t len = strlen(text);
     int n = 0;
     size_t seg = 0, i = 0;

@@ -27,6 +27,7 @@
 
 #define MAX_ROWS 512             // rows per forward (prompt chunks); decode and T <= 8 use the matvecs
 #define MAXP (MAX_ROWS * 8)      // (row, expert) pairs per forward
+#define MAX_GRAPHS 64            // instantiated decode graphs kept (decode at one length range needs a handful)
 #ifndef MAX_SPLITS
 #define MAX_SPLITS 32            // decode attention: at most this many key splits
 #endif
@@ -110,16 +111,20 @@ struct Eng {
     float *pred_w, *pred_sel;
     cudaEvent_t *ev_pred, *ev_predv;   // a layer's predicted MLP / value experts in VRAM
     int pred_pending;   // the layer whose prediction the main stream must join first, or -1
+    int seed_f32;       // NSLM_SEED_GEMM_F32: the prefill GEMM's seed weights exact (kc_seed_gemm_f32)
+    int in_lm;          // forward_lm's layer-major pass: no prediction (its admits would race the prefetch's job lists)
     // layer-major prefill: the hidden states, tokens and rows of up to xmax prompt rows
     float* x_all;
     int32_t *ids_all, *h_ids_all;
     RowInfo *ri_all, *h_ri_all;
     int xmax;
     cudaGraphExec_t graphs[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 2];   // small forwards, by (rows, splits, head)
+    uint64_t graph_use[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 2], graph_tick;   // last launch of each (LRU)
+    int ngraphs;        // instantiated (at most MAX_GRAPHS: each is a whole forward's thousands of nodes)
     int no_graph;
     EngMem mem;
     Seq seq;
-    char desc[320];
+    char desc[640];   // eng_describe (the device name alone can be 255 bytes)
     // route capture
     int route_on, route_max;
     int32_t *route_mlp, *route_val;
@@ -290,8 +295,10 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
         f.e = e; f.p = p; f.ws = ws; f.host = host; f.units = units;
         pthread_mutex_init(&f.mu, NULL);
         pthread_t th[8];
-        for (int i = 0; i < 8; ++i) pthread_create(&th[i], NULL, fill_worker, &f);
-        for (int i = 0; i < 8; ++i) pthread_join(th[i], NULL);
+        int nth = 0;
+        for (int i = 0; i < 8; ++i) nth += pthread_create(&th[nth], NULL, fill_worker, &f) == 0;
+        if (!nth) fill_worker(&f);   // no thread could start: fill on this one
+        for (int i = 0; i < nth; ++i) pthread_join(th[i], NULL);
         pthread_mutex_destroy(&f.mu);
         if (f.fail) { snprintf(err, (size_t) errlen, "expert cache: cannot read the experts"); return -1; }
     }
@@ -323,7 +330,10 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
             const int u = sl * per_layer + x;
             us[u] = s;
             su[s] = u;
-            if (!CK(cudaMemcpy(p->vram + (uint64_t) s * cur, host + (uint64_t) u * cur, cur, cudaMemcpyHostToDevice))) return -1;
+            if (!CK(cudaMemcpy(p->vram + (uint64_t) s * cur, host + (uint64_t) u * cur, cur, cudaMemcpyHostToDevice))) {
+                free(us); free(su); free(tab);
+                return -1;
+            }
         }
     for (int sl = 0; sl < nsl; ++sl)
         for (int i = 0; i < ntens; ++i)
@@ -489,7 +499,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { snprintf(err, (size_t) errlen, "no CUDA device"); free(e); return NULL; }
     if (!CK(cudaSetDevice(0)) || !CK(cudaStreamCreateWithFlags(&e->st, cudaStreamNonBlocking))) { snprintf(err, (size_t) errlen, "CUDA init failed"); free(e); return NULL; }
-    if (ns_open(&e->nm, o->model_dir, err, errlen)) { free(e); return NULL; }
+    if (ns_open(&e->nm, o->model_dir, err, errlen)) { cudaStreamDestroy(e->st); free(e); return NULL; }
     snprintf(e->model_dir, sizeof e->model_dir, "%s", o->model_dir);
     MovaTensor* all = NULL;
     const int na = mova_tensors(c, &all);
@@ -539,14 +549,15 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         uint32_t* g = (uint32_t*) malloc(65536 * 4);
         e->stab = (uint32_t*) dalloc(e, 65536 * 4, &e->mem.lut);
         for (uint32_t s = 0; s < 65536; ++s) g[s] = lfsr_stream24((uint16_t) s);
-        cudaMemcpy(e->stab, g, 65536 * 4, cudaMemcpyHostToDevice);
-        if (seeds4) {
+        int ok = e->stab && CK(cudaMemcpy(e->stab, g, 65536 * 4, cudaMemcpyHostToDevice));
+        if (ok && seeds4) {
             e->stab32 = (uint32_t*) dalloc(e, 65536 * 4, &e->mem.lut);
             for (uint32_t s = 0; s < 65536; ++s) g[s] = lfsr_stream32((uint16_t) s);
-            cudaMemcpy(e->stab32, g, 65536 * 4, cudaMemcpyHostToDevice);
+            ok = e->stab32 && CK(cudaMemcpy(e->stab32, g, 65536 * 4, cudaMemcpyHostToDevice));
         } else e->stab32 = e->stab;
         free(g);
         (void) seeds;
+        if (!ok) { snprintf(err, (size_t) errlen, "seed tables: out of GPU memory"); eng_close(e); return NULL; }
     }
     // KV caches
     const int kvd = c->n_kv * c->head_dim;
@@ -662,6 +673,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         if (!ok) { snprintf(err, (size_t) errlen, "prefetch: CUDA setup failed"); eng_close(e); return NULL; }
     }
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL || getenv("MOVA_DUMP") != NULL;
+    e->seed_f32 = getenv("NSLM_SEED_GEMM_F32") != NULL;   // a rounding-point experiment; BF16 seed weights by default
     e->seq.cap = 1024;
     e->seq.hist = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->seq.cap);
     struct cudaDeviceProp prop;
@@ -866,7 +878,7 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
     if (e->pred_pending == l) { CK(cudaStreamWaitEvent(e->st, e->ev_pred[l], 0)); e->pred_pending = -1; }
     kc_cache_admit(e->st, &e->pm, l - g->first_sparse, ri, T * g->top_k, 0);
     kc_cache_copy(e->st, &e->pm, 256);
-    if (!big && e->predict && l + 1 < g->n_layer) {   // decode: prefetch the next layer's likely experts
+    if (!big && e->predict && !e->in_lm && l + 1 < g->n_layer) {   // decode: prefetch the next layer's likely experts
         const Layer* N = &e->L[l + 1];
         enc_router(e, &N->vr, &N->vb, e->xn, g->n_vexp, g->top_kv, e->pred_vinds, e->pred_w, e->pred_sel, T);
         kc_cache_admit(e->st, &e->pv_pre, l + 1 - g->first_sparse, e->pred_vinds, T * g->top_kv, CACHE_PROTECT_PREV);
@@ -949,6 +961,7 @@ static void route_collect(Eng* e, int T);
 // Forward of T rows (tokens tok[0..T-1] at positions pos0..pos0+T-1).  Rows [h0, T) get logits (into logits_out,
 // (T - h0) x vocab, may be NULL) and arg max (into am, may be NULL); h0 = T: no head.
 static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* logits_out, int32_t* am) {
+    kc_seed_gemm_f32(e->seed_f32);   // a launch setting of the kernels' host side (engines in one process may differ)
     if (T < 1 || T > MAX_ROWS) return -1;
     if (pos0 + T > e->kv_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->kv_cap); return -1; }
     memcpy(e->h_ids, tok, (size_t) T * 4);
@@ -963,14 +976,25 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
     if (graph) {
         const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, pos0 + T)) * 2 + (h0 < T));
         if (!e->graphs[key]) {
+            if (e->ngraphs >= MAX_GRAPHS) {   // drop the least recently launched
+                int lru = -1;
+                for (int i = 0; i < (int) (sizeof e->graphs / sizeof e->graphs[0]); ++i)
+                    if (e->graphs[i] && (lru < 0 || e->graph_use[i] < e->graph_use[lru])) lru = i;
+                if (!CK(cudaStreamSynchronize(e->st))) return -1;   // it may still be running
+                cudaGraphExecDestroy(e->graphs[lru]);
+                e->graphs[lru] = NULL;
+                --e->ngraphs;
+            }
             cudaGraph_t gr;
             if (!CK(cudaStreamBeginCapture(e->st, cudaStreamCaptureModeThreadLocal))) return -1;
             const int rc = encode_forward(e, T, pos0 + T, h0);
             if (h0 < T) encode_head(e, h0, T - h0);
             if (!CK(cudaStreamEndCapture(e->st, &gr)) || rc) return -1;
-            if (!CK(cudaGraphInstantiate(&e->graphs[key], gr, 0))) return -1;
+            if (!CK(cudaGraphInstantiate(&e->graphs[key], gr, 0))) { e->graphs[key] = NULL; cudaGraphDestroy(gr); return -1; }
             cudaGraphDestroy(gr);
+            ++e->ngraphs;
         }
+        e->graph_use[key] = ++e->graph_tick;
         if (!CK(cudaGraphLaunch(e->graphs[key], e->st))) return -1;
     } else if (encode_forward(e, T, pos0 + T, h0)) return -1;
     for (int r = h0; r < T; r += MAX_LOGIT_ROWS) {
@@ -1004,7 +1028,18 @@ static void prefetch_layer(Eng* e, int l) {
 // Rows ids[0..n) at positions pos0.., layer by layer over up to xmax rows at a time (sub-chunks of MAX_ROWS): every
 // layer's experts come to VRAM once per xmax rows, not once per chunk.  Rows [h0, n) get logits (into logits_out,
 // (n - h0) x vocab, may be NULL).  Route capture takes the chunked forward (its records are per forward).
+static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out);
 static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
+    if (e->route_on || n <= MV_MAXT) return forward_lm_body(e, ids, n, pos0, h0, logits_out);
+    // a sub-chunk of 1 .. MV_MAXT rows takes the decode path, whose next-layer prediction would admit into the
+    // prefetch's views while their copy is pending (that copy would then see no jobs)
+    e->in_lm = 1;
+    const int rc = forward_lm_body(e, ids, n, pos0, h0, logits_out);
+    e->in_lm = 0;
+    return rc;
+}
+static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
+    kc_seed_gemm_f32(e->seed_f32);
     if (e->route_on || n <= MV_MAXT) {
         for (int p = 0; p < n; p += MAX_ROWS) {
             const int T = n - p < MAX_ROWS ? n - p : MAX_ROWS;
@@ -1080,7 +1115,8 @@ int eng_prefill(Eng* e, int seq, const int32_t* ids, int n) {
     if (seq != 0 || n < 1 || n > e->kv_cap) return -1;
     e->seq.len = 0;
     for (int i = 0; i < n; ++i) hist_push(&e->seq, ids[i]);
-    return n > 1 ? forward_lm(e, ids, n - 1, 0, n - 1, NULL) : 0;
+    if (n > 1 && forward_lm(e, ids, n - 1, 0, n - 1, NULL)) { e->seq.len = 0; return -1; }   // no half-written KV
+    return 0;
 }
 int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     if (seq != 0 || n < 1 || n > e->kv_cap) return -1;
@@ -1088,7 +1124,7 @@ int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) 
     while (c < e->seq.len - 1 && c < n - 1 && e->seq.hist[c] == ids[c]) ++c;   // KV is valid for hist[0 .. len-2]
     e->seq.len = c;
     for (int i = c; i < n; ++i) hist_push(&e->seq, ids[i]);
-    if (n - 1 > c && forward_lm(e, ids + c, n - 1 - c, c, n - 1 - c, NULL)) return -1;
+    if (n - 1 > c && forward_lm(e, ids + c, n - 1 - c, c, n - 1 - c, NULL)) { e->seq.len = 0; return -1; }
     if (reused) *reused = c;
     return 0;
 }

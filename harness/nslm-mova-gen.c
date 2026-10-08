@@ -9,6 +9,7 @@
 // u = (z >> 11) * 2^-53 * sum, the first index whose cumulative sum exceeds u.  Both stop at <|ifm|endoftext|> (1),
 // <|ifm|im_end|> (250019) or max_tokens.  Writes OUT/<id>.<mode>.json: tokens, the top-2 logit margin of every step,
 // finish reason, timing.  Existing outputs are skipped (resumable).
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,7 +117,9 @@ int main(int argc, char** argv) {
             char tmp[2100];
             snprintf(tmp, sizeof tmp, "%s.tmp", path);
             FILE* f = fopen(tmp, "wb");
-            if (f) { fputs(js, f); fclose(f); rename(tmp, path); }
+            int ok = f && fputs(js, f) >= 0;
+            if (f && fclose(f)) ok = 0;
+            if (!ok || rename(tmp, path)) { fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno)); remove(tmp); }
             free(js);
             printf("%-8s %-7s prompt %5d  gen %5d  %-6s %6.1fs %5.1f tok/s\n", q->id, mode, q->n, ng, finish, t2 - t1, ng / (t2 - t1));
             fflush(stdout);

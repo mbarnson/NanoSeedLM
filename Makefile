@@ -30,7 +30,8 @@ ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm
 METALLIBS := $(RES)/kernels_moe.metallib $(RES)/search.metallib $(RES)/search4.metallib
 ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes
 TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-mova-pack nslm-bits-probe)
-C_TESTS   := $(filter-out tests/test_engine.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c,$(wildcard tests/test_*.c))
+C_TESTS   := $(filter-out tests/test_engine.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c \
+                            tests/test_mova_kernels.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
              $(BIN)/test_search4_gpu $(BIN)/test_mova_kernels
 
@@ -93,7 +94,7 @@ $(BIN)/nslm-bits-probe: nslm/bits_probe.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -O3 $< $(LIB_O) -o $@ -lm -lpthread
 
-# ---- tests (the same C sources as the CUDA build; test_mova_kernels checks the Metal kernels one by one) -----------
+# ---- tests (the same C sources as the CUDA build; test_mova_kernels runs on tests/kernel_backend_metal.m) ---------
 $(BIN)/test_%: tests/test_%.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(LIB_O) -o $@ -lm -lpthread
@@ -112,9 +113,11 @@ $(BIN)/test_search_gpu: tests/test_search_gpu.c $(OBJ)/search_metal.o $(LIB_O) $
 $(BIN)/test_search4_gpu: tests/test_search4_gpu.c $(OBJ)/search4_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/search4.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(OBJ)/search4_metal.o $(LIB_O) $(LIBS) -lpthread -o $@
-$(BIN)/test_mova_kernels: tests/test_mova_kernels.m engine/kernels_moe.metal nslm/lfsr.h nslm/lib_affine.c $(RES)/kernels_moe.metallib
+$(BIN)/test_mova_kernels: tests/test_mova_kernels.c tests/kernel_backend_metal.m tests/kernel_backend.h engine/kernels_moe.metal \
+                          $(LIB_O) $(RES)/kernels_moe.metallib
 	@mkdir -p $(@D)
-	$(CC) $(OBJCFLAGS) tests/test_mova_kernels.m nslm/lib_affine.c $(LIBS) -o $@
+	$(CC) $(CFLAGS) -c tests/test_mova_kernels.c -o $(OBJ)/test_mova_kernels.o
+	$(CC) $(OBJCFLAGS) -Itests tests/kernel_backend_metal.m $(OBJ)/test_mova_kernels.o $(LIB_O) $(LIBS) -o $@
 
 $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 	$(PY) tools/mova_affine_golden.py --out $(OUT)/test/affine
@@ -123,8 +126,8 @@ $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 test-mlx:
 	$(PY) tools/test_nanoseedlm_k2.py
 
-# the MLX goldens of test_affine are built first (macOS has MLX); test_mova_cfg needs MOVA_DIR (a model folder).  A test
-# that exits 77 is skipped.
+# the MLX goldens of test_affine are built first (macOS has MLX); test_mova_cfg and test_tokenizer read MOVA_DIR (a model
+# folder) and are skipped without one.  A test that exits 77 is skipped.
 test: $(TESTS) $(OUT)/test/affine/index.txt
 	@for t in $(TESTS); do echo "== $$t"; $$t; r=$$?; if [ $$r -eq 77 ]; then echo "(skipped)"; elif [ $$r -ne 0 ]; then exit 1; fi; done; echo "all tests passed"
 

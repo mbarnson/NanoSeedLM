@@ -7,11 +7,20 @@
 # Binaries land in build/bin.  Every C translation unit is compiled without FMA contraction: the scalar, vector and
 # GPU paths of the seed search must agree bit for bit (as -ffp-contract=off in the Makefile).
 cmake_minimum_required(VERSION 3.24)
-# GPUs: Ampere (sm_80, 86), Ada (sm_89), Blackwell (sm_120); BF16 tensor cores need sm_80 or newer
+# GPUs (BF16 tensor cores need sm_80 or newer): machine code for Ampere (sm_80, 86), Ada (sm_89) and, with CUDA 12.8 or
+# newer, consumer Blackwell (sm_120); compute_89 PTX for the rest (Hopper sm_90, datacenter Blackwell sm_100), which the
+# driver compiles at first use.  -DCMAKE_CUDA_ARCHITECTURES=native (or a list) overrides this.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 80 86 89 120)
+  set(CMAKE_CUDA_ARCHITECTURES 80-real CACHE STRING "CUDA architectures (80-real: the default list below)")
 endif()
 project(NanoSeedLM LANGUAGES C CXX CUDA)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "80-real")
+  set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES 120-real)
+  endif()
+  message(STATUS "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: architectures ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -61,8 +70,9 @@ set_tests_properties(test_affine PROPERTIES SKIP_RETURN_CODE 77)
 set(NSLM_MODEL_DIR "" CACHE PATH "a NanoSeedLM model folder for the tests that need one")
 add_executable(test_mova_cfg tests/test_mova_cfg.c)
 target_link_libraries(test_mova_cfg nslm)
-if(NSLM_MODEL_DIR)   # registered only with a model folder: without one it has nothing to read
-  add_test(NAME test_mova_cfg COMMAND test_mova_cfg WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME test_mova_cfg COMMAND test_mova_cfg WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_mova_cfg PROPERTIES SKIP_RETURN_CODE 77)   # 77: no model folder to read
+if(NSLM_MODEL_DIR)
   set_tests_properties(test_mova_cfg PROPERTIES ENVIRONMENT "MOVA_DIR=${NSLM_MODEL_DIR}")
 endif()
 foreach(t chat_template tool_calls)
@@ -106,6 +116,7 @@ add_test(NAME test_search4_gpu COMMAND test_search4_gpu WORKING_DIRECTORY ${CMAK
 add_executable(test_search_gpu tests/test_search_gpu.c)
 target_link_libraries(test_search_gpu nslm_search_gpu)
 add_test(NAME test_search_gpu COMMAND test_search_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_search_gpu test_search4_gpu PROPERTIES SKIP_RETURN_CODE 77)   # 77: no GPU
 
 # the compressor: seed search (nslm-moe), the packer, the bits probe
 add_executable(nslm-moe nslm/moe.c)
@@ -119,6 +130,11 @@ target_link_libraries(nslm-bits-probe nslm)
 add_executable(test_engine tests/test_engine.c)
 target_link_libraries(test_engine nslm_engine)
 add_test(NAME test_engine COMMAND test_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_engine PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_mova_kernels tests/test_mova_kernels.c tests/kernel_backend_cuda.c)   # the kernels one by one
+target_link_libraries(test_mova_kernels nslm_engine)
+add_test(NAME test_mova_kernels COMMAND test_mova_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_mova_kernels PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_tokenizer tests/test_tokenizer.c)
 target_link_libraries(test_tokenizer nslm_harness)
 add_test(NAME test_tokenizer COMMAND test_tokenizer WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

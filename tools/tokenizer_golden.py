@@ -42,6 +42,9 @@ CASES = [
     "To Sherlock Holmes she is always THE woman. I have seldom heard him mention her under any other name. In his eyes "
     "she eclipses and predominates the whole of her sex. It was not that he felt any emotion akin to love for Irene "
     "Adler. All emotions, and that one particularly, were abhorrent to his cold, precise but admirably balanced mind.",
+    # one word of 200000 letters: past ICU's default regex backtracking stack (which ends near 195000 here;
+    # tokenizer.c lifts the cap), and long enough that a quadratic BPE would be slow
+    "a" * 200000,
 ]
 
 
@@ -50,7 +53,8 @@ def main():
     tok = Tokenizer.from_file(str(d / "tokenizer.json"))
     out = [{"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in CASES]
     p = ROOT / "tests" / "data" / "tokenizer_golden.json"
-    p.write_text(json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    lines = ",\n".join(json.dumps(c, ensure_ascii=False, separators=(",", ":")) for c in out)   # one case per line
+    p.write_text("[\n" + lines + "\n]\n", encoding="utf-8")
     print(f"{p}: {len(out)} cases, {sum(len(c['ids']) for c in out)} ids")
 
 

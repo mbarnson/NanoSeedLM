@@ -6,9 +6,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+
 #include "json.h"
 #include "platform.h"
 #include "tokenizer.h"
+
+typedef struct {
+    Tok* t;
+    const Json* g;
+    int first, bad;
+} Conc;
+static void* conc_run(void* p) {   // every case three times, starting at a different case in each thread
+    Conc* c = (Conc*) p;
+    int32_t* ids = (int32_t*) malloc(sizeof(int32_t) * 65536);
+    for (int k = 0; k < 3 * c->g->n; ++k) {
+        const Json* cs = c->g->v[(c->first + k) % c->g->n];
+        const Json* want = json_get(cs, "ids");
+        const int n = tok_encode(c->t, json_gets(cs, "text"), 0, ids, 65536);
+        int same = n == want->n;
+        for (int i = 0; same && i < n; ++i) same = ids[i] == (int32_t) want->v[i]->i;
+        c->bad += !same;
+    }
+    free(ids);
+    return NULL;
+}
 
 int main(int argc, char** argv) {
     const char* dir = argc > 1 ? argv[1] : getenv("MOVA_DIR");
@@ -43,6 +65,20 @@ int main(int argc, char** argv) {
         char* back = tok_decode(t, ids, n < 0 ? 0 : n, &valid);
         if (!strstr(text, "decomposed") && strcmp(back, text)) { ++fails; printf("FAIL case %d: decode differs: \"%.60s\"\n", c, back); }
         free(back);
+    }
+    // the same cases from four threads at once (a server encodes on every connection's thread): every id must match
+    {
+        enum { NT = 4 };
+        Conc cc[NT];
+        pthread_t th[NT];
+        for (int i = 0; i < NT; ++i) {
+            cc[i] = (Conc) {t, g, i, 0};
+            pthread_create(&th[i], NULL, conc_run, &cc[i]);
+        }
+        int bad = 0;
+        for (int i = 0; i < NT; ++i) { pthread_join(th[i], NULL); bad += cc[i].bad; }
+        printf("tokenizer: %d threads x %d cases x 3 rounds: %d mismatches\n", NT, g->n, bad);
+        if (bad) ++fails;
     }
     printf("tokenizer: %d cases, %d ids: %s\n", g->n, nids, fails ? "FAIL" : "PASS");
     json_free(g);

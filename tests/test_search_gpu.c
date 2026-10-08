@@ -20,6 +20,7 @@ static double frand(unsigned* s) { *s = *s * 1103515245u + 12345u; return ((*s >
 int main(int argc, char** argv) {
     char err[512];
     NslmGpu* g = nslm_gpu_open(argc > 1 ? argv[1] : "out/res/search.metallib", err, sizeof err);
+    if (!g && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); return 77; }   // a machine without a GPU
     if (!g) { printf("FAIL: %s\n", err); return 1; }
     const float shs[3][8] = {{1, 1, 1, 1, 1, 1, 1, 1},
                              {0.1012f, 0.07429f, 0.06921f, 0.06821f, 0.08077f, 0.06578f, 185.2f, 0.06626f},

@@ -88,10 +88,10 @@ static int write_model(const char* dir, char* err, int errlen) {
     mkdir("out", 0755);
     mkdir("out/test", 0755);
     mkdir(dir, 0755);
-    char path[512];
+    char path[1024];
     snprintf(path, sizeof path, "%s/config.json", dir);
     FILE* f = fopen(path, "wb");
-    if (!f) { snprintf(err, (size_t) errlen, "cannot write %s", path); return -1; }
+    if (!f) { snprintf(err, (size_t) errlen, "cannot write %.400s", path); return -1; }
     fputs(CONFIG, f);
     fclose(f);
     MovaCfg c;
@@ -194,6 +194,7 @@ int main(void) {
     o.max_seqs = 1;
     o.kv_tokens = 1024;
     Eng* e = eng_open(&o, err, sizeof err);
+    if (!e && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); return 77; }   // a machine without a GPU
     if (!e) { printf("FAIL: eng_open: %s\n", err); return 1; }
     printf("%s\n", eng_describe(e));
     const int V = eng_vocab(e), N = 48, NS = 4, TK = 4, TKV = 2;
@@ -238,6 +239,7 @@ int main(void) {
     printf("scoring: %d rows, %d before the first router flip (%d rows flipped); logit error: those rows max %.2e, all rows "
            "mean %.2e; argmax equal %d / %d\n", N - 1, clean, flips, worst, mean, am_same, N - 1);
     CHECK(flips <= (N - 1) / 4, "scoring: %d rows with a different router choice", flips);
+    CHECK(clean >= (N - 1) / 4, "scoring: only %d rows before the first router flip", clean);   // else worst says nothing
     CHECK(worst < 0.02, "scoring: logit error %.3e before the first flip", worst);
     CHECK(mean < 0.05, "scoring: mean logit error %.3e", mean);
     CHECK(am_same >= (N - 1) * 9 / 10, "scoring: argmax equal in %d of %d rows", am_same, N - 1);
@@ -246,15 +248,21 @@ int main(void) {
     const int P0 = 8;
     CHECK(eng_prefill(e, 0, ids, P0) == 0, "prefill");
     float* lg = (float*) malloc(sizeof(float) * (size_t) V);
-    double dworst = 0;
+    double dworst = 0, dmean = 0;
     int dsame = 0;
     for (int t = P0 - 1; t < N - 1; ++t) {
         CHECK(eng_step(e, 0, lg) == 0, "step");
-        dworst = fmax(dworst, row_err(lg, rd + (size_t) t * V, V));
+        const double re = row_err(lg, rd + (size_t) t * V, V);
+        dworst = fmax(dworst, re);
+        dmean += re / (N - P0);
         dsame += argmax(lg, V) == argmax(rd + (size_t) t * V, V);
         eng_push(e, 0, ids[t + 1]);
     }
-    printf("decode: %d steps, logit error max %.2e (all rows), argmax equal %d / %d\n", N - P0, dworst, dsame, N - P0);
+    printf("decode: %d steps, logit error max %.2e, mean %.2e (all rows), argmax equal %d / %d\n", N - P0, dworst, dmean,
+           dsame, N - P0);
+    // the same bounds as scoring's all-row ones (rows after a router flip may differ more: a gross bound for the max)
+    CHECK(dmean < 0.05, "decode: mean logit error %.3e", dmean);
+    CHECK(dworst < 0.25, "decode: logit error %.3e", dworst);
     CHECK(dsame >= (N - P0) * 9 / 10, "decode: argmax equal in %d of %d steps", dsame, N - P0);
 
     // 3. prompt lookup must commit the tokens of plain greedy decode (a repetitive prompt so drafts are offered)
@@ -271,23 +279,37 @@ int main(void) {
            (long long) sp.accepted, (long long) sp.proposals);
 
     // 4. long prompts: scoring with route capture (forward by forward) and without (an engine may then run the prompt
-    // layer by layer) must give the same logits bit for bit: same kernels, same chunks, same positions
+    // layer by layer) must give the same logits bit for bit: same kernels, same chunks, same positions.  600 rows: two
+    // chunks; 517: a last chunk of 5 rows, which takes the decode kernels (and must not disturb the layer prefetch);
+    // also with an expert cache too small for one layer's experts, so that every layer's experts are copied in
     {
-        const int NL = 600;   // more than one prompt chunk
-        int32_t* lid = (int32_t*) malloc(sizeof(int32_t) * NL);
-        for (int i = 0; i < NL; ++i) lid[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
-        const int from = NL - 70, cnt = 70;
-        float* la = (float*) malloc(sizeof(float) * (size_t) cnt * V);
-        float* lb = (float*) malloc(sizeof(float) * (size_t) cnt * V);
-        CHECK(eng_score(e, 0, lid, from, cnt, la) == 0, "long scoring");
-        eng_mova_routes(e, 1, NL);
-        CHECK(eng_score(e, 0, lid, from, cnt, lb) == 0, "long scoring with routes");
-        eng_mova_routes(e, 0, 0);
-        int diff = 0;
-        for (size_t i = 0; i < (size_t) cnt * V; ++i) diff += la[i] != lb[i];
-        printf("long prompt (%d tokens): %d of %d logits differ between the two forwards\n", NL, diff, cnt * V);
-        CHECK(diff == 0, "long prompt: layer-major and chunked forwards differ");
-        free(lid); free(la); free(lb);
+        EngOpts os = o;
+        set_env("NSLM_EXPERT_VRAM_MB", "13");
+        Eng* es = eng_open(&os, err, sizeof err);
+        set_env("NSLM_EXPERT_VRAM_MB", NULL);
+        CHECK(es != NULL, "eng_open (small expert cache): %s", err);
+        const int lens[2] = {600, 517};
+        for (int k = 0; k < 4; ++k) {
+            Eng* ek = k < 2 ? e : es;
+            const int NL = lens[k & 1];
+            if (!ek) continue;
+            int32_t* lid = (int32_t*) malloc(sizeof(int32_t) * NL);
+            for (int i = 0; i < NL; ++i) lid[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+            const int from = NL - 70, cnt = 70;
+            float* la = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+            float* lb = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+            CHECK(eng_score(ek, 0, lid, from, cnt, la) == 0, "long scoring");
+            eng_mova_routes(ek, 1, NL);
+            CHECK(eng_score(ek, 0, lid, from, cnt, lb) == 0, "long scoring with routes");
+            eng_mova_routes(ek, 0, 0);
+            int diff = 0;
+            for (size_t i = 0; i < (size_t) cnt * V; ++i) diff += la[i] != lb[i];
+            printf("long prompt (%d tokens, %s expert cache): %d of %d logits differ between the two forwards\n", NL,
+                   k < 2 ? "full" : "small", diff, cnt * V);
+            CHECK(diff == 0, "long prompt (%d tokens): layer-major and chunked forwards differ", NL);
+            free(lid); free(la); free(lb);
+        }
+        if (es) eng_close(es);
     }
 
     // 5. cached prefill: a shared prefix is reused and the result equals a full prefill's next step
@@ -324,6 +346,10 @@ int main(void) {
         diff = compare_engines(e, &o, ENG_KV_BF16, "NSLM_KV_VRAM_MB", "1", &st, V, &rel, "KV mostly in host memory");
         printf("KV mostly in host memory: %d differences\n", diff);
         CHECK(diff == 0, "KV placement changed the results");
+        // the prefill GEMM with exact (f32) seed weights: a different rounding point, so close, not equal
+        diff = compare_engines(e, &o, ENG_KV_BF16, "NSLM_SEED_GEMM_F32", "1", &st, V, &rel, "f32 seed weights in the GEMM");
+        printf("f32 seed weights in the GEMM: %d values differ, relative logit difference mean %.2e\n", diff, rel);
+        CHECK(rel < 0.05, "f32 seed weights in the GEMM: mean relative logit difference %.3e", rel);
     }
 
     // 7. the 8-bit KV cache: close to BF16 (its rounding is of BF16's size), and placement-invariant itself

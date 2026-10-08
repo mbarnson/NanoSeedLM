@@ -1,5 +1,6 @@
 // tests/test_lfsr.c - the LFSR spec (nslm/lfsr.h): period, taps, seed semantics, word-parallel and state-cache
 // generators vs scalar on every seed, block pack/unpack, decode exactness.  Exit 0 = pass.
+#undef NDEBUG   // the checks are asserts: they must run in Release builds (CMake defines NDEBUG)
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
