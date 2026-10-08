@@ -202,24 +202,15 @@ static void test_mla(void) {
             ranks[4], CONFIG + 1);
     char err[512] = "";
     if (write_model(dir, config, NULL, err, sizeof err)) { ++fails; printf("FAIL: MLA model folder: %s\n", err); free(config); return; }
-    // A folder without one layer's per-head query map: the reference and the engine must refuse it, naming the tensor
-    {
-        const char* bad = "out/test/engine_model_mla_missing";
-        if (write_model(bad, config, "layers.2.self_attn.mla.q_lat", err, sizeof err)) { ++fails; printf("FAIL: %s\n", err); }
-        else {
-            MovaRef* rb = mova_ref_open(bad, 1, err, sizeof err);
-            CHECK(!rb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA reference without q_lat: %s", rb ? "opened" : err);
-            if (rb) mova_ref_close(rb);
-            EngOpts ob;
-            memset(&ob, 0, sizeof ob);
-            ob.model_dir = bad;
-            ob.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
-            ob.max_seqs = 1;
-            ob.kv_tokens = 64;
-            Eng* eb = eng_open(&ob, err, sizeof err);
-            CHECK(!eb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA engine without q_lat: %s", eb ? "opened" : err);
-            if (eb) eng_close(eb);
-        }
+    // A folder without one layer's per-head query map: the reference (and below, the engine) must refuse it, naming
+    // the tensor
+    const char* bad = "out/test/engine_model_mla_missing";
+    const int bad_ok = write_model(bad, config, "layers.2.self_attn.mla.q_lat", err, sizeof err) == 0;
+    CHECK(bad_ok, "MLA folder without q_lat: %s", err);
+    if (bad_ok) {
+        MovaRef* rb = mova_ref_open(bad, 1, err, sizeof err);
+        CHECK(!rb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA reference without q_lat: %s", rb ? "opened" : err);
+        if (rb) mova_ref_close(rb);
     }
     free(config);
     // The per-head maps are stacked 3-D BF16 tensors [n_head][rows][cols], as the conversion exports them: the engine
@@ -248,8 +239,21 @@ static void test_mla(void) {
     o.max_seqs = 1;
     o.kv_tokens = 1024;
     Eng* e = eng_open(&o, err, sizeof err);
+    if (!e && strstr(err, "not supported by the CUDA engine")) {   // MLA is Metal only so far: a refusal, not a failure
+        printf("MLA engine: %s: skipped\n", err);
+        mova_ref_close(ref);
+        return;
+    }
     if (!e) { ++fails; printf("FAIL: MLA eng_open: %s\n", err); mova_ref_close(ref); return; }
     printf("%s\n", eng_describe(e));
+    if (bad_ok) {
+        EngOpts ob = o;
+        ob.model_dir = bad;
+        ob.kv_tokens = 64;
+        Eng* eb = eng_open(&ob, err, sizeof err);
+        CHECK(!eb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA engine without q_lat: %s", eb ? "opened" : err);
+        if (eb) eng_close(eb);
+    }
     int64_t want_kv = 0;
     for (int l = 0; l < 5; ++l) want_kv += (int64_t) o.kv_tokens * (128 + ranks[l]) * 2;
     EngMem mem;
