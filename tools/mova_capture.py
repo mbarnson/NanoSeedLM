@@ -114,7 +114,7 @@ def main():
     for i in range(L0, L0 + NL):
         model.layers[i].mlp._cap_layer = i
         model.layers[i].self_attn._cap_layer = i
-    ids = mc.encode(tok, open(mc.ROOT / a.text).read())
+    ids = mc.encode(tok, open(mc.ROOT / a.text, encoding="utf-8").read())
     step = a.ctx - 1
     nw = len(ids) // step
     if a.max_windows:

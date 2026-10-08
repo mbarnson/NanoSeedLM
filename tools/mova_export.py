@@ -29,7 +29,7 @@ CTX = 2048
 
 
 def windows(tok, text, limit=0):
-    ids = mc.encode(tok, open(mc.ROOT / text).read())
+    ids = mc.encode(tok, open(mc.ROOT / text, encoding="utf-8").read())
     step = CTX - 1
     nw = len(ids) // step
     if limit:
@@ -96,7 +96,7 @@ def cmd_prompts(a):
     out = mc.ROOT / a.out
     out.parent.mkdir(parents=True, exist_ok=True)
     allids, lines = [], []
-    for l in open(mc.ROOT / a.prompts):
+    for l in open(mc.ROOT / a.prompts, encoding="utf-8"):
         p = json.loads(l)
         ids = mc.encode(tok, "<|ifm|begin_of_text|>" + p["text"])
         allids += ids
@@ -112,7 +112,7 @@ BUCKETS = {"ctx1k": 1024, "ctx4k": 4096, "ctx12k": 12288}
 def cmd_bench(a):
     """Matched-bench prompts: BOS + held-out filler + one chat question, exactly n tokens per bucket."""
     tok = mc.tokenizer()
-    filler = mc.encode(tok, open(mc.ROOT / a.text).read())
+    filler = mc.encode(tok, open(mc.ROOT / a.text, encoding="utf-8").read())
     q = mc.encode(tok, "<|ifm|im_start|>user\nWrite a short paragraph about the history of the bicycle.<|ifm|im_end|>"
                        "<|ifm|im_start|>assistant\n<ifm|think>\n")
     out = mc.ROOT / a.out

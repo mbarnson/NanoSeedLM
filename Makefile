@@ -97,7 +97,7 @@ $(BIN)/nslm-bits-probe: nslm/bits_probe.c $(LIB_O) $(NSLM_HDRS)
 $(BIN)/test_%: tests/test_%.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(LIB_O) -o $@ -lm -lpthread
-$(BIN)/test_chat_template $(BIN)/test_tool_calls: $(BIN)/test_%: tests/test_%.c $(HARN_O) $(LIB_O) tests/data/template_golden.json
+$(BIN)/test_chat_template $(BIN)/test_tool_calls $(BIN)/test_tokenizer: $(BIN)/test_%: tests/test_%.c $(HARN_O) $(LIB_O) tests/data/template_golden.json
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(HARN_O) $(LIB_O) $(HLIBS) -o $@ -lm
 $(BIN)/test_engine: tests/test_engine.c $(ENG_O) $(LIB_O) $(ENG_HDRS) $(RES)/kernels_moe.metallib
