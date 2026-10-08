@@ -64,6 +64,9 @@ int main(int argc, char** argv) {
     MovaCfg c;
     if (mova_cfg_load(&c, model, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
     const int ns = c.n_layer - c.first_sparse, V = c.vocab;
+    // the reference first (it only maps the folder): a folder it cannot read fails before the engine's run
+    MovaRef* r = mova_ref_open(model, threads, err, sizeof err);
+    if (!r) { fprintf(stderr, "reference: %s\n", err); return 1; }
 
     EngOpts o;
     memset(&o, 0, sizeof o);
@@ -81,19 +84,14 @@ int main(int argc, char** argv) {
     // --noise-floor: in place of the engine, the reference with exact attention, so the totals show how far two equally
     // valid BF16 forwards (rounding attention at different points) drift apart on this text
     const int floor_only = opt_flag(argc, argv, "--noise-floor");
-    MovaRef* r = NULL;
     if (floor_only) {
         eng_close(e);
-        r = mova_ref_open(model, threads, err, sizeof err);
-        if (!r) { fprintf(stderr, "reference: %s\n", err); return 1; }
         mova_ref_attn_rounding(r, 0);
         if (mova_ref_forward(r, ids, n - 1, 0, el, em, ev)) { fprintf(stderr, "reference failed\n"); return 1; }
     } else {
         eng_mova_routes(e, 1, n);
         if (eng_score(e, 0, ids, 1, n - 1, el) || eng_mova_routes_read(e, n - 1, em, ev, NULL, NULL)) { fprintf(stderr, "engine failed\n"); return 1; }
         eng_close(e);
-        r = mova_ref_open(model, threads, err, sizeof err);
-        if (!r) { fprintf(stderr, "reference: %s\n", err); return 1; }
     }
     float* rl = (float*) malloc(sizeof(float) * (size_t) n * V);
     int32_t* rm = (int32_t*) malloc(sizeof(int32_t) * (size_t) n * ns * c.top_k);

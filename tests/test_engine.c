@@ -356,6 +356,17 @@ int main(void) {
     if (write_model(dir, CONFIG, NULL, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
     MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
     if (!ref) { printf("FAIL: reference: %s\n", err); return 1; }
+    {   // a folder without one layer's stacked experts (as an original checkpoint, which stores them per expert): the
+        // reference refuses it, naming the tensor (was a NULL dereference in forward)
+        const char* nx = "out/test/engine_model_no_experts";
+        char e2[512] = "";
+        const int ok = write_model(nx, CONFIG, "layers.2.mlp.experts.up_proj", e2, sizeof e2) == 0;
+        CHECK(ok, "folder without experts: %s", e2);
+        MovaRef* rx = ok ? mova_ref_open(nx, 1, e2, sizeof e2) : NULL;
+        CHECK(ok && !rx && strstr(e2, "layers.2.mlp.experts.up_proj") && strstr(e2, "packed"), "reference without experts: %s",
+              rx ? "opened" : e2);
+        if (rx) mova_ref_close(rx);
+    }
     EngOpts o;
     memset(&o, 0, sizeof o);
     o.model_dir = dir;

@@ -167,16 +167,22 @@ static void lin1(const MovaRef* r, const NsTensor* t, int slice, const float* x,
 MovaRef* mova_ref_open(const char* dir, int threads, char* err, int errlen) {
     MovaRef* r = (MovaRef*) calloc(1, sizeof *r);
     if (mova_cfg_load(&r->c, dir, err, errlen) || ns_open(&r->nm, dir, err, errlen)) { free(r); return NULL; }
-    if (r->c.mla) {   // the MLA tensors are read without further checks: all present, BF16, of their shapes
+    {   // the forward reads every tensor without further checks: all present (stacked experts: a packed folder, not the
+        // original checkpoint, which stores them one per expert), of their shapes; the MLA tensors BF16
         MovaTensor* mt = NULL;
         const int n = mova_tensors(&r->c, &mt);
         int bad = 0;
         for (int i = 0; i < n && !bad; ++i) {
-            if (mt[i].kind != MOVA_K_HEADS && !strstr(mt[i].name, ".mla.")) continue;
             const NsTensor* t = ns_find(&r->nm, mt[i].name);
-            bad = !t || t->enc != NS_BF16 || t->slices != mt[i].slices || t->rows != mt[i].rows || t->cols != mt[i].cols;
-            if (bad) snprintf(err, (size_t) errlen, "%s: missing, not BF16, or not %d x %d x %d", mt[i].name, mt[i].slices,
-                              mt[i].rows, mt[i].cols);
+            const int mla = mt[i].kind == MOVA_K_HEADS || strstr(mt[i].name, ".mla.") != NULL;
+            if (!t && (mt[i].kind == MOVA_K_EXPERTS || mt[i].kind == MOVA_K_VEXPERTS))
+                snprintf(err, (size_t) errlen, "%s: missing (the reference reads a packed folder with stacked experts, e.g. "
+                         "from nslm-mova-pack --config q8mx; the original checkpoint stores them per expert)", mt[i].name);
+            else if (!t || (mla && t->enc != NS_BF16) || t->slices != mt[i].slices || t->rows != mt[i].rows || t->cols != mt[i].cols)
+                snprintf(err, (size_t) errlen, "%s: missing, %snot %d x %d x %d", mt[i].name, mla ? "not BF16, or " : "",
+                         mt[i].slices, mt[i].rows, mt[i].cols);
+            else continue;
+            bad = 1;
         }
         free(mt);
         if (bad) { ns_close(&r->nm); free(r); return NULL; }
