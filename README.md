@@ -97,7 +97,7 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   (`tests/data/template_golden.json`).
 - Template options go in `chat_template_kwargs`: `tool_presentation_format` (`markdown`, `json`) and
   `tool_call_format` (`xml`, `json`, `xml_typed`).
-- `reasoning_effort` is `low` (the default when a request names none), `medium` or `high`. The model always thinks
+- `reasoning_effort` is `low`, `medium` or `high` (the default when a request names none). The model always thinks
   first; the reasoning text is in `reasoning_content`.
 - Sampling defaults: `temperature` 1.0, `top_p` 0.95 (IFM). Use `temperature` 0 for greedy decode.
 - The server keeps the KV cache of the previous request's common prefix. Repeated system prompts and tools are not
