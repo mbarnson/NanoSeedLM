@@ -58,6 +58,19 @@ int kt_attn(AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc, 
 // prefill attention (causal, gate fused)
 int kt_attn_prefill(AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc, int npos, const RowInfo* ri,
                     const float* g, float* o, int T);
+// The 8-bit KV cache (EngOpts.kv_format = ENG_KV_Q8): npos positions x n_kv heads x 128 int8 values and one f32 scale
+// per (position, head): a value is q * scale, which the attention kernels read rounded to BF16.
+typedef struct {
+    int8_t *k, *v;
+    float *ks, *vs;
+} KtKvQ8;
+// rope of q (in place) and of k, and v, quantized into the 8-bit caches at the rows' positions (scale = max |x| / 127 of
+// the head's BF16 values); the caches are updated
+int kt_rope_kv_q8(AttnArgs a, float* q, const float* k, const float* v, KtKvQ8 kv, int npos, const RowInfo* ri,
+                  const float* inv, int T);
+// decode and prefill attention (+ gate) on 8-bit caches
+int kt_attn_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const RowInfo* ri, const float* g, float* o, int T);
+int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const RowInfo* ri, const float* g, float* o, int T);
 // fmt MF_BF16 (E) or MF_Q8 (q8, s8, b8): x[t] = row ids[t]
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x);

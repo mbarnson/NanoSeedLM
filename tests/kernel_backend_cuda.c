@@ -225,6 +225,50 @@ int kt_attn_prefill(AttnArgs a, const float* q, const uint16_t* Kc, const uint16
                     (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T), (const float*) dev(g, qn), dout, T);
     return done("kc_attn_prefill", o, dout, qn);
 }
+static KvView q8_kv(const KtKvQ8* kv, int npos, int nkv, void** dk, void** dv, float** dks, float** dvs) {   // segment a
+    const size_t cn = (size_t) npos * nkv * 128, sn = 4 * (size_t) npos * nkv;
+    *dk = dev(kv->k, cn); *dv = dev(kv->v, cn);
+    *dks = (float*) dev(kv->ks, sn); *dvs = (float*) dev(kv->vs, sn);
+    KvView v;
+    memset(&v, 0, sizeof v);
+    v.a.k = *dk; v.a.v = *dv; v.a.ks = *dks; v.a.vs = *dvs;
+    v.b = v.a;
+    v.nv = 1 << 30;
+    v.fmt = KV_Q8;
+    return v;
+}
+int kt_rope_kv_q8(AttnArgs a, float* q, const float* k, const float* v, KtKvQ8 kv, int npos, const RowInfo* ri,
+                  const float* inv, int T) {
+    const size_t qn = 4 * (size_t) T * a.n_head * 128, kn = 4 * (size_t) T * a.n_kv * 128;
+    const size_t cn = (size_t) npos * a.n_kv * 128, sn = 4 * (size_t) npos * a.n_kv;
+    void *dk, *dv;
+    float *dks, *dvs;
+    const KvView view = q8_kv(&kv, npos, a.n_kv, &dk, &dv, &dks, &dvs);
+    float* dq = (float*) dev(q, qn);
+    kc_rope_kv(0, dq, (const float*) dev(k, kn), (const float*) dev(v, kn), view, (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T),
+               (const float*) dev(inv, 4 * 64), a.n_head, a.n_kv, T);
+    if (fetch("kc_rope_kv (Q8)", q, dq, qn) || fetch("kc_rope_kv (Q8)", kv.k, dk, cn) || fetch("kc_rope_kv (Q8)", kv.v, dv, cn) ||
+        fetch("kc_rope_kv (Q8)", kv.ks, dks, sn))
+        return -1;
+    return done("kc_rope_kv (Q8)", kv.vs, dvs, sn);
+}
+int kt_attn_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const RowInfo* ri, const float* g, float* o, int T) {
+    void *dk, *dv;
+    float *dks, *dvs;
+    const KvView view = q8_kv(&kv, npos, a.n_kv, &dk, &dv, &dks, &dvs);
+    return attn(a, (float*) dev(q, 4 * (size_t) T * a.n_head * 128), view, (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T), g,
+                o, T, "kc_attn (Q8)");
+}
+int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const RowInfo* ri, const float* g, float* o, int T) {
+    const size_t qn = 4 * (size_t) T * a.n_head * 128;
+    void *dk, *dv;
+    float *dks, *dvs;
+    const KvView view = q8_kv(&kv, npos, a.n_kv, &dk, &dv, &dks, &dvs);
+    float* dout = (float*) dev(NULL, qn);
+    kc_attn_prefill(0, a, (const float*) dev(q, qn), view, (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T),
+                    (const float*) dev(g, qn), dout, T);
+    return done("kc_attn_prefill (Q8)", o, dout, qn);
+}
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {
     WSlice w;

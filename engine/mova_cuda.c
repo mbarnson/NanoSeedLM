@@ -709,11 +709,12 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     cudaGetDeviceProperties(&prop, 0);
     const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
     snprintf(e->desc, sizeof e->desc,
-             "mova engine (CUDA, %s): experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s; "
+             "mova engine (CUDA, %s): experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s; "
              "expert cache %d + %d of %d + %d experts in VRAM",
              prop.name, fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
-             fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->pm.slots, e->pv.slots,
-             (c->n_layer - c->first_sparse) * c->n_exp, (c->n_layer - c->first_sparse) * c->n_vexp);
+             fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt],
+             e->kv_fmt == KV_Q8 ? ", KV q8" : "", e->pm.slots, e->pv.slots, (c->n_layer - c->first_sparse) * c->n_exp,
+             (c->n_layer - c->first_sparse) * c->n_vexp);
     return e;
 }
 

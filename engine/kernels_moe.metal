@@ -694,12 +694,76 @@ kernel void k_rope_kv(device float* q [[buffer(0)]], device const float* k [[buf
     }
 }
 
+// The 8-bit KV cache (EngOpts ENG_KV_Q8): int8 [cap][n_kv*128] and one f32 scale per (position, KV head) [cap][n_kv]; a
+// value is q * scale, read rounded to BF16 (kv_load4 / kv_load8), as the CUDA kernels do.  k_rope_kv_q8 quantizes the BF16
+// values the BF16 cache would hold: scale = max |x| / 127 over the head (1 for a zero head), q = round(x / scale).  As
+// k_rope_kv, plus Ks, Vs at buffers 8, 9; threadgroups of 64 threads, one head each (the scale's reduction).
+kernel void k_rope_kv_q8(device float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                         device char* Kc [[buffer(3)]], device char* Vc [[buffer(4)]], device const RowInfo* ri [[buffer(5)]],
+                         device const float* inv [[buffer(6)]], constant int2& hk [[buffer(7)]], device float* Ks [[buffer(8)]],
+                         device float* Vs [[buffer(9)]], uint2 g [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                         uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[2][2];
+    const int n_head = hk.x, n_kv = hk.y, t = (int) g.y, i = (int) g.x;   // i: head * 64 + pair
+    const int pos = ri[t].pos;
+    const int head = i / 64, p = i % 64;
+    const float th = (float) pos * inv[p];
+    const float c = cos(th), s = sin(th);
+    if (head < n_head) {
+        device float* qh = q + (ulong) t * n_head * ATT_HD + head * ATT_HD;
+        const float a = qh[p], b = qh[p + 64];
+        qh[p] = bfr(a * c - b * s);
+        qh[p + 64] = bfr(b * c + a * s);
+    }
+    if (head >= n_kv) return;   // uniform over the threadgroup
+    device const float* kh = k + (ulong) t * n_kv * ATT_HD + head * ATT_HD;
+    device const float* vh = v + (ulong) t * n_kv * ATT_HD + head * ATT_HD;
+    const float a = kh[p], b = kh[p + 64];
+    const float k0 = bfr(a * c - b * s), k1 = bfr(b * c + a * s), v0 = bfr(vh[p]), v1 = bfr(vh[p + 64]);
+    const float mk = simd_max(max(fabs(k0), fabs(k1))), mv = simd_max(max(fabs(v0), fabs(v1)));
+    if (lane == 0) { red[sgi][0] = mk; red[sgi][1] = mv; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float MK = max(red[0][0], red[1][0]), MV = max(red[0][1], red[1][1]);
+    const float sk = MK > 0 ? MK / 127.0f : 1.0f, sv = MV > 0 ? MV / 127.0f : 1.0f;
+    const ulong row = (ulong) pos * n_kv + head;
+    device char* kc = Kc + row * ATT_HD;
+    device char* vc = Vc + row * ATT_HD;
+    kc[p] = (char) (int) rint(k0 / sk);
+    kc[p + 64] = (char) (int) rint(k1 / sk);
+    vc[p] = (char) (int) rint(v0 / sv);
+    vc[p + 64] = (char) (int) rint(v1 / sv);
+    if (p == 0) { Ks[row] = sk; Vs[row] = sv; }
+}
+
+// Cache reads for the attention kernels (templates over the cache element: ushort BF16, char 8-bit with scales s).
+// kv_load4: 4 values at c + pos * stride (c at the head and the lane's dims); kv_load8: 8 values as BF16 bits at
+// c + row * stride + off.  The scale of (pos, kvh) is s[pos * n_kv + kvh].
+static inline float4 bfr4(float4 x) { return float4(bfr(x.x), bfr(x.y), bfr(x.z), bfr(x.w)); }
+static inline float4 kv_load4(device const ushort* c, device const float* s, int pos, int stride, int n_kv, int kvh) {
+    const uint2 u = *(device const uint2*) (c + (ulong) pos * stride);
+    return float4(as_type<float>(u.x << 16), as_type<float>(u.x & 0xFFFF0000u), as_type<float>(u.y << 16), as_type<float>(u.y & 0xFFFF0000u));
+}
+static inline float4 kv_load4(device const char* c, device const float* s, int pos, int stride, int n_kv, int kvh) {
+    const char4 u = *(device const char4*) (c + (ulong) pos * stride);
+    return bfr4(float4(u) * s[(ulong) pos * n_kv + kvh]);
+}
+static inline uint4 kv_load8(device const ushort* c, device const float* s, int pos, int stride, int n_kv, int kvh, int off) {
+    return *(device const uint4*) (c + (ulong) pos * stride + off);
+}
+static inline uint4 kv_load8(device const char* c, device const float* s, int pos, int stride, int n_kv, int kvh, int off) {
+    const uint2 w = *(device const uint2*) (c + (ulong) pos * stride + off);
+    const float sc = s[(ulong) pos * n_kv + kvh];
+    const float4 x = float4(as_type<char4>(w.x)) * sc, y = float4(as_type<char4>(w.y)) * sc;
+    return uint4((uint) tobf(x.x) | (uint) tobf(x.y) << 16, (uint) tobf(x.z) | (uint) tobf(x.w) << 16,
+                 (uint) tobf(y.x) | (uint) tobf(y.y) << 16, (uint) tobf(y.z) | (uint) tobf(y.w) << 16);
+}
+
 // Split-key attention: threadgroup (split, kv head, row); simdgroup = one of the 4 query heads; lanes hold 4 dims each.
 // Partials [row][head][split] = (m, l, acc[128]).
-kernel void k_attn(constant AttnArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const ushort* Kc [[buffer(2)]],
-                   device const ushort* Vc [[buffer(3)]], device const RowInfo* ri [[buffer(4)]], device float* part [[buffer(5)]],
-                   uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-                   uint sgi [[simdgroup_index_in_threadgroup]]) {
+template <typename KT>
+static inline void attn_split(constant AttnArgs& a, device const float* q, device const KT* Kc, device const KT* Vc,
+                              device const float* Ks, device const float* Vs, device const RowInfo* ri, device float* part,
+                              uint3 tg, uint lane, uint sgi) {
     const int split = (int) tg.x, kvh = (int) tg.y, t = (int) tg.z;
     const int qh = kvh * (a.n_head / a.n_kv) + (int) sgi;
     const int pos = ri[t].pos;
@@ -711,20 +775,16 @@ kernel void k_attn(constant AttnArgs& a [[buffer(0)]], device const float* q [[b
     float m = -INFINITY, l = 0;
     float4 acc = 0;
     const int stride = a.n_kv * ATT_HD;
-    device const ushort* kb = Kc + kvh * ATT_HD + lane * 4;
-    device const ushort* vb = Vc + kvh * ATT_HD + lane * 4;
+    device const KT* kb = Kc + kvh * ATT_HD + lane * 4;
+    device const KT* vb = Vc + kvh * ATT_HD + lane * 4;
     // ATT_KU keys per step: their loads in flight together, ATT_KU independent reductions, one online-softmax update
     for (int p = p0; p < p1; p += ATT_KU) {
         float s[ATT_KU];
         float4 vf[ATT_KU];
         for (int u = 0; u < ATT_KU; ++u) {
             const int pu = min(p + u, p1 - 1);
-            const uint2 kk = *(device const uint2*) (kb + (ulong) pu * stride);
-            const uint2 vv = *(device const uint2*) (vb + (ulong) pu * stride);
-            const float4 kv = float4(as_type<float>(kk.x << 16), as_type<float>(kk.x & 0xFFFF0000u), as_type<float>(kk.y << 16),
-                                     as_type<float>(kk.y & 0xFFFF0000u));
-            vf[u] = float4(as_type<float>(vv.x << 16), as_type<float>(vv.x & 0xFFFF0000u), as_type<float>(vv.y << 16),
-                           as_type<float>(vv.y & 0xFFFF0000u));
+            const float4 kv = kv_load4(kb, Ks, pu, stride, a.n_kv, kvh);
+            vf[u] = kv_load4(vb, Vs, pu, stride, a.n_kv, kvh);
             s[u] = dot(qv, kv);
         }
         float mx = m;
@@ -745,6 +805,20 @@ kernel void k_attn(constant AttnArgs& a [[buffer(0)]], device const float* q [[b
     device float* pp = part + (((ulong) t * a.n_head + qh) * a.n_splits + split) * (ATT_HD + 2);
     if (lane == 0) { pp[0] = m; pp[1] = l; }
     pp[2 + lane * 4 + 0] = acc.x; pp[2 + lane * 4 + 1] = acc.y; pp[2 + lane * 4 + 2] = acc.z; pp[2 + lane * 4 + 3] = acc.w;
+}
+kernel void k_attn(constant AttnArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const ushort* Kc [[buffer(2)]],
+                   device const ushort* Vc [[buffer(3)]], device const RowInfo* ri [[buffer(4)]], device float* part [[buffer(5)]],
+                   uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                   uint sgi [[simdgroup_index_in_threadgroup]]) {
+    attn_split(a, q, Kc, Vc, (device const float*) nullptr, (device const float*) nullptr, ri, part, tg, lane, sgi);
+}
+// k_attn on the 8-bit cache: scales Ks, Vs at buffers 6, 7
+kernel void k_attn_q8(constant AttnArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const char* Kc [[buffer(2)]],
+                      device const char* Vc [[buffer(3)]], device const RowInfo* ri [[buffer(4)]], device float* part [[buffer(5)]],
+                      device const float* Ks [[buffer(6)]], device const float* Vs [[buffer(7)]],
+                      uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                      uint sgi [[simdgroup_index_in_threadgroup]]) {
+    attn_split(a, q, Kc, Vc, Ks, Vs, ri, part, tg, lane, sgi);
 }
 
 // Reduce the splits, then the softplus output gate: o[t][h*128+d] = bf16(bf16(attn) * bf16(softplus_ln2(g)))
@@ -795,21 +869,28 @@ static inline void frag_bf(thread simdgroup_float8x8& f, threadgroup const ushor
     e[1] = as_type<float>(w & 0xFFFF0000u);
 }
 #endif
-kernel void k_attn_prefill(constant AttnArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const ushort* Kc [[buffer(2)]],
-                           device const ushort* Vc [[buffer(3)]], device const RowInfo* ri [[buffer(4)]], device const float* g [[buffer(5)]],
-                           device float* o [[buffer(6)]], constant int& T [[buffer(7)]],
-                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
-    // BF16 bits; row strides padded by one word so a fragment's 8 rows fall in different banks
-    constexpr int QLD = ATT_HD + 2, VLD = ATT_HD + 2, KLD = ATTF_BK + 2;
-    threadgroup ushort Kt[ATT_HD * KLD];                     // transposed: [dim][key]
-    threadgroup ushort Vt[ATTF_BK * VLD];                    // [key][dim]
+// Threadgroup memory (declared by each kernel: Metal allows it only at kernel scope): BF16 bits; row strides padded by
+// one word so a fragment's 8 rows fall in different banks.  Kt: K transposed [dim][key]; Vt: [key][dim]; per simdgroup
+// qs: bf16(q * scale) [row][dim] and ox: output staging.
+#define ATTF_QLD (ATT_HD + 2)
+#define ATTF_VLD (ATT_HD + 2)
+#define ATTF_KLD (ATTF_BK + 2)
 #if ATTF_DIAG_F32
-    threadgroup float Qt[ATTF_G * ATTF_RS][8 * QLD];
+typedef float attf_q;
 #else
-    threadgroup ushort Qt[ATTF_G * ATTF_RS][8 * QLD];        // per simdgroup: bf16(q * scale) [row][dim]
+typedef ushort attf_q;
 #endif
-    threadgroup float Ox[ATTF_G * ATTF_RS][64];              // per simdgroup: output staging
+#define ATTF_SHARED                                                                                                    \
+    threadgroup ushort Kt[ATT_HD * ATTF_KLD];                                                                          \
+    threadgroup ushort Vt[ATTF_BK * ATTF_VLD];                                                                         \
+    threadgroup attf_q Qt[ATTF_G * ATTF_RS][8 * ATTF_QLD];                                                             \
+    threadgroup float Ox[ATTF_G * ATTF_RS][64];
+template <typename KT>
+static inline void attn_prefill(constant AttnArgs& a, device const float* q, device const KT* Kc, device const KT* Vc,
+                                device const float* Ks, device const float* Vs, device const RowInfo* ri, device const float* g,
+                                device float* o, int T, uint2 tg, uint tid, uint lane, uint sgi, threadgroup ushort* Kt,
+                                threadgroup ushort* Vt, threadgroup attf_q* qs, threadgroup float* ox) {
+    constexpr int QLD = ATTF_QLD, VLD = ATTF_VLD, KLD = ATTF_KLD;
     const int nthr = 32 * ATTF_G * ATTF_RS;
     const int kvh = (int) tg.y, hq = (int) sgi / ATTF_RS, h = kvh * ATTF_G + hq;
     const int t0 = (int) tg.x * 8 * ATTF_RS, r0 = t0 + ((int) sgi % ATTF_RS) * 8;
@@ -818,11 +899,6 @@ kernel void k_attn_prefill(constant AttnArgs& a [[buffer(0)]], device const floa
     const int qid = (int) lane / 4, fm = (qid & 4) + ((int) lane / 2) % 4, fn = (qid & 2) * 2 + ((int) lane % 2) * 2;
     const int mypos = ri[min(r0 + fm, T - 1)].pos;
     const int lastpos = ri[min(r0 + 7, T - 1)].pos;
-#if ATTF_DIAG_F32
-    threadgroup float* qs = Qt[sgi];
-#else
-    threadgroup ushort* qs = Qt[sgi];
-#endif
     for (int e = (int) lane; e < 8 * ATT_HD; e += 32) {   // rows past T repeat row T - 1
         const int rr = min(r0 + e / ATT_HD, T - 1);
 #if ATTF_DIAG_F32
@@ -840,8 +916,8 @@ kernel void k_attn_prefill(constant AttnArgs& a [[buffer(0)]], device const floa
             const int key = e / (ATT_HD / 8), d8 = (e % (ATT_HD / 8)) * 8, p = k0 + key;
             uint4 kk = 0, vv = 0;
             if (p < kend) {
-                kk = *(device const uint4*) (Kc + (ulong) p * stride + kvh * ATT_HD + d8);
-                vv = *(device const uint4*) (Vc + (ulong) p * stride + kvh * ATT_HD + d8);
+                kk = kv_load8(Kc, Ks, p, stride, a.n_kv, kvh, kvh * ATT_HD + d8);
+                vv = kv_load8(Vc, Vs, p, stride, a.n_kv, kvh, kvh * ATT_HD + d8);
             }
             const uint kw[4] = {kk.x, kk.y, kk.z, kk.w}, vw[4] = {vv.x, vv.y, vv.z, vv.w};
             for (int u = 0; u < 4; ++u) {
@@ -919,7 +995,6 @@ kernel void k_attn_prefill(constant AttnArgs& a [[buffer(0)]], device const floa
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (!live) return;
-    threadgroup float* ox = Ox[sgi];
     for (int j = 0; j < 16; ++j) {
         simdgroup_store(O[j], ox, 8);
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -936,6 +1011,25 @@ kernel void k_attn_prefill(constant AttnArgs& a [[buffer(0)]], device const floa
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+kernel void k_attn_prefill(constant AttnArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const ushort* Kc [[buffer(2)]],
+                           device const ushort* Vc [[buffer(3)]], device const RowInfo* ri [[buffer(4)]], device const float* g [[buffer(5)]],
+                           device float* o [[buffer(6)]], constant int& T [[buffer(7)]],
+                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
+    ATTF_SHARED
+    attn_prefill(a, q, Kc, Vc, (device const float*) nullptr, (device const float*) nullptr, ri, g, o, T, tg, tid, lane, sgi, Kt, Vt,
+                 Qt[sgi], Ox[sgi]);
+}
+// k_attn_prefill on the 8-bit cache: scales Ks, Vs at buffers 8, 9
+kernel void k_attn_prefill_q8(constant AttnArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const char* Kc [[buffer(2)]],
+                              device const char* Vc [[buffer(3)]], device const RowInfo* ri [[buffer(4)]], device const float* g [[buffer(5)]],
+                              device float* o [[buffer(6)]], constant int& T [[buffer(7)]], device const float* Ks [[buffer(8)]],
+                              device const float* Vs [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                              uint sgi [[simdgroup_index_in_threadgroup]]) {
+    ATTF_SHARED
+    attn_prefill(a, q, Kc, Vc, Ks, Vs, ri, g, o, T, tg, tid, lane, sgi, Kt, Vt, Qt[sgi], Ox[sgi]);
 }
 
 // Greedy argmax over the vocabulary (ties: the lowest id); one threadgroup of 1024 per row.
