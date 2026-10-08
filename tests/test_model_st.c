@@ -26,6 +26,7 @@ static const NsSpec SPECS[] = {
     {"model.layers.3.mlp.gate.weight", NS_BF16, 1, 4, 64},
     {"model.layers.3.mlp.gate.bias", NS_BF16, 1, 1, 4},
     {"model.layers.3.mlp.experts.gate_proj.weight", NS_SEED4P4, 4, 64, 256},
+    {"model.layers.3.self_attn.q_proj.weight", NS_SEED6P8, 1, 64, 256},
     {"model.layers.3.mlp.experts.down_proj.weight", NS_SEED4, 4, 64, 128},
     {"model.layers.3.self_attn.v_experts.weight", NS_Q4, 3, 64, 128},
     {"model.layers.3.mlp.shared_experts.up_proj.weight", NS_BF16, 2, 32, 64},
