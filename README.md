@@ -104,7 +104,10 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   computed again.
 - `--ctx` sets the context (prompt and output). On a 32 GB Mac, 4096 fits; on a larger Mac, use a larger value, for
   example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held.
-- `--kv q8` keeps the KV cache in 8 bits (see below).
+- `--kv q8` keeps the KV cache in 8 bits (int8 with a scale per token and head) on either engine: half the memory, so a
+  200k-token cache takes about 20 GB instead of 39 GB.  On an M4 Max it costs little quality (KLD against BF16,
+  held-out / chat: 0.0267 / 0.0136 against BF16 KV's 0.0260 / 0.0126, each within about one standard error; top-1
+  agreement unchanged) and about a tenth of decode speed at 4k context.
 
 Example:
 

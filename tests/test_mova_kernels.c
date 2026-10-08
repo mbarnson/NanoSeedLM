@@ -490,8 +490,96 @@ static double gated(double acc, float g) {
     return bfr(bfr(acc) * sp);
 }
 
-// ---- decode attention at a GQA 4 layout: several splits, rows at different positions --------------------------------
-static void test_attn_decode(void) {
+// ---- the 8-bit KV cache: a BF16 cache of np positions x nkv heads quantized per (position, head) (scale = max |x| / 127,
+// q = round(x / scale)), and the BF16 cache replaced by the values the kernels read, bf16(q * scale) ----------------------
+static KtKvQ8 q8_cache(uint16_t* Kc, uint16_t* Vc, int np, int nkv) {
+    KtKvQ8 kv = {malloc((size_t) np * nkv * 128), malloc((size_t) np * nkv * 128), malloc(4 * (size_t) np * nkv),
+                 malloc(4 * (size_t) np * nkv)};
+    for (int which = 0; which < 2; ++which) {
+        uint16_t* c = which ? Vc : Kc;
+        int8_t* q = which ? kv.v : kv.k;
+        float* sc = which ? kv.vs : kv.ks;
+        for (size_t r = 0; r < (size_t) np * nkv; ++r) {
+            float m = 0;
+            for (int e = 0; e < 128; ++e) m = fmaxf(m, fabsf(bf2f(c[r * 128 + e])));
+            const float s = m > 0 ? m / 127.0f : 1.0f;
+            sc[r] = s;
+            for (int e = 0; e < 128; ++e) {
+                q[r * 128 + e] = (int8_t) lrintf(bf2f(c[r * 128 + e]) / s);
+                c[r * 128 + e] = f2bf((float) q[r * 128 + e] * s);
+            }
+        }
+    }
+    return kv;
+}
+static void q8_free(KtKvQ8 kv) { free(kv.k); free(kv.v); free(kv.ks); free(kv.vs); }
+
+// ---- rope + the 8-bit cache: K rotated and rounded to BF16, V as BF16, each (position, head) quantized with its own
+// scale.  GPU sines and divisions may differ from the reference in the last bit: a K value within one BF16 ulp, a scale
+// within one ulp of its maximum, and every code within 1 of round(reference / scale).  Other positions untouched. --------
+static void test_rope_kv_q8(void) {
+    unsigned sd = 31;
+    enum { nh = 8, nkv = 2, P = 6, T = 2 };
+    float q[T * nh * 128], k[T * nkv * 128], v[T * nkv * 128];
+    for (int i = 0; i < T * nh * 128; ++i) q[i] = bfr(frand(&sd));
+    for (int i = 0; i < T * nkv * 128; ++i) { k[i] = bfr(frand(&sd) * (1 + i % 5)); v[i] = bfr(frand(&sd) * 0.3); }
+    for (int e = 0; e < 128; ++e) v[128 + e] = 0;   // a zero head: scale 1, codes 0
+    int8_t K8[P * nkv * 128], V8[P * nkv * 128];
+    float Ks[P * nkv], Vs[P * nkv];
+    memset(K8, 0x55, sizeof K8);
+    memset(V8, 0x55, sizeof V8);
+    for (int i = 0; i < P * nkv; ++i) Ks[i] = Vs[i] = -1;
+    float inv[64];
+    for (int p = 0; p < 64; ++p) inv[p] = (float) pow(1e7, -2.0 * p / 128);
+    const RowInfo ri[T] = {{2, {0}}, {5, {0}}};
+    const AttnArgs a = {nh, nkv, 0, 1, (float) (1 / sqrt(128.0))};
+    const KtKvQ8 kv = {K8, V8, Ks, Vs};
+    int bad = 0, badk = 0, untouched = 0;
+    if (kt_rope_kv_q8(a, q, k, v, kv, P, ri, inv, T)) { ++fails; return; }
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < nkv; ++h) {
+            double x[2][128];   // reference K (rotated, BF16) and V
+            const int pos = ri[t].pos;
+            for (int i = 0; i < 64; ++i) {
+                const double th = (double) (float) ((float) pos * inv[i]), cs = cos(th), sn = sin(th);
+                const double k0 = k[(t * nkv + h) * 128 + i], k1 = k[(t * nkv + h) * 128 + i + 64];
+                x[0][i] = bfr(k0 * cs - k1 * sn);
+                x[0][i + 64] = bfr(k1 * cs + k0 * sn);
+            }
+            for (int e = 0; e < 128; ++e) x[1][e] = v[(t * nkv + h) * 128 + e];
+            for (int which = 0; which < 2; ++which) {
+                double m = 0;
+                for (int e = 0; e < 128; ++e) m = fmax(m, fabs(x[which][e]));
+                const double sref = m > 0 ? m / 127.0 : 1.0;
+                const float s = (which ? Vs : Ks)[pos * nkv + h];
+                if (fabs(s - sref) > sref * (which ? 1e-6 : 1.0 / 128)) {
+                    if (bad < 3) printf("  rope q8 %s t %d h %d: scale %.8g vs %.8g\n", which ? "V" : "K", t, h, s, sref);
+                    ++bad;
+                }
+                for (int e = 0; e < 128; ++e) {
+                    const int code = (which ? V8 : K8)[(pos * nkv + h) * 128 + e];
+                    // K: the reference may sit one BF16 ulp away from the GPU's rotation
+                    const double slack = which ? 0 : fabs(x[0][e]) / 128.0 / s;
+                    if (fabs(code - x[which][e] / s) > 0.5 + 1e-4 + slack + (which ? 0 : 0.5)) {
+                        if (bad < 3) printf("  rope q8 %s t %d h %d d %d: code %d for %.8g / %.8g\n", which ? "V" : "K", t, h, e, code, x[which][e], s);
+                        ++bad;
+                        badk += !which;
+                    }
+                }
+            }
+        }
+    for (int p = 0; p < P; ++p) {
+        if (p == ri[0].pos || p == ri[1].pos) continue;
+        for (int i = 0; i < nkv * 128; ++i) untouched += K8[p * nkv * 128 + i] != 0x55 || V8[p * nkv * 128 + i] != 0x55;
+        for (int h = 0; h < nkv; ++h) untouched += Ks[p * nkv + h] != -1 || Vs[p * nkv + h] != -1;
+    }
+    CHECK(!bad && !untouched, "rope into the 8-bit cache: %d mismatches (%d in K), %d writes outside the rows' positions", bad, badk,
+          untouched);
+    printf("rope into the 8-bit cache: %d rows x %d KV heads, %d mismatches\n", T, nkv, bad);
+}
+
+// ---- decode attention at a GQA 4 layout: several splits, rows at different positions; q8: on the 8-bit cache ---------
+static void test_attn_decode(int q8) {
     unsigned sd = 21;
     const int nh = 8, nkv = 2, NP = 301, T = 3, ns = 5;
     const int pos[3] = {300, 299, 37};
@@ -504,7 +592,9 @@ static void test_attn_decode(void) {
     for (int t = 0; t < T; ++t) ri[t].pos = pos[t];
     const AttnArgs a = {nh, nkv, (NP + ns - 1) / ns, ns, (float) (1 / sqrt(128.0))};
     int bad = 0;
-    if (kt_attn(a, q, Kc, Vc, NP, ri, g, o, T)) ++fails;
+    KtKvQ8 kv = {0};
+    if (q8) kv = q8_cache(Kc, Vc, NP, nkv);   // Kc / Vc: the values the kernel reads, for the reference
+    if (q8 ? kt_attn_q8(a, q, kv, NP, ri, g, o, T) : kt_attn(a, q, Kc, Vc, NP, ri, g, o, T)) ++fails;
     else {
         double* s = malloc(sizeof(double) * NP);
         for (int t = 0; t < T; ++t)
@@ -530,16 +620,18 @@ static void test_attn_decode(void) {
             }
         free(s);
     }
-    CHECK(!bad, "attention decode (%d rows, %d splits, GQA %d/%d): %d mismatches of %d", T, ns, nh, nkv, bad, T * nh * 128);
-    printf("attention decode: %d rows x %d heads, %d splits, %d mismatches\n", T, nh, ns, bad);
+    CHECK(!bad, "attention decode%s (%d rows, %d splits, GQA %d/%d): %d mismatches of %d", q8 ? ", 8-bit KV" : "", T, ns, nh, nkv,
+          bad, T * nh * 128);
+    printf("attention decode%s: %d rows x %d heads, %d splits, %d mismatches\n", q8 ? ", 8-bit KV" : "", T, nh, ns, bad);
+    if (q8) q8_free(kv);
     free(q); free(g); free(o); free(Kc); free(Vc);
 }
 
 // ---- prefill attention: causal, the softplus gate.  MLX's prefill rounding points: q * scale and the probabilities to
 // BF16 for the matrix products (f32 sums), the row sum from the unrounded probabilities.  Reference in double with those
 // roundings, online over the backend's key tiles; outputs within 1 BF16 ulp, except at most 2 of the (row, head) pairs (a
-// probability within f32 noise of a BF16 rounding boundary can flip).
-static void test_attn_prefill(void) {
+// probability within f32 noise of a BF16 rounding boundary can flip).  q8: on the 8-bit cache.
+static void test_attn_prefill(int q8) {
     unsigned sd = 11;
     const int nh = 8, nkv = 2, P0 = 37, T = 45, NP = P0 + T;   // rows at positions P0 .. P0 + T - 1, keys 0 .. their own
     float* q = malloc(4 * (size_t) T * nh * 128), *g = malloc(4 * (size_t) T * nh * 128), *o = malloc(4 * (size_t) T * nh * 128);
@@ -551,7 +643,9 @@ static void test_attn_prefill(void) {
     const AttnArgs a = {nh, nkv, 0, 1, (float) (1 / sqrt(128.0))};
     const int BK = kt_attn_key_tile();
     int bad = 0, badpairs = 0;
-    if (kt_attn_prefill(a, q, Kc, Vc, NP, ri, g, o, T)) ++fails;
+    KtKvQ8 kv = {0};
+    if (q8) kv = q8_cache(Kc, Vc, NP, nkv);
+    if (q8 ? kt_attn_prefill_q8(a, q, kv, NP, ri, g, o, T) : kt_attn_prefill(a, q, Kc, Vc, NP, ri, g, o, T)) ++fails;
     else {
         double* s = malloc(sizeof(double) * NP);
         for (int t = 0; t < T; ++t)
@@ -588,9 +682,11 @@ static void test_attn_prefill(void) {
             }
         free(s);
     }
-    CHECK(badpairs <= 2, "attention prefill (T %d after %d cached, GQA %d/%d, gate): %d (row, head) pairs off (%d outputs of %d)",
-          T, P0, nh, nkv, badpairs, bad, T * nh * 128);
-    printf("attention prefill: %d rows x %d heads, %d (row, head) pairs off, %d outputs\n", T, nh, badpairs, bad);
+    CHECK(badpairs <= 2, "attention prefill%s (T %d after %d cached, GQA %d/%d, gate): %d (row, head) pairs off (%d outputs of %d)",
+          q8 ? ", 8-bit KV" : "", T, P0, nh, nkv, badpairs, bad, T * nh * 128);
+    printf("attention prefill%s: %d rows x %d heads, %d (row, head) pairs off, %d outputs\n", q8 ? ", 8-bit KV" : "", T, nh,
+           badpairs, bad);
+    if (q8) q8_free(kv);
     free(q); free(g); free(o); free(Kc); free(Vc); free(ri);
 }
 
@@ -606,8 +702,11 @@ int main(void) {
     test_mv(512);
     test_misc();
     test_mm();
-    test_attn_prefill();
-    test_attn_decode();
+    test_attn_prefill(0);
+    test_attn_decode(0);
+    test_rope_kv_q8();
+    test_attn_prefill(1);
+    test_attn_decode(1);
     kt_close();
     printf("test_mova_kernels: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

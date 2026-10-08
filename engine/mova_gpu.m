@@ -65,6 +65,9 @@ struct Eng {
     id<MTLBuffer> stab32;                 // the 32-bit stream table (SEED4P4)
     id<MTLBuffer> __strong* Kc;
     id<MTLBuffer> __strong* Vc;
+    id<MTLBuffer> __strong* Ks;           // 8-bit KV cache (kv_q8): one f32 scale per (position, KV head); Kc / Vc are int8
+    id<MTLBuffer> __strong* Vs;
+    int kv_q8;
     int64_t kv_cap;
     // scratch (MAX_ROWS rows)
     id<MTLBuffer> x, xn, q, k, v, gq, ao, ga, ua, aa, G, U, A, D, V, sh, logits, ids, ri, inv, part, inds, wts, vinds, vwts, am;
@@ -279,8 +282,8 @@ static void make_resident(Eng* e) {
 
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     @autoreleasepool {
-        if (o->kv_format != ENG_KV_BF16) {   // engine_api.h: an engine may support only BF16; say so, never ignore it
-            snprintf(err, (size_t) errlen, "KV format %d not supported by the Metal engine (BF16 only)", o->kv_format);
+        if (o->kv_format != ENG_KV_BF16 && o->kv_format != ENG_KV_Q8) {   // engine_api.h: never ignore a format
+            snprintf(err, (size_t) errlen, "KV format %d not supported by the Metal engine", o->kv_format);
             return NULL;
         }
         Eng* e = (Eng*) calloc(1, sizeof *e);
@@ -358,12 +361,23 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         // KV caches
         const int kvd = c->n_kv * c->head_dim;
         e->kv_cap = o->kv_tokens > 0 ? o->kv_tokens : 32768;
+        e->kv_q8 = o->kv_format == ENG_KV_Q8;   // int8 values (half of BF16's bytes) and a scale per (position, head)
         e->Kc = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Vc = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
+        e->Ks = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
+        e->Vs = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         for (int l = 0; l < c->n_layer; ++l) {
-            e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * 2, "K", &e->mem.kv);
-            e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * 2, "V", &e->mem.kv);
-            if (!e->Kc[l] || !e->Vc[l]) { snprintf(err, (size_t) errlen, "KV cache: out of memory"); eng_close(e); return NULL; }
+            e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * (e->kv_q8 ? 1 : 2), "K", &e->mem.kv);
+            e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * (e->kv_q8 ? 1 : 2), "V", &e->mem.kv);
+            if (e->kv_q8) {
+                e->Ks[l] = alloc_k(e, (uint64_t) e->kv_cap * c->n_kv * 4, "Ks", &e->mem.kv);
+                e->Vs[l] = alloc_k(e, (uint64_t) e->kv_cap * c->n_kv * 4, "Vs", &e->mem.kv);
+            }
+            if (!e->Kc[l] || !e->Vc[l] || (e->kv_q8 && (!e->Ks[l] || !e->Vs[l]))) {
+                snprintf(err, (size_t) errlen, "KV cache: out of memory");
+                eng_close(e);
+                return NULL;
+            }
         }
         // scratch
         const int T = MAX_ROWS, d = c->d, qd = c->n_head * c->head_dim, ffmax = c->ff_dense > c->ff_exp ? c->ff_dense : c->ff_exp;
@@ -411,9 +425,9 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->seq.cap = 1024;
         e->seq.hist = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->seq.cap);
         const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
-        snprintf(e->desc, sizeof e->desc, "mova engine: experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s",
+        snprintf(e->desc, sizeof e->desc, "mova engine: experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s",
                  fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
-                 fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt]);
+                 fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt], e->kv_q8 ? ", KV q8" : "");
         return e;
     }
 }
@@ -423,6 +437,7 @@ void eng_close(Eng* e) {
     @autoreleasepool {
         [e->buffers removeAllObjects];
         if (e->Kc) { for (int l = 0; l < e->c.n_layer; ++l) { e->Kc[l] = nil; e->Vc[l] = nil; } free(e->Kc); free(e->Vc); }
+        if (e->Ks) { for (int l = 0; l < e->c.n_layer; ++l) { e->Ks[l] = nil; e->Vs[l] = nil; } free(e->Ks); free(e->Vs); }
         ns_close(&e->nm);
         if (e->ck) mova_ckpt_close(e->ck);
         free(e->L);
@@ -659,7 +674,8 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
         cmd_group(c, MOVA_TG_ATTN);
         {
             const int32_t hk[2] = {g->n_head, g->n_kv};
-            cpipe(c, pipe_(e, "k_rope_kv", 0, 0));
+            const int q8 = e->kv_q8;   // the 8-bit cache: the _q8 kernels, scales at buffers 8, 9 (rope, prefill) / 6, 7 (decode)
+            cpipe(c, pipe_(e, q8 ? "k_rope_kv_q8" : "k_rope_kv", 0, 0));
             cbuf(c, 0, e->q, 0);
             cbuf(c, 1, e->k, 0);
             cbuf(c, 2, e->v, 0);
@@ -668,10 +684,11 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
             cbuf(c, 5, e->ri, 0);
             cbuf(c, 6, e->inv, 0);
             cbytes(c, 7, hk, 8);
+            if (q8) { cbuf(c, 8, e->Ks[l], 0); cbuf(c, 9, e->Vs[l], 0); }
             [c->enc dispatchThreads:MTLSizeMake((NSUInteger) g->n_head * 64, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             if (big) {   // prefill: key tiles on simdgroup matrices, the gate fused
                 const int32_t TT = T;
-                cpipe(c, pipe_(e, "k_attn_prefill", 0, 0));
+                cpipe(c, pipe_(e, q8 ? "k_attn_prefill_q8" : "k_attn_prefill", 0, 0));
                 cbytes(c, 0, &aa, sizeof aa);
                 cbuf(c, 1, e->q, 0);
                 cbuf(c, 2, e->Kc[l], 0);
@@ -680,15 +697,17 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
                 cbuf(c, 5, e->gq, 0);
                 cbuf(c, 6, e->ao, 0);
                 cbytes(c, 7, &TT, 4);
+                if (q8) { cbuf(c, 8, e->Ks[l], 0); cbuf(c, 9, e->Vs[l], 0); }
                 crun(c, (uint64_t) (T + 8 * ATTF_RS - 1) / (8 * ATTF_RS), (uint64_t) g->n_kv, 1, 32 * ATTF_G * ATTF_RS);
             } else {
-                cpipe(c, pipe_(e, "k_attn", 0, 0));
+                cpipe(c, pipe_(e, q8 ? "k_attn_q8" : "k_attn", 0, 0));
                 cbytes(c, 0, &aa, sizeof aa);
                 cbuf(c, 1, e->q, 0);
                 cbuf(c, 2, e->Kc[l], 0);
                 cbuf(c, 3, e->Vc[l], 0);
                 cbuf(c, 4, e->ri, 0);
                 cbuf(c, 5, e->part, 0);
+                if (q8) { cbuf(c, 6, e->Ks[l], 0); cbuf(c, 7, e->Vs[l], 0); }
                 crun(c, (uint64_t) ns, (uint64_t) g->n_kv, (uint64_t) T, 32 * ATT_SG);
                 cpipe(c, pipe_(e, "k_attn_reduce", 0, 0));
                 cbytes(c, 0, &aa, sizeof aa);
