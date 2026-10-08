@@ -1,8 +1,9 @@
-// nslm/dense.c - nslm-dense: P = 4 seed search over MoVA's dense 2-D tensors (attention, shared / dense MLPs, LM head,
-// embedding), one .blk4 per tensor (nslm-moe's format with one slice) for nslm-mova-pack --seeds.
+// nslm/dense.c - nslm-dense: seed search over MoVA's dense 2-D tensors (attention, shared / dense MLPs, LM head,
+// embedding), one file per tensor for nslm-mova-pack --seeds: P = 4 (.blk4, nslm-moe's format with one slice) or
+// P = 8 (.blk8: the same layout with 32-bit coefficient words; search8.h).
 //
-//   nslm-dense --model DIR --xtx DIR --out DIR --mode aw|gptq [--parts amhe] [--workers 4] [--seeds 65535]
-//              [--damp 0.01] [--res out/res] [--only SUBSTR]
+//   nslm-dense --model DIR --xtx DIR --out DIR --mode aw|gptq [--codec p4|p8] [--parts amhe] [--workers 4]
+//              [--seeds 65535] [--damp 0.01] [--res out/res] [--only SUBSTR]
 //
 // --xtx: tools/mova_capture_dense.py's L<l>_<site>.bin (site 0 attention input, 1 o_proj input, 2 MLP input, 3 the MLP
 // down_proj input; L<n_layers>_0 the LM head input).  aw: the search weighted by h = diag(H) / rows (as nslm-moe).
@@ -25,6 +26,8 @@
 #include "search.h"
 #include "search4.h"
 #include "search4_gpu.h"
+#include "search8.h"
+#include "search8_gpu.h"
 
 typedef struct {
     char magic[8];
@@ -44,7 +47,7 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 
 static MovaCkpt* g_ck;
 static const char* g_xtx, *g_out, *g_res;
-static int g_gptq, g_layers;
+static int g_gptq, g_layers, g_p8;
 static double g_damp;
 static Search4Opts g_o;
 
@@ -107,10 +110,34 @@ static void feedback(float* W, const float* E, const double* U, int R, int cols,
     for (int i = 0; i < NT; ++i) pthread_join(th[i], NULL);
 }
 
-static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
+static int fwrite16(const uint32_t* c, size_t n, FILE* f) {   // P = 4: 16-bit coefficient words on disk
+    uint16_t* h = malloc(2 * n);
+    for (size_t k = 0; k < n; ++k) h[k] = (uint16_t) c[k];
+    const int bad = fwrite(h, 2, n, f) != n;
+    free(h);
+    return bad;
+}
+
+// One tensor's search through either codec: rows x cols (A: ng x 64 or NULL, then sh), coefficients as 32-bit words.
+static int gpu_search(Nslm4Gpu* g4, Nslm8Gpu* g8, const float* w, int rows, int cols, const float* sh, const float* A, int bias,
+                      uint16_t* seed, uint32_t* coef, uint8_t* ec, char* err, int errlen) {
+    if (g_p8) return nslm8_gpu_search(g8, w, rows, cols, sh, A, bias, &g_o, seed, coef, ec, NULL, err, errlen);
+    const size_t nb = (size_t) rows * cols / 8;
+    uint16_t* c16 = malloc(2 * nb);
+    const int rc = A ? nslm4_gpu_search_a(g4, w, rows, cols, A, bias, &g_o, seed, c16, ec, NULL, err, errlen)
+                     : nslm4_gpu_search(g4, w, rows, cols, sh, bias, &g_o, seed, c16, ec, NULL, err, errlen);
+    for (size_t k = 0; k < nb; ++k) coef[k] = c16[k];
+    free(c16);
+    return rc;
+}
+static void decode_block(uint16_t s, uint32_t c, int e, uint16_t bf[8]) {
+    if (g_p8) nslm8_decode_block(s, c, e, bf); else nslm4_decode_block(s, (uint16_t) c, e, bf);
+}
+
+static int search_tensor(Nslm4Gpu* g4, Nslm8Gpu* g8, const MovaTensor* t) {
     char path[2048], base[160], err[512];
     snprintf(base, sizeof base, "%.*s", (int) (strlen(t->name) - 7), t->name);   // without ".weight"
-    snprintf(path, sizeof path, "%s/%s.blk4", g_out, base);
+    snprintf(path, sizeof path, "%s/%s.%s", g_out, base, g_p8 ? "blk8" : "blk4");
     struct stat st;
     if (!stat(path, &st)) { printf("%-52s done\n", base); return 0; }
     const int R = t->rows, C = t->cols, ng = C / 8;
@@ -121,7 +148,8 @@ static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
     for (size_t k = 0; k < (size_t) R * C; ++k) W[k] = W0[k] = nslm4_bf2f(wb[k]);
     int64_t clamped = 0;
     const int32_t bias = nslm_choose_bias(W0, (int64_t) nb, &clamped);
-    uint16_t* seed = malloc(2 * nb), *coef = malloc(2 * nb);
+    uint16_t* seed = malloc(2 * nb);
+    uint32_t* coef = malloc(4 * nb);
     uint8_t* ec = malloc(nb);
     int layer = 0;
     const int site = site_of(t, &layer);
@@ -135,14 +163,15 @@ static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
             sh = malloc(sizeof(float) * C);
             for (int c = 0; c < C; ++c) { const double v = h[(size_t) c * C + c]; sh[c] = sqrtf(v > 1e-12 ? (float) v : 1e-12f); }
         }
-        rc = nslm4_gpu_search(gpu, W0, R, C, sh, bias, &g_o, seed, coef, ec, NULL, err, sizeof err);
+        rc = gpu_search(g4, g8, W0, R, C, sh, NULL, bias, seed, coef, ec, err, sizeof err);
         free(sh);
     } else {
         double* U = malloc(sizeof(double) * (size_t) C * C);
         double used = 0;
         if (nslm_gptq_factor(h, C, g_damp, U, &used)) { fprintf(stderr, "%s: H + damp not positive definite\n", base); return -1; }
         float* w8 = malloc(sizeof(float) * (size_t) R * 8), *E = malloc(sizeof(float) * (size_t) R * 128);
-        uint16_t* sg = malloc(2 * (size_t) R), *cg = malloc(2 * (size_t) R);
+        uint16_t* sg = malloc(2 * (size_t) R);
+        uint32_t* cg = malloc(4 * (size_t) R);
         uint8_t* eg = malloc((size_t) R);
         for (int bb = 0; bb < ng && !rc; bb += 16) {   // 128-column batches (lazy feedback)
             const int b1 = bb + 16 < ng ? bb + 16 : ng, c0 = bb * 8, c1 = b1 * 8;
@@ -153,13 +182,13 @@ static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
                 nslm_upper8_inverse(U + (size_t) cb * C + cb, C, T);
                 for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) A[i * 8 + j] = (float) T[j * 8 + i];
                 for (int r = 0; r < R; ++r) memcpy(w8 + (size_t) r * 8, W + (size_t) r * C + cb, sizeof(float) * 8);
-                if ((rc = nslm4_gpu_search_a(gpu, w8, R, 8, A, bias, &g_o, sg, cg, eg, NULL, err, sizeof err))) break;
+                if ((rc = gpu_search(g4, g8, w8, R, 8, NULL, A, bias, sg, cg, eg, err, sizeof err))) break;
                 for (int r = 0; r < R; ++r) {
                     seed[(size_t) r * ng + b] = sg[r];
                     coef[(size_t) r * ng + b] = cg[r];
                     ec[(size_t) r * ng + b] = eg[r];
                     uint16_t bf[8];
-                    nslm4_decode_block(sg[r], cg[r], bias + eg[r], bf);
+                    decode_block(sg[r], cg[r], bias + eg[r], bf);
                     double d[8];
                     for (int c = 0; c < 8; ++c) d[c] = (double) w8[(size_t) r * 8 + c] - nslm4_bf2f(bf[c]);
                     float* er = E + (size_t) r * 128 + (cb - c0);
@@ -190,7 +219,7 @@ static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
     double se = 0, sw = 0, wse = 0, wsw = 0;
     for (size_t k = 0; k < nb; ++k) {
         uint16_t bf[8];
-        nslm4_decode_block(seed[k], coef[k], bias + ec[k], bf);
+        decode_block(seed[k], coef[k], bias + ec[k], bf);
         const int c0 = (int) (k % (size_t) ng) * 8;
         for (int c = 0; c < 8; ++c) {
             const double x = W0[k * 8 + c], d = x - nslm4_bf2f(bf[c]), hc = h ? h[(size_t) (c0 + c) * C + c0 + c] : 1.0;
@@ -199,7 +228,7 @@ static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
     }
     MoeBlkHeader hd;
     memset(&hd, 0, sizeof hd);
-    memcpy(hd.magic, "NSLMBLK4", 8);
+    memcpy(hd.magic, g_p8 ? "NSLMBLK8" : "NSLMBLK4", 8);
     hd.rows = (uint32_t) R; hd.cols = (uint32_t) C; hd.n_experts = 1;
     hd.n_seeds = (uint32_t) g_o.n_seeds; hd.n_exp = (uint32_t) g_o.n_exp; hd.refit = (uint32_t) g_o.refit;
     memcpy(hd.exp_delta, g_o.exp_delta, sizeof hd.exp_delta);
@@ -209,7 +238,8 @@ static int search_tensor(Nslm4Gpu* gpu, const MovaTensor* t) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE* f = fopen(tmp, "wb");
     if (!f || fwrite(&hd, sizeof hd, 1, f) != 1 || fwrite(&bias, 4, 1, f) != 1 || fwrite(&rel, 4, 1, f) != 1 || fwrite(&wrel, 4, 1, f) != 1 ||
-        fwrite(seed, 2, nb, f) != nb || fwrite(coef, 2, nb, f) != nb || fwrite(ec, 1, nb, f) != nb || fclose(f) || rename(tmp, path)) {
+        fwrite(seed, 2, nb, f) != nb || (g_p8 ? fwrite(coef, 4, nb, f) != nb : fwrite16(coef, nb, f)) || fwrite(ec, 1, nb, f) != nb || fclose(f) ||
+        rename(tmp, path)) {
         fprintf(stderr, "cannot write %s\n", path);
         return -1;
     }
@@ -222,15 +252,17 @@ typedef struct { const MovaTensor* list; int n; atomic_int next, fail; } Jobs;
 static void* worker(void* arg) {
     Jobs* j = (Jobs*) arg;
     char err[512], lib[2048];
-    snprintf(lib, sizeof lib, "%s/search4.metallib", g_res);
-    Nslm4Gpu* gpu = nslm4_gpu_open(lib, err, sizeof err);
-    if (!gpu) { fprintf(stderr, "%s\n", err); atomic_store(&j->fail, 1); return NULL; }
+    snprintf(lib, sizeof lib, "%s/%s.metallib", g_res, g_p8 ? "search8" : "search4");
+    Nslm4Gpu* g4 = g_p8 ? NULL : nslm4_gpu_open(lib, err, sizeof err);
+    Nslm8Gpu* g8 = g_p8 ? nslm8_gpu_open(lib, err, sizeof err) : NULL;
+    if (!g4 && !g8) { fprintf(stderr, "%s\n", err); atomic_store(&j->fail, 1); return NULL; }
     for (;;) {
         const int i = atomic_fetch_add(&j->next, 1);
         if (i >= j->n || atomic_load(&j->fail)) break;
-        if (search_tensor(gpu, &j->list[i])) atomic_store(&j->fail, 1);
+        if (search_tensor(g4, g8, &j->list[i])) atomic_store(&j->fail, 1);
     }
-    nslm4_gpu_close(gpu);
+    nslm4_gpu_close(g4);
+    nslm8_gpu_close(g8);
     return NULL;
 }
 
@@ -242,11 +274,14 @@ int main(int argc, char** argv) {
     const int workers = atoi(opt(argc, argv, "--workers", "4"));
     if (!model || !g_out || !mode || (strcmp(mode, "aw") && strcmp(mode, "gptq")) || (!g_xtx && strcmp(parts, "e")) || workers < 1 || workers > 32 ||
         has_flag(argc, argv, "-h")) {
-        fprintf(stderr, "usage: nslm-dense --model DIR --xtx DIR --out DIR --mode aw|gptq [--parts amhe] [--workers 4] [--seeds 65535] "
+        fprintf(stderr, "usage: nslm-dense --model DIR --xtx DIR --out DIR --mode aw|gptq [--codec p4|p8] [--parts amhe] [--workers 4] [--seeds 65535] "
                         "[--damp 0.01] [--res out/res] [--only SUBSTR]\n");
         return 2;
     }
     g_gptq = !strcmp(mode, "gptq");
+    const char* codec = opt(argc, argv, "--codec", "p4");
+    if (strcmp(codec, "p4") && strcmp(codec, "p8")) { fprintf(stderr, "--codec p4|p8\n"); return 2; }
+    g_p8 = !strcmp(codec, "p8");
     g_damp = atof(opt(argc, argv, "--damp", "0.01"));
     g_o = (Search4Opts) {atoi(opt(argc, argv, "--seeds", "65535")), 3, {0, -1, 1}, 1};
     char err[512];
@@ -267,7 +302,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i)   // largest first, so the LM head and embedding do not finish last
         for (int k = i + 1; k < n; ++k)
             if ((double) sel[k].rows * sel[k].cols > (double) sel[i].rows * sel[i].cols) { MovaTensor x = sel[i]; sel[i] = sel[k]; sel[k] = x; }
-    printf("%d tensors, mode %s, %d seeds, %d workers\n", n, mode, g_o.n_seeds, workers);
+    printf("%d tensors, codec %s, mode %s, %d seeds, %d workers\n", n, codec, mode, g_o.n_seeds, workers);
     Jobs j = {sel, n, 0, 0};
     pthread_t th[32];
     for (int i = 0; i < workers; ++i) pthread_create(&th[i], NULL, worker, &j);

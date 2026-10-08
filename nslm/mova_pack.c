@@ -1,7 +1,7 @@
 // nslm/mova_pack.c - nslm-mova-pack: writes a NanoSeedLM model folder for K2-Horizon MoVA (nslm/model_st.h).
 //
 //   nslm-mova-pack --model DIR --config CONFIG --out DIR [--blk DIR] [--blk4 DIR] [--q4 PARTS|--rest4] [--seeds PARTS]
-//                  [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] [--threads 16]
+//                  [--seeds8 PARTS] [--seeds-only SUBSTR] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] [--threads 16]
 //   --mla-q8: MLA tensors kept in Q8 while the rest take --mla, comma-separated, each optionally for layers A-B (v_up@0-23);
 //             default with --mla p4: v_up (held-out KLD -0.0039 for 80 MB on J768), "none" for all seeds
 //                  [--shard-gb 4.5] [--loader tools/nanoseedlm_k2.py]
@@ -19,7 +19,8 @@
 // Value experts, attention, shared / dense MLPs, embedding and LM head are Q8, or Q4 for the parts named in --q4
 // (v value experts, a attention, m shared / dense MLPs, h LM head; --rest4 = vamh; the embedding is always Q8), or
 // SEED4P4 for the parts named in --seeds, from --blk4 (v: L{l}_v_experts.blk4 of nslm-moe; a, m, h, e (embedding):
-// NAME.blk4 of nslm-dense, NAME without ".weight");
+// NAME.blk4 of nslm-dense, NAME without ".weight"), or SEED6P8 for the parts in --seeds8 (a, m, h, e: NAME.blk8 of
+// nslm-dense --codec p8, in --blk4); --seeds-only: only tensors whose name contains SUBSTR take --seeds8;
 // routers are BF16 holding their Q8 round trip (the router needs BF16 operands); norms and router biases are BF16.
 // MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported, or Q8 / Q4
 // with --mla (per-head maps quantized per head along their input dim; a map or projection whose input dim is not a
@@ -203,6 +204,37 @@ static int streams_blk4(Ctx* c, const MovaTensor* t, int s, uint8_t* dst, uint64
     return 0;
 }
 
+// SEED6P8 streams from a .blk8 (one slice): s0 seeds, s1 32-bit coefficient words, s2 int32 bias, s3 exponent codes.
+static int streams_blk8(Ctx* c, const MovaTensor* t, int s, uint8_t* dst, uint64_t len) {
+    const size_t nb = (size_t) t->rows * t->cols / 8;
+    if (s == 0) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/%.*s.blk8", c->blk4, (int) strlen(t->name) - 7, t->name);
+        FILE* f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "cannot read %s\n", path); return -1; }
+        fseek(f, 0, SEEK_END);
+        c->blklen = (size_t) ftell(f);
+        fseek(f, 0, SEEK_SET);
+        free(c->blkbuf);
+        c->blkbuf = (uint8_t*) malloc(c->blklen);
+        const size_t got = fread(c->blkbuf, 1, c->blklen, f);
+        fclose(f);
+        const MoeBlkHeader* h = (const MoeBlkHeader*) c->blkbuf;
+        if (got != c->blklen || memcmp(h->magic, "NSLMBLK8", 8) || h->rows != (uint32_t) t->rows || h->cols != (uint32_t) t->cols ||
+            h->n_experts != 1 || t->slices != 1 || c->blklen != sizeof *h + 12 + 7 * nb) {
+            fprintf(stderr, "%s: not the expected P = 8 seed file\n", path);
+            return -1;
+        }
+    }
+    const uint8_t* base = c->blkbuf + sizeof(MoeBlkHeader);
+    if (s == 0) { memcpy(dst, base + 12, len); return 0; }
+    if (s == 1) { memcpy(dst, base + 12 + 2 * nb, len); return 0; }
+    if (s == 2) { memcpy(dst, base, 4); return 0; }
+    const uint8_t* ec = base + 12 + 6 * nb;
+    for (size_t k = 0; k < nb; k += 2) dst[k / 2] = (uint8_t) ((ec[k] & 15) | ((k + 1 < nb ? ec[k + 1] & 15 : 0) << 4));
+    return 0;
+}
+
 static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     Ctx* c = (Ctx*) ctx;
     const MovaTensor* t = &c->src[ti];
@@ -216,6 +248,7 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     }
     if (enc == NS_BF16 && t->kind == MOVA_K_EXPERTS) return decode_blk4(c, t, dst, len);
     if (enc == NS_SEED4P4) return streams_blk4(c, t, s, dst, len);
+    if (enc == NS_SEED6P8) return streams_blk8(c, t, s, dst, len);
     if (enc == NS_BF16 && t->kind == MOVA_K_HEADS) {   // MLA's per-head maps: one stacked 3-D tensor
         const uint16_t* w = mova_ckpt_bf16_3d(c->ck, t->name, t->slices, t->rows, t->cols, err, sizeof err);
         if (!w) { fprintf(stderr, "%s\n", err); return -1; }
@@ -330,7 +363,7 @@ int main(int argc, char** argv) {
     const char* loader = opt(argc, argv, "--loader", "tools/nanoseedlm_k2.py");
     if (!model || !config || !out) {
         fprintf(stderr, "usage: nslm-mova-pack --model DIR --config q8mx|q4mx|nslmmx|gu4d|gup4d|p4mx|p4mxbf [--blk DIR] [--blk4 DIR] "
-                        "[--q4 vamh|--rest4] [--seeds vamhe] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] --out DIR [--threads N] [--shard-gb 4.5] [--loader FILE]\n");
+                        "[--q4 vamh|--rest4] [--seeds vamhe] [--seeds8 amhe] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] --out DIR [--threads N] [--shard-gb 4.5] [--loader FILE]\n");
         return 2;
     }
     const int q8mx = !strcmp(config, "q8mx"), q4mx = !strcmp(config, "q4mx"), mx = !strcmp(config, "nslmmx"),
@@ -346,7 +379,11 @@ int main(int argc, char** argv) {
     // MLA tensors kept in Q8 (mova_mla_keep_q8); seeds keep v_up in Q8 unless told otherwise ("none")
     const char* mla_q8 = opt(argc, argv, "--mla-q8", mla_enc == NS_SEED4P4 ? "v_up" : "");
     if (!strcmp(mla_q8, "none")) mla_q8 = "";
-    const char* seedparts = opt(argc, argv, "--seeds", "");
+    const char* seedparts = opt(argc, argv, "--seeds", ""), *seed8parts = opt(argc, argv, "--seeds8", ""), *seedonly = opt(argc, argv, "--seeds-only", "");
+    if (*seed8parts && (strspn(seed8parts, "amhe") != strlen(seed8parts) || strpbrk(seed8parts, seedparts) || !opt(argc, argv, "--blk4", NULL))) {
+        fprintf(stderr, "--seeds8 takes a, m, h, e (not also in --seeds) and needs --blk4\n");
+        return 2;
+    }
     if (*seedparts && (strspn(seedparts, "vamhe") != strlen(seedparts) || !opt(argc, argv, "--blk4", NULL))) {
         fprintf(stderr, "--seeds takes v, a, m, h, e and needs --blk4\n");
         return 2;
@@ -383,7 +420,9 @@ int main(int argc, char** argv) {
             // --q4 PARTS: v value experts, a attention, m shared / dense MLPs, h LM head (--rest4 = vamh)
             const int part = t->kind == MOVA_K_VEXPERTS ? 'v' : t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 'e'
                            : strstr(t->name, "self_attn") ? 'a' : 'm';
-            enc = strchr(seedparts, part) ? NS_SEED4P4 : part != 'e' && strchr(q4parts, part) ? NS_Q4 : NS_Q8;
+            const int sel_ok = !*seedonly || strstr(t->name, seedonly);
+            enc = sel_ok && strchr(seed8parts, part) ? NS_SEED6P8 : strchr(seedparts, part) ? NS_SEED4P4
+                : part != 'e' && strchr(q4parts, part) ? NS_Q4 : NS_Q8;
             break;
         }
         default: break;
@@ -398,7 +437,7 @@ int main(int argc, char** argv) {
         static char wname[2048][176];   // seed-encoded MLA projections are stored as NAME.weight (model_st.h's seed names)
         snprintf(wname[n], sizeof wname[n], "%s%s", sel[n].name, enc == NS_SEED4P4 && strstr(sel[n].name, ".mla.") ? ".weight" : "");
         spec[n] = (NsSpec) {wname[n], enc, t->slices, t->rows, t->cols};
-        seeds |= enc == NS_SEED4 || enc == NS_SEED4P4;
+        seeds |= enc == NS_SEED4 || enc == NS_SEED4P4 || enc == NS_SEED6P8;
         params += (double) t->slices * t->rows * t->cols;
         for (int s = 0; s < 4; ++s) bytes += (double) ns_stream_len(enc, t->slices, t->rows, t->cols, s);
         ++n;
