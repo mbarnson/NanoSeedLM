@@ -20,6 +20,7 @@
 // .blk (magic NSLMBLKM): MoeBlkHeader, int32 bias[E], float rel_err[E] (unweighted), float wrel_err[E] (h-weighted),
 // uint16 seed[E][nb], uint16 nib[E][nb]  (nb = rows * cols / 8, row-major block order).
 // .blk4 (magic NSLMBLK4, search4.h): as .blk, but nib = the 4 coefficients, then uint8 ecode[E][nb] (e - bias).
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -84,7 +85,7 @@ static int scope_mask(const char* s) {
 
 static char* g_index;
 static const char* g_model;
-static struct { char name[96]; StFile st; int open; } g_shard[64];
+static struct { char name[128]; StFile st; int open; } g_shard[64];   // the shard file name (as file below)
 static int g_nshard;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -313,11 +314,14 @@ static void* job_worker(void* arg) {
         char tmp[2100];
         snprintf(tmp, sizeof tmp, "%s.tmp", path);
         FILE* f = fopen(tmp, "wb");
-        if (!f || fwrite(&h, sizeof h, 1, f) != 1 || fwrite(bias, 4, (size_t) E, f) != (size_t) E || fwrite(rel, 4, (size_t) E, f) != (size_t) E ||
-            fwrite(wrel, 4, (size_t) E, f) != (size_t) E || fwrite(seed, 2, nb * (size_t) E, f) != nb * (size_t) E ||
-            fwrite(nib, 2, nb * (size_t) E, f) != nb * (size_t) E || (ec && fwrite(ec, 1, nb * (size_t) E, f) != nb * (size_t) E) ||
-            fclose(f) || rename(tmp, path)) {
-            fprintf(stderr, "cannot write %s\n", path);
+        int ok = f && fwrite(&h, sizeof h, 1, f) == 1 && fwrite(bias, 4, (size_t) E, f) == (size_t) E && fwrite(rel, 4, (size_t) E, f) == (size_t) E &&
+                 fwrite(wrel, 4, (size_t) E, f) == (size_t) E && fwrite(seed, 2, nb * (size_t) E, f) == nb * (size_t) E &&
+                 fwrite(nib, 2, nb * (size_t) E, f) == nb * (size_t) E && (!ec || fwrite(ec, 1, nb * (size_t) E, f) == nb * (size_t) E);
+        if (f && fclose(f)) ok = 0;
+        if (ok && rename(tmp, path)) ok = 0;
+        if (!ok) {
+            fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno));
+            remove(tmp);
             atomic_store(&j->failed, 1);
         }
         double mr = 0, mw = 0;

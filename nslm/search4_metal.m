@@ -17,6 +17,7 @@ Nslm4Gpu* nslm4_gpu_open(const char* metallib, char* err, int errlen) {
     @autoreleasepool {
         Nslm4Gpu* g = (Nslm4Gpu*) calloc(1, sizeof(Nslm4Gpu));
         g->dev = MTLCreateSystemDefaultDevice();
+        if (!g->dev) { snprintf(err, errlen, "no Metal device"); free(g); return NULL; }
         NSError* e = nil;
         id<MTLLibrary> lib = g->dev ? [g->dev newLibraryWithURL:[NSURL fileURLWithPath:@(metallib)] error:&e] : nil;
         id<MTLFunction> f = lib ? [lib newFunctionWithName:@"k_seed_search4"] : nil;

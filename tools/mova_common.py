@@ -1,6 +1,8 @@
 """tools/mova_common.py - shared pieces of the MoVA Python tools: load K2-Horizon-MoVA-36B-A4B (BF16) in MLX through
 the MLX reference implementation (k2_horizon_model.py, registered as mlx_lm.models.k2_horizon), the tokenizer, and the
 weight overrides that turn the BF16 model into a candidate (expanded NSLM experts, or MLX affine quantize-dequantize).
+MLX is needed only by the model functions: the tokenizer and the file exports (mova_export.py windows / prompts /
+bench) run on any platform with `tokenizers` and `numpy` (MOVA_MODEL: any folder with the model's tokenizer.json).
 
 Environment:
   OMLX_K2_MODEL  path to k2_horizon_model.py (default: omlx/patches/k2_horizon/k2_horizon_model.py of an importable
@@ -13,7 +15,10 @@ import os
 import sys
 from pathlib import Path
 
-import mlx.core as mx
+try:
+    import mlx.core as mx   # macOS: the model functions below
+except ImportError:         # elsewhere: tokenizer and exports only
+    mx = None
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO_ID = "IFM/K2-Horizon-MoVA-36B-A4B"
@@ -182,6 +187,11 @@ def _apply_one(model, spec):
 def machine_state():
     import subprocess
     st = {}
+    if sys.platform != "darwin":
+        if hasattr(os, "getloadavg"):
+            la = os.getloadavg()
+            st["load1"], st["load5"] = round(la[0], 2), round(la[1], 2)
+        return st
     try:
         st["power"] = "AC" if "AC Power" in subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout else "battery"
         la = os.getloadavg()

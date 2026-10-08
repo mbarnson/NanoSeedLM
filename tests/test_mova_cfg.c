@@ -12,8 +12,13 @@ static int fails = 0;
 int main(int argc, char** argv) {
     char def[512];
     snprintf(def, sizeof def, "%s/.cache/huggingface/hub/models--IFM--K2-Horizon-MoVA-36B-A4B/snapshots/"
-             "cca48b6631d03c338a0e1d8beb0c392af8becbd3", getenv("HOME"));
+             "cca48b6631d03c338a0e1d8beb0c392af8becbd3", getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE") ? getenv("USERPROFILE") : ".");
     const char* dir = argc > 1 ? argv[1] : getenv("MOVA_DIR") ? getenv("MOVA_DIR") : def;
+    char probe[1100];
+    snprintf(probe, sizeof probe, "%s/config.json", dir);
+    FILE* pf = fopen(probe, "rb");
+    if (!pf) { printf("SKIP: no model folder (MOVA_DIR, or the Hugging Face snapshot): %s\n", dir); return 77; }
+    fclose(pf);
     MovaCfg c;
     char err[256] = "";
     CHECK(mova_cfg_load(&c, dir, err, sizeof err) == 0, "load: %s", err);

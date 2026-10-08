@@ -57,7 +57,7 @@ int main(void) {
     }
     // search: reference vs brute force (double) over seeds 1..NS
     {
-        const int NS = 1024, NB = 200;
+        enum { NS = 1024, NB = 200 };   // constants: no VLAs (MSVC)
         unsigned sd = 7;
         float sh[8];
         for (int c = 0; c < 8; ++c) sh[c] = (float) (0.5 + (frand(&sd) + 1));

@@ -279,6 +279,10 @@ static void make_resident(Eng* e) {
 
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     @autoreleasepool {
+        if (o->kv_format != ENG_KV_BF16) {   // engine_api.h: an engine may support only BF16; say so, never ignore it
+            snprintf(err, (size_t) errlen, "KV format %d not supported by the Metal engine (BF16 only)", o->kv_format);
+            return NULL;
+        }
         Eng* e = (Eng*) calloc(1, sizeof *e);
         e->buffers = [NSMutableArray new];
         e->pipes = [NSMutableDictionary new];
@@ -290,6 +294,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             return NULL;
         }
         e->dev = MTLCreateSystemDefaultDevice();
+        if (!e->dev) { snprintf(err, (size_t) errlen, "no Metal device"); free(e); return NULL; }
         e->queue = [e->dev newCommandQueue];
         NSError* nerr = nil;
         NSString* lib = [NSString stringWithFormat:@"%s/kernels_moe.metallib", o->resource_dir ? o->resource_dir : "out/res"];
@@ -813,7 +818,7 @@ int eng_prefill(Eng* e, int seq, const int32_t* ids, int n) {
     for (int i = 0; i < n; ++i) hist_push(&e->seq, ids[i]);
     for (int p = 0; p < n - 1; p += MAX_ROWS) {
         const int T = n - 1 - p < MAX_ROWS ? n - 1 - p : MAX_ROWS;
-        if (forward(e, ids + p, T, p, T, NULL, NULL)) return -1;
+        if (forward(e, ids + p, T, p, T, NULL, NULL)) { e->seq.len = 0; return -1; }   // no half-written KV
     }
     return 0;
 }
@@ -825,7 +830,7 @@ int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) 
     for (int i = c; i < n; ++i) hist_push(&e->seq, ids[i]);
     for (int p = c; p < n - 1; p += MAX_ROWS) {
         const int T = n - 1 - p < MAX_ROWS ? n - 1 - p : MAX_ROWS;
-        if (forward(e, ids + p, T, p, T, NULL, NULL)) return -1;
+        if (forward(e, ids + p, T, p, T, NULL, NULL)) { e->seq.len = 0; return -1; }
     }
     if (reused) *reused = c;
     return 0;

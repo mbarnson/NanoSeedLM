@@ -22,7 +22,7 @@ int main(void) {
     char path[512], name[128];
     snprintf(path, sizeof path, "%s/index.txt", dir);
     FILE* idx = fopen(path, "r");
-    if (!idx) { printf("FAIL: no golden files (run tools/mova_affine_golden.py)\n"); return 1; }
+    if (!idx) { printf("SKIP: no golden files (run tools/mova_affine_golden.py)\n"); return 77; }
     int fails = 0, n = 0, rows, cols;
     while (fscanf(idx, "%127s %d %d", name, &rows, &cols) == 3) {
         const size_t N = (size_t) rows * cols, G = N / 64;

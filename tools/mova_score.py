@@ -28,7 +28,7 @@ V = 250624
 
 
 def windows(tok, text, limit):
-    ids = mc.encode(tok, open(mc.ROOT / text).read())
+    ids = mc.encode(tok, open(mc.ROOT / text, encoding="utf-8").read())
     step = CTX - 1
     nw = len(ids) // step
     if limit:

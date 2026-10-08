@@ -304,11 +304,37 @@ void py_num(Buf* b, const Json* j) {
         else buf_puts(b, "0");
     }
 }
+// Length of the valid UTF-8 sequence at s (1 .. 4), or 0 (overlong forms, surrogates and code points past U+10FFFF are
+// invalid, as RFC 3629).
+static int utf8_seq(const unsigned char* s) {
+    const unsigned c = s[0];
+    if (c < 0x80) return 1;
+    int n;
+    unsigned cp;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; cp = c & 0x07; }
+    else return 0;
+    for (int i = 1; i < n; ++i) {
+        if ((s[i] & 0xC0) != 0x80) return 0;   // also stops at the terminating 0
+        cp = cp << 6 | (s[i] & 0x3Fu);
+    }
+    if ((n == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) || (n == 4 && (cp < 0x10000 || cp > 0x10FFFF))) return 0;
+    return n;
+}
+// A JSON string; bytes that are not valid UTF-8 (a model can sample any byte token) become U+FFFD, one per byte, so the
+// output is always valid JSON text (RFC 8259).
 static void dump_str(Buf* b, const char* s) {
     buf_puts(b, "\"");
     for (; *s; ++s) {
         const unsigned char c = (unsigned char) *s;
         char e[8];
+        if (c >= 0x80) {
+            const int n = utf8_seq((const unsigned char*) s);
+            if (n) { buf_put(b, s, (size_t) n); s += n - 1; }
+            else buf_puts(b, "\xEF\xBF\xBD");
+            continue;
+        }
         if (c == '"') buf_puts(b, "\\\"");
         else if (c == '\\') buf_puts(b, "\\\\");
         else if (c == '\n') buf_puts(b, "\\n");

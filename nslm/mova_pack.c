@@ -363,7 +363,9 @@ int main(int argc, char** argv) {
     memset(&c, 0, sizeof c);
     c.ck = ck; c.src = sel; c.blk = blk; c.blk4 = opt(argc, argv, "--blk4", NULL); c.threads = atoi(opt(argc, argv, "--threads", "16"));
     if (c.threads < 1 || c.threads > 64) c.threads = 16;
-    const double t0 = (double) clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    const double t0 = (double) ts0.tv_sec + 1e-9 * (double) ts0.tv_nsec;
     const uint64_t shard = (uint64_t) (atof(opt(argc, argv, "--shard-gb", "4.5")) * 1e9);
     char meta[128];
     snprintf(meta, sizeof meta, "\"nanoseedlm\": \"%s\"", config);
@@ -382,7 +384,8 @@ int main(int argc, char** argv) {
     }
     snprintf(to, sizeof to, "%s/%s", out, loader_name);
     if (seeds && copy_file(loader, to)) { fprintf(stderr, "%s: cannot copy the MLX loader\n", loader); return 1; }
-    printf("wrote %s in %.1f s\n", out, (double) clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9 - t0);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    printf("wrote %s in %.1f s\n", out, (double) ts1.tv_sec + 1e-9 * (double) ts1.tv_nsec - t0);
     free(c.words); free(c.scales); free(c.biases); free(c.blkbuf); free(all);
     mova_ckpt_close(ck);
     return 0;

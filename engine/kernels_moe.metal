@@ -1,6 +1,8 @@
 // engine/kernels_moe.metal - Metal kernels of the MoVA engine (engine/mova_gpu.m); host code #includes it for the
 // argument structs and constants.  Activations are f32 buffers of BF16-rounded values, rounded wherever the MLX
-// reference implementation produces a BF16 tensor.  Every kernel has a C reference in tests/test_mova_kernels.m.
+// reference implementation produces a BF16 tensor.  Every kernel has a C reference in tests/test_mova_kernels.c.
+#ifndef NSLM_KERNELS_MOE_METAL
+#define NSLM_KERNELS_MOE_METAL
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 using namespace metal;
@@ -962,3 +964,5 @@ kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [
 }
 
 #endif
+
+#endif   // NSLM_KERNELS_MOE_METAL

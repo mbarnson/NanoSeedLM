@@ -27,7 +27,7 @@ static int g_nt = 16;
 static float bf2f(uint16_t h) { uint32_t u = (uint32_t) h << 16; float f; memcpy(&f, &u, 4); return f; }
 
 static void* run(void* arg) {
-    const int id = (int) (long) arg, P = F->P;
+    const int id = (int) (intptr_t) arg, P = F->P;
     for (int b = id; b < NB; b += g_nt) {
         const float* w = W + b * 8;
         double wn = 0;
@@ -80,7 +80,7 @@ static double seeds(int P, int qbits) {
         for (int c = 0; c < 8; ++c) for (int p = 0; p < P; ++p) F->U[s][c * P + p] = (double) st[P * c + p] - 32768.0;
     }
     pthread_t th[64];
-    for (int i = 0; i < g_nt; ++i) pthread_create(&th[i], NULL, run, (void*) (long) i);
+    for (int i = 0; i < g_nt; ++i) pthread_create(&th[i], NULL, run, (void*) (intptr_t) i);
     for (int i = 0; i < g_nt; ++i) pthread_join(th[i], NULL);
     double e = 0, n = 0;
     for (int b = 0; b < NB; ++b) { e += best[b]; for (int c = 0; c < 8; ++c) n += (double) W[b * 8 + c] * W[b * 8 + c]; }

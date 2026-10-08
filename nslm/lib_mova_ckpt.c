@@ -12,7 +12,7 @@
 struct MovaCkpt {
     char dir[1024];
     char* index;
-    struct { char name[96]; StFile st; } shard[64];
+    struct { char name[128]; StFile st; } shard[64];   // the shard file name (as file below)
     int nshard;
     pthread_mutex_t mu;
 };

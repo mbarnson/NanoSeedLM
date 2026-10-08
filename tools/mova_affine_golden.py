@@ -35,7 +35,7 @@ def main():
     out = mc.ROOT / a.out
     out.mkdir(parents=True, exist_ok=True)
     import json
-    idx = json.load(open(mc.MOVA / "model.safetensors.index.json"))["weight_map"]
+    idx = json.load(open(mc.MOVA / "model.safetensors.index.json", encoding="utf-8"))["weight_map"]
     items = []
     for name, rows in TENSORS:
         w = mx.load(str(mc.MOVA / idx[name]))[name]

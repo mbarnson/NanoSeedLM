@@ -1,6 +1,5 @@
-// tests/test_search4_gpu.m - the P = 4 Metal search (nslm/search4.metal) against the scalar C reference
+// tests/test_search4_gpu.c - the P = 4 GPU search (nslm/search4.metal or nslm/search4.cu) against the scalar C reference
 // (nslm4_search_ref): identical seed, coefficients, exponent code and error bits for every block.
-#import <Foundation/Foundation.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +11,10 @@
 static double frand(unsigned* s) { *s = *s * 1103515245u + 12345u; return ((*s >> 8) & 0xFFFF) / 65536.0 * 2 - 1; }
 
 int main(void) {
-    @autoreleasepool {
+    {
         char err[512];
         Nslm4Gpu* g = nslm4_gpu_open("out/res/search4.metallib", err, sizeof err);
+        if (!g && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); return 77; }   // a machine without a GPU
         if (!g) { printf("FAIL: %s\n", err); return 1; }
         const int rows = 600, cols = 32, ng = cols / 8, NS = 2048, bias = -22;
         unsigned sd = 11;
