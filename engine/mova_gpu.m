@@ -76,6 +76,7 @@ struct Eng {
     id<MTLBuffer> perm, tiles, vperm, vtiles;   // grouped GEMM: pairs sorted by expert, tile tables (prompt chunks)
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     int mla_hg;                           // MLA: query heads per latent-attention threadgroup (pipeline limit)
+    int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
     EngMem mem;
     Seq* seqs;                            // slot s: KV cache rows s * slot_cap ..
     int nseqs;
@@ -620,7 +621,7 @@ static void enc_swiglu(Cmd* c, id<MTLBuffer> G, id<MTLBuffer> U, id<MTLBuffer> A
 // Dense projection: matvec for T <= 8 rows, GEMM above.
 static void enc_dense(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuffer> Y, int ys, int T, bool add) {
     Eng* e = c->e;
-    if (T <= MV_MAXT) { enc_mv(c, W, X, xs, Y, ys, T, add, nil, 0, 1); return; }
+    if (T <= MV_MAXT && !e->prompt) { enc_mv(c, W, X, xs, Y, ys, T, add, nil, 0, 1); return; }
     MmArgs a = {W->cols, W->rows, T, xs, ys, 1, add ? 1 : 0, 0};
     cpipe(c, pipe_(e, "k_mm", W->fmt, 1));
     cbytes(c, 0, &a, sizeof a);
@@ -710,7 +711,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     enc_heads_mv(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);
     enc_heads_mv(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);
     cmd_group(c, MOVA_TG_ATTN);
-    const int big = T > MV_MAXT, nsp = big ? 1 : ns;
+    const int big = T > MV_MAXT || e->prompt, nsp = big ? 1 : ns;
     const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
     cpipe(c, pipe_(e, "k_mla_rope", 0, 0));
     cbytes(c, 0, &ma, sizeof ma);
@@ -748,7 +749,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
 static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
     const MovaCfg* g = &e->c;
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim;
-    const bool big = T > MV_MAXT;
+    const bool big = T > MV_MAXT || e->prompt;
     cmd_group(c, MOVA_TG_EMBED_NORM);
     {
         const int32_t dd = d;
@@ -997,7 +998,10 @@ int eng_prefill_next(Eng* e, int seq, int max_rows) {
     const int left = s->len - 1 - s->done;
     if (left <= 0) return 0;
     const int T = left < max_rows ? (left < MAX_ROWS ? left : MAX_ROWS) : (max_rows < MAX_ROWS ? max_rows : MAX_ROWS);
-    if (forward(e, seq, s->hist + s->done, T, s->done, T, NULL, NULL)) { s->len = s->done = 0; return -1; }   // no half-written KV
+    e->prompt = 1;
+    const int rc = forward(e, seq, s->hist + s->done, T, s->done, T, NULL, NULL);
+    e->prompt = 0;
+    if (rc) { s->len = s->done = 0; return -1; }   // no half-written KV
     s->done += T;
     return left - T;
 }

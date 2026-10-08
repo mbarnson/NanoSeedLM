@@ -196,8 +196,9 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
 // 9. batched decode (eng_step_batch): NB sequences of mixed lengths in their own slots (more than one forward's MV_MAXT
 // rows), filled by chunked prefill (eng_prefill_begin / eng_prefill_next, interleaved), then stepped together with
 // teacher-forced tokens.  Each row against the same sequence run alone (same chunks, same steps) in a one-slot engine:
-// rows whose router choices agree must agree to the engines' rounding (a one-row and a several-row matvec may sum in
-// different orders) and in arg max; route flips are counted and bounded.
+// rows whose router choices agree must agree to the engines' rounding (CUDA's one-row and several-row matvecs sum in
+// different orders) and in arg max; route flips are counted and bounded.  Metal must agree bit for bit, and its prompt
+// caches must not depend on the prefill chunks either (a server's chunks start wherever a slot's cache reuse ends).
 static void test_batch(const char* dir, const char* what) {
     enum { NB = 11, STEPS = 4, CAP = 256, CH = 50, NSP = 4, TK = 4, TKV = 2 };
     EngOpts o;
@@ -238,6 +239,20 @@ static void test_batch(const char* dir, const char* what) {
         }
     }
     eng_mova_routes(e1, 0, 0);
+    const int exact_engine = !strstr(eng_describe(eb), "CUDA");
+    for (int k = 0; k < 2; ++k) {   // sequence 5 (187 tokens) prefilled in chunks of 7, and in one call
+        const int i = 5;
+        int left = 0;
+        if (k == 0) {
+            CHECK(eng_prefill_begin(e1, 0, ids[i], len[i], NULL) == 0, "%s batch: prefill_begin", what);
+            while ((left = eng_prefill_next(e1, 0, 7)) > 0) {}
+        } else left = eng_prefill(e1, 0, ids[i], len[i]);
+        CHECK(left == 0 && eng_step(e1, 0, lb) == 0, "%s batch: prefill in chunks", what);
+        const int same = !memcmp(lb, ref + (size_t) i * STEPS * V, sizeof(float) * (size_t) V);
+        const double re = row_err(lb, ref + (size_t) i * STEPS * V, V);
+        printf("%s prefill %s: %s (logit error %.2e)\n", what, k ? "in one call" : "in chunks of 7", same ? "bit-equal to chunks of 50" : "differs", re);
+        CHECK(exact_engine ? same : re < 2e-2, "%s batch: prefill chunking changed the logits (error %.3e)", what, re);
+    }
     // together: chunked prefills interleaved, then batched steps
     for (int i = 0; i < NB; ++i) CHECK(eng_prefill_begin(eb, seqs[i], ids[i], len[i], NULL) == 0, "%s batch: prefill_begin", what);
     CHECK(eng_step_batch(eb, seqs, NB, lb) != 0, "%s batch: a step over slots still prefilling must fail", what);
@@ -273,6 +288,7 @@ static void test_batch(const char* dir, const char* what) {
     CHECK(flips <= rows / 8, "%s batch: %d rows with different router choices", what, flips);
     CHECK(worst < 2e-2, "%s batch: logit error %.3e against decoding alone", what, worst);
     CHECK(am_same == rows - flips, "%s batch: argmax differs in %d rows", what, rows - flips - am_same);
+    CHECK(!exact_engine || exact == rows, "%s batch: %d of %d rows differ from decoding alone", what, rows - exact, rows);
     CHECK(eng_prefill(eb, NB + 1, ids[0], 4) != 0 && eng_prefill(eb, 1, ids[0], CAP + 1) != 0, "%s batch: slot bounds", what);
     eng_close(e1);
     eng_close(eb);

@@ -62,6 +62,7 @@ typedef struct {
 typedef struct {
     int32_t* hist;
     int len, cap;
+    int done;   // positions whose KV is computed (hist[0 .. done-1])
 } Seq;
 
 
@@ -129,7 +130,9 @@ struct Eng {
     int ngraphs;        // instantiated (at most MAX_GRAPHS: each is a whole forward's thousands of nodes)
     int no_graph;
     EngMem mem;
-    Seq seq;
+    Seq* seqs;   // slot s: KV cache rows s * slot_cap ..
+    int nseqs;
+    int64_t slot_cap;
     char desc[640];   // eng_describe (the device name alone can be 255 bytes)
     // route capture
     int route_on, route_max;
@@ -602,6 +605,13 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     // KV caches
     const int kvd = c->n_kv * c->head_dim;
     e->kv_cap = o->kv_tokens > 0 ? o->kv_tokens : 32768;
+    e->nseqs = o->max_seqs > 0 ? o->max_seqs : 1;
+    e->slot_cap = e->kv_cap / e->nseqs;
+    if (e->slot_cap < 1 || e->kv_cap > INT32_MAX) {
+        snprintf(err, (size_t) errlen, "KV cache: %lld tokens for %d sequences", (long long) e->kv_cap, e->nseqs);
+        eng_close(e);
+        return NULL;
+    }
     e->kv_fmt = o->kv_format == ENG_KV_Q8 ? KV_Q8 : KV_BF16;
     e->kv_row = (uint64_t) kvd * (e->kv_fmt == KV_Q8 ? 1 : 2);
     e->kv_srow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
@@ -753,8 +763,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     }
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL || getenv("MOVA_DUMP") != NULL;
     e->seed_f32 = getenv("NSLM_SEED_GEMM_F32") != NULL;   // a rounding-point experiment; BF16 seed weights by default
-    e->seq.cap = 1024;
-    e->seq.hist = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->seq.cap);
+    e->seqs = (Seq*) calloc((size_t) e->nseqs, sizeof(Seq));
+    for (int s = 0; s < e->nseqs; ++s) {
+        e->seqs[s].cap = 1024;
+        e->seqs[s].hist = (int32_t*) malloc(sizeof(int32_t) * 1024);
+    }
     struct cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
@@ -801,7 +814,8 @@ void eng_close(Eng* e) {
     if (e->st) cudaStreamDestroy(e->st);
     ns_close(&e->nm);
     if (e->ck) mova_ckpt_close(e->ck);
-    free(e->seq.hist);
+    if (e->seqs) for (int s = 0; s < e->nseqs; ++s) free(e->seqs[s].hist);
+    free(e->seqs);
     free(e->kv_vrow); free(e->kv_voff);
     free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
     free(e);
@@ -1074,14 +1088,19 @@ static void encode_head(Eng* e, int h0, int n) {
 
 static void route_collect(Eng* e, int T);
 
-// Forward of T rows (tokens tok[0..T-1] at positions pos0..pos0+T-1).  Rows [h0, T) get logits (into logits_out,
-// (T - h0) x vocab, may be NULL) and arg max (into am, may be NULL); h0 = T: no head.
-static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* logits_out, int32_t* am) {
+// Forward of T rows (tokens tok[0..T-1], rows[t]: position and slot cache base).  Rows [h0, T) get logits (into
+// logits_out, (T - h0) x vocab, may be NULL) and arg max (into am, may be NULL); h0 = T: no head.  Rows of more than
+// MV_MAXT (the prefill kernels) must be consecutive positions of one slot.
+static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, int h0, float* logits_out, int32_t* am) {
     kc_seed_gemm_f32(e->seed_f32);   // a launch setting of the kernels' host side (engines in one process may differ)
     if (T < 1 || T > MAX_ROWS) return -1;
-    if (pos0 + T > e->kv_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->kv_cap); return -1; }
+    int max_ctx = 0;
+    for (int t = 0; t < T; ++t) {
+        if (rows[t].pos >= e->slot_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->slot_cap); return -1; }
+        if (rows[t].pos + 1 > max_ctx) max_ctx = rows[t].pos + 1;
+    }
     memcpy(e->h_ids, tok, (size_t) T * 4);
-    for (int t = 0; t < T; ++t) { memset(&e->h_ri[t], 0, sizeof e->h_ri[t]); e->h_ri[t].pos = pos0 + t; }
+    memcpy(e->h_ri, rows, (size_t) T * sizeof(RowInfo));
     if (!CK(cudaMemcpyAsync(e->ids, e->h_ids, (size_t) T * 4, cudaMemcpyHostToDevice, e->st)) ||
         !CK(cudaMemcpyAsync(e->ri, e->h_ri, (size_t) T * sizeof(RowInfo), cudaMemcpyHostToDevice, e->st)))
         return -1;
@@ -1090,7 +1109,7 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
     // (a head from row 0 < h0 < T would be baked into the graph).
     const int graph = T <= MV_MAXT && !e->timing_on && !e->no_graph && (h0 == 0 || h0 >= T);
     if (graph) {
-        const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, pos0 + T)) * 2 + (h0 < T));
+        const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, max_ctx)) * 2 + (h0 < T));
         if (!e->graphs[key]) {
             if (e->ngraphs >= MAX_GRAPHS) {   // drop the least recently launched
                 int lru = -1;
@@ -1103,7 +1122,7 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
             }
             cudaGraph_t gr;
             if (!CK(cudaStreamBeginCapture(e->st, cudaStreamCaptureModeThreadLocal))) return -1;
-            const int rc = encode_forward(e, T, pos0 + T, h0);
+            const int rc = encode_forward(e, T, max_ctx, h0);
             if (h0 < T) encode_head(e, h0, T - h0);
             if (!CK(cudaStreamEndCapture(e->st, &gr)) || rc) return -1;
             if (!CK(cudaGraphInstantiate(&e->graphs[key], gr, 0))) { e->graphs[key] = NULL; cudaGraphDestroy(gr); return -1; }
@@ -1112,7 +1131,7 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
         }
         e->graph_use[key] = ++e->graph_tick;
         if (!CK(cudaGraphLaunch(e->graphs[key], e->st))) return -1;
-    } else if (encode_forward(e, T, pos0 + T, h0)) return -1;
+    } else if (encode_forward(e, T, max_ctx, h0)) return -1;
     for (int r = h0; r < T; r += MAX_LOGIT_ROWS) {
         const int n = T - r < MAX_LOGIT_ROWS ? T - r : MAX_LOGIT_ROWS;
         if (!graph) encode_head(e, r, n);
@@ -1126,6 +1145,13 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
     if (!CK(cudaGetLastError())) return -1;
     if (e->route_on) route_collect(e, T);
     return 0;
+}
+// Forward of T rows of slot seq at positions pos0 .. pos0 + T - 1.
+static int forward(Eng* e, int seq, const int32_t* tok, int T, int pos0, int h0, float* logits_out, int32_t* am) {
+    RowInfo ri[MAX_ROWS];
+    if (T < 1 || T > MAX_ROWS) return -1;
+    for (int t = 0; t < T; ++t) ri[t] = (RowInfo){pos0 + t, (int) (seq * e->slot_cap), {0}};
+    return forward_rows(e, tok, ri, T, h0, logits_out, am);
 }
 
 #define PREFETCH_ROWS 64
@@ -1144,17 +1170,17 @@ static void prefetch_layer(Eng* e, int l) {
 // Rows ids[0..n) at positions pos0.., layer by layer over up to xmax rows at a time (sub-chunks of MAX_ROWS): every
 // layer's experts come to VRAM once per xmax rows, not once per chunk.  Rows [h0, n) get logits (into logits_out,
 // (n - h0) x vocab, may be NULL).  Route capture takes the chunked forward (its records are per forward).
-static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out);
-static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
-    if (e->route_on || n <= MV_MAXT) return forward_lm_body(e, ids, n, pos0, h0, logits_out);
+static int forward_lm_body(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out);
+static int forward_lm(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
+    if (e->route_on || n <= MV_MAXT) return forward_lm_body(e, seq, ids, n, pos0, h0, logits_out);
     // a sub-chunk of 1 .. MV_MAXT rows takes the decode path, whose next-layer prediction could replace a slot the
     // pending prefetch copy is filling
     e->in_lm = 1;
-    const int rc = forward_lm_body(e, ids, n, pos0, h0, logits_out);
+    const int rc = forward_lm_body(e, seq, ids, n, pos0, h0, logits_out);
     e->in_lm = 0;
     return rc;
 }
-static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
+static int forward_lm_body(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
     kc_seed_gemm_f32(e->seed_f32);
     if (e->route_on || n <= MV_MAXT) {
         for (int p = 0; p < n; p += MAX_ROWS) {
@@ -1162,17 +1188,17 @@ static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, 
             int hh = h0 - p;
             if (hh < 0) hh = 0;
             if (hh > T) hh = T;
-            if (forward(e, ids + p, T, pos0 + p, hh, hh < T && logits_out ? logits_out + (size_t) (p + hh - h0) * e->c.vocab : NULL, NULL)) return -1;
+            if (forward(e, seq, ids + p, T, pos0 + p, hh, hh < T && logits_out ? logits_out + (size_t) (p + hh - h0) * e->c.vocab : NULL, NULL)) return -1;
         }
         return 0;
     }
     const MovaCfg* g = &e->c;
-    const int d = g->d;
-    if (pos0 + n > e->kv_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->kv_cap); return -1; }
+    const int d = g->d, kv0 = (int) (seq * e->slot_cap);
+    if (pos0 + n > e->slot_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->slot_cap); return -1; }
     for (int s0 = 0; s0 < n; s0 += e->xmax) {
         const int N = n - s0 < e->xmax ? n - s0 : e->xmax;
         memcpy(e->h_ids_all, ids + s0, sizeof(int32_t) * (size_t) N);
-        for (int i = 0; i < N; ++i) { memset(&e->h_ri_all[i], 0, sizeof(RowInfo)); e->h_ri_all[i].pos = pos0 + s0 + i; }
+        for (int i = 0; i < N; ++i) e->h_ri_all[i] = (RowInfo){pos0 + s0 + i, kv0, {0}};
         if (!CK(cudaMemcpyAsync(e->ids_all, e->h_ids_all, sizeof(int32_t) * (size_t) N, cudaMemcpyHostToDevice, e->st)) ||
             !CK(cudaMemcpyAsync(e->ri_all, e->h_ri_all, sizeof(RowInfo) * (size_t) N, cudaMemcpyHostToDevice, e->st)))
             return -1;
@@ -1189,11 +1215,12 @@ static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, 
                 if (l >= g->first_sparse) CK(cudaStreamWaitEvent(e->st, e->ev_ready[l], 0));
                 if (l + 1 < g->n_layer && l + 1 > g->first_sparse) prefetch_layer(e, l + 1);
             }
-            // host KV rows: this pass reads rows [0, p0 - nv) and writes [p0 - nv, p1 - nv); staged while the layer runs
-            const int64_t p0 = pos0 + s0, p1 = p0 + N, hr0 = p0 > e->kv_nv ? p0 - e->kv_nv : 0, hr1 = p1 - e->kv_nv;
+            // host KV rows: this pass reads the slot's rows [b0, hr0) and writes [hr0, hr1); staged while the layer runs
+            const int64_t p0 = kv0 + pos0 + s0, p1 = p0 + N, hr0 = p0 > e->kv_nv ? p0 - e->kv_nv : 0, hr1 = p1 - e->kv_nv;
+            const int64_t b0 = kv0 > e->kv_nv ? kv0 - e->kv_nv : 0;
             const int stage = hr1 > 0;
             if (stage) {
-                if (kv_stage_copy(e, l, 0, hr0, 1)) return -1;
+                if (kv_stage_copy(e, l, b0, hr0, 1)) return -1;
                 e->kv_staged = l;
             }
             for (int c0 = 0; c0 < N; c0 += MAX_ROWS) {
@@ -1220,49 +1247,89 @@ static int forward_lm_body(Eng* e, const int32_t* ids, int n, int pos0, int h0, 
     return 0;
 }
 
-// ---- sequences (one slot) -------------------------------------------------------------------------------------------
+// ---- sequences (as engine/mova_gpu.m) ------------------------------------------------------------------------------
 
 static void hist_push(Seq* s, int32_t t) {
     if (s->len == s->cap) { s->cap *= 2; s->hist = (int32_t*) realloc(s->hist, sizeof(int32_t) * (size_t) s->cap); }
     s->hist[s->len++] = t;
 }
-
-int eng_prefill(Eng* e, int seq, const int32_t* ids, int n) {
-    if (seq != 0 || n < 1 || n > e->kv_cap) return -1;
-    e->seq.len = 0;
-    for (int i = 0; i < n; ++i) hist_push(&e->seq, ids[i]);
-    if (n > 1 && forward_lm(e, ids, n - 1, 0, n - 1, NULL)) { e->seq.len = 0; return -1; }   // no half-written KV
-    return 0;
+static Seq* seq_of(Eng* e, int seq) { return seq >= 0 && seq < e->nseqs ? &e->seqs[seq] : NULL; }
+// Distinct slots, each prefilled (only the pending token uncached).
+static int ready(Eng* e, const int* seqs, int n) {
+    if (n < 1) return 0;
+    for (int i = 0; i < n; ++i) {
+        const Seq* s = seq_of(e, seqs[i]);
+        if (!s || s->len < 1 || s->done < s->len - 1) return 0;
+        for (int k = 0; k < i; ++k) if (seqs[k] == seqs[i]) return 0;
+    }
+    return 1;
 }
-int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
-    if (seq != 0 || n < 1 || n > e->kv_cap) return -1;
+
+int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
+    Seq* s = seq_of(e, seq);
+    if (!s || n < 1 || n > e->slot_cap) return -1;
     int c = 0;
-    while (c < e->seq.len - 1 && c < n - 1 && e->seq.hist[c] == ids[c]) ++c;   // KV is valid for hist[0 .. len-2]
-    e->seq.len = c;
-    for (int i = c; i < n; ++i) hist_push(&e->seq, ids[i]);
-    if (n - 1 > c && forward_lm(e, ids + c, n - 1 - c, c, n - 1 - c, NULL)) { e->seq.len = 0; return -1; }
+    while (c < s->done && c < n - 1 && s->hist[c] == ids[c]) ++c;
+    s->len = s->done = c;
+    for (int i = c; i < n; ++i) hist_push(s, ids[i]);
     if (reused) *reused = c;
     return 0;
 }
+int eng_prefill_next(Eng* e, int seq, int max_rows) {
+    Seq* s = seq_of(e, seq);
+    if (!s || s->len < 1 || max_rows < 1) return -1;
+    const int left = s->len - 1 - s->done;
+    if (left <= 0) return 0;
+    const int T = left < max_rows ? left : max_rows;
+    if (forward_lm(e, seq, s->hist + s->done, T, s->done, T, NULL)) { s->len = s->done = 0; return -1; }   // no half-written KV
+    s->done += T;
+    return left - T;
+}
+int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
+    if (eng_prefill_begin(e, seq, ids, n, reused)) return -1;
+    return eng_prefill_next(e, seq, INT32_MAX);   // one layer-major pass
+}
+int eng_prefill(Eng* e, int seq, const int32_t* ids, int n) {
+    Seq* s = seq_of(e, seq);
+    if (!s) return -1;
+    s->len = s->done = 0;
+    return eng_prefill_cached(e, seq, ids, n, NULL);
+}
 int eng_rewind(Eng* e, int seq, int n) {
-    if (seq != 0 || n < 1 || n > e->seq.len) return -1;
-    e->seq.len = n;
+    Seq* s = seq_of(e, seq);
+    if (!s || n < 1 || n > s->len) return -1;
+    s->len = n;
+    if (s->done > n) s->done = n;
     return 0;
 }
 int eng_fork(Eng* e, int dst, int src) { (void) e; return dst == src ? 0 : -1; }
-void eng_free(Eng* e, int seq) { if (seq == 0) e->seq.len = 0; }
-int eng_len(Eng* e, int seq) { return seq == 0 ? e->seq.len : 0; }
+void eng_free(Eng* e, int seq) { Seq* s = seq_of(e, seq); if (s) s->len = s->done = 0; }
+int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len : 0; }
 
-int eng_step(Eng* e, int seq, float* logits) {
-    if (seq != 0 || e->seq.len < 1) return -1;
-    const int32_t t = e->seq.hist[e->seq.len - 1];
-    return forward(e, &t, 1, e->seq.len - 1, 0, logits, NULL);
-}
+int eng_step(Eng* e, int seq, float* logits) { return eng_step_batch(e, &seq, 1, logits); }
 int eng_push(Eng* e, int seq, int32_t tok) {
-    if (seq != 0) return -1;
-    hist_push(&e->seq, tok);
+    Seq* s = seq_of(e, seq);
+    if (!s) return -1;
+    hist_push(s, tok);
     return 0;
 }
+// The pending tokens of seqs[0..n-1] (ready()) in forwards of up to MV_MAXT rows: logits (n x vocab) and / or arg max.
+static int step_rows(Eng* e, const int* seqs, int n, float* logits, int32_t* am) {
+    for (int i0 = 0; i0 < n; i0 += MV_MAXT) {
+        const int T = n - i0 < MV_MAXT ? n - i0 : MV_MAXT;
+        int32_t tok[MV_MAXT];
+        RowInfo ri[MV_MAXT];
+        for (int t = 0; t < T; ++t) {
+            const Seq* s = &e->seqs[seqs[i0 + t]];
+            tok[t] = s->hist[s->len - 1];
+            ri[t] = (RowInfo){s->len - 1, (int) (seqs[i0 + t] * e->slot_cap), {0}};
+        }
+        if (forward_rows(e, tok, ri, T, 0, logits ? logits + (size_t) i0 * e->c.vocab : NULL, am ? am + i0 : NULL)) return -1;
+        for (int t = 0; t < T; ++t) e->seqs[seqs[i0 + t]].done = e->seqs[seqs[i0 + t]].len;
+    }
+    return 0;
+}
+int eng_step_batch(Eng* e, const int* seqs, int n, float* logits) { return ready(e, seqs, n) ? step_rows(e, seqs, n, logits, NULL) : -1; }
 
 // Prompt-lookup speculative decoding (ENG_MODE_PL), as engine/mova_gpu.m: the draft continues the most recent earlier
 // occurrence of the history's last PL_NMAX..PL_NMIN tokens; one forward verifies [pending, d_1 .. d_k] with the decode
@@ -1286,44 +1353,49 @@ static int pl_draft(const Seq* s, int32_t* d) {
     }
     return 0;
 }
-static int gen_pl(Eng* e, int n_new, int32_t* out, EngStats* st) {
+static int gen_pl(Eng* e, int seq, int n_new, int32_t* out, EngStats* st) {
     int32_t tok[PL_K + 1], am[PL_K + 1], d[PL_K];
+    Seq* s = &e->seqs[seq];
     for (int done = 0; done < n_new;) {
-        const int nd = pl_draft(&e->seq, d), p = e->seq.len - 1;
-        tok[0] = e->seq.hist[p];
+        const int nd = pl_draft(s, d), p = s->len - 1;
+        tok[0] = s->hist[p];
         for (int j = 0; j < nd; ++j) tok[j + 1] = d[j];
-        if (forward(e, tok, nd + 1, p, 0, NULL, am)) return -1;
+        if (forward(e, seq, tok, nd + 1, p, 0, NULL, am)) return -1;
         int a = 0;
         while (a < nd && d[a] == am[a]) ++a;
         for (int j = 0; j <= a && done < n_new; ++j) {
-            hist_push(&e->seq, am[j]);
+            hist_push(s, am[j]);
             out[done++] = am[j];
             if (st) st->tokens++;
         }
+        s->done = s->len - 1;
         if (st) { st->forwards++; st->rows += nd + 1; st->cycles++; st->proposals += nd; st->accepted += a; }
     }
     return 0;
 }
 
 int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t* out, EngStats* st) {
-    if (nseq != 1 || seqs[0] != 0) return -1;
-    if (mode == ENG_MODE_PL) return gen_pl(e, n_new, out, st);
+    if (!ready(e, seqs, nseq)) return -1;
+    if (mode == ENG_MODE_PL) return nseq == 1 ? gen_pl(e, seqs[0], n_new, out, st) : -1;
+    int32_t* am = (int32_t*) malloc(sizeof(int32_t) * (size_t) nseq);
     for (int j = 0; j < n_new; ++j) {
-        int32_t am;
-        const int32_t t = e->seq.hist[e->seq.len - 1];
-        if (forward(e, &t, 1, e->seq.len - 1, 0, NULL, &am)) return -1;
-        hist_push(&e->seq, am);
-        out[j] = am;
-        if (st) { st->tokens++; st->forwards++; st->rows++; }
+        if (step_rows(e, seqs, nseq, NULL, am)) { free(am); return -1; }
+        for (int i = 0; i < nseq; ++i) {
+            hist_push(&e->seqs[seqs[i]], am[i]);
+            out[(size_t) i * n_new + j] = am[i];
+        }
+        if (st) { st->tokens += nseq; st->forwards += (nseq + MV_MAXT - 1) / MV_MAXT; st->rows += nseq; }
     }
+    free(am);
     return 0;
 }
 
 int eng_score(Eng* e, int seq, const int32_t* ids, int from, int count, float* logits) {
-    if (seq != 0 || from < 1 || count < 1) return -1;
+    Seq* s = seq_of(e, seq);
+    if (!s || from < 1 || count < 1) return -1;
+    s->len = s->done = 0;   // the slot's cache is overwritten
     const int last = from + count - 2;
-    if (forward_lm(e, ids, last + 1, 0, from - 1, logits)) return -1;
-    e->seq.len = 0;
+    if (forward_lm(e, seq, ids, last + 1, 0, from - 1, logits)) return -1;
     return 0;
 }
 
