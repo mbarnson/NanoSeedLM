@@ -75,7 +75,6 @@ struct Eng {
     id<MTLBuffer> x, xn, q, k, v, gq, ao, ga, ua, aa, G, U, A, D, V, sh, logits, ids, ri, inv, part, inds, wts, vinds, vwts, am;
     id<MTLBuffer> perm, tiles, vperm, vtiles;   // grouped GEMM: pairs sorted by expert, tile tables (prompt chunks)
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
-    int mla_hg;                           // MLA: query heads per latent-attention threadgroup (pipeline limit)
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
@@ -467,8 +466,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             e->qrp = scratch(e, (uint64_t) T * qd * 4, "MLA query RoPE parts");
             e->qlat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA absorbed queries");
             e->olat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA latent outputs");
-            const int hg = (int) pipe_(e, "k_mla_attn", 0, 0).maxTotalThreadsPerThreadgroup / 32;
-            e->mla_hg = hg < c->n_head ? hg : c->n_head;
+            if (pipe_(e, "k_mla_attn", 0, 0).maxTotalThreadsPerThreadgroup < 32 * MLAF_SG) {
+                snprintf(err, (size_t) errlen, "k_mla_attn: fewer than %d threads per threadgroup", 32 * MLAF_SG);
+                eng_close(e);
+                return NULL;
+            }
         }
         e->inds = scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4, "inds");       // per layer (route capture)
         e->wts = scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4, "wts");
@@ -639,6 +641,7 @@ static void enc_dense(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuffer
     cbuf(c, 7, stab_for(e, W), 0);
     cbuf(c, 8, e->ids, 0);
     bind_nibbles(c, W, 9);
+    cbuf(c, 10, Y, 0);   // the gate's (unused)
     crun(c, (uint64_t) (W->rows + MM_BM - 1) / MM_BM, (uint64_t) (T + MM_BN - 1) / MM_BN, 1, 128);
 }
 // Grouped expert projection over the tile table built by bucket(): pairs perm[], tiles[].
@@ -658,6 +661,7 @@ static void enc_grouped(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuff
     cbuf(c, 7, stab_for(e, W), 0);
     cbuf(c, 8, tiles, 0);
     bind_nibbles(c, W, 9);
+    cbuf(c, 10, Y, 0);   // the gate's (unused)
     crun(c, (uint64_t) (W->rows + MM_BM - 1) / MM_BM, (uint64_t) ntiles, 1, 128);
 }
 // Host bucketing of T x k selections (inds) by expert: perm = pair ids grouped by expert (ascending pair id within an
@@ -702,6 +706,28 @@ static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
+// The per-head maps for prompt rows: one GEMM per head (k_mm on its slice), with the gate when G is given.
+static void enc_heads_mm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
+    Eng* e = c->e;
+    const int H = W->slices, O = W->rows, I = W->cols;
+    const MmArgs a = {I, O, T, xs, H * O, 1, G ? 2 : 0, 0};
+    cpipe(c, pipe_(e, "k_mm", MF_BF16, 1));
+    cbytes(c, 0, &a, sizeof a);
+    cbuf(c, 2, W->b[0], 0);
+    cbuf(c, 3, W->b[0], 0);
+    cbuf(c, 6, e->ids, 0);
+    cbuf(c, 7, e->stab, 0);
+    cbuf(c, 8, e->ids, 0);
+    cbuf(c, 9, e->stab, 0);
+    for (int h = 0; h < H; ++h) {
+        cbuf(c, 1, W->b[0], W->o[0] + (uint64_t) h * O * I * 2);
+        cbuf(c, 4, X, (uint64_t) h * hs * 4);
+        cbuf(c, 5, Y, (uint64_t) h * O * 4);
+        cbuf(c, 10, G ? G : Y, (uint64_t) h * O * 4);
+        crun(c, (uint64_t) (O + MM_BM - 1) / MM_BM, (uint64_t) (T + MM_BN - 1) / MM_BN, 1, 128);
+    }
+}
+
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v): the latent
 // c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write, latent attention (split-key +
 // reduce for decode, one pass for prompt chunks), then v_up with the gate into ao.
@@ -713,10 +739,11 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     enc_dense(c, &L->ka_x, e->xn, d, e->lat, r, T, false);
     if (L->sparse) enc_dense(c, &L->ka_v, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(c, &L->kr, e->xn, d, e->k, g->mla_rope, T, false);
-    enc_heads_mv(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);
-    enc_heads_mv(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);
-    cmd_group(c, MOVA_TG_ATTN);
     const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns;
+    void (*heads)(Cmd*, const MW*, id<MTLBuffer>, int, int, id<MTLBuffer>, id<MTLBuffer>, int) = big ? enc_heads_mm : enc_heads_mv;
+    heads(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);   // prompt rows: GEMMs
+    heads(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);
+    cmd_group(c, MOVA_TG_ATTN);
     const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
     cpipe(c, pipe_(e, "k_mla_rope", 0, 0));
     cbytes(c, 0, &ma, sizeof ma);
@@ -737,8 +764,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     cbuf(c, 4, e->Vc[l], 0);
     cbuf(c, 5, e->ri, 0);
     cbuf(c, 6, nsp > 1 ? e->part : e->olat, 0);
-    [c->enc setThreadgroupMemoryLength:(NSUInteger) (2 * MLA_KU * (r + g->mla_rope) + 15) / 16 * 16 atIndex:0];
-    crun(c, (uint64_t) nsp, (uint64_t) ((H + e->mla_hg - 1) / e->mla_hg), (uint64_t) T, (uint64_t) 32 * e->mla_hg);
+    crun(c, (uint64_t) nsp, (uint64_t) ((H + MLAF_Q - 1) / MLAF_Q), (uint64_t) T, 32 * MLAF_SG);
     if (nsp > 1) {
         cpipe(c, pipe_(e, "k_mla_reduce", 0, 0));
         cbytes(c, 0, &ma, sizeof ma);
@@ -747,7 +773,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
         crun(c, (uint64_t) H, (uint64_t) T, 1, 256);
     }
     cmd_group(c, MOVA_TG_ATTN_PROJ);
-    enc_heads_mv(c, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
+    heads(c, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
     (void) kvd;
 }
 

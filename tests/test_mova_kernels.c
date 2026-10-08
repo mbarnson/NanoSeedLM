@@ -697,8 +697,8 @@ static void test_attn_prefill(int q8) {
 // ---- MLA (TransMLA conversion): per-head maps (+ gate), RoPE + latent cache write, latent attention ------------------
 static void test_mla(void) {
     unsigned sd = 31;
-    {   // per-head maps: q_lat-like (H 4, O 96, I 128, q's [T][H*128] layout) and v_up-like with the gate (O 128, I 96)
-        enum { H = 4, T = 3 };
+    for (int T = 3; T <= 20; T += 17) {   // per-head maps: q_lat-like (H 4, O 96, I 128, q's [T][H*128] layout) and
+        enum { H = 4 };                     // v_up-like with the gate (O 128, I 96); 20 rows: Metal's prompt GEMMs
         const int shapes[2][2] = {{96, 128}, {128, 96}};
         for (int c = 0; c < 2; ++c) {
             const int O = shapes[c][0], I = shapes[c][1], gate = c == 1;
@@ -757,16 +757,23 @@ static void test_mla(void) {
             }
         CHECK(!bad, "MLA rope + latent cache write: %d mismatches", bad);
     }
-    for (int split = 0; split < 2; ++split) {   // latent attention: 32 heads, r 768; 1 split or 5; rows in three slots
-        const int nh = 32, r = 768, NP = 640, T = 3, ns = split ? 5 : 1;
-        const int pos[3] = {300, 299, 37}, kv0[3] = {0, 310, 600};
+    // latent attention: 32 heads, r 768, rows in three slots, 1 split or 5; 20 heads (not a multiple of the kernel's head
+    // blocks), r 64, 3 splits; a prompt chunk (45 consecutive rows of one slot, 8 heads, r 96, one pass)
+    static const struct { int nh, r, T, ns; } C[4] = {{32, 768, 3, 1}, {32, 768, 3, 5}, {20, 64, 3, 3}, {8, 96, 45, 1}};
+    for (int cs = 0; cs < 4; ++cs) {
+        const int nh = C[cs].nh, r = C[cs].r, NP = 640, T = C[cs].T, ns = C[cs].ns;
+        int pos[45], kv0[45];
+        for (int t = 0; t < T; ++t) {
+            pos[t] = T == 3 ? (const int[3]){300, 299, 37}[t] : 37 + t;
+            kv0[t] = T == 3 ? (const int[3]){0, 310, 600}[t] : 19;
+        }
         float* ql = malloc(4 * (size_t) T * nh * r), *qr = malloc(4 * (size_t) T * nh * 128), *ol = malloc(4 * (size_t) T * nh * r);
         uint16_t* Kc = malloc(2 * (size_t) NP * 128), *Vc = malloc(2 * (size_t) NP * r);
         for (int i = 0; i < T * nh * r; ++i) ql[i] = bfr(frand(&sd) * 0.3);
         for (int i = 0; i < T * nh * 128; ++i) qr[i] = bfr(frand(&sd));
         for (int i = 0; i < NP * 128; ++i) Kc[i] = f2bf((float) frand(&sd));
         for (int i = 0; i < NP * r; ++i) Vc[i] = f2bf((float) frand(&sd));
-        RowInfo ri[3];
+        RowInfo ri[45];
         memset(ri, 0, sizeof ri);
         for (int t = 0; t < T; ++t) { ri[t].pos = pos[t]; ri[t].kv0 = kv0[t]; }
         const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
@@ -800,7 +807,8 @@ static void test_mla(void) {
                 }
             free(s); free(acc);
         }
-        CHECK(!bad, "MLA latent attention (%d split%s): %d mismatches of %d", ns, ns > 1 ? "s" : "", bad, T * nh * r);
+        CHECK(!bad, "MLA latent attention (%d rows, %d heads, r %d, %d split%s): %d mismatches of %d", T, nh, r, ns, ns > 1 ? "s" : "",
+              bad, T * nh * r);
         printf("MLA latent attention: %d rows x %d heads, r %d, %d split(s), %d mismatches\n", T, nh, r, ns, bad);
         free(ql); free(qr); free(ol); free(Kc); free(Vc);
     }

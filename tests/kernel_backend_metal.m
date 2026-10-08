@@ -147,6 +147,7 @@ static int mm_dispatch(const KtWeight* w, MmArgs a, int dense, int gy, id<MTLBuf
         [e setBuffer:m.W offset:0 atIndex:1]; [e setBuffer:m.S offset:0 atIndex:2]; [e setBuffer:m.B offset:0 atIndex:3];
         [e setBuffer:xb offset:0 atIndex:4]; [e setBuffer:yb offset:0 atIndex:5]; [e setBuffer:pb offset:0 atIndex:6];
         [e setBuffer:m.G offset:0 atIndex:7]; [e setBuffer:tb offset:0 atIndex:8]; [e setBuffer:m.N offset:0 atIndex:9];
+        [e setBuffer:yb offset:0 atIndex:10];
         [e dispatchThreadgroups:MTLSizeMake((w->R + MM_BM - 1) / MM_BM, gy, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     });
 }
@@ -374,6 +375,25 @@ int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, 
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     id<MTLBuffer> wb = buf(W, 2 * (size_t) H * O * I), xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
     const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+    if (T > MV_MAXT) {   // prompt rows, as the engine runs them: a GEMM per head (k_mm), with the gate
+        const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
+        id<MTLComputePipelineState> pm = pipe_("k_mm", MF_BF16, 1);
+        if (!pm || run(^(id<MTLComputeCommandEncoder> e) {
+                [e setComputePipelineState:pm]; [e setBytes:&m length:sizeof m atIndex:0];
+                for (int i = 2; i <= 9; ++i) if (i != 4 && i != 5) [e setBuffer:wb offset:0 atIndex:(NSUInteger) i];
+                for (int h = 0; h < H; ++h) {
+                    [e setBuffer:wb offset:(NSUInteger) h * O * I * 2 atIndex:1];
+                    [e setBuffer:xb offset:(NSUInteger) h * hs * 4 atIndex:4];
+                    [e setBuffer:yb offset:(NSUInteger) h * O * 4 atIndex:5];
+                    [e setBuffer:(g ? gb : yb) offset:(NSUInteger) h * O * 4 atIndex:10];
+                    [e dispatchThreadgroups:MTLSizeMake((O + MM_BM - 1) / MM_BM, (T + MM_BN - 1) / MM_BN, 1)
+                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+            }))
+            return -1;
+        memcpy(y, yb.contents, yn);
+        return 0;
+    }
     id<MTLComputePipelineState> pp = pipe_("k_heads_mv", 0, 0);
     if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
@@ -406,11 +426,6 @@ int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t*
     memcpy(Vc, Vb.contents, 2 * (size_t) npos * a.r);
     return 0;
 }
-// The latent attention's head group: as many query heads per threadgroup as the pipeline allows (32 lanes each)
-static int mla_heads_per_group(id<MTLComputePipelineState> p, int n_head) {
-    int hg = (int) (p.maxTotalThreadsPerThreadgroup / 32);
-    return hg < n_head ? hg : n_head;
-}
 int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
                 const RowInfo* ri, float* olat, int T) {
     const size_t on = 4 * (size_t) T * a.n_head * a.r;
@@ -419,14 +434,13 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
                   pb = buf(NULL, 4 * (size_t) T * a.n_head * a.n_splits * (a.r + 2));
     id<MTLComputePipelineState> pa = pipe_("k_mla_attn", 0, 0), pd = pipe_("k_mla_reduce", 0, 0);
     if (!pa || !pd) return -1;
-    const int hg = mla_heads_per_group(pa, a.n_head), ng = (a.n_head + hg - 1) / hg;
+    const int ng = (a.n_head + MLAF_Q - 1) / MLAF_Q;
     if (run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:pa]; [e setBytes:&a length:sizeof a atIndex:0];
             [e setBuffer:lb offset:0 atIndex:1]; [e setBuffer:qb offset:0 atIndex:2]; [e setBuffer:Kb offset:0 atIndex:3];
             [e setBuffer:Vb offset:0 atIndex:4]; [e setBuffer:rb offset:0 atIndex:5];
             [e setBuffer:(a.n_splits > 1 ? pb : ob) offset:0 atIndex:6];
-            [e setThreadgroupMemoryLength:(NSUInteger) (2 * MLA_KU * (a.r + 128) + 15) / 16 * 16 atIndex:0];
-            [e dispatchThreadgroups:MTLSizeMake(a.n_splits, ng, T) threadsPerThreadgroup:MTLSizeMake(32 * hg, 1, 1)];
+            [e dispatchThreadgroups:MTLSizeMake(a.n_splits, ng, T) threadsPerThreadgroup:MTLSizeMake(32 * MLAF_SG, 1, 1)];
             if (a.n_splits > 1) {
                 [e setComputePipelineState:pd]; [e setBytes:&a length:sizeof a atIndex:0];
                 [e setBuffer:pb offset:0 atIndex:1]; [e setBuffer:ob offset:0 atIndex:2];
