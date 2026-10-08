@@ -106,6 +106,11 @@ double self_cpu_s(void) {
     if (!GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u)) return -1;
     return ft_s(k) + ft_s(u);
 }
+uint64_t plat_mem_available(void) {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPhys : 0;
+}
 MachineState machine_state(void) {
     MachineState s;
     memset(&s, 0, sizeof s);
@@ -181,6 +186,12 @@ double host_cpu_busy_s(void) {
     const double busy = (double) c.cpu_ticks[CPU_STATE_USER] + c.cpu_ticks[CPU_STATE_SYSTEM] + c.cpu_ticks[CPU_STATE_NICE];
     return busy / (double) sysconf(_SC_CLK_TCK);
 }
+uint64_t plat_mem_available(void) {   // free, inactive, purgeable and speculative pages
+    vm_statistics64_data_t v;
+    mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &v, &n) != KERN_SUCCESS) return 0;
+    return ((uint64_t) v.free_count + v.inactive_count + v.purgeable_count + v.speculative_count) * (uint64_t) vm_page_size;
+}
 MachineState machine_state(void) {
     MachineState s;
     memset(&s, 0, sizeof s);
@@ -222,6 +233,15 @@ double host_cpu_busy_s(void) {
     const int ok = fscanf(f, "cpu %llu %llu %llu", &u, &n, &s) == 3;
     fclose(f);
     return ok ? (double) (u + n + s) / (double) sysconf(_SC_CLK_TCK) : -1;
+}
+uint64_t plat_mem_available(void) {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %llu", &kb) == 1) break;
+    fclose(f);
+    return (uint64_t) kb * 1024;
 }
 MachineState machine_state(void) {
     MachineState s;

@@ -26,6 +26,7 @@ typedef struct {
 ProcMem proc_mem(void);
 double host_cpu_busy_s(void);   // CPU seconds used by every core (-1 if unavailable)
 double self_cpu_s(void);        // CPU seconds used by this process
+uint64_t plat_mem_available(void);   // bytes of physical memory available without swapping (0 if unknown)
 
 typedef struct {
     double load1, load5, load15;   // -1 where the OS has no load average

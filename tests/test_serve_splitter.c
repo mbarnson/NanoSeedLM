@@ -89,5 +89,35 @@ int main(void) {
     json_free(a);
     printf("JSON output and request numbers: %s\n", jf ? "FAILED" : "passed");
     failed += jf;
+
+    // sampling: min_p keeps the tokens of at least min_p x the top probability (with temperature, top_p and top_k), and
+    // a request's draws depend only on its own seed
+    int sf = 0;
+    const float lg[8] = {5, 4.5f, 3, 2, 1, 0, -1, -2};   // p / p_max = 1, .61, .14, .05, ...
+    int hits[8] = {0};
+    for (uint64_t k = 0; k < 4000; ++k) {
+        uint64_t r = k;
+        ++hits[sample_row(lg, 8, 1.0, 1.0, 0, 0.1, &r)];
+    }
+    sf += !hits[0] || !hits[1] || !hits[2];
+    for (int i = 3; i < 8; ++i) sf += hits[i] != 0;
+    memset(hits, 0, sizeof hits);
+    for (uint64_t k = 0; k < 4000; ++k) {   // min_p 0: the whole distribution (here every token has p > 1e-8)
+        uint64_t r = k;
+        ++hits[sample_row(lg, 8, 1.0, 1.0, 0, 0, &r)];
+    }
+    sf += !hits[3] || !hits[4];
+    {
+        uint64_t a = 77, b = 77, x = 5;
+        int32_t ta[64], tb[64];
+        for (int i = 0; i < 64; ++i) ta[i] = sample_row(lg, 8, 1.3, 0.95, 6, 0.02, &a);
+        for (int i = 0; i < 64; ++i) {   // interleaved with another request's draws
+            sample_row(lg, 8, 0.7, 1.0, 0, 0, &x);
+            tb[i] = sample_row(lg, 8, 1.3, 0.95, 6, 0.02, &b);
+        }
+        sf += memcmp(ta, tb, sizeof ta) != 0;
+    }
+    printf("sampling (min_p, per-request seeds): %s\n", sf ? "FAILED" : "passed");
+    failed += sf;
     return failed ? 1 : 0;
 }

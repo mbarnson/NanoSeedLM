@@ -1,7 +1,7 @@
 // harness/nslm-serve.c - OpenAI-compatible HTTP server for K2-Horizon-MoVA on the nslm engine.
 //
 //   nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080]
-//              [--ctx 65536] [--kv bf16|q8] [--model-id ID] [--quiet]
+//              [--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]
 //   nslm-serve --render REQUEST.json     print the prompt a chat request renders to, and exit
 //
 // GET /v1/models, GET /health, POST /v1/chat/completions, POST /v1/completions (stream or not).
@@ -9,7 +9,10 @@
 // come back as OpenAI tool_calls (harness/tool_calls.c).  The thinking span is returned as reasoning_content.
 // Sampling defaults: IFM's model card (temperature 1.0, top_p 0.95); temperature 0 is greedy.  reasoning_effort defaults
 // to high when a request names none.
-// One request at a time on one sequence slot; the KV cache of the previous request's common prefix is reused.
+// Continuous batching: a scheduler thread owns the engine; each request gets one of --max-seqs sequence slots (--ctx
+// tokens each; default: as many as free memory holds), the idle slot whose cache shares the longest prefix with the
+// prompt.  Every scheduler step computes one prompt chunk of one slot and one decode step of every decoding slot, each
+// sampled with its own parameters and seed: a request's tokens do not depend on what else runs (Metal: bit for bit).
 // --kv q8: the 8-bit KV cache (long contexts in less memory; see engine_api.h).
 #include <math.h>
 #include <signal.h>
@@ -45,12 +48,15 @@ typedef int sock_t;
 #include "chat_template.h"
 #include "engine_api.h"
 #include "json.h"
+#include "model_st.h"
+#include "mova_cfg.h"
 #include "platform.h"
 #include "tokenizer.h"
 #include "tool_calls.h"
 
-#define CHUNK 16          // tokens per engine call: the streaming granularity
-#define FIRST_CHUNK 4     // a short first call, so the first token arrives early
+#define CHUNK 16          // tokens per streamed update
+#define FIRST_CHUNK 4     // a short first update, so the first token arrives early
+#define PREFILL_CHUNK 256 // prompt rows per scheduler step: decoding slots wait at most one chunk
 #define MAX_BODY (16 << 20)      // a request body (a full 64k-token context is well under 1 MB of text)
 #define MAX_CONNS 64             // connections served at once; more are answered 503 and closed
 #define READ_DEADLINE_S 60.0     // a request must arrive whole within this
@@ -61,8 +67,8 @@ typedef int sock_t;
 static char g_model_id[256];
 static Eng* g_eng;
 static Tok* g_tok;
-static pthread_mutex_t g_eng_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_ctx = 65536;
+static int g_max_seqs = 1;
 static int g_verbose = 1;
 
 // ---- JSON building ----
@@ -268,7 +274,7 @@ static size_t utf8_complete(const char* buf, size_t n) {
 
 typedef struct {
     int max_tokens, top_k;
-    double temperature, top_p;
+    double temperature, top_p, min_p;
     uint64_t rng;
     bool chat, stream, include_usage;
     char** stops;
@@ -430,8 +436,9 @@ static int cand_cmp(const void* a, const void* b) {
     const Cand *x = (const Cand*) a, *y = (const Cand*) b;
     return x->p > y->p ? -1 : x->p < y->p ? 1 : x->id - y->id;
 }
-// Temperature, top_p and top_k from one logits row.  Tokens below max - temp * ln(1e8) are left out (< 1e-8 each).
-static int sample_row(const float* l, int V, double temp, double top_p, int top_k, uint64_t* rng) {
+// Temperature, top_p, top_k and min_p (tokens of at least min_p x the top probability) from one logits row.  Tokens
+// below max - temp * ln(1e8) are left out (< 1e-8 each).
+static int sample_row(const float* l, int V, double temp, double top_p, int top_k, double min_p, uint64_t* rng) {
     static Cand* c = NULL;
     if (!c) c = (Cand*) malloc(sizeof(Cand) * (size_t) V);
     float mx = l[0];
@@ -446,6 +453,7 @@ static int sample_row(const float* l, int V, double temp, double top_p, int top_
     double cum = 0;
     for (int i = 0; i < n; ++i) { cum += c[i].p / tot; if (cum >= top_p) { keep = i + 1; break; } }
     if (top_k > 0 && keep > top_k) keep = top_k;
+    while (keep > 1 && c[keep - 1].p < min_p) --keep;   // c[i].p = p_i / p_max
     double ks = 0;
     for (int i = 0; i < keep; ++i) ks += c[i].p;
     const double u = (double) (splitmix64(rng) >> 11) * (1.0 / 9007199254740992.0) * ks;
@@ -453,58 +461,220 @@ static int sample_row(const float* l, int V, double temp, double top_p, int top_
     for (int i = 0; i < keep; ++i) { a += c[i].p; if (a > u) return c[i].id; }
     return c[keep - 1].id;
 }
-static int gen_tokens(Gen* g, int k, int32_t* out) {
-    int seq = 0;
-    if (g->temperature <= 0) return eng_generate(g_eng, &seq, 1, k, ENG_MODE_AR, out, NULL);
-    static float* logits = NULL;
-    if (!logits) logits = (float*) malloc(sizeof(float) * (size_t) eng_vocab(g_eng));
-    for (int j = 0; j < k; ++j) {
-        if (eng_step(g_eng, 0, logits)) return -1;
-        out[j] = sample_row(logits, eng_vocab(g_eng), g->temperature, g->top_p, g->top_k, &g->rng);
-        if (out[j] == TOK_EOS || out[j] == TOK_IM_END) { for (int r = j + 1; r < k; ++r) out[r] = out[j]; return 0; }
-        if (eng_push(g_eng, 0, out[j])) return -1;
-    }
-    return 0;
+// ---- scheduler ----
+
+// A request as the scheduler sees it: the connection thread fills the inputs and submits it, then reads the outputs
+// under g_lock until the scheduler releases it.
+typedef struct Job {
+    const int32_t* ids;
+    int n, max_tokens, top_k;
+    double temperature, top_p, min_p;
+    uint64_t rng;
+    int32_t* out;                     // generated tokens (the end token excluded), up to max_tokens
+    int nout, cached, slot;
+    bool prefilled, done, eos, failed, cancel, released;
+    double t_admit, t_prefill;
+    pthread_cond_t cv;                // signalled with new tokens, at the end and on release
+    struct Job* next;                 // the queue
+} Job;
+typedef struct {
+    Job* job;                         // NULL: idle
+    int32_t* hist;                    // the tokens the slot's cache holds (as far as the server knows)
+    int len, cap;
+    uint64_t used;                    // last admission: ties go to the least recently used slot
+} Slot;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // queue, slots, jobs
+static pthread_cond_t g_wake = PTHREAD_COND_INITIALIZER;     // the scheduler: a job queued or cancelled
+static Job* g_queue;
+static Slot* g_slots;
+
+static void slot_set(Slot* s, const int32_t* t, int n) {
+    if (n > s->cap) { s->cap = n + 1024; s->hist = (int32_t*) realloc(s->hist, sizeof(int32_t) * (size_t) s->cap); }
+    memcpy(s->hist, t, sizeof(int32_t) * (size_t) n);
+    s->len = n;
 }
+static void slot_push(Slot* s, int32_t t) {
+    if (s->len == s->cap) { s->cap = 2 * s->cap + 1024; s->hist = (int32_t*) realloc(s->hist, sizeof(int32_t) * (size_t) s->cap); }
+    s->hist[s->len++] = t;
+}
+// The idle slot whose cache shares the longest prefix with ids (ties: the least recently used), or -1.
+static int pick_slot(const int32_t* ids, int n) {
+    int best = -1, bl = -1;
+    for (int i = 0; i < g_max_seqs; ++i) {
+        const Slot* s = &g_slots[i];
+        if (s->job) continue;
+        int c = 0;
+        while (c < s->len && c < n && s->hist[c] == ids[c]) ++c;
+        if (c > bl || (c == bl && s->used < g_slots[best].used)) { best = i; bl = c; }
+    }
+    return best;
+}
+static void release(Job* j) {   // under g_lock: the scheduler is done with j
+    if (j->slot >= 0) g_slots[j->slot].job = NULL;
+    j->released = true;
+    pthread_cond_broadcast(&j->cv);
+}
+static int sample_job(Job* j, const float* l, int V) {
+    if (j->temperature > 0) return sample_row(l, V, j->temperature, j->top_p, j->top_k, j->min_p, &j->rng);
+    int b = 0;   // greedy: the first maximum, as the engine's arg max
+    for (int i = 1; i < V; ++i) if (l[i] > l[b]) b = i;
+    return b;
+}
+
+static void* scheduler(void* arg) {
+    (void) arg;
+    const int V = eng_vocab(g_eng);
+    float* logits = (float*) malloc(sizeof(float) * (size_t) V * (size_t) g_max_seqs);
+    int* seqs = (int*) malloc(sizeof(int) * (size_t) g_max_seqs);
+    int32_t* tok = (int32_t*) malloc(sizeof(int32_t) * (size_t) g_max_seqs);
+    Job** dec = (Job**) malloc(sizeof(Job*) * (size_t) g_max_seqs);
+    uint64_t tick = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_lock);
+        for (Job** q = &g_queue; *q;) {   // cancelled while queued
+            Job* j = *q;
+            if (j->cancel) { *q = j->next; release(j); } else q = &j->next;
+        }
+        for (int i = 0; i < g_max_seqs; ++i) {
+            Job* j = g_slots[i].job;
+            if (j && (j->done || j->cancel)) release(j);
+        }
+        while (g_queue) {   // admit in arrival order
+            const int si = pick_slot(g_queue->ids, g_queue->n);
+            if (si < 0) break;
+            Job* j = g_queue;
+            g_queue = j->next;
+            Slot* s = &g_slots[si];
+            j->slot = si;
+            s->job = j;
+            s->used = ++tick;
+            j->t_admit = now_s();
+            slot_set(s, j->ids, j->n);
+            if (eng_prefill_begin(g_eng, si, j->ids, j->n, &j->cached)) { s->len = 0; j->failed = j->done = true; pthread_cond_broadcast(&j->cv); }
+        }
+        // this step: one prompt chunk of the earliest admitted slot still prefilling, one decode step of the others
+        Job* pj = NULL;
+        int n = 0;
+        for (int i = 0; i < g_max_seqs; ++i) {
+            Job* j = g_slots[i].job;
+            if (!j || j->done || j->cancel) continue;
+            if (j->prefilled) { dec[n] = j; seqs[n++] = i; }
+            else if (!pj || g_slots[i].used < g_slots[pj->slot].used) pj = j;
+        }
+        if (!pj && !n) {
+            pthread_cond_wait(&g_wake, &g_lock);
+            pthread_mutex_unlock(&g_lock);
+            continue;
+        }
+        pthread_mutex_unlock(&g_lock);
+        if (pj) {
+            const int left = eng_prefill_next(g_eng, pj->slot, PREFILL_CHUNK);
+            pthread_mutex_lock(&g_lock);
+            if (left < 0) { g_slots[pj->slot].len = 0; pj->failed = pj->done = true; pthread_cond_broadcast(&pj->cv); }
+            else if (left == 0) { pj->prefilled = true; pj->t_prefill = now_s(); }
+            pthread_mutex_unlock(&g_lock);
+        }
+        if (n) {
+            const int rc = eng_step_batch(g_eng, seqs, n, logits);
+            for (int k = 0; k < n && !rc; ++k) {
+                tok[k] = sample_job(dec[k], logits + (size_t) k * V, V);
+                if (tok[k] != TOK_EOS && tok[k] != TOK_IM_END && dec[k]->nout < dec[k]->max_tokens) {
+                    eng_push(g_eng, seqs[k], tok[k]);
+                    slot_push(&g_slots[seqs[k]], tok[k]);
+                }
+            }
+            pthread_mutex_lock(&g_lock);
+            for (int k = 0; k < n; ++k) {
+                Job* j = dec[k];
+                if (rc) { g_slots[seqs[k]].len = 0; j->failed = j->done = true; }
+                else if (tok[k] == TOK_EOS || tok[k] == TOK_IM_END) j->eos = j->done = true;
+                else {
+                    j->out[j->nout++] = tok[k];
+                    j->done = j->nout >= j->max_tokens;
+                }
+                pthread_cond_broadcast(&j->cv);
+            }
+            pthread_mutex_unlock(&g_lock);
+        }
+    }
+    return NULL;
+}
+
+// Whether a non-streaming client has closed its connection (an orderly close reads as 0 bytes).
+static bool conn_closed(Conn* c) {
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(c->fd, &rf);
+    struct timeval tv = {0, 0};
+    char b;
+    return select((int) c->fd + 1, &rf, NULL, NULL, &tv) > 0 && recv(c->fd, &b, 1, MSG_PEEK) == 0;
+}
+
 static bool run_generation(Conn* c, Gen* g, const int32_t* ids, int n) {
+    Job j;
+    memset(&j, 0, sizeof j);
+    j.ids = ids;
+    j.n = n;
+    j.max_tokens = g->max_tokens;
+    j.top_k = g->top_k;
+    j.temperature = g->temperature;
+    j.top_p = g->top_p;
+    j.min_p = g->min_p;
+    j.rng = g->rng;
+    j.slot = -1;
+    j.out = (int32_t*) malloc(sizeof(int32_t) * (size_t) g->max_tokens);
+    pthread_cond_init(&j.cv, NULL);
     const double t0 = now_s();
-    if (eng_prefill_cached(g_eng, 0, ids, n, &g->cached_tokens)) return false;
-    const double t1 = now_s();
-    g->prefill_s = t1 - t0;
+    pthread_mutex_lock(&g_lock);
+    Job** q = &g_queue;
+    while (*q) q = &(*q)->next;
+    *q = &j;
+    pthread_cond_signal(&g_wake);
+    pthread_mutex_unlock(&g_lock);
     g->prompt_tokens = n;
-    size_t hold = 0;   // a stop string split across chunks is never streamed
+    size_t hold = 0;   // a stop string split across updates is never streamed
     for (int i = 0; i < g->nstops; ++i) if (strlen(g->stops[i]) - 1 > hold) hold = strlen(g->stops[i]) - 1;
-    int32_t* outp = (int32_t*) malloc(sizeof(int32_t) * (size_t) (g->max_tokens + CHUNK));
-    int nout = 0;
     Splitter sp = {0};
     char* raw = NULL;
-    size_t rawlen = 0;
     g->finish = "length";
-    bool done = false, first = true;
-    while (!done && nout < g->max_tokens) {
-        const int k = (first ? FIRST_CHUNK : CHUNK) < g->max_tokens - nout ? (first ? FIRST_CHUNK : CHUNK) : g->max_tokens - nout;
-        if (gen_tokens(g, k, outp + nout)) { free(outp); free(raw); return false; }
-        if (first) { g->ttft_s = now_s() - t0; first = false; }
-        for (int j = 0; j < k; ++j)
-            if (outp[nout + j] == TOK_EOS || outp[nout + j] == TOK_IM_END) { nout += j; g->finish = "stop"; done = true; break; }
-        if (!done) nout += k;
+    bool done = false, ok = true;
+    int seen = 0;
+    while (!done) {
+        const int want = seen ? CHUNK : FIRST_CHUNK;
+        pthread_mutex_lock(&g_lock);
+        while (!j.done && j.nout - seen < want) pthread_cond_wait(&j.cv, &g_lock);
+        const int nout = j.nout;
+        const bool fin = j.done, eos = j.eos, failed = j.failed;
+        pthread_mutex_unlock(&g_lock);
+        if (failed) { ok = false; break; }
+        if (!seen && nout) g->ttft_s = now_s() - t0;
+        if (fin) { done = true; if (eos) g->finish = "stop"; }
+        seen = nout;
         free(raw);
-        raw = tok_decode(g_tok, outp, nout, NULL);
-        rawlen = strlen(raw);
+        raw = tok_decode(g_tok, j.out, nout, NULL);
+        size_t rawlen = strlen(raw);
         for (int i = 0; i < g->nstops; ++i) {
             const char* hit = strstr(raw, g->stops[i]);
             if (hit && (size_t) (hit - raw) < rawlen) { rawlen = (size_t) (hit - raw); g->finish = "stop"; done = true; }
         }
         const size_t upto = done ? rawlen : utf8_complete(raw, rawlen > hold ? rawlen - hold : 0);
-        if (!emit_upto(c, g, &sp, raw, upto, done)) { g->finish = "cancelled"; done = true; }
+        if (!emit_upto(c, g, &sp, raw, upto, done) || (!g->stream && conn_closed(c))) { g->finish = "cancelled"; done = true; }
     }
-    if (!done && raw) emit_upto(c, g, &sp, raw, rawlen, true);
-    flush_content(c, g, true);
-    g->decode_s = now_s() - t1;
-    g->completion_tokens = nout;
-    free(outp);
+    if (ok) flush_content(c, g, true);
+    pthread_mutex_lock(&g_lock);   // the scheduler frees the slot and lets go of the job
+    j.cancel = true;
+    pthread_cond_signal(&g_wake);
+    while (!j.released) pthread_cond_wait(&j.cv, &g_lock);
+    pthread_mutex_unlock(&g_lock);
+    const double t1 = now_s();
+    g->cached_tokens = j.cached;
+    g->prefill_s = j.prefilled ? j.t_prefill - j.t_admit : 0;
+    g->decode_s = j.prefilled ? t1 - j.t_prefill : 0;
+    g->completion_tokens = seen;
+    pthread_cond_destroy(&j.cv);
+    free(j.out);
     free(raw);
-    return true;
+    return ok;
 }
 
 static Json* usage_of(Gen* g) {
@@ -584,6 +754,8 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     if (g.top_p <= 0 || g.top_p > 1) g.top_p = 1;
     v = jfield(req, "top_k", J_NUM);
     g.top_k = v ? (int) jclamp(v, 0, INT32_MAX) : 0;
+    v = jfield(req, "min_p", J_NUM);
+    g.min_p = v ? jnumber(v) : 0;
     v = jfield(req, "seed", J_NUM);
     g.rng = !v ? plat_random_u64() : v->t == J_INT ? (uint64_t) v->i : (uint64_t) jclamp(v, INT64_MIN, INT64_MAX);
     if (g.max_tokens < 1) { json_free(req); send_error(c, 400, "max_tokens must be >= 1"); return; }
@@ -635,9 +807,7 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
         }
     }
 
-    pthread_mutex_lock(&g_eng_lock);
     const bool ok = run_generation(c, &g, ids, n);
-    pthread_mutex_unlock(&g_eng_lock);
     free(ids);
     buf_put(&g.content, "", 0);
     buf_put(&g.reasoning, "", 0);
@@ -816,6 +986,22 @@ static void base_name(const char* path, char* out, size_t cap) {
     snprintf(out, cap, "%s", b);
 }
 
+// The --max-seqs default: slots of --ctx tokens in half of the memory available beyond the weights (1 .. 16).
+static int default_max_seqs(const char* model, int kv_q8) {
+    MovaCfg c;
+    char err[256];
+    if (mova_cfg_load(&c, model, err, sizeof err)) return 1;
+    double per = 0, wb = 0;   // KV bytes per position, weight bytes
+    for (int l = 0; l < c.n_layer; ++l) per += c.mla ? 2.0 * (c.mla_rope + c.mla_rank[l]) : 2.0 * c.n_kv * (kv_q8 ? c.head_dim + 4 : 2 * c.head_dim);
+    NsModel nm;
+    if (!ns_open(&nm, model, err, sizeof err)) {
+        for (int i = 0; i < nm.n; ++i) for (int k = 0; k < 4; ++k) wb += (double) nm.t[i].s[k].len;
+        ns_close(&nm);
+    }
+    const int n = (int) (0.5 * ((double) plat_mem_available() - wb) / (per * g_ctx));
+    return n < 1 ? 1 : n > 16 ? 16 : n;
+}
+
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     if (opt(argc, argv, "--render", NULL)) return render_file(opt(argc, argv, "--render", NULL));
@@ -825,7 +1011,7 @@ int main(int argc, char** argv) {
     if (opt_flag(argc, argv, "--quiet")) g_verbose = 0;
     if (!model || g_ctx < 64) {
         fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
-                        "[--ctx 65536] [--kv bf16|q8] [--model-id ID] [--quiet]\n       nslm-serve --render REQUEST.json\n");
+                        "[--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]\n       nslm-serve --render REQUEST.json\n");
         return 2;
     }
     char base[256];
@@ -843,9 +1029,11 @@ int main(int argc, char** argv) {
     memset(&o, 0, sizeof o);
     o.model_dir = model;
     o.resource_dir = opt(argc, argv, "--res", res);
-    o.max_seqs = 1;
-    o.kv_tokens = g_ctx;
     o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
+    g_max_seqs = opt(argc, argv, "--max-seqs", NULL) ? atoi(opt(argc, argv, "--max-seqs", NULL)) : default_max_seqs(model, o.kv_format == ENG_KV_Q8);
+    if (g_max_seqs < 1) g_max_seqs = 1;
+    o.max_seqs = g_max_seqs;
+    o.kv_tokens = (int64_t) g_ctx * g_max_seqs;
 
     char err[512] = "", tpath[1100];
     snprintf(tpath, sizeof tpath, "%s/tokenizer.json", model);
@@ -858,15 +1046,22 @@ int main(int argc, char** argv) {
     eng_mem(g_eng, &m);
     fprintf(stderr, "nslm-serve: loaded in %.1f s: %s; weights %.2f GB, KV %.2f GB, GPU %.2f GB\n", now_s() - t0,
             eng_describe(g_eng), (m.weights + m.lut) / 1e9, m.kv / 1e9, m.gpu_allocated / 1e9);
-    {   // build the pipelines before the first request
+    {   // build the pipelines before the first request: prompts, and decode steps of 1 .. 8 slots
         int32_t w[64], out[8];
         const int n = tok_encode(g_tok, "<|ifm|begin_of_text|><|ifm|im_start|>user\nHi<|ifm|im_end|><|ifm|im_start|>assistant\n", 0, w, 64);
-        int seq = 0;
-        if (eng_prefill(g_eng, 0, w, n) || eng_generate(g_eng, &seq, 1, 8, ENG_MODE_AR, out, NULL)) {
-            fprintf(stderr, "engine: warm-up failed\n");
-            return 1;
+        int seqs[8];
+        for (int k = 0; k < 8 && k < g_max_seqs; ++k) {
+            seqs[k] = k;
+            if (eng_prefill(g_eng, k, w, n) || eng_generate(g_eng, seqs, k + 1, 1, ENG_MODE_AR, out, NULL)) {
+                fprintf(stderr, "engine: warm-up failed\n");
+                return 1;
+            }
         }
+        for (int k = 0; k < g_max_seqs; ++k) eng_free(g_eng, k);
     }
+    g_slots = (Slot*) calloc((size_t) g_max_seqs, sizeof(Slot));
+    pthread_t sched;
+    if (pthread_create(&sched, NULL, scheduler, NULL)) { fprintf(stderr, "nslm-serve: cannot start the scheduler\n"); return 1; }
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa)) { fprintf(stderr, "nslm-serve: WSAStartup failed\n"); return 1; }
@@ -886,7 +1081,7 @@ int main(int argc, char** argv) {
     addr.sin_port = htons((uint16_t) port);
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { fprintf(stderr, "bad --host %s\n", host); return 2; }
     if (bind(ls, (struct sockaddr*) &addr, sizeof addr) || listen(ls, 64)) { fprintf(stderr, "nslm-serve: cannot listen on %s:%d\n", host, port); return 1; }
-    fprintf(stderr, "nslm-serve: http://%s:%d/v1, model \"%s\", context %d tokens\n", host, port, g_model_id, g_ctx);
+    fprintf(stderr, "nslm-serve: http://%s:%d/v1, model \"%s\", %d sequences of %d tokens\n", host, port, g_model_id, g_max_seqs, g_ctx);
     for (;;) {
         const sock_t fd = accept(ls, NULL, NULL);
         if (fd == INVALID_SOCKET) continue;
