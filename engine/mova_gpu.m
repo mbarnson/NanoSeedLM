@@ -49,7 +49,7 @@ typedef struct {
     int32_t* hist;
     int len, cap;
     int done;   // positions whose KV is computed (hist[0 .. done-1])
-    int expand; // MLA: this prefill's prompt rows attend with the latent expanded per head
+    int xend;   // MLA: prompt rows at positions below xend attend with the latent expanded per head
 } Seq;
 
 struct Eng {
@@ -79,7 +79,7 @@ struct Eng {
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     id<MTLBuffer> latf, kn, vn, mst, lst, ost;   // MLA prompt rows: latent rows (f32), expanded keys / values, softmax state
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
-    int expand, expand_min;               // MLA prompt rows: the latent expanded per head (a prefill of expand_min+ new rows)
+    int expand, expand_min;               // MLA prompt rows: the latent expanded per head (Seq.xend)
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
@@ -1078,7 +1078,7 @@ int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     int c = 0;
     while (c < s->done && c < n - 1 && s->hist[c] == ids[c]) ++c;
     s->len = s->done = c;
-    s->expand = n - 1 - c >= e->expand_min;
+    s->xend = n - 1 - c >= e->expand_min ? (n - 1) / e->expand_min * e->expand_min : 0;
     for (int i = c; i < n; ++i) hist_push(s, ids[i]);
     if (reused) *reused = c;
     return 0;
@@ -1088,9 +1088,10 @@ int eng_prefill_next(Eng* e, int seq, int max_rows) {
     if (!s || s->len < 1 || max_rows < 1) return -1;
     const int left = s->len - 1 - s->done;
     if (left <= 0) return 0;
-    const int T = left < max_rows ? (left < MAX_ROWS ? left : MAX_ROWS) : (max_rows < MAX_ROWS ? max_rows : MAX_ROWS);
+    int T = left < max_rows ? (left < MAX_ROWS ? left : MAX_ROWS) : (max_rows < MAX_ROWS ? max_rows : MAX_ROWS);
+    if (s->done < s->xend && s->done + T > s->xend) T = s->xend - s->done;   // a forward on one side of xend
     e->prompt = 1;
-    e->expand = s->expand;
+    e->expand = s->done < s->xend;
     const int rc = forward(e, seq, s->hist + s->done, T, s->done, T, NULL, NULL);
     e->prompt = 0;
     e->expand = 1;

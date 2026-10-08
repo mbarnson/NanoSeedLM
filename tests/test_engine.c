@@ -507,6 +507,7 @@ static void test_mla(void) {
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
     test_batch(dir, "MLA", 0);                // these prompts (< 256 rows): attention in latent space
     test_batch(dir, "MLA expanded", 1);       // every prompt with the latent expanded per head
+    test_batch(dir, "MLA blocks of 16", 16);  // expanded up to the last multiple of 16 (the copied cache: 128 positions)
 }
 
 int main(void) {
