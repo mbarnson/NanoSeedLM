@@ -931,6 +931,31 @@ kernel void k_mla_rope(constant MlaArgs& a [[buffer(0)]], device float* qr [[buf
 // Keys past the row's split are zero / -inf.  Sums f32.  n_splits > 1: partials [row][head][split] = (m, l, acc[r])
 // for k_mla_reduce; n_splits == 1: olat[row][head] = bf16(acc / l).
 static inline float2 bf2(uint w) { return float2(as_type<float>(w << 16), as_type<float>(w & 0xFFFF0000u)); }
+// Staging (N8 / N4 > 0: a full chunk, the index arithmetic constant-folded; 0: n8 / n4 at run time).  Keys k0.. (before
+// p1) of the slot at kv0, dims [dc, dc + 8 n8) of [c, k] into Kt [key][dim]; queries of heads h0.. into Qt [dim][head].
+template <int N8>
+static inline void mlaf_keys(threadgroup ushort* Kt, device const ushort* Kc, device const ushort* Vc, ulong kv0, int k0, int p1,
+                             int dc, int r, int n8, uint tid) {
+    const int n = N8 > 0 ? N8 : n8;
+    for (int e = (int) tid; e < MLAF_K * n; e += 32 * MLAF_SG) {
+        const int key = e / n, d = dc + (e % n) * 8, p = k0 + key;
+        uint4 w = 0;
+        if (p < p1) w = *(device const uint4*) (d < r ? Vc + (kv0 + (ulong) p) * r + d : Kc + (kv0 + (ulong) p) * ATT_HD + d - r);
+        threadgroup uint* kt = (threadgroup uint*) (Kt + key * MLAF_KLD + d - dc);
+        kt[0] = w.x; kt[1] = w.y; kt[2] = w.z; kt[3] = w.w;
+    }
+}
+template <int N4>
+static inline void mlaf_queries(threadgroup ushort* Qt, device const float* ql, device const float* qr, int t, int H, int h0,
+                                int dc, int r, int n4, uint tid) {
+    const int n = N4 > 0 ? N4 : n4;
+    for (int e = (int) tid; e < MLAF_Q * n; e += 32 * MLAF_SG) {
+        const int q = e / n, d = dc + (e % n) * 4, h = h0 + q;
+        float4 v = 0;
+        if (h < H) v = *(device const float4*) (d < r ? ql + ((ulong) t * H + h) * r + d : qr + ((ulong) t * H + h) * ATT_HD + d - r);
+        for (int j = 0; j < 4; ++j) Qt[(d - dc + j) * MLAF_QLD + q] = tobf(v[j]);
+    }
+}
 kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql [[buffer(1)]], device const float* qr [[buffer(2)]],
                        device const ushort* Kc [[buffer(3)]], device const ushort* Vc [[buffer(4)]],
                        device const RowInfo* ri [[buffer(5)]], device float* out [[buffer(6)]],
@@ -963,18 +988,12 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
         for (int dc = 0; dc < D; dc += MLAF_DC) {
             const int cw = min(MLAF_DC, D - dc);
             threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous chunk's (or phase's) readers are done
-            for (int e = (int) tid; e < MLAF_K * cw / 8; e += 32 * MLAF_SG) {   // keys: 8 dims per load
-                const int key = e / (cw / 8), d = dc + (e % (cw / 8)) * 8, p = k0 + key;
-                uint4 w = 0;
-                if (p < p1) w = *(device const uint4*) (d < r ? Vc + (kv0 + (ulong) p) * r + d : Kc + (kv0 + (ulong) p) * ATT_HD + d - r);
-                threadgroup uint* kt = (threadgroup uint*) (Kt + key * MLAF_KLD + d - dc);
-                kt[0] = w.x; kt[1] = w.y; kt[2] = w.z; kt[3] = w.w;
-            }
-            for (int e = (int) tid; e < MLAF_Q * cw / 4; e += 32 * MLAF_SG) {   // queries: 4 dims per load, transposed
-                const int q = e / (cw / 4), d = dc + (e % (cw / 4)) * 4, h = h0 + q;
-                float4 v = 0;
-                if (h < H) v = *(device const float4*) (d < r ? ql + ((ulong) t * H + h) * r + d : qr + ((ulong) t * H + h) * ATT_HD + d - r);
-                for (int j = 0; j < 4; ++j) Qt[(d - dc + j) * MLAF_QLD + q] = tobf(v[j]);
+            if (cw == MLAF_DC) {
+                mlaf_keys<MLAF_DC / 8>(Kt, Kc, Vc, kv0, k0, p1, dc, r, 0, tid);
+                mlaf_queries<MLAF_DC / 4>(Qt, ql, qr, t, H, h0, dc, r, 0, tid);
+            } else {
+                mlaf_keys<0>(Kt, Kc, Vc, kv0, k0, p1, dc, r, cw / 8, tid);
+                mlaf_queries<0>(Qt, ql, qr, t, H, h0, dc, r, cw / 4, tid);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (int i = 0; i < cw / 8; ++i) {
@@ -1027,12 +1046,8 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
                 if (ci >= nc) continue;   // unrolled with constant indices: O stays in registers
                 const int dc = ci * MLAF_DC, cw = min(MLAF_DC, r - dc);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (int e = (int) tid; e < MLAF_K * cw / 8; e += 32 * MLAF_SG) {   // latent values: 8 dims per load
-                    const int key = e / (cw / 8), d = dc + (e % (cw / 8)) * 8, p = k0 + key;
-                    const uint4 w = p < p1 ? *(device const uint4*) (Vc + (kv0 + (ulong) p) * r + d) : uint4(0);
-                    threadgroup uint* kt = (threadgroup uint*) (Kt + key * MLAF_KLD + d - dc);
-                    kt[0] = w.x; kt[1] = w.y; kt[2] = w.z; kt[3] = w.w;
-                }
+                if (cw == MLAF_DC) mlaf_keys<MLAF_DC / 8>(Kt, Kc, Vc, kv0, k0, p1, dc, r, 0, tid);   // latent values (d < r)
+                else mlaf_keys<0>(Kt, Kc, Vc, kv0, k0, p1, dc, r, cw / 8, tid);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if ((int) sgi * 8 >= cw) continue;
                 for (int j = 0; j < nkb; ++j) {
