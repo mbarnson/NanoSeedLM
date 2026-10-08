@@ -57,8 +57,8 @@ void eng_mem(Eng* e, EngMem* m);
 // Replace slot `seq` with the prompt ids[0..n-1] (n >= 1) and fill the KV cache for ids[0..n-2].  0 on success.
 int eng_prefill(Eng* e, int seq, const int32_t* ids, int n);
 // As eng_prefill, but keeps the KV cache of the longest common prefix with the slot's history (*reused tokens) and
-// computes only the rest.  CUDA: short tails take the decode kernels, so logits can differ from eng_prefill's in the last
-// bits (Metal: prompt rows always take the prefill kernels, whose results do not depend on the chunks).
+// computes only the rest.  Prompt rows always take the prefill kernels, whose results do not depend on the chunks: the
+// cache and logits are eng_prefill's, bit for bit.
 int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused);
 // eng_prefill_cached in steps (a server interleaving prompts with decode): eng_prefill_begin sets the history and keeps
 // the reusable cache (*reused, may be NULL) but computes nothing; each eng_prefill_next computes up to max_rows more

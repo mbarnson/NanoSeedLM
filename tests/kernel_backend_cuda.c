@@ -311,6 +311,29 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
                 dout, T);
     return done("kc_mla_attn", olat, dout, on);
 }
+int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos, const RowInfo* ri,
+                   const uint16_t* Wql, const uint16_t* Wvu, const float* g, float* o, int T, int dec_keys, uint16_t* Kn_out,
+                   uint16_t* Vd_out) {
+    const size_t qn = 4 * (size_t) T * a.n_head * 128;
+    const int kv0 = ri[0].kv0, end = ri[T - 1].pos + 1;
+    const KvView kv = mla_kv(dev(Kc, 2 * (size_t) npos * 128), dev(Vc, 2 * (size_t) npos * a.r), npos, a.r);
+    const float *dq = (const float*) dev(q, qn), *dqr = (const float*) dev(qr, qn), *dg = (const float*) dev(g, qn);
+    const RowInfo* dri = (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T);
+    const uint16_t* dql = (const uint16_t*) dev(Wql, 2 * (size_t) a.n_head * a.r * 128);
+    const uint16_t* dvu = (const uint16_t*) dev(Wvu, 2 * (size_t) a.n_head * a.r * 128);
+    uint16_t* Kn = (uint16_t*) dev(NULL, 2 * (size_t) dec_keys * a.n_head * 128);
+    uint16_t* Vd = (uint16_t*) dev(NULL, 2 * (size_t) dec_keys * a.n_head * 128);
+    float* st = (float*) dev(NULL, 4 * (size_t) T * a.n_head * 130);
+    float* dout = (float*) dev(NULL, qn);
+    for (int kb0 = 0; kb0 < end; kb0 += dec_keys) {
+        const int kb1 = end - kb0 < dec_keys ? end : kb0 + dec_keys;
+        kc_mla_decomp(0, a, kv, kv0, kb0, kb0, kb1, dql, dvu, Kn, Vd);
+        const size_t off = (size_t) kb0 * a.n_head * 128, n = 2 * (size_t) (kb1 - kb0) * a.n_head * 128;
+        if (fetch("kc_mla_decomp", Kn_out + off, Kn, n) || fetch("kc_mla_decomp", Vd_out + off, Vd, n)) return -1;
+        kc_mla_prefill(0, a, dq, dqr, kv, dri, Kn, Vd, kb0, kb1, kb0 == 0, kb1 == end, st, dg, dout, T);
+    }
+    return done("kc_mla_prefill", o, dout, qn);
+}
 
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {

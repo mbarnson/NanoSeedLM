@@ -4,6 +4,7 @@
 // block.  Written in C style: one __device__ body per kernel, specialised per weight format by the FMT_KERNELS macro.
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "kernels_cuda.h"
@@ -98,6 +99,26 @@ static __device__ __forceinline__ void wblock(int fmt, const WSlice* w, int r, i
     }
 }
 
+// Q8, two adjacent blocks (one 16-byte load, one group): the products of one token, in the order mv_lane and mv_body
+// (several tokens) both add them, so a token's dense matvec does not depend on the forward's row count.
+static __device__ __forceinline__ float q8x16(const float* wq, const float* xb) {
+    const float4* xr = (const float4*) xb;
+    float acc = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 xv = xr[i];
+        acc += wq[4 * i] * xv.x + wq[4 * i + 1] * xv.y + wq[4 * i + 2] * xv.z + wq[4 * i + 3] * xv.w;
+    }
+    return acc;
+}
+static __device__ __forceinline__ void q8w16(uint4 q, float s, float b, float* wq) {
+    const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int k = 0; k < 4; ++k) wq[4 * i + k] = bfr(s * (float) ((qw[i] >> (8 * k)) & 255u) + b);
+}
+
 // One lane's share of row r . x (one token), every format: the Metal mv_lane arithmetic.  The caller sums the lanes.
 static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const uint32_t* G, int r, int K, const float* xb, int lane) {
     const int nbk = K / 8;
@@ -168,16 +189,9 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
 #pragma unroll 2
         for (int jq = lane; jq < nbk / 2; jq += 32) {
             const size_t gi = ((size_t) r * K + (size_t) jq * 16) / 64;
-            const float s = bf(S[gi]), b = bf(B[gi]);
-            const uint4 q = qr[jq];
-            const uint32_t qw[4] = {q.x, q.y, q.z, q.w};
-            const float4* xr = (const float4*) (xb + (size_t) jq * 16);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float4 xv = xr[i];
-                acc += bfr(s * (float) (qw[i] & 255u) + b) * xv.x + bfr(s * (float) ((qw[i] >> 8) & 255u) + b) * xv.y +
-                       bfr(s * (float) ((qw[i] >> 16) & 255u) + b) * xv.z + bfr(s * (float) (qw[i] >> 24) + b) * xv.w;
-            }
+            float wq[16];
+            q8w16(qr[jq], bf(S[gi]), bf(B[gi]), wq);
+            acc += q8x16(wq, xb + (size_t) jq * 16);
         }
         return acc;
     }
@@ -191,6 +205,10 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
 }
 
 static __device__ __forceinline__ void store_y(float* yo, float s, int add) { *yo = add ? bfr(*yo + bfr(s)) : bfr(s); }
+static __device__ __forceinline__ float softplus_gate(float g) {   // softplus(x, beta = ln 2) in f32, then BF16
+    const float gx = g * 0.69314718055994531f;
+    return bfr((fmaxf(gx, 0.0f) + logf(1.0f + expf(-fabsf(gx)))) / 0.69314718055994531f);
+}
 
 // ---- matvec: one warp per output row, lanes over the 8-weight blocks; MV_ROWS warps per block ------------------------
 // Dense: T tokens (<= MV_MAXT) share each weight-row load (and each seed expansion).  Gather: grid y = pair p.
@@ -211,7 +229,44 @@ static __device__ __forceinline__ void mv_body(int fmt, MvArgs a, WSlice wd, con
     float acc[MV_MAXT];
 #pragma unroll
     for (int t = 0; t < MV_MAXT; ++t) acc[t] = 0;
-    if (fmt == MF_SEED4P4 || fmt == MF_SEED4) {   // one state expansion per block for every token
+    // Every token's products add exactly as mv_lane adds them (nt == 1): a row's result does not depend on how many
+    // rows share the forward (batched decode equals decoding alone).
+    if (fmt == MF_SEED4P4 && nbk % 64 == 0) {   // mv_lane's two adjacent blocks per lane
+        const uint32_t* s2 = (const uint32_t*) ((const uint16_t*) w.p[0] + (size_t) r * nbk);
+        const uint32_t* c2 = (const uint32_t*) ((const uint16_t*) w.p[1] + (size_t) r * nbk);
+        const uint8_t* EN = (const uint8_t*) w.p[3];
+        const uint32_t kb = (uint32_t) r * (uint32_t) nbk;
+        for (int jq = lane; jq < nbk / 2; jq += 32) {
+            const uint32_t ss = s2[jq], cc = c2[jq], eb2 = EN[(kb + 2 * jq) >> 1];
+            const uint32_t sa = ss & 0xFFFFu, sb = ss >> 16;
+            const uint32_t ga = __ldg(G + sa), gb = __ldg(G + sb);
+            const int ea = w.eb + (int) (eb2 & 15u), eb = w.eb + (int) ((eb2 >> 4) & 15u);
+#pragma unroll
+            for (int t = 0; t < MV_MAXT; ++t) {
+                if (t >= nt) break;
+                const float4* xr = (const float4*) (xb + (size_t) t * a.xs + (size_t) (2 * jq) * 8);
+                const float4 x0 = xr[0], x1 = xr[1], x2 = xr[2], x3 = xr[3];
+                acc[t] += seed4_dot(sa, ga, cc & 0xFFFFu, ea, x0, x1, -1.5f * sum8(x0, x1));
+                acc[t] += seed4_dot(sb, gb, cc >> 16, eb, x2, x3, -1.5f * sum8(x2, x3));
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < MV_MAXT; ++t) acc[t] *= (1.0f / 32767.0f);
+    } else if (fmt == MF_Q8 && nbk % 64 == 0) {   // mv_lane's 16-byte path
+        const uint16_t* S = (const uint16_t*) w.p[1];
+        const uint16_t* B = (const uint16_t*) w.p[2];
+        const uint4* qr = (const uint4*) ((const uint32_t*) w.p[0] + ((size_t) r * a.K) / 4);
+        for (int jq = lane; jq < nbk / 2; jq += 32) {
+            const size_t gi = ((size_t) r * a.K + (size_t) jq * 16) / 64;
+            float wq[16];
+            q8w16(qr[jq], bf(S[gi]), bf(B[gi]), wq);
+#pragma unroll
+            for (int t = 0; t < MV_MAXT; ++t) {
+                if (t >= nt) break;
+                acc[t] += q8x16(wq, xb + (size_t) t * a.xs + (size_t) jq * 16);
+            }
+        }
+    } else if (fmt == MF_SEED4P4 || fmt == MF_SEED4) {   // one state expansion per block for every token
         const uint16_t* seeds = (const uint16_t*) w.p[0] + (size_t) r * nbk;
         const uint16_t* cws = (const uint16_t*) w.p[1] + (size_t) r * nbk;
         const uint8_t* EN = (const uint8_t*) w.p[3];
@@ -346,7 +401,7 @@ static __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, con
 template <int NT>   // weight terms (shared memory and MMAs scale with it: a template, so NT = 1 keeps its occupancy)
 static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
                                                const int32_t* perm, const MmTile* tiles, const int32_t* ntiles,
-                                               const uint32_t* G) {
+                                               const uint32_t* G, const float* gate = NULL) {
     __shared__ __align__(16) uint16_t Ws[NT][MMT_BM][SLD];
     __shared__ __align__(16) uint16_t Xs[MMT_BN][SLD];
     __shared__ int srow[MMT_BN], drow[MMT_BN];
@@ -433,7 +488,9 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
             for (int q = 0; q < 4; ++q) {
                 const int rr = wm + mt * 16 + g + (q >> 1) * 8, cc = wn + nt * 8 + t4 * 2 + (q & 1), row = r0 + rr, dst = drow[cc];
                 if (dst < 0 || row >= a.R) continue;
-                store_y(Y + (size_t) dst * a.ys + row, acc[mt][nt][q], a.add);
+                const size_t yi = (size_t) dst * a.ys + row;
+                if (a.add == 2) Y[yi] = bfr(bfr(acc[mt][nt][q]) * softplus_gate(gate[yi]));   // MLA's v_up with the gate
+                else store_y(Y + yi, acc[mt][nt][q], a.add);
             }
 }
 
@@ -776,10 +833,6 @@ __global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q
     if (lane == 0) { pp[0] = m; pp[1] = l; }
     pp[2 + lane * 4 + 0] = acc.x; pp[2 + lane * 4 + 1] = acc.y; pp[2 + lane * 4 + 2] = acc.z; pp[2 + lane * 4 + 3] = acc.w;
 }
-static __device__ __forceinline__ float softplus_gate(float g) {   // softplus(x, beta = ln 2) in f32, then BF16
-    const float gx = g * 0.69314718055994531f;
-    return bfr((fmaxf(gx, 0.0f) + logf(1.0f + expf(-fabsf(gx)))) / 0.69314718055994531f);
-}
 // Reduce the splits, then the softplus output gate: o[t][h*128+d] = bf16(bf16(attn) * bf16(softplus_ln2(g)))
 __global__ void k_attn_reduce(AttnArgs a, const float* part, const float* g, float* o) {
     const int h = (int) blockIdx.x, t = (int) blockIdx.y, d = threadIdx.x;
@@ -941,12 +994,12 @@ __global__ void __launch_bounds__(32 * MLA_HG) k_mla_attn(MlaArgs a, const float
     }
 }
 // Reduce the latent attention's splits: olat[t][h][d] = bf16(acc / l).  Block (head, row); threads stride d.
-__global__ void __launch_bounds__(256) k_mla_reduce(MlaArgs a, const float* part, float* olat) {
+__global__ void __launch_bounds__(128) k_mla_reduce(MlaArgs a, const float* part, float* olat) {
     const int h = (int) blockIdx.x, t = (int) blockIdx.y, r = a.r, w = r + 2;
     const float* pp = part + ((size_t) t * a.n_head + h) * a.n_splits * w;
     float m = -INFINITY;
     for (int s = 0; s < a.n_splits; ++s) m = fmaxf(m, pp[s * w]);
-    for (int d = threadIdx.x; d < r; d += (int) blockDim.x) {
+    for (int d = (int) (blockIdx.z * blockDim.x + threadIdx.x); d < r; d += (int) (gridDim.z * blockDim.x)) {
         float l = 0, acc = 0;
         for (int s = 0; s < a.n_splits; ++s) {
             const float ms = pp[s * w];
@@ -957,6 +1010,483 @@ __global__ void __launch_bounds__(256) k_mla_reduce(MlaArgs a, const float* part
         }
         olat[((size_t) t * a.n_head + h) * r + d] = bfr(acc / l);
     }
+}
+
+// Per-head maps of prompt rows (T > MV_MAXT) on tensor cores: head blockIdx.z's [T x I] x [I x O] through the dense
+// GEMM body (the inputs are BF16 values and the weights BF16: exact products, f32 sums, as k_heads_mv), the gate fused.
+__global__ void __launch_bounds__(MMT_THREADS) k_heads_mm(HmvArgs h, MmArgs a, const uint16_t* W, const float* X, const float* g,
+                                                          float* Y) {
+    const int hd = (int) blockIdx.z;
+    WSlice w;
+    memset(&w, 0, sizeof w);
+    w.p[0] = W + (size_t) hd * h.O * h.I;
+    mm_body<1>(MF_BF16, a, w, NULL, X + (size_t) hd * h.hs, Y + (size_t) hd * h.O, NULL, NULL, NULL, NULL,
+               h.gate ? g + (size_t) hd * h.O : NULL);
+}
+
+// Latent attention on tensor cores (absorbed MLA is multi-query attention over the latent: every head reads the same
+// keys).  Block (split, group of 16 MT query heads, row): the row's heads share each tile of MLAT_KT keys (latent c, then
+// the RoPE key: [key][r + 128] BF16), double-buffered in shared memory by cp.async.  16 warps, NSL = 16 / MT slices:
+//   scores  S = Q K^T: warp (M-tile w % MT, k-slice w / MT) sums its share of the r + 128 dims (BF16 mma, f32 sums: the
+//           queries are BF16 values, exact); the NSL partial sums meet in shared memory; score = scale (q . k);
+//   softmax one thread per (head, key): online softmax in f32, as k_mla_attn;
+//   P c     warp (M-tile w % MT, column group w / MT) owns the 16-dim column pairs w / MT, + NSL, ..; P enters the mma as
+//           two BF16 terms hi + lo (= P - hi), so P c keeps about 16 bits of P (f32 P in k_mla_attn and on Metal).
+// MT = 2 (32 heads a block) for one-pass rows: each key tile serves twice the queries.  MT = 1 for split-key decode: a
+// row's two head groups are separate blocks (the second's tile reads hit L2), so a decode step fills twice the SMs.
+// Output and partials as k_mla_attn.  r <= MLAT_MAXR (kc_mla_attn falls back to k_mla_attn above).
+#define MLAT_KT 16
+#define MLAT_W 16
+#define MLAT_MAXR 768
+#define MLAT_PLD (MLAT_KT + 8)
+#ifndef MLAT_PLO
+#define MLAT_PLO 1   // 1: P as BF16 hi + lo terms (about 16 bits); 0: P rounded to BF16 (one MMA)
+#endif
+static __device__ __forceinline__ void cp_async16(void* dst, const void* src, int bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"((uint32_t) __cvta_generic_to_shared(dst)), "l"(src), "r"(bytes));
+}
+static __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+static __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+static __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+static __device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+static size_t mlat_smem(int r, int mt) {
+    const int kld = r + ATT_HD + 8, q = 16 * mt;
+    return (size_t) 2 * MLAT_KT * kld * 2 + (size_t) MLAT_W * 16 * MLAT_KT * 4 + (size_t) 2 * q * MLAT_PLD * 2 + 3 * q * 4;
+}
+template <int MT>
+__global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const float* ql, const float* qr, KvView kv, const RowInfo* ri,
+                                                            float* out) {
+    constexpr int Q = 16 * MT, NSL = MLAT_W / MT;
+    constexpr int SPS = ((MLAT_MAXR + ATT_HD) / 16 + NSL - 1) / NSL;   // k-steps per slice, at most
+    constexpr int NP = MLAT_MAXR / 16 / NSL;                           // column pairs per warp, at most
+    extern __shared__ __align__(16) uint8_t mlat_sm[];
+    const int r = a.r, D = r + ATT_HD, kld = D + 8, nch = D / 8, H = a.n_head;
+    uint16_t* Ks = (uint16_t*) mlat_sm;                      // [2][KT][kld]
+    float* Sp = (float*) (Ks + 2 * MLAT_KT * kld);           // [NSL][Q][KT] partial scores
+    uint16_t* Ph = (uint16_t*) (Sp + NSL * Q * MLAT_KT);     // [Q][PLD] P: BF16 hi
+    uint16_t* Pl = Ph + Q * MLAT_PLD;                        //             and lo
+    float* scor = (float*) (Pl + Q * MLAT_PLD);              // [Q] the tile's rescale
+    float* sl = scor + Q;                                    // [Q] final l
+    float* sm = sl + Q;                                      // [Q] final m
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, gq = lane >> 2, t4 = lane & 3;
+    const int split = (int) blockIdx.x, h0 = (int) blockIdx.y * Q, t = (int) blockIdx.z;
+    const int pos = ri[t].pos, kv0 = ri[t].kv0;
+    const int nsr = min(a.n_splits, (pos + a.chunk) / a.chunk);
+    const int chunk = (pos + nsr) / nsr;
+    const int p0 = split * chunk, p1 = min(pos + 1, p0 + chunk);
+    const int ntile = p1 > p0 ? (p1 - p0 + MLAT_KT - 1) / MLAT_KT : 0;
+    const int mt = w % MT, ks = w / MT;
+    // queries: this warp's k-slice of its 16 heads, as A fragments (BF16 values: exact)
+    const int nsteps = D / 16, sps = (nsteps + NSL - 1) / NSL, s0 = ks * sps, ns_w = max(0, min(sps, nsteps - s0));
+    uint32_t qf[SPS][4];
+    {
+        const int ha = h0 + mt * 16 + gq, hb = ha + 8;
+#pragma unroll
+        for (int i = 0; i < SPS; ++i) {
+            const int c = (s0 + i) * 16 + t4 * 2;
+            float va[4] = {0, 0, 0, 0}, vb[4] = {0, 0, 0, 0};
+            if (i < ns_w) {
+                if (ha < H) {
+                    const float* q = c < r ? ql + ((size_t) t * H + ha) * r + c : qr + ((size_t) t * H + ha) * ATT_HD + c - r;
+                    va[0] = q[0]; va[1] = q[1]; va[2] = q[8]; va[3] = q[9];
+                }
+                if (hb < H) {
+                    const float* q = c < r ? ql + ((size_t) t * H + hb) * r + c : qr + ((size_t) t * H + hb) * ATT_HD + c - r;
+                    vb[0] = q[0]; vb[1] = q[1]; vb[2] = q[8]; vb[3] = q[9];
+                }
+            }
+            qf[i][0] = pack_bf2(va[0], va[1]);
+            qf[i][1] = pack_bf2(vb[0], vb[1]);
+            qf[i][2] = pack_bf2(va[2], va[3]);
+            qf[i][3] = pack_bf2(vb[2], vb[3]);
+        }
+    }
+    const int npair = r / 16, cg = w / MT;
+    float acc[NP][2][4];
+#pragma unroll
+    for (int i = 0; i < NP; ++i)
+#pragma unroll
+        for (int n = 0; n < 2; ++n) acc[i][n][0] = acc[i][n][1] = acc[i][n][2] = acc[i][n][3] = 0;
+    const int sq = tid >> 4, su = tid & 15;   // softmax: (head, key)
+    float m_run = -INFINITY, l_run = 0;       // l_run: this thread's key column (the head's sum at the end)
+    // this thread's 16-byte chunks of a tile (the same in every tile): key u, column j (packed u << 16 | j)
+    int cmap[(MLAT_KT * (MLAT_MAXR + ATT_HD) / 8 + 32 * MLAT_W - 1) / (32 * MLAT_W)];
+#pragma unroll
+    for (int k = 0; k < (int) (sizeof cmap / sizeof cmap[0]); ++k) {
+        const int c = tid + k * 32 * MLAT_W, u = c / nch;
+        cmap[k] = c < MLAT_KT * nch ? u << 16 | (c - u * nch) : -1;
+    }
+    auto load_tile = [&](int buf, int p) {
+#pragma unroll
+        for (int k = 0; k < (int) (sizeof cmap / sizeof cmap[0]); ++k) {
+            if (cmap[k] < 0) continue;
+            const int u = cmap[k] >> 16, j = cmap[k] & 0xFFFF, kp = p + u;
+            const void* src = kv.a.k;
+            int ok = 0;
+            if (kp < p1) {
+                int row;
+                const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
+                src = j * 8 < r ? (const void*) ((const uint16_t*) sg.v + (size_t) row * r + j * 8)
+                                : (const void*) ((const uint16_t*) sg.k + (size_t) row * ATT_HD + j * 8 - r);
+                ok = 16;
+            }
+            cp_async16(Ks + ((size_t) buf * MLAT_KT + u) * kld + j * 8, src, ok);   // keys past the split: zeros
+        }
+        cp_async_commit();
+    };
+    if (ntile) load_tile(0, p0);
+    // Three barriers per tile: (A) the tile has landed and every warp is done with the previous one, so the other buffer
+    // takes the next tile while this one computes; (B) partial scores written; (C) P and the rescale written.  The next
+    // tile's scores (after its A) overwrite Sp, P and scor only once this tile's P c has read them.
+    for (int it = 0; it < ntile; ++it) {
+        const int buf = it & 1, p = p0 + it * MLAT_KT;
+        cp_async_wait<0>();
+        __syncthreads();
+        if (it + 1 < ntile) load_tile(buf ^ 1, p + MLAT_KT);
+        const uint16_t* Kb = Ks + (size_t) buf * MLAT_KT * kld;
+        {   // partial scores of this warp's k-slice
+            float sc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+#pragma unroll
+            for (int i = 0; i < SPS; ++i) {
+                if (i < ns_w) {
+                    uint32_t b[4];
+                    ldsm_x4(b, Kb + (size_t) ((lane >> 4) * 8 + (lane & 7)) * kld + (s0 + i) * 16 + ((lane >> 3) & 1) * 8);
+                    mma_bf16(sc[0], qf[i], b);
+                    mma_bf16(sc[1], qf[i], b + 2);
+                }
+            }
+            float* sp = Sp + (ks * Q + mt * 16) * MLAT_KT;
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                *(float2*) &sp[gq * MLAT_KT + n * 8 + t4 * 2] = make_float2(sc[n][0], sc[n][1]);
+                *(float2*) &sp[(gq + 8) * MLAT_KT + n * 8 + t4 * 2] = make_float2(sc[n][2], sc[n][3]);
+            }
+        }
+        __syncthreads();
+        if (sq < Q) {   // online softmax: thread (head sq, key su); a head's 16 keys are one half-warp (MT = 1: 8 warps)
+            float s = 0;
+#pragma unroll
+            for (int k = 0; k < NSL; ++k) s += Sp[(k * Q + sq) * MLAT_KT + su];
+            const bool ok = p + su < p1;
+            s = ok ? s * a.scale : -INFINITY;
+            float mx = s;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o));
+            mx = fmaxf(mx, m_run);
+            const float cor = expf(m_run - mx), e = ok ? expf(s - mx) : 0.0f;
+            l_run = l_run * cor + e;
+            m_run = mx;
+            const uint16_t hi = tobf(e);
+            Ph[sq * MLAT_PLD + su] = hi;
+            Pl[sq * MLAT_PLD + su] = tobf(e - bf(hi));
+            if (su == 0) scor[sq] = cor;
+        }
+        __syncthreads();
+        {   // acc = acc * cor + P c
+            const float ca = scor[mt * 16 + gq], cb = scor[mt * 16 + gq + 8];
+            const bool rescale = __any_sync(FULL, ca != 1.0f || cb != 1.0f);   // no running max moved: no rescale
+            uint32_t ah[4], al[4];
+            const int prow = mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, pcol = (lane >> 4) * 8;
+            ldsm_x4(ah, Ph + prow * MLAT_PLD + pcol);
+            if (MLAT_PLO) ldsm_x4(al, Pl + prow * MLAT_PLD + pcol);
+#pragma unroll
+            for (int i = 0; i < NP; ++i) {
+                const int pi = cg + NSL * i;
+                if (pi < npair) {
+                    uint32_t b[4];
+                    ldsm_x4_t(b, Kb + (size_t) ((lane & 7) + ((lane >> 3) & 1) * 8) * kld + pi * 16 + (lane >> 4) * 8);
+#pragma unroll
+                    for (int n = 0; n < 2; ++n) {
+                        if (rescale) { acc[i][n][0] *= ca; acc[i][n][1] *= ca; acc[i][n][2] *= cb; acc[i][n][3] *= cb; }
+                        mma_bf16(acc[i][n], ah, b + 2 * n);
+                        if (MLAT_PLO) mma_bf16(acc[i][n], al, b + 2 * n);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) l_run += __shfl_xor_sync(FULL, l_run, o);
+    if (su == 0 && sq < Q) { sl[sq] = l_run; sm[sq] = m_run; }
+    __syncthreads();
+    const int qa = mt * 16 + gq, qb = qa + 8;
+    if (a.n_splits == 1) {
+        const float la = sl[qa], lb = sl[qb];
+#pragma unroll
+        for (int i = 0; i < NP; ++i) {
+            const int pi = cg + NSL * i;
+            if (pi < npair) {
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    const int d = pi * 16 + n * 8 + t4 * 2;
+                    if (h0 + qa < H)
+                        *(float2*) &out[((size_t) t * H + h0 + qa) * r + d] = make_float2(bfr(acc[i][n][0] / la), bfr(acc[i][n][1] / la));
+                    if (h0 + qb < H)
+                        *(float2*) &out[((size_t) t * H + h0 + qb) * r + d] = make_float2(bfr(acc[i][n][2] / lb), bfr(acc[i][n][3] / lb));
+                }
+            }
+        }
+    } else {
+        const size_t w2 = (size_t) r + 2;
+        if (tid < Q && h0 + tid < H) {
+            float* pp = out + (((size_t) t * H + h0 + tid) * a.n_splits + split) * w2;
+            pp[0] = sm[tid];
+            pp[1] = sl[tid];
+        }
+#pragma unroll
+        for (int i = 0; i < NP; ++i) {
+            const int pi = cg + NSL * i;
+            if (pi < npair) {
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    const int d = pi * 16 + n * 8 + t4 * 2;
+                    if (h0 + qa < H) {
+                        float* pp = out + (((size_t) t * H + h0 + qa) * a.n_splits + split) * w2 + 2 + d;
+                        pp[0] = acc[i][n][0];
+                        pp[1] = acc[i][n][1];
+                    }
+                    if (h0 + qb < H) {
+                        float* pp = out + (((size_t) t * H + h0 + qb) * a.n_splits + split) * w2 + 2 + d;
+                        pp[0] = acc[i][n][2];
+                        pp[1] = acc[i][n][3];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- MLA prompt rows, not absorbed ------------------------------------------------------------------------------------
+// Absorbed attention costs every query row a pass over each key's whole latent (r + 128 dims for scores, r for P c); for
+// prompt rows the keys are decompressed per head once instead (as DeepSeek's MLA prefill does), and attention is plain
+// multi-head attention over 128 + 128 dims (q . Kn + RoPE parts) with 128-dim values, the gate fused:
+//   Kn[key][h] = bf16(q_lat_h^T c[key])   (so q_h . Kn_h = (q_lat_h q_h) . c without q_lat q's rounding)
+//   Vd[key][h] = bf16(v_up_h c[key])      (so sum p Vd_h = v_up_h (sum p c) without olat's rounding)
+// The rounding points move (the decompressed K and V are BF16 tensors; the absorbed path rounds q_lat q and the latent
+// output instead); held-out KLD against the BF16 reference is unchanged (README).
+
+// Decompression: block (64 keys, head, K or V), 8 warps of 16 keys x 64 dims, BF16 mma over the latent in steps of 32.
+// Keys [k_lo, k_hi) of the slot at cache row kv0 into Kn / Vd rows key - kb0.
+#define MLD_BK 64
+#define MLD_BJ 32
+#define MLD_ALD (MLD_BJ + 8)
+#define MLD_KLD (ATT_HD + 8)   // K weights staged [j][d]
+#define MLD_VLD (MLD_BJ + 8)   // V weights staged [d][j]
+__global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, const uint16_t* Wql,
+                                                   const uint16_t* Wvu, uint16_t* Kn, uint16_t* Vd) {
+    __shared__ __align__(16) uint16_t As[MLD_BK * MLD_ALD];
+    __shared__ __align__(16) uint16_t Bs[MLD_BJ * MLD_KLD > ATT_HD * MLD_VLD ? MLD_BJ * MLD_KLD : ATT_HD * MLD_VLD];
+    const int h = (int) blockIdx.y, isv = (int) blockIdx.z, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int gq = lane >> 2, t4 = lane & 3, r = a.r, H = a.n_head;
+    const int key0 = k_lo + (int) blockIdx.x * MLD_BK, wk = (w & 3) * 16, wd = (w >> 2) * 64;
+    float acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0;
+    // this thread's latent row (one 16-byte chunk per step)
+    const int au = tid >> 2, aj = (tid & 3) * 8, akp = key0 + au;
+    const uint16_t* arow = NULL;
+    if (akp < k_hi) {
+        int row;
+        const KvSeg sg = kv_seg(kv, kv0 + akp, &row);
+        arow = (const uint16_t*) sg.v + (size_t) row * r;
+    }
+    for (int j0 = 0; j0 < r; j0 += MLD_BJ) {
+        *(uint4*) &As[au * MLD_ALD + aj] = arow ? *(const uint4*) (arow + j0 + aj) : make_uint4(0, 0, 0, 0);
+        if (!isv)
+            for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[j][d] = q_lat[h][j0 + j][d]
+                const int j = c >> 4, d8 = (c & 15) * 8;
+                *(uint4*) &Bs[j * MLD_KLD + d8] = *(const uint4*) (Wql + ((size_t) h * r + j0 + j) * ATT_HD + d8);
+            }
+        else
+            for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[d][j] = v_up[h][d][j0 + j]
+                const int d = c >> 2, j8 = (c & 3) * 8;
+                *(uint4*) &Bs[d * MLD_VLD + j8] = *(const uint4*) (Wvu + ((size_t) h * ATT_HD + d) * r + j0 + j8);
+            }
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < MLD_BJ; ks += 16) {
+            uint32_t af[4];
+            ldsm_x4(af, &As[(wk + (lane & 7) + ((lane >> 3) & 1) * 8) * MLD_ALD + ks + (lane >> 4) * 8]);
+#pragma unroll
+            for (int np = 0; np < 4; ++np) {
+                const int d0 = wd + np * 16;
+                uint32_t b[4];
+                if (!isv) ldsm_x4_t(b, &Bs[(ks + (lane & 7) + ((lane >> 3) & 1) * 8) * MLD_KLD + d0 + (lane >> 4) * 8]);
+                else ldsm_x4(b, &Bs[(d0 + (lane >> 4) * 8 + (lane & 7)) * MLD_VLD + ks + ((lane >> 3) & 1) * 8]);
+                mma_bf16(acc[2 * np], af, b);
+                mma_bf16(acc[2 * np + 1], af, b + 2);
+            }
+        }
+        __syncthreads();
+    }
+    uint16_t* out = isv ? Vd : Kn;
+    const int ka = key0 + wk + gq, kb = ka + 8;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        const int d = wd + nt * 8 + t4 * 2;
+        if (ka < k_hi) *(uint32_t*) &out[((size_t) (ka - kb0) * H + h) * ATT_HD + d] = pack_bf2(acc[nt][0], acc[nt][1]);
+        if (kb < k_hi) *(uint32_t*) &out[((size_t) (kb - kb0) * H + h) * ATT_HD + d] = pack_bf2(acc[nt][2], acc[nt][3]);
+    }
+}
+
+// Attention of prompt rows over keys [kb0, kb1) (decompressed in Kn / Vd rows key - kb0): block (64 consecutive rows of
+// one slot, head), a warp per 16 rows; keys in tiles of MLP_BK through shared memory.  Scores scale (q . Kn + qr . kr)
+// from BF16 operands (exact products, f32 sums), causal online softmax in f32, P as BF16 hi + lo (as k_mla_attn_tc).
+// first: start the softmax state, else read it from st ([T][H][130]: m, l, O); last: o = bf16(bf16(O / l) *
+// softplus_ln2(g)) (k_attn_reduce's gate), else write the state.
+#define MLP_RW 4
+#define MLP_BK 32
+#define MLP_KLD (2 * ATT_HD + 8)
+#define MLP_VLD (ATT_HD + 8)
+__global__ void __launch_bounds__(32 * MLP_RW) k_mla_prefill(MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri,
+                                                            const uint16_t* Kn, const uint16_t* Vd, int kb0, int kb1, int first,
+                                                            int last, float* st, const float* g, float* o, int T) {
+    __shared__ __align__(16) uint16_t Ks[MLP_BK * MLP_KLD];
+    __shared__ __align__(16) uint16_t Vs[MLP_BK * MLP_VLD];
+    const int H = a.n_head, h = (int) blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, gq = lane >> 2, t4 = lane & 3;
+    const int b0 = (int) blockIdx.x * 16 * MLP_RW, tw = b0 + w * 16, live = tw < T;
+    const int t0 = live ? tw : T - 1, nrows = live ? min(16, T - tw) : 1;
+    const int ra = t0 + min(gq, nrows - 1), rb = t0 + min(gq + 8, nrows - 1);
+    const int pa = ri[ra].pos, pb = ri[rb].pos, plast = ri[t0 + nrows - 1].pos, kv0 = ri[b0].kv0;
+    const int kend = min(kb1, ri[min(b0 + 16 * MLP_RW, T) - 1].pos + 1);
+    uint32_t qf[16][4];   // 8 steps of q (128 dims), 8 of the roped query part
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+        const float* src = s < 8 ? q : qr;
+        const float* qa = src + ((size_t) ra * H + h) * ATT_HD;
+        const float* qb = src + ((size_t) rb * H + h) * ATT_HD;
+        const int c = (s & 7) * 16 + t4 * 2;
+        qf[s][0] = pack_bf2(qa[c], qa[c + 1]);
+        qf[s][1] = pack_bf2(qb[c], qb[c + 1]);
+        qf[s][2] = pack_bf2(qa[c + 8], qa[c + 9]);
+        qf[s][3] = pack_bf2(qb[c + 8], qb[c + 9]);
+    }
+    float O[16][4], ma = -INFINITY, mb = -INFINITY, la = 0, lb = 0;
+    const float* sa_ = st + ((size_t) ra * H + h) * (ATT_HD + 2);
+    const float* sb_ = st + ((size_t) rb * H + h) * (ATT_HD + 2);
+    if (first) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) O[j][0] = O[j][1] = O[j][2] = O[j][3] = 0;
+    } else {
+        ma = sa_[0]; la = sa_[1]; mb = sb_[0]; lb = sb_[1];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int d = 2 + j * 8 + t4 * 2;
+            O[j][0] = sa_[d]; O[j][1] = sa_[d + 1]; O[j][2] = sb_[d]; O[j][3] = sb_[d + 1];
+        }
+    }
+    for (int k0 = kb0; k0 < kend; k0 += MLP_BK) {
+        for (int c = threadIdx.x; c < MLP_BK * 2 * ATT_HD / 8; c += 32 * MLP_RW) {   // [Kn | kr] per key
+            const int u = c >> 5, j = c & 31, kp = k0 + u;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (kp < kend) {
+                if (j < 16) v = *(const uint4*) (Kn + ((size_t) (kp - kb0) * H + h) * ATT_HD + j * 8);
+                else {
+                    int row;
+                    const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
+                    v = *(const uint4*) ((const uint16_t*) sg.k + (size_t) row * ATT_HD + (j - 16) * 8);
+                }
+            }
+            *(uint4*) &Ks[u * MLP_KLD + j * 8] = v;
+        }
+        for (int c = threadIdx.x; c < MLP_BK * ATT_HD / 8; c += 32 * MLP_RW) {
+            const int u = c >> 4, j = c & 15, kp = k0 + u;
+            *(uint4*) &Vs[u * MLP_VLD + j * 8] =
+                kp < kend ? *(const uint4*) (Vd + ((size_t) (kp - kb0) * H + h) * ATT_HD + j * 8) : make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        if (live && k0 <= plast) {
+            float S[4][4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) S[j][0] = S[j][1] = S[j][2] = S[j][3] = 0;
+#pragma unroll
+            for (int s = 0; s < 16; ++s)
+#pragma unroll
+                for (int np = 0; np < 2; ++np) {
+                    uint32_t b[4];
+                    ldsm_x4(b, &Ks[(np * 16 + (lane >> 4) * 8 + (lane & 7)) * MLP_KLD + s * 16 + ((lane >> 3) & 1) * 8]);
+                    mma_bf16(S[2 * np], qf[s], b);
+                    mma_bf16(S[2 * np + 1], qf[s], b + 2);
+                }
+            float mxa = -INFINITY, mxb = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int key = k0 + j * 8 + t4 * 2;
+                S[j][0] = key > pa ? -INFINITY : S[j][0] * a.scale;
+                S[j][1] = key + 1 > pa ? -INFINITY : S[j][1] * a.scale;
+                S[j][2] = key > pb ? -INFINITY : S[j][2] * a.scale;
+                S[j][3] = key + 1 > pb ? -INFINITY : S[j][3] * a.scale;
+                mxa = fmaxf(mxa, fmaxf(S[j][0], S[j][1]));
+                mxb = fmaxf(mxb, fmaxf(S[j][2], S[j][3]));
+            }
+            mxa = fmaxf(mxa, __shfl_xor_sync(FULL, mxa, 1)); mxa = fmaxf(mxa, __shfl_xor_sync(FULL, mxa, 2));
+            mxb = fmaxf(mxb, __shfl_xor_sync(FULL, mxb, 1)); mxb = fmaxf(mxb, __shfl_xor_sync(FULL, mxb, 2));
+            const float na = fmaxf(ma, mxa), nb = fmaxf(mb, mxb);
+            const float ca = na == -INFINITY ? 1.0f : expf(ma - na), cb = nb == -INFINITY ? 1.0f : expf(mb - nb);
+            float sa = 0, sb = 0;
+            uint32_t ph[2][4], pl[2][4];   // P as A fragments (2 key steps of 16): BF16 hi and lo
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float p0 = S[j][0] == -INFINITY ? 0.0f : expf(S[j][0] - na);
+                const float p1 = S[j][1] == -INFINITY ? 0.0f : expf(S[j][1] - na);
+                const float p2 = S[j][2] == -INFINITY ? 0.0f : expf(S[j][2] - nb);
+                const float p3 = S[j][3] == -INFINITY ? 0.0f : expf(S[j][3] - nb);
+                sa += p0 + p1;
+                sb += p2 + p3;
+                const uint16_t h0 = tobf(p0), h1 = tobf(p1), h2 = tobf(p2), h3 = tobf(p3);
+                ph[j >> 1][(j & 1) * 2] = (uint32_t) h0 | (uint32_t) h1 << 16;
+                ph[j >> 1][(j & 1) * 2 + 1] = (uint32_t) h2 | (uint32_t) h3 << 16;
+                pl[j >> 1][(j & 1) * 2] = pack_bf2(p0 - bf(h0), p1 - bf(h1));
+                pl[j >> 1][(j & 1) * 2 + 1] = pack_bf2(p2 - bf(h2), p3 - bf(h3));
+            }
+            sa += __shfl_xor_sync(FULL, sa, 1); sa += __shfl_xor_sync(FULL, sa, 2);
+            sb += __shfl_xor_sync(FULL, sb, 1); sb += __shfl_xor_sync(FULL, sb, 2);
+            la = la * ca + sa;
+            lb = lb * cb + sb;
+            ma = na;
+            mb = nb;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) { O[j][0] *= ca; O[j][1] *= ca; O[j][2] *= cb; O[j][3] *= cb; }
+#pragma unroll
+            for (int s = 0; s < 2; ++s)
+#pragma unroll
+                for (int dp = 0; dp < 8; ++dp) {
+                    uint32_t b[4];
+                    ldsm_x4_t(b, &Vs[(s * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * MLP_VLD + dp * 16 + (lane >> 4) * 8]);
+                    mma_bf16(O[2 * dp], ph[s], b);
+                    mma_bf16(O[2 * dp], pl[s], b);
+                    mma_bf16(O[2 * dp + 1], ph[s], b + 2);
+                    mma_bf16(O[2 * dp + 1], pl[s], b + 2);
+                }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int q2 = 0; q2 < 4; ++q2) {
+            const int rr = (q2 >> 1) ? gq + 8 : gq;
+            if (rr >= nrows) continue;
+            const int t = t0 + rr, d = j * 8 + t4 * 2 + (q2 & 1);
+            if (last) {
+                const size_t i = ((size_t) t * H + h) * ATT_HD + d;
+                o[i] = bfr(bfr(O[j][q2] / ((q2 >> 1) ? lb : la)) * softplus_gate(g[i]));
+            } else {
+                float* sp = st + ((size_t) t * H + h) * (ATT_HD + 2);
+                sp[2 + d] = O[j][q2];
+                if (j == 0 && t4 == 0 && (q2 & 1) == 0) { sp[0] = (q2 >> 1) ? mb : ma; sp[1] = (q2 >> 1) ? lb : la; }
+            }
+        }
 }
 
 // Prefill attention on tensor cores: block (FA_RG x 16 rows, KV head), one warp per (query head of the group, 16 rows);
@@ -1293,7 +1823,15 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T) {
     k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS * FA_RG - 1) / (FA_ROWS * FA_RG), (unsigned) a.n_kv), 32 * ATTF_G * FA_RG, 0, s>>>(a, q, kv, ri, g, o, T);
 }
+int kc_heads_mm(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T) {
+    if (a.I % MMT_BK || a.xs % 4 || a.hs % 4) return -1;
+    const MmArgs m = {a.I, a.O, T, a.xs, a.H * a.O, 1, a.gate ? 2 : 0, 0};
+    k_heads_mm<<<dim3((unsigned) (a.O + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN, (unsigned) a.H), MMT_THREADS, 0, s>>>(
+        a, m, W, x, g, y);
+    return 0;
+}
 void kc_heads_mv(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T) {
+    if (T > MV_MAXT && !kc_heads_mm(s, a, W, x, g, y, T)) return;   // more rows than a matvec takes: the GEMM
     k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, W, x, g ? g : x, y);
 }
 void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const float* c, KvView kv, const RowInfo* ri,
@@ -1303,9 +1841,38 @@ void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const fl
 }
 void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, KvView kv, const RowInfo* ri, float* part,
                  float* olat, int T) {
+    static int tc = -1;
+    if (tc < 0) {   // NSLM_MLA_SCALAR=1: the one-pass kernel (k_mla_attn) throughout
+        tc = !getenv("NSLM_MLA_SCALAR") || !atoi(getenv("NSLM_MLA_SCALAR"));
+        if (tc) {
+            cudaFuncSetAttribute(k_mla_attn_tc<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mlat_smem(MLAT_MAXR, 1));
+            cudaFuncSetAttribute(k_mla_attn_tc<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mlat_smem(MLAT_MAXR, 2));
+        }
+    }
+    if (tc && a.r <= MLAT_MAXR && a.r % 16 == 0) {
+        float* o = a.n_splits > 1 ? part : olat;
+        if (a.n_splits > 1)   // decode: 16 heads a block
+            k_mla_attn_tc<1><<<dim3((unsigned) a.n_splits, (unsigned) (a.n_head + 15) / 16, (unsigned) T), 32 * MLAT_W, mlat_smem(a.r, 1), s>>>(
+                a, ql, qr, kv, ri, o);
+        else
+            k_mla_attn_tc<2><<<dim3(1, (unsigned) (a.n_head + 31) / 32, (unsigned) T), 32 * MLAT_W, mlat_smem(a.r, 2), s>>>(a, ql, qr, kv, ri, o);
+        if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
+        return;
+    }
     k_mla_attn<<<dim3((unsigned) a.n_splits, (unsigned) (a.n_head + MLA_HG - 1) / MLA_HG, (unsigned) T), 32 * MLA_HG, 0, s>>>(
         a, ql, qr, kv, ri, a.n_splits > 1 ? part : olat);
-    if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T), 256, 0, s>>>(a, part, olat);
+    if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
+}
+void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, const uint16_t* Wql,
+                   const uint16_t* Wvu, uint16_t* Kn, uint16_t* Vd) {
+    if (k_hi <= k_lo) return;
+    k_mla_decomp<<<dim3((unsigned) (k_hi - k_lo + MLD_BK - 1) / MLD_BK, (unsigned) a.n_head, 2), 256, 0, s>>>(a, kv, kv0, kb0, k_lo, k_hi,
+                                                                                                         Wql, Wvu, Kn, Vd);
+}
+void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri, const uint16_t* Kn,
+                    const uint16_t* Vd, int kb0, int kb1, int first, int last, float* st, const float* g, float* o, int T) {
+    k_mla_prefill<<<dim3((unsigned) (T + 16 * MLP_RW - 1) / (16 * MLP_RW), (unsigned) a.n_head), 32 * MLP_RW, 0, s>>>(
+        a, q, qr, kv, ri, Kn, Vd, kb0, kb1, first, last, st, g, o, T);
 }
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int flags) {
     k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count, flags);

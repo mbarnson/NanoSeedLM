@@ -812,6 +812,88 @@ static void test_mla(void) {
         printf("MLA latent attention: %d rows x %d heads, r %d, %d split(s), %d mismatches\n", T, nh, r, ns, bad);
         free(ql); free(qr); free(ol); free(Kc); free(Vc);
     }
+    // prompt rows without absorption (CUDA): 40 consecutive rows (positions 30 .. 69 of the slot at cache row 7, the cache
+    // split in two segments at 64), 8 heads, r 96; keys decompressed 64 at a time (the softmax state carried across the
+    // blocks) and 128 (one block).  The decompression against double sums (each value within its BF16 rounding), then the
+    // attention against a reference that reads the kernel's own decompressed keys and values (a BF16 rounding the other
+    // way in one value can move an output that cancels to near zero by far more than that output's ulp)
+    for (int dk = 64; dk <= 128; dk += 64) {
+        enum { nh = 8, r = 96, NP = 128, T = 40, P0 = 30, KV0 = 7 };
+        unsigned sd = 57;   // the same data for both block sizes
+        float* q = malloc(4 * (size_t) T * nh * 128), *qr = malloc(4 * (size_t) T * nh * 128), *g = malloc(4 * (size_t) T * nh * 128);
+        float* o = malloc(4 * (size_t) T * nh * 128);
+        uint16_t* Kc = malloc(2 * (size_t) NP * 128), *Vc = malloc(2 * (size_t) NP * r);
+        uint16_t* Wql = malloc(2 * (size_t) nh * r * 128), *Wvu = malloc(2 * (size_t) nh * 128 * r);
+        for (int i = 0; i < T * nh * 128; ++i) { q[i] = bfr(frand(&sd)); qr[i] = bfr(frand(&sd)); g[i] = bfr(frand(&sd) * 3); }
+        for (int i = 0; i < NP * 128; ++i) Kc[i] = f2bf((float) frand(&sd));
+        for (int i = 0; i < NP * r; ++i) Vc[i] = f2bf((float) frand(&sd));
+        for (int i = 0; i < nh * r * 128; ++i) { Wql[i] = f2bf((float) (frand(&sd) * 0.15)); Wvu[i] = f2bf((float) (frand(&sd) * 0.15)); }
+        RowInfo ri[T];
+        memset(ri, 0, sizeof ri);
+        for (int t = 0; t < T; ++t) { ri[t].pos = P0 + t; ri[t].kv0 = KV0; }
+        const MlaArgs a = {nh, r, 128, 1, (float) (1 / sqrt(128.0)), {0}};
+        const int NK = P0 + T;
+        uint16_t* Kd = malloc(2 * (size_t) NK * nh * 128), *Vdd = malloc(2 * (size_t) NK * nh * 128);
+        const int rc = kt_mla_prefill(a, q, qr, Kc, Vc, NP, ri, Wql, Wvu, g, o, T, dk, Kd, Vdd);
+        if (rc == 1) { printf("MLA prompt rows (not absorbed): not on this backend\n"); free(Kd); free(Vdd); break; }
+        int bad = 0, dbad = 0;
+        if (rc) ++fails;
+        else {
+            double* Kn = malloc(sizeof(double) * (size_t) NK * nh * 128), *Vd = malloc(sizeof(double) * (size_t) NK * nh * 128);
+            for (int p = 0; p < NK; ++p)
+                for (int h = 0; h < nh; ++h)
+                    for (int d = 0; d < 128; ++d) {
+                        double k = 0, v = 0;
+                        for (int j = 0; j < r; ++j) {
+                            const double c = bf2f(Vc[(size_t) (KV0 + p) * r + j]);
+                            k += bf2f(Wql[((size_t) h * r + j) * 128 + d]) * c;
+                            v += bf2f(Wvu[((size_t) h * 128 + d) * r + j]) * c;
+                        }
+                        const size_t i = ((size_t) p * nh + h) * 128 + d;
+                        dbad += !close_bf(bf2f(Kd[i]), bfr(k), 1e-6) + !close_bf(bf2f(Vdd[i]), bfr(v), 1e-6);
+                        Kn[i] = bf2f(Kd[i]);
+                        Vd[i] = bf2f(Vdd[i]);
+                    }
+            double s[NP], acc[128];
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < nh; ++h) {
+                    double mx = -1e300, l = 0;
+                    for (int p = 0; p <= ri[t].pos; ++p) {
+                        double d = 0;
+                        for (int e = 0; e < 128; ++e)
+                            d += (double) q[((size_t) t * nh + h) * 128 + e] * Kn[((size_t) p * nh + h) * 128 + e] +
+                                 (double) qr[((size_t) t * nh + h) * 128 + e] * bf2f(Kc[(size_t) (KV0 + p) * 128 + e]);
+                        s[p] = d * a.scale;
+                        mx = fmax(mx, s[p]);
+                    }
+                    memset(acc, 0, sizeof acc);
+                    for (int p = 0; p <= ri[t].pos; ++p) {
+                        const double e = exp(s[p] - mx);
+                        l += e;
+                        for (int k = 0; k < 128; ++k) acc[k] += e * Vd[((size_t) p * nh + h) * 128 + k];
+                    }
+                    for (int k = 0; k < 128; ++k) {
+                        const size_t i = ((size_t) t * nh + h) * 128 + k;
+                        const double want = gated(acc[k] / l, g[i]);
+                        // the attention's BF16 output (before the gate) may round either way: f32 sums, P in two terms
+                        const float lo = bf2f((uint16_t) (f2bf((float) (acc[k] / l)) & 0xFFFFu));
+                        const uint32_t lb = (uint32_t) f2bf(lo) + (fabs(acc[k] / l) > fabs(lo) ? 1u : 0xFFFFFFFFu);
+                        const double alt = gated(bf2f((uint16_t) lb), g[i]);
+                        if (!close_bf(o[i], want, 2e-6) && !close_bf(o[i], alt, 2e-6)) {
+                            if (bad < 3) printf("  mla prefill t %d h %d d %d: %.8g vs %.8g\n", t, h, k, o[i], want);
+                            ++bad;
+                        }
+                    }
+                }
+            free(Kn); free(Vd);
+        }
+        CHECK(!dbad, "MLA decompressed keys and values (%d a block): %d mismatches of %d", dk, dbad, 2 * NK * nh * 128);
+        CHECK(!bad, "MLA prompt rows (not absorbed, %d keys a block): %d mismatches of %d", dk, bad, T * nh * 128);
+        printf("MLA prompt rows (not absorbed): %d rows x %d heads, r %d, keys %d a block, %d + %d mismatches\n", T, nh, r, dk, dbad,
+               bad);
+        free(Kd); free(Vdd);
+        free(q); free(qr); free(g); free(o); free(Kc); free(Vc); free(Wql); free(Wvu);
+    }
 }
 
 int main(void) {

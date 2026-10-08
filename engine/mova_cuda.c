@@ -88,6 +88,13 @@ struct Eng {
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
     float *lat, *qrp, *qlat, *olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
+    // MLA prompt rows (kc_mla_prefill): decompressed keys and values of up to dec_keys positions ([key][n_head][128]
+    // BF16), the softmax state across key blocks, and which keys the buffers hold: [0, dec_n) of layer dec_l in the slot
+    // at cache row dec_kv0 (dec_l -1: none).  Any forward that is not a prompt's, and any cache write, forgets them.
+    uint16_t *dec_k, *dec_v;
+    float* dec_st;
+    int dec_keys, dec_l, dec_kv0, dec_n;
+    int cur_kv0;        // the slot (cache row of position 0) of the prompt rows being computed
     int32_t *ids, *inds, *vinds, *am, *perm, *vperm, *ntiles, *vntiles;
     RowInfo* ri;
     MmTile *tiles, *vtiles;
@@ -119,6 +126,7 @@ struct Eng {
     cudaEvent_t *ev_pred, *ev_predv;   // a layer's predicted MLP / value experts in VRAM
     int pred_pending;   // the layer whose prediction the main stream must join first, or -1
     int seed_f32;       // NSLM_SEED_GEMM_F32: the prefill GEMM's seed weights exact (kc_seed_gemm_f32)
+    int prompt;         // prompt rows (forward_lm): the prefill kernels for any row count, so caches do not depend on chunks
     int in_lm;          // forward_lm's layer-major pass: no prediction (it could replace a slot a pending prefetch copy fills)
     // layer-major prefill: the hidden states, tokens and rows of up to xmax prompt rows
     float* x_all;
@@ -668,6 +676,19 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             eng_close(e);
             return NULL;
         }
+        // NSLM_MLA_DEC_KEYS: keys decompressed at a time for prompt rows (default 8192: 128 MiB); 0: absorbed attention
+        // for prompts as for decode
+        const char* dk = getenv("NSLM_MLA_DEC_KEYS");
+        int64_t nk = dk ? atoll(dk) : 8192;
+        if (nk > e->slot_cap) nk = e->slot_cap;
+        nk = (nk + 63) / 64 * 64;
+        e->dec_l = -1;
+        if (nk > 0 && rmax % 32 == 0) {
+            e->dec_k = (uint16_t*) scratch(e, (uint64_t) nk * c->n_head * ATT_HD * 2);
+            e->dec_v = (uint16_t*) scratch(e, (uint64_t) nk * c->n_head * ATT_HD * 2);
+            e->dec_st = (float*) scratch(e, (uint64_t) T * c->n_head * (ATT_HD + 2) * 4);
+            if (e->dec_k && e->dec_v && e->dec_st) e->dec_keys = (int) nk;
+        }
     }
     e->inds = (int32_t*) scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4);
     e->wts = (float*) scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4);
@@ -863,7 +884,7 @@ static const uint32_t* stab_for(Eng* e, const MW* w) { return w->fmt == MF_SEED4
 
 // Dense projection: matvec for T <= MV_MAXT rows, GEMM above.
 static void enc_dense(Eng* e, const MW* W, const float* X, int xs, float* Y, int ys, int T, int add) {
-    if (T <= MV_MAXT) kc_mv(e->st, W->fmt, W->w0, W->cols, W->rows, X, xs, Y, ys, T, add, stab_for(e, W));
+    if (T <= MV_MAXT && !e->prompt) kc_mv(e->st, W->fmt, W->w0, W->cols, W->rows, X, xs, Y, ys, T, add, stab_for(e, W));
     else kc_mm(e->st, W->fmt, W->w0, W->cols, W->rows, X, xs, Y, ys, T, add, stab_for(e, W));
 }
 static void enc_router(Eng* e, const MW* W, const MW* bias, const float* X, int n, int k, int32_t* inds, float* wts, float* sel, int T) {
@@ -925,13 +946,13 @@ static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
 // MLA per-head maps (kc_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by G (y's layout)
 static void enc_heads_mv(Eng* e, const MW* W, const float* X, int xs, int hs, const float* G, float* Y, int T) {
     const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != NULL, {0}};
-    kc_heads_mv(e->st, a, (const uint16_t*) W->w0.p[0], X, G, Y, T);
+    if (!e->prompt || kc_heads_mm(e->st, a, (const uint16_t*) W->w0.p[0], X, G, Y, T)) kc_heads_mv(e->st, a, (const uint16_t*) W->w0.p[0], X, G, Y, T);
 }
 
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v), as Metal's
 // encode_mla_attn: the latent c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write,
 // latent attention (split-key + reduce for <= MV_MAXT rows, one pass for prompt chunks), then v_up with the gate into ao.
-static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns) {
+static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int max_ctx) {
     const MovaCfg* g = &e->c;
     const Layer* L = &e->L[l];
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim, r = L->mla_r, H = g->n_head;
@@ -940,9 +961,35 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns) {
     if (L->sparse) enc_dense(e, &L->ka_v, e->v, kvd, e->lat, r, T, 1);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0);
     enc_heads_mv(e, &L->qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
+    const int big = T > MV_MAXT || e->prompt;
+    if (big && e->dec_keys) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
+        tgroup(e, MOVA_TG_ATTN);
+        const MlaArgs ma = {H, r, 128, 1, 1.0f / sqrtf((float) g->head_dim), {0}};
+        const KvView kv = kv_view(e, l);
+        kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
+        const int pos0 = max_ctx - T, kv0 = e->cur_kv0;   // consecutive positions of one slot
+        for (int kb0 = 0; kb0 < max_ctx; kb0 += e->dec_keys) {
+            const int kb1 = max_ctx - kb0 < e->dec_keys ? max_ctx : kb0 + e->dec_keys;
+            // the keys before this chunk stay decompressed while one layer's chunks follow each other (layer-major)
+            const int lo = kb0 == 0 && e->dec_l == l && e->dec_kv0 == kv0 ? (e->dec_n < pos0 ? e->dec_n : pos0) : kb0;
+            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, (const uint16_t*) L->ql.w0.p[0], (const uint16_t*) L->vu.w0.p[0],
+                          e->dec_k, e->dec_v);
+            e->dec_l = kb0 == 0 ? l : -1;
+            e->dec_kv0 = kv0;
+            e->dec_n = kb1;
+            kc_mla_prefill(e->st, ma, e->q, e->qrp, kv, RI, e->dec_k, e->dec_v, kb0, kb1, kb0 == 0, kb1 == max_ctx, e->dec_st,
+                           e->gq, e->ao, T);
+        }
+        tgroup(e, MOVA_TG_ATTN_PROJ);
+        return;
+    }
     enc_heads_mv(e, &L->ql, e->q, qd, g->head_dim, NULL, e->qlat, T);
     tgroup(e, MOVA_TG_ATTN);
-    const MlaArgs ma = {H, r, 128, T > MV_MAXT ? 1 : ns, 1.0f / sqrtf((float) g->head_dim), {0}};
+    // decode: twice the GQA splits (keys in parts of >= 64), at most MAX_SPLITS: one block holds all of a row's heads
+    // (kc_mla_attn).  64 splits measured no faster at 8k (RTX 4080: the reduce's cost doubled).  A row's split count
+    // depends on its position alone, so batched rows match rows decoded alone.
+    const int nsp = T > MV_MAXT || e->prompt ? 1 : (2 * ns < MAX_SPLITS ? 2 * ns : MAX_SPLITS);
+    const MlaArgs ma = {H, r, 64, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
     const KvView kv = kv_view(e, l);
     kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
     kc_mla_attn(e->st, ma, e->qlat, e->qrp, kv, RI, e->part, e->olat, T);
@@ -954,7 +1001,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns) {
 static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int max_ctx) {
     const MovaCfg* g = &e->c;
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim;
-    const int big = T > MV_MAXT;
+    const int big = T > MV_MAXT || e->prompt;   // prompt rows: the prefill kernels whatever their count
     AttnArgs aa = {g->n_head, g->n_kv, 128, attn_splits(T, max_ctx), 1.0f / sqrtf((float) g->head_dim)};
     Layer* L = &e->L[l];
     tgroup(e, MOVA_TG_EMBED_NORM);
@@ -981,7 +1028,7 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         }
         kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
     }
-    if (g->mla) encode_mla_attn(e, l, T, RI, aa.n_splits);
+    if (g->mla) encode_mla_attn(e, l, T, RI, aa.n_splits, max_ctx);
     else {
         tgroup(e, MOVA_TG_ATTN);
         const KvView kv = kv_view(e, l);
@@ -1094,6 +1141,8 @@ static void route_collect(Eng* e, int T);
 static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, int h0, float* logits_out, int32_t* am) {
     kc_seed_gemm_f32(e->seed_f32);   // a launch setting of the kernels' host side (engines in one process may differ)
     if (T < 1 || T > MAX_ROWS) return -1;
+    if (!e->prompt) e->dec_l = -1;   // decode rows write cache rows the decompressed keys may hold
+    e->cur_kv0 = rows[0].kv0;
     int max_ctx = 0;
     for (int t = 0; t < T; ++t) {
         if (rows[t].pos >= e->slot_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->slot_cap); return -1; }
@@ -1107,7 +1156,7 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
     // Forwards of up to MV_MAXT rows (decode, prompt-lookup verification) have no host round trip: they run as a CUDA
     // graph, captured once per (rows, attention splits, head) and launched as one unit.  The head is all rows or none
     // (a head from row 0 < h0 < T would be baked into the graph).
-    const int graph = T <= MV_MAXT && !e->timing_on && !e->no_graph && (h0 == 0 || h0 >= T);
+    const int graph = T <= MV_MAXT && !e->prompt && !e->timing_on && !e->no_graph && (h0 == 0 || h0 >= T);
     if (graph) {
         const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, max_ctx)) * 2 + (h0 < T));
         if (!e->graphs[key]) {
@@ -1172,12 +1221,12 @@ static void prefetch_layer(Eng* e, int l) {
 // (n - h0) x vocab, may be NULL).  Route capture takes the chunked forward (its records are per forward).
 static int forward_lm_body(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out);
 static int forward_lm(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
-    if (e->route_on || n <= MV_MAXT) return forward_lm_body(e, seq, ids, n, pos0, h0, logits_out);
-    // a sub-chunk of 1 .. MV_MAXT rows takes the decode path, whose next-layer prediction could replace a slot the
-    // pending prefetch copy is filling
-    e->in_lm = 1;
+    // prompt rows take the prefill kernels whatever the chunk (a slot's cache does not depend on how its prompt was
+    // split); in_lm: no next-layer prediction beside the layer-major pass's prefetch copies
+    e->prompt = 1;
+    e->in_lm = !(e->route_on || n <= MV_MAXT);
     const int rc = forward_lm_body(e, seq, ids, n, pos0, h0, logits_out);
-    e->in_lm = 0;
+    e->prompt = e->in_lm = 0;
     return rc;
 }
 static int forward_lm_body(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
@@ -1194,6 +1243,7 @@ static int forward_lm_body(Eng* e, int seq, const int32_t* ids, int n, int pos0,
     }
     const MovaCfg* g = &e->c;
     const int d = g->d, kv0 = (int) (seq * e->slot_cap);
+    e->cur_kv0 = kv0;
     if (pos0 + n > e->slot_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->slot_cap); return -1; }
     for (int s0 = 0; s0 < n; s0 += e->xmax) {
         const int N = n - s0 < e->xmax ? n - s0 : e->xmax;
@@ -1343,6 +1393,7 @@ int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst) {
 int eng_kv_write(Eng* e, int seq, const int32_t* ids, int p0, int p1, const void* src) {
     Seq* s = seq_of(e, seq);
     if (!s || p0 < 0 || p0 > s->done || p1 < p0 || p1 > e->slot_cap) return -1;
+    e->dec_l = -1;
     if (kv_copy(e, seq, p0, p1, (uint8_t*) src, 0)) return -1;
     s->len = 0;
     for (int i = 0; i < p1; ++i) hist_push(s, ids[i]);

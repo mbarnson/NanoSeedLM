@@ -481,3 +481,9 @@ int kt_argmax(const float* logits, int V, int n, int32_t* out) {
     memcpy(out, ob.contents, 4 * (size_t) n);
     return 0;
 }
+int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos, const RowInfo* ri,
+                   const uint16_t* Wql, const uint16_t* Wvu, const float* g, float* o, int T, int dec_keys, uint16_t* Kn, uint16_t* Vd) {
+    (void) a; (void) q; (void) qr; (void) Kc; (void) Vc; (void) npos; (void) ri; (void) Wql; (void) Wvu; (void) g; (void) o; (void) T;
+    (void) dec_keys; (void) Kn; (void) Vd;
+    return 1;   // the Metal engine computes prompt rows absorbed (k_mla_attn)
+}

@@ -105,7 +105,7 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   tokens (default: as many as half of the memory left after the weights holds, up to 16); more requests wait in line.
   Prompts are computed in chunks of 256 tokens between decode steps, so a new prompt does not stall the others. A
   request's tokens do not depend on what else runs: with a `seed` (or greedy) it gets the same answer alone or among
-  others (on Metal, bit for bit). Decode steps run in forwards of up to 8 slots. Experimental (Metal):
+  others, bit for bit (Metal and CUDA). Decode steps run in forwards of up to 8 slots. Experimental (Metal):
   `NSLM_BATCH_GEMM=32` runs steps of 32 or more slots through the prompt GEMMs instead, which is faster at large batches
   (M4 Max, q8mx: 171 tok/s at 64 streams against about 112) but gives up the bit-for-bit equality.
 - Prefix reuse: a request takes the free slot whose cache shares the longest prefix with its prompt. Repeated system
@@ -169,6 +169,8 @@ cores. `NSLM_SEED_GEMM_F32=1` keeps them exact in f32, as the decode matvec and 
 reference this changed neither KLD (held-out 0.0261 vs 0.0260) nor NLL, and it costs about 30% of 4k prefill (the
 tensor cores do three times the work). `NSLM_PREFILL_RANGE` sets the prompt rows computed layer by layer at a time
 (default 8192, or 32768 when the KV cache spills to host memory: each range re-stages the earlier host rows).
+MLA models: `NSLM_MLA_DEC_KEYS` (keys decompressed at a time for prompt rows, default 8192, 128 MiB of VRAM; 0 attends
+prompts absorbed as decode does), `NSLM_MLA_SCALAR=1` (the earlier one-pass latent kernel, for comparison).
 
 ## MLX and oMLX
 
@@ -202,9 +204,29 @@ the per-head `v_up` and the gate. On Metal, `k_mla_attn` is flash style: 16 quer
 staged in threadgroup memory, scores and `P c` on simdgroup matrices, online softmax, for prompts and (split-key)
 decode alike; prompt rows run the per-head maps as GEMMs. On an M4 Max (q8mx) that took prefill of 2048 tokens from
 21.3 s to 6.6 s (GQA: 3.2 s) and of 8192 tokens from 272 s to 64 s (GQA: 15 s); absorbed attention still does about
-6x the arithmetic of GQA's. The CUDA engine keeps its one-pass latent kernel (8 query heads per block); its KV cache
-places MLA's per-layer latent widths in VRAM and host memory as it does GQA's rows. Not yet: the 8-bit cache for MLA
-(`--kv q8` is refused), packed (Q8 / seed) MLA tensors (the MLA projections stay BF16), and the flash kernel on CUDA.
+6x the arithmetic of GQA's.
+
+On CUDA, decode attends absorbed with `k_mla_attn_tc`. Per block it handles 16 query heads of a row and one key split, with
+16-key tiles double-buffered in shared memory by `cp.async`. Scores come from BF16 `mma` with the 896 dims split over 16
+warps, the softmax is online, and `P c` runs as an `mma` with P in two BF16 terms (hi + lo, about 16 bits, close to
+Metal's f32 P). Prompt rows are not absorbed: each layer's keys are decompressed per head, `Kn = q_latᵀ c` and
+`V = v_up c` in BF16, by tensor-core GEMMs straight from the latent cache, and kept while a layer's chunks follow each other.
+They are then attended as multi-head attention over 128 + 128 dims (`q · Kn` + the RoPE parts) with the gate fused
+(`k_mla_prefill`). That is about a quarter of the absorbed arithmetic and of its L2 traffic. Each absorbed query row
+re-reads every key's 1.8 KB latent, and on an RTX 4080 that L2 bandwidth, not the tensor cores, limits the absorbed
+prefill kernel. The rounding points move (decompressed K and V instead of `q_lat q` and the latent output). Held-out KLD
+against BF16 (8 windows) was 0.0996 decompressed against 0.1000 absorbed and 0.1001 with the earlier one-pass kernel,
+standard error 0.002. Measured on an RTX 4080 with the heal-pilot delta over the p4mx-q4v seeds (`nslm-mova-bench --text
+holmes.txt --decode 256`; the one-pass kernel is the earlier `k_mla_attn` with per-head matvecs):
+
+| RTX 4080, tok/s | MLA, one-pass kernel | MLA, now | GQA (same seeds) |
+|---|---|---|---|
+| prefill, 1k / 4k / 8k prompt | 499 / 186 / 86 | 1369 / 1726 / 1556 | 1416 / 1925 / 1787 |
+| decode, 1k / 4k / 8k context | 37.7 / 32.1 / 20.0 | 54.1 / 51.2 / 47.7 | 61.2 / 58.6 / 50.6 |
+
+The KV cache places MLA's per-layer latent widths in VRAM and host memory as it does GQA's rows. Decode is still
+slower than GQA's mostly because it streams the BF16 MLA projections (945 MB per token at rank 768). Not yet: the
+8-bit cache for MLA (`--kv q8` is refused) and packed (Q8 / seed) MLA tensors (the MLA projections stay BF16).
 
 ## Make a model folder
 

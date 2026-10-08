@@ -82,6 +82,13 @@ int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t*
 // ql [T][n_head][r], qr [T][n_head][128] (rotated) and the caches; split-key + reduce when a.n_splits > 1
 int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos,
                 const RowInfo* ri, float* olat, int T);
+// MLA prompt rows without absorption (CUDA; 1 where a backend has no such path): keys 0 .. pos of T consecutive rows
+// decompressed per head (Kn = bf16(q_lat_h^T c), Vd = bf16(v_up_h c)) dec_keys at a time, then o[t][h] =
+// bf16(bf16(sum_p softmax_p(scale (q_th . Kn_ph + qr_th . k_p)) Vd_ph) * bf16(softplus_ln2(g))), from q, qr [T][n_head][128],
+// the caches and Wql [n_head][r][128], Wvu [n_head][128][r] (BF16); Kn, Vd ([pos + 1][n_head][128]) receive the
+// decompressed keys and values
+int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos, const RowInfo* ri,
+                   const uint16_t* Wql, const uint16_t* Wvu, const float* g, float* o, int T, int dec_keys, uint16_t* Kn, uint16_t* Vd);
 // fmt MF_BF16 (E) or MF_Q8 (q8, s8, b8): x[t] = row ids[t]
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x);

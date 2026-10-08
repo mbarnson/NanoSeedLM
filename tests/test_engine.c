@@ -196,9 +196,9 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
 // 9. batched decode (eng_step_batch): NB sequences of mixed lengths in their own slots (more than one forward's MV_MAXT
 // rows), filled by chunked prefill (eng_prefill_begin / eng_prefill_next, interleaved), then stepped together with
 // teacher-forced tokens.  Each row against the same sequence run alone (same chunks, same steps) in a one-slot engine:
-// rows whose router choices agree must agree to the engines' rounding (CUDA's one-row and several-row matvecs sum in
-// different orders) and in arg max; route flips are counted and bounded.  Metal must agree bit for bit, and its prompt
-// caches must not depend on the prefill chunks either (a server's chunks start wherever a slot's cache reuse ends).
+// every row must agree bit for bit (a dense matvec adds each row's products in the same order for any row count), and
+// prompt caches must not depend on the prefill chunks either (a server's chunks start wherever a slot's cache reuse
+// ends).  Route flips are still counted and bounded, and argmax checked, so a failure says how far apart the rows are.
 static void test_batch(const char* dir, const char* what) {
     enum { NB = 11, STEPS = 4, CAP = 256, CH = 50, NSP = 4, TK = 4, TKV = 2 };
     EngOpts o;
@@ -239,7 +239,6 @@ static void test_batch(const char* dir, const char* what) {
         }
     }
     eng_mova_routes(e1, 0, 0);
-    const int exact_engine = !strstr(eng_describe(eb), "CUDA");
     for (int k = 0; k < 2; ++k) {   // sequence 5 (187 tokens) prefilled in chunks of 7, and in one call
         const int i = 5;
         int left = 0;
@@ -251,7 +250,7 @@ static void test_batch(const char* dir, const char* what) {
         const int same = !memcmp(lb, ref + (size_t) i * STEPS * V, sizeof(float) * (size_t) V);
         const double re = row_err(lb, ref + (size_t) i * STEPS * V, V);
         printf("%s prefill %s: %s (logit error %.2e)\n", what, k ? "in one call" : "in chunks of 7", same ? "bit-equal to chunks of 50" : "differs", re);
-        CHECK(exact_engine ? same : re < 2e-2, "%s batch: prefill chunking changed the logits (error %.3e)", what, re);
+        CHECK(same, "%s batch: prefill chunking changed the logits (error %.3e)", what, re);
     }
     // together: chunked prefills interleaved, then batched steps
     for (int i = 0; i < NB; ++i) CHECK(eng_prefill_begin(eb, seqs[i], ids[i], len[i], NULL) == 0, "%s batch: prefill_begin", what);
@@ -288,7 +287,7 @@ static void test_batch(const char* dir, const char* what) {
     CHECK(flips <= rows / 8, "%s batch: %d rows with different router choices", what, flips);
     CHECK(worst < 2e-2, "%s batch: logit error %.3e against decoding alone", what, worst);
     CHECK(am_same == rows - flips, "%s batch: argmax differs in %d rows", what, rows - flips - am_same);
-    CHECK(!exact_engine || exact == rows, "%s batch: %d of %d rows differ from decoding alone", what, rows - exact, rows);
+    CHECK(exact == rows, "%s batch: %d of %d rows differ from decoding alone", what, rows - exact, rows);
     CHECK(eng_prefill(eb, NB + 1, ids[0], 4) != 0 && eng_prefill(eb, 1, ids[0], CAP + 1) != 0, "%s batch: slot bounds", what);
     {   // a slot's cache copied out (eng_kv_read) and into another slot (eng_kv_write): that slot then reuses it and
         // decodes as the original sequence did alone
@@ -308,7 +307,7 @@ static void test_batch(const char* dir, const char* what) {
         const double re = row_err(lb, ref + (size_t) i * STEPS * V, V);
         const int same = !memcmp(lb, ref + (size_t) i * STEPS * V, sizeof(float) * (size_t) V);
         printf("%s cache copied between slots: %s (logit error %.2e)\n", what, same ? "bit-equal" : "differs", re);
-        CHECK(exact_engine ? same : re < 2e-2, "%s batch: a copied cache decodes differently (error %.3e)", what, re);
+        CHECK(same, "%s batch: a copied cache decodes differently (error %.3e)", what, re);
         free(kv);
     }
     eng_close(e1);
@@ -391,31 +390,49 @@ static void test_mla(void) {
     int32_t* rm = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *rv = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
     int32_t* em = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *ev = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
     CHECK(mova_ref_forward(ref, ids, N - 1, 0, rl, rm, rv) == 0, "MLA reference forward");
-    eng_mova_routes(e, 1, N);
-    CHECK(eng_score(e, 0, ids, 1, N - 1, el) == 0, "MLA eng_score");
-    CHECK(eng_mova_routes_read(e, N - 1, em, ev, NULL, NULL) == 0, "MLA routes");
-    eng_mova_routes(e, 0, 0);
-    int flips = 0, clean = 0, am_same = 0;
-    double worst = 0, mean = 0;
-    for (int t = 0; t < N - 1; ++t) {
-        const int same = same_choice(em + t * NS * TK, rm + t * NS * TK, NS, TK) && same_choice(ev + t * NS * TKV, rv + t * NS * TKV, NS, TKV);
-        flips += !same;
-        const double re = row_err(el + (size_t) t * V, rl + (size_t) t * V, V);
-        am_same += argmax(el + (size_t) t * V, V) == argmax(rl + (size_t) t * V, V);
-        mean += re;
-        if (!flips) { ++clean; worst = fmax(worst, re); }
+    // Prompt rows: the CUDA engine decompresses the keys per head (kc_mla_prefill), and with NSLM_MLA_DEC_KEYS=0 attends
+    // absorbed as the Metal engine does; both against the reference (absorbed, in double).
+    const int cuda = strstr(eng_describe(e), "CUDA") != NULL;
+    for (int path = 0; path < 1 + cuda; ++path) {
+        Eng* es = e;
+        if (path) {
+            EngOpts oa = o;
+            oa.kv_format = ENG_KV_BF16;
+            set_env("NSLM_MLA_DEC_KEYS", "0");
+            es = eng_open(&oa, err, sizeof err);
+            set_env("NSLM_MLA_DEC_KEYS", NULL);
+            if (!es) { ++fails; printf("FAIL: MLA eng_open (absorbed prompts): %s\n", err); break; }
+        }
+        const char* pn = !cuda ? "" : path ? " (absorbed prompts)" : " (prompt keys decompressed)";
+        eng_mova_routes(es, 1, N);
+        CHECK(eng_score(es, 0, ids, 1, N - 1, el) == 0, "MLA eng_score%s", pn);
+        CHECK(eng_mova_routes_read(es, N - 1, em, ev, NULL, NULL) == 0, "MLA routes%s", pn);
+        eng_mova_routes(es, 0, 0);
+        int flips = 0, clean = 0, am_same = 0;
+        double worst = 0, mean = 0;
+        for (int t = 0; t < N - 1; ++t) {
+            const int same = same_choice(em + t * NS * TK, rm + t * NS * TK, NS, TK) && same_choice(ev + t * NS * TKV, rv + t * NS * TKV, NS, TKV);
+            flips += !same;
+            const double re = row_err(el + (size_t) t * V, rl + (size_t) t * V, V);
+            am_same += argmax(el + (size_t) t * V, V) == argmax(rl + (size_t) t * V, V);
+            mean += re;
+            if (!flips) { ++clean; worst = fmax(worst, re); }
+        }
+        mean /= N - 1;
+        printf("MLA scoring%s: %d rows, %d before the first router flip (%d flipped); logit error max %.2e (clean rows), mean "
+               "%.2e; argmax equal %d / %d\n", pn, N - 1, clean, flips, worst, mean, am_same, N - 1);
+        // The latent attention computes in f32 against the reference's double (GQA's prefill kernel instead reproduces
+        // MLX's rounding points, which the reference mirrors), and the decompressed path rounds its keys and values to
+        // BF16 where the reference rounds q_lat q and the latent output, so 1-ulp differences start at row 0 and tip a
+        // near-tie route early.  Over five token sequences on an RTX 4080 the first flip came at rows 3-47 (absorbed) and
+        // 2-12 (decompressed), with up to 8 flips, clean-row errors up to 1.3e-2 and argmax equal in 44 or more of 47
+        // rows on either path.  The kernels themselves are pinned to BF16 ulps by tests/test_mova_kernels.c; this test
+        // checks the wiring, which these bounds already rule out.
+        CHECK(flips <= (N - 1) / 4 && clean >= 2, "MLA scoring%s: %d flips, %d clean rows", pn, flips, clean);
+        CHECK(worst < 0.02 && mean < 0.05, "MLA scoring%s: logit error max %.3e, mean %.3e", pn, worst, mean);
+        CHECK(am_same >= (N - 1) * 9 / 10, "MLA scoring%s: argmax equal in %d of %d rows", pn, am_same, N - 1);
+        if (path) eng_close(es);
     }
-    mean /= N - 1;
-    printf("MLA scoring: %d rows, %d before the first router flip (%d flipped); logit error max %.2e (clean rows), mean "
-           "%.2e; argmax equal %d / %d\n", N - 1, clean, flips, worst, mean, am_same, N - 1);
-    // The latent attention computes in f32 against the reference's double (GQA's prefill kernel instead reproduces MLX's
-    // rounding points, which the reference mirrors), so 1-ulp differences in its BF16 outputs start at row 0 and tip a
-    // near-tie route earlier: over four token sequences the first flip came at rows 5-11 (GQA here: 18), with clean-row
-    // errors of 7e-3 to 9e-3.  The kernels themselves are pinned to one BF16 ulp by tests/test_mova_kernels.c; this test
-    // checks the wiring, which a few clean rows at this error already rule out.
-    CHECK(flips <= (N - 1) / 4 && clean >= 4, "MLA scoring: %d flips, %d clean rows", flips, clean);
-    CHECK(worst < 0.02 && mean < 0.05, "MLA scoring: logit error max %.3e, mean %.3e", worst, mean);
-    CHECK(am_same >= (N - 1) * 9 / 10, "MLA scoring: argmax equal in %d of %d rows", am_same, N - 1);
     const int P0 = 8;   // decode: prefill 8 rows (the split-key path), then one row at a time
     CHECK(eng_prefill(e, 0, ids, P0) == 0, "MLA prefill");
     float* lg = (float*) malloc(sizeof(float) * (size_t) V);
