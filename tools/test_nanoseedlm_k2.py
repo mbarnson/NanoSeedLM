@@ -47,6 +47,28 @@ def ref_decode(seeds, coefs, codes, bias):
     return out.reshape(e, n, kb * 8)
 
 
+def ref_decode8(seeds, coefs, codes, bias):
+    """P = 8 blocks (search8.h): 64 states, 8 int4 coefficients in a 32-bit word."""
+    e, n, kb = seeds.shape
+    s, c, k = seeds.reshape(-1), coefs.reshape(-1), codes.reshape(-1)
+    out = np.empty((s.size, 8), np.float32)
+    for g in range(s.size):
+        st, v = [], int(s[g])
+        for _ in range(64):
+            v = lfsr_step(v)
+            st.append(v)
+        q = [((int(c[g]) >> (4 * p)) & 15) - (16 if (int(c[g]) >> (4 * p)) & 8 else 0) for p in range(8)]
+        sc = np.float32(np.ldexp(R32, int(bias[g // (n * kb)]) + int((k[g >> 1] >> ((g & 1) * 4)) & 15)))
+        out[g] = np.array([np.float32(sum((st[8 * cc + p] - 32768) * q[p] for p in range(8))) * sc for cc in range(8)], np.float32)
+    return out.reshape(e, n, kb * 8)
+
+
+def random_seeds8(shape, rng, bias=-22):
+    e, n, k = shape
+    return (rng.integers(1, 65536, (e, n, k // 8)).astype(np.uint16), rng.integers(0, 2 ** 32, (e, n, k // 8), dtype=np.uint64).astype(np.uint32),
+            rng.integers(0, 256, (e, n, k // 16)).astype(np.uint8), (bias + rng.integers(-2, 3, e)).astype(np.int32))
+
+
 def bf16_bits(w):
     u = w.astype(np.float32).view(np.uint32).astype(np.uint64)
     return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
@@ -192,8 +214,30 @@ def test_seed_embedding():
     assert np.array_equal(np.array(got.view(mx.uint16)), want)
 
 
+def test_p8_dense():
+    """P = 8 SeedLinear (mat-vec and GEMM) and SeedEmbedding against the scalar decode."""
+    rng = np.random.default_rng(23)
+    parts = random_seeds8((1, 40, 64), rng, -20)
+    w = ref_decode8(*parts)[0]
+    assert np.array_equal(np.array(ns.decode(*map(mx.array, parts))[0].view(mx.uint16)), bf16_bits(w))
+    layer = ns.SeedLinear(64, 40, p8=True)
+    layer.seeds, layer.coefs, layer.codes, layer.exp_bias = map(mx.array, parts)
+    for tokens in (1, 3, 40):
+        x = mx.array(rng.standard_normal((1, tokens, 64)).astype(np.float32)).astype(mx.bfloat16)
+        want = x @ mx.array(w).astype(mx.bfloat16).T
+        got = layer(x)
+        assert got.shape == (1, tokens, 40) and rel_err(want, got) < 1e-2, tokens
+    emb = ns.SeedEmbedding(40, 64, p8=True)
+    emb.seeds, emb.coefs, emb.codes, emb.exp_bias = map(mx.array, parts)
+    ids = mx.array(rng.integers(0, 40, (2, 5)).astype(np.int32))
+    assert np.array_equal(np.array(emb(ids).view(mx.uint16)), bf16_bits(w)[np.array(ids)])
+
+
 DENSE_SEEDED = ("model.layers.1.self_attn.q_proj", "model.layers.1.self_attn.o_proj", "model.layers.1.mlp.shared_experts.down_proj",
                 "lm_head", "model.embed_tokens")
+
+
+DENSE_P8 = ("model.layers.1.self_attn.o_proj", "lm_head")
 
 
 def small_config():
@@ -220,7 +264,8 @@ def test_load_through_mlx_lm():
         path = name.rsplit(".", 1)[0]
         hf = name.replace("mlp.expert_bias", "mlp.gate.bias").replace("self_attn.v_expert_bias", "self_attn.v_router.bias")
         if "mlp.experts." in name or "v_experts" in name or path in DENSE_SEEDED:
-            parts = random_seeds(value.shape if value.ndim == 3 else (1,) + value.shape, rng)
+            gen = random_seeds8 if path in DENSE_P8 else random_seeds
+            parts = gen(value.shape if value.ndim == 3 else (1,) + value.shape, rng)
             seeded[path] = parts
             for k, v in zip(("seeds", "coefs", "codes", "exp_bias"), parts):
                 weights[f"{path}.{k}"] = mx.array(v)
@@ -242,7 +287,7 @@ def test_load_through_mlx_lm():
     nn.quantize(ref, class_predicate=lambda p, m: {"group_size": 64, "bits": quant[p]} if p in quant else False)
     for path, parts in seeded.items():
         e, n, k = parts[0].shape
-        w = mx.array(bf16_bits(ref_decode(*parts))).view(mx.bfloat16)
+        w = mx.array(bf16_bits((ref_decode8 if path in DENSE_P8 else ref_decode)(*parts))).view(mx.bfloat16)
         if path in DENSE_SEEDED:
             layer = nn.Embedding(n, k * 8) if path.endswith("embed_tokens") else nn.Linear(k * 8, n, bias=False)
             layer.weight = w[0]
@@ -253,7 +298,7 @@ def test_load_through_mlx_lm():
     assert type(model.model.layers[1].mlp.experts).__name__ == "SeedSwitchGLU"   # model_file is imported as its own module
     assert type(model.model.layers[1].self_attn.v_experts).__name__ == "SeedSwitchLinear"
     assert type(model.model.layers[1].self_attn.q_proj).__name__ == "SeedLinear"
-    assert type(model.lm_head).__name__ == "SeedLinear"
+    assert type(model.lm_head).__name__ == "SeedLinear" and model.lm_head.coefs.dtype == mx.uint32
     assert type(model.model.embed_tokens).__name__ == "SeedEmbedding"
     assert isinstance(model.model.layers[1].self_attn.k_proj, nn.QuantizedLinear)
     assert type(model.model.layers[1].mlp).__name__ == "SeedSparseMoeBlock"

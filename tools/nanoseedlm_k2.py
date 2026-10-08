@@ -55,6 +55,31 @@ inline float block_dot(uint g, const device uint16_t* seeds, const device uint16
     }
     return d * sc;
 }
+// P = 8 (32-bit coefficient words, 64 states; states 33..64 are states 1..32 of s2 = state 32 = table[s] >> 16):
+// isum_c / 2^16 = sum_p q_p v_p - 1.5 sum_p q_p, exact (multiples of 2^-16 below 2^7).
+inline float block_dot(uint g, const device uint16_t* seeds, const device uint32_t* coefs, const device uint8_t* codes,
+                       const device uint32_t* table, thread const float* xv, int bias, thread float* w) {
+    uint s = seeds[g], cw = coefs[g];
+    int code = (codes[g >> 1] >> ((g & 1) * 4)) & 15;
+    float sc = ldexp(R32, bias + code + 16);
+    uint t = table[s], lo = s | (t << 16), s2 = t >> 16, t2 = table[s2], lo2 = s2 | (t2 << 16);
+    float q[8], qs = 0.0f;
+    for (uint p = 0; p < 8; ++p) { q[p] = float(int(cw << (28 - 4 * p)) >> 28); qs += q[p]; }
+    qs *= 1.5f;
+    float d = 0.0f;
+    for (uint c = 0; c < 8; ++c) {
+        float isum = 0.0f;
+        for (uint p = 0; p < 8; ++p) {
+            uint k = 8 * c + p + 1;
+            uint src = k <= 16 ? lo >> k : k <= 32 ? t >> (k - 16) : k <= 48 ? lo2 >> (k - 32) : t2 >> (k - 48);
+            isum += as_type<float>(insert_bits(0x3F800000u, src, 7u, 16u)) * q[p];
+        }
+        isum -= qs;
+        if (w) w[c] = isum * sc;
+        if (xv) d += isum * xv[c];
+    }
+    return d * sc;
+}
 template <typename U> inline float round_to(float x) { return float(static_cast<U>(x)); }
 template <> inline float round_to<bfloat16_t>(float x) {   // nearest even, in integer ops (kept by the compiler)
     uint u = as_type<uint>(x);
@@ -369,14 +394,14 @@ class SeedSwitchLinear(nn.Module):
 
 
 class SeedLinear(nn.Module):
-    """nn.Linear (no bias) with SeedLM P=4 weights: a one-expert SeedSwitchLinear."""
+    """nn.Linear (no bias) with SeedLM P=4 (or P=8: 32-bit coefficient words) weights: a one-expert SeedSwitchLinear."""
 
-    def __init__(self, input_dims: int, output_dims: int):
+    def __init__(self, input_dims: int, output_dims: int, p8: bool = False):
         super().__init__()
         if input_dims % BK:
             raise ValueError(f"SeedLM P=4 in MLX needs input_dims divisible by {BK}")
         self.seeds = mx.zeros((1, output_dims, input_dims // 8), mx.uint16)
-        self.coefs = mx.zeros((1, output_dims, input_dims // 8), mx.uint16)
+        self.coefs = mx.zeros((1, output_dims, input_dims // 8), mx.uint32 if p8 else mx.uint16)
         self.codes = mx.zeros((1, output_dims, input_dims // 16), mx.uint8)
         self.exp_bias = mx.zeros((1,), mx.int32)
         self.input_dims, self.output_dims = input_dims, output_dims
@@ -390,12 +415,12 @@ class SeedLinear(nn.Module):
 
 
 class SeedEmbedding(nn.Module):
-    """nn.Embedding with SeedLM P=4 rows, decoded per token."""
+    """nn.Embedding with SeedLM P=4 (or P=8) rows, decoded per token."""
 
-    def __init__(self, num_embeddings: int, dims: int):
+    def __init__(self, num_embeddings: int, dims: int, p8: bool = False):
         super().__init__()
         self.seeds = mx.zeros((1, num_embeddings, dims // 8), mx.uint16)
-        self.coefs = mx.zeros((1, num_embeddings, dims // 8), mx.uint16)
+        self.coefs = mx.zeros((1, num_embeddings, dims // 8), mx.uint32 if p8 else mx.uint16)
         self.codes = mx.zeros((1, num_embeddings, dims // 16), mx.uint8)
         self.exp_bias = mx.zeros((1,), mx.int32)
 
@@ -465,19 +490,20 @@ class Model(_k2.Model):
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})
         for p in seeded:
             if p + ".codes" not in weights:
-                raise ValueError(f"{p}: only SeedLM P=4 tensors load in MLX")
+                raise ValueError(f"{p}: only SeedLM P=4 / P=8 tensors load in MLX")
             weights[p + ".weight"] = mx.zeros((0,))   # the stack exists: K2's sanitize must not rebuild it
         weights = super().sanitize(weights)
         for p in seeded:
             weights.pop(p + ".weight")
             e, n, kb = weights[p + ".seeds"].shape
+            p8 = weights[p + ".coefs"].dtype == mx.uint32
             m = _module(self, p)
-            if hasattr(m, "num_experts"):
+            if hasattr(m, "num_experts") and not p8:
                 new = SeedSwitchLinear(kb * 8, n, e)
             elif isinstance(m, nn.Embedding) and e == 1:
-                new = SeedEmbedding(n, kb * 8)
+                new = SeedEmbedding(n, kb * 8, p8)
             elif isinstance(m, nn.Linear) and e == 1 and "bias" not in m:
-                new = SeedLinear(kb * 8, n)
+                new = SeedLinear(kb * 8, n, p8)
             else:
                 raise ValueError(f"{p}: seed weights need a SwitchLinear, bias-free Linear or Embedding module")
             self.update_modules(tree_unflatten([(p, new)]))
