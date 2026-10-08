@@ -71,7 +71,7 @@ typedef struct {
     float scale;
 } AttnArgs;
 
-typedef struct { int pos; int pad[3]; } RowInfo;
+typedef struct { int pos, kv0; int pad[2]; } RowInfo;   // kv0: the KV cache row of the sequence slot's position 0
 // MLA (a TransMLA conversion, nslm/mova_cfg.h): latent attention over one shared latent c (rank r) and one 128-dim RoPE
 // key per position.  chunk / n_splits as AttnArgs (n_splits 1: one pass that writes the output, the prefill path).
 #define MLA_KU 4           // latent attention: keys per step (staged in threadgroup memory for all heads)
@@ -685,6 +685,7 @@ kernel void k_rope_kv(device float* q [[buffer(0)]], device const float* k [[buf
                       device const float* inv [[buffer(6)]], constant int2& hk [[buffer(7)]], uint2 g [[thread_position_in_grid]]) {
     const int n_head = hk.x, n_kv = hk.y, t = (int) g.y, i = (int) g.x;   // i: head * 64 + pair
     const int pos = ri[t].pos;
+    const ulong at = (ulong) (ri[t].kv0 + pos);   // the cache row
     const int head = i / 64, p = i % 64;
     const float th = (float) pos * inv[p];
     const float c = cos(th), s = sin(th);
@@ -697,11 +698,11 @@ kernel void k_rope_kv(device float* q [[buffer(0)]], device const float* k [[buf
     if (head < n_kv) {
         device const float* kh = k + (ulong) t * n_kv * ATT_HD + head * ATT_HD;
         const float a = kh[p], b = kh[p + 64];
-        device ushort* kc = Kc + (ulong) pos * n_kv * ATT_HD + head * ATT_HD;
+        device ushort* kc = Kc + at * n_kv * ATT_HD + head * ATT_HD;
         kc[p] = tobf(a * c - b * s);
         kc[p + 64] = tobf(b * c + a * s);
         device const float* vh = v + (ulong) t * n_kv * ATT_HD + head * ATT_HD;
-        device ushort* vc = Vc + (ulong) pos * n_kv * ATT_HD + head * ATT_HD;
+        device ushort* vc = Vc + at * n_kv * ATT_HD + head * ATT_HD;
         vc[p] = tobf(vh[p]);
         vc[p + 64] = tobf(vh[p + 64]);
     }
@@ -738,7 +739,7 @@ kernel void k_rope_kv_q8(device float* q [[buffer(0)]], device const float* k [[
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float MK = max(red[0][0], red[1][0]), MV = max(red[0][1], red[1][1]);
     const float sk = MK > 0 ? MK / 127.0f : 1.0f, sv = MV > 0 ? MV / 127.0f : 1.0f;
-    const ulong row = (ulong) pos * n_kv + head;
+    const ulong row = (ulong) (ri[t].kv0 + pos) * n_kv + head;
     device char* kc = Kc + row * ATT_HD;
     device char* vc = Vc + row * ATT_HD;
     kc[p] = (char) (int) rint(k0 / sk);
@@ -795,7 +796,7 @@ static inline void attn_split(constant AttnArgs& a, device const float* q, devic
         float s[ATT_KU];
         float4 vf[ATT_KU];
         for (int u = 0; u < ATT_KU; ++u) {
-            const int pu = min(p + u, p1 - 1);
+            const int pu = ri[t].kv0 + min(p + u, p1 - 1);   // the cache row
             const float4 kv = kv_load4(kb, Ks, pu, stride, a.n_kv, kvh);
             vf[u] = kv_load4(vb, Vs, pu, stride, a.n_kv, kvh);
             s[u] = dot(qv, kv);
@@ -890,7 +891,8 @@ kernel void k_mla_rope(constant MlaArgs& a [[buffer(0)]], device float* qr [[buf
                        device const RowInfo* ri [[buffer(6)]], device const float* inv [[buffer(7)]],
                        uint2 g [[thread_position_in_grid]]) {
     const int i = (int) g.x, t = (int) g.y, pos = ri[t].pos;
-    if (i < a.r) Vc[(ulong) pos * a.r + i] = tobf(c[(ulong) t * a.r + i]);
+    const ulong at = (ulong) (ri[t].kv0 + pos);   // the cache row
+    if (i < a.r) Vc[at * a.r + i] = tobf(c[(ulong) t * a.r + i]);
     const int head = i / 64, p = i % 64;
     if (head > a.n_head) return;
     const float th = (float) pos * inv[p];
@@ -903,8 +905,8 @@ kernel void k_mla_rope(constant MlaArgs& a [[buffer(0)]], device float* qr [[buf
     } else {
         device const float* kh = kr + (ulong) t * ATT_HD;
         const float x0 = kh[p], x1 = kh[p + 64];
-        Kc[(ulong) pos * ATT_HD + p] = tobf(x0 * cs - x1 * sn);
-        Kc[(ulong) pos * ATT_HD + p + 64] = tobf(x1 * cs + x0 * sn);
+        Kc[at * ATT_HD + p] = tobf(x0 * cs - x1 * sn);
+        Kc[at * ATT_HD + p + 64] = tobf(x1 * cs + x0 * sn);
     }
 }
 
@@ -938,7 +940,8 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int e = (int) tid; e < nk * kw; e += (int) ntg) {
             const int u = e / kw, d = e - u * kw;
-            sh[e] = d < r ? Vc[(ulong) (p + u) * r + d] : Kc[(ulong) (p + u) * ATT_HD + d - r];
+            const ulong at = (ulong) (ri[t].kv0 + p + u);   // the cache row
+            sh[e] = d < r ? Vc[at * r + d] : Kc[at * ATT_HD + d - r];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float s[MLA_KU];
@@ -1071,8 +1074,8 @@ static inline void attn_prefill(constant AttnArgs& a, device const float* q, dev
             const int key = e / (ATT_HD / 8), d8 = (e % (ATT_HD / 8)) * 8, p = k0 + key;
             uint4 kk = 0, vv = 0;
             if (p < kend) {
-                kk = kv_load8(Kc, Ks, p, stride, a.n_kv, kvh, kvh * ATT_HD + d8);
-                vv = kv_load8(Vc, Vs, p, stride, a.n_kv, kvh, kvh * ATT_HD + d8);
+                kk = kv_load8(Kc, Ks, ri[t0].kv0 + p, stride, a.n_kv, kvh, kvh * ATT_HD + d8);   // a block's rows: one slot
+                vv = kv_load8(Vc, Vs, ri[t0].kv0 + p, stride, a.n_kv, kvh, kvh * ATT_HD + d8);
             }
             const uint kw[4] = {kk.x, kk.y, kk.z, kk.w}, vw[4] = {vv.x, vv.y, vv.z, vv.w};
             for (int u = 0; u < 4; ++u) {

@@ -700,7 +700,7 @@ __global__ void __launch_bounds__(64) k_rope_kv(float* q, const float* k, const 
     const float* vh = v + (size_t) t * n_kv * ATT_HD + head * ATT_HD;
     const float k0 = kh[p] * cs - kh[p + 64] * sn, k1 = kh[p + 64] * cs + kh[p] * sn, v0 = vh[p], v1 = vh[p + 64];
     int row;
-    const KvSeg sg = kv_seg(kv, pos, &row);
+    const KvSeg sg = kv_seg(kv, ri[t].kv0 + pos, &row);   // the slot's cache row
     const size_t off = ((size_t) row * n_kv + head) * ATT_HD;
     if (kv.fmt == KV_BF16) {
         uint16_t* kc = (uint16_t*) sg.k + off;
@@ -749,7 +749,7 @@ __global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q
         float4 vf[ATT_KU];
 #pragma unroll
         for (int u = 0; u < ATT_KU; ++u) {
-            const int pu = min(p + u, p1 - 1);
+            const int pu = ri[t].kv0 + min(p + u, p1 - 1);   // the cache row
             const float4 kf = kv_load4<KVF>(kv, 0, pu, kvh, a.n_kv, lane * 4);
             vf[u] = kv_load4<KVF>(kv, 1, pu, kvh, a.n_kv, lane * 4);
             s[u] = dot4(qv, kf);
@@ -834,7 +834,7 @@ __global__ void __launch_bounds__(64) k_mla_rope(MlaArgs a, float* qr, const flo
                                                  const float* inv) {
     const int i = (int) blockIdx.x * 64 + threadIdx.x, t = (int) blockIdx.y, pos = ri[t].pos;
     int row;
-    const KvSeg sg = kv_seg(kv, pos, &row);
+    const KvSeg sg = kv_seg(kv, ri[t].kv0 + pos, &row);   // the slot's cache row
     if (i < a.r) ((uint16_t*) sg.v)[(size_t) row * a.r + i] = tobf(c[(size_t) t * a.r + i]);
     const int head = i / 64, p = i % 64;
     if (head > a.n_head) return;
@@ -889,7 +889,7 @@ __global__ void __launch_bounds__(32 * MLA_HG) k_mla_attn(MlaArgs a, const float
         for (int e = tid; e < nk * kw; e += ntg) {
             const int u = e / kw, d = e - u * kw;
             int row;
-            const KvSeg sg = kv_seg(kv, p + u, &row);
+            const KvSeg sg = kv_seg(kv, ri[t].kv0 + p + u, &row);
             sh[e] = d < r ? ((const uint16_t*) sg.v)[(size_t) row * r + d] : ((const uint16_t*) sg.k)[(size_t) row * ATT_HD + d - r];
         }
         __syncthreads();
@@ -1009,8 +1009,8 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
             const int key = e / (ATT_HD / 8), d8 = (e % (ATT_HD / 8)) * 8, p = k0 + key;
             uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
             if (p < kend) {
-                kk = kv_load8_bf(kv, 0, p, kvh, a.n_kv, d8);
-                vv = kv_load8_bf(kv, 1, p, kvh, a.n_kv, d8);
+                kk = kv_load8_bf(kv, 0, ri[b0].kv0 + p, kvh, a.n_kv, d8);   // a block's rows: one slot
+                vv = kv_load8_bf(kv, 1, ri[b0].kv0 + p, kvh, a.n_kv, d8);
             }
             *(uint4*) &Ks[key * FA_KLD + d8] = kk;
             const uint32_t vw[4] = {vv.x, vv.y, vv.z, vv.w};

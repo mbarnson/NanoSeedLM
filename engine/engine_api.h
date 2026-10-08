@@ -2,6 +2,7 @@
 //
 // A sequence slot holds its committed token ids hist[0..n-1].  The KV cache holds positions 0..n-2; the last committed
 // token hist[n-1] is "pending" (not yet cached) and the next forward consumes it.  Rolling back = shortening the history.
+// Each slot has kv_tokens / max_seqs positions of the KV cache.
 #pragma once
 #include <stdint.h>
 
@@ -58,6 +59,11 @@ int eng_prefill(Eng* e, int seq, const int32_t* ids, int n);
 // As eng_prefill, but keeps the KV cache of the longest common prefix with the slot's history (*reused tokens) and
 // computes only the rest.  Short tails take the decode kernels, so logits can differ from eng_prefill's in the last bits.
 int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused);
+// eng_prefill_cached in steps (a server interleaving prompts with decode): eng_prefill_begin sets the history and keeps
+// the reusable cache (*reused, may be NULL) but computes nothing; each eng_prefill_next computes up to max_rows more
+// positions and returns how many remain (0: ready to step), or -1.  The slot cannot step until 0.
+int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused);
+int eng_prefill_next(Eng* e, int seq, int max_rows);
 // Keep the first n committed tokens of `seq` (1 <= n <= length).
 int eng_rewind(Eng* e, int seq, int n);
 // Make slot dst an exact copy of slot src (history and KV).
@@ -78,6 +84,9 @@ int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t
 // without eng_push recomputes the same position.
 int eng_step(Eng* e, int seq, float* logits);
 int eng_push(Eng* e, int seq, int32_t tok);
+// eng_step for n distinct sequences at once (their own positions), in forwards of up to 8 rows: logits[i * vocab ..]
+// for seqs[i], as eng_step gives that sequence alone (Metal: bit for bit).
+int eng_step_batch(Eng* e, const int* seqs, int n, float* logits);
 
 // Teacher-forced scoring: for j in [0, count), logits[j * vocab ..] are the full-vocabulary logits predicting
 // ids[from + j] from ids[0 .. from + j - 1].  Uses slot `seq` as scratch.

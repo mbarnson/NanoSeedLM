@@ -6,7 +6,8 @@
 //   prompt scoring (eng_score: the GEMM and prefill-attention kernels) against the reference logits,
 //   token-by-token decode (eng_prefill + eng_step: the matvec and split-key attention kernels) against them,
 //   the engine's router choices (eng_mova_routes) against the reference's,
-//   prompt-lookup decode (ENG_MODE_PL) committing exactly the tokens of plain greedy decode.
+//   prompt-lookup decode (ENG_MODE_PL) committing exactly the tokens of plain greedy decode,
+//   batched decode of several sequence slots (eng_step_batch) against decoding each alone.
 // Logits agree to the engines' f32 accumulation (relative error well under a BF16 step of the logit scale) wherever
 // the router choices agree; a choice can flip on a near tie, which the test counts and bounds.
 #define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c11 (macOS declares them anyway; Windows: _putenv_s)
@@ -192,6 +193,93 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
     return diff;
 }
 
+// 9. batched decode (eng_step_batch): NB sequences of mixed lengths in their own slots (more than one forward's MV_MAXT
+// rows), filled by chunked prefill (eng_prefill_begin / eng_prefill_next, interleaved), then stepped together with
+// teacher-forced tokens.  Each row against the same sequence run alone (same chunks, same steps) in a one-slot engine:
+// rows whose router choices agree must agree to the engines' rounding (a one-row and a several-row matvec may sum in
+// different orders) and in arg max; route flips are counted and bounded.
+static void test_batch(const char* dir, const char* what) {
+    enum { NB = 11, STEPS = 4, CAP = 256, CH = 50, NSP = 4, TK = 4, TKV = 2 };
+    EngOpts o;
+    memset(&o, 0, sizeof o);
+    o.model_dir = dir;
+    o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
+    o.max_seqs = 1;
+    o.kv_tokens = CAP;
+    char err[512] = "";
+    Eng* e1 = eng_open(&o, err, sizeof err);
+    o.max_seqs = NB + 1;
+    o.kv_tokens = (int64_t) CAP * (NB + 1);
+    Eng* eb = e1 ? eng_open(&o, err, sizeof err) : NULL;
+    if (!e1 || !eb) { ++fails; printf("FAIL: %s batch: eng_open: %s\n", what, err); eng_close(e1); return; }
+    const int V = eng_vocab(eb);
+    uint64_t st = 4242;
+    int len[NB], seqs[NB];
+    int32_t ids[NB][CAP], tf[NB][STEPS];
+    for (int i = 0; i < NB; ++i) {
+        len[i] = 2 + (i * 37) % 190;   // 2 .. 189 tokens: chunks of CH rows and short tails (the decode kernels)
+        seqs[i] = NB - i;              // slots 11 .. 1, slot 0 unused: nonzero cache bases
+        for (int k = 0; k < len[i]; ++k) ids[i][k] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+        for (int j = 0; j < STEPS; ++j) tf[i][j] = (int32_t) (rng_u32(&st) % (uint32_t) V);
+    }
+    // alone: each sequence in the one-slot engine
+    float* ref = (float*) malloc(sizeof(float) * (size_t) NB * STEPS * V), *lb = (float*) malloc(sizeof(float) * (size_t) NB * V);
+    int32_t rm[NB][STEPS][NSP * TK], rv[NB][STEPS][NSP * TKV], bm[NB][NSP * TK], bv[NB][NSP * TKV];
+    for (int i = 0; i < NB; ++i) {
+        int reused = -1, left;
+        CHECK(eng_prefill_begin(e1, 0, ids[i], len[i], &reused) == 0 && reused == 0, "%s batch: prefill_begin alone", what);
+        while ((left = eng_prefill_next(e1, 0, CH)) > 0) {}
+        CHECK(left == 0, "%s batch: prefill_next alone", what);
+        for (int j = 0; j < STEPS; ++j) {
+            eng_mova_routes(e1, 1, 1);
+            CHECK(eng_step(e1, 0, ref + ((size_t) i * STEPS + j) * V) == 0, "%s batch: step alone", what);
+            CHECK(eng_mova_routes_read(e1, 1, rm[i][j], rv[i][j], NULL, NULL) == 0, "%s batch: routes alone", what);
+            eng_push(e1, 0, tf[i][j]);
+        }
+    }
+    eng_mova_routes(e1, 0, 0);
+    // together: chunked prefills interleaved, then batched steps
+    for (int i = 0; i < NB; ++i) CHECK(eng_prefill_begin(eb, seqs[i], ids[i], len[i], NULL) == 0, "%s batch: prefill_begin", what);
+    CHECK(eng_step_batch(eb, seqs, NB, lb) != 0, "%s batch: a step over slots still prefilling must fail", what);
+    for (int busy = 1; busy;) {
+        busy = 0;
+        for (int i = 0; i < NB; ++i) {
+            const int left = eng_prefill_next(eb, seqs[i], CH);
+            CHECK(left >= 0, "%s batch: prefill_next", what);
+            busy |= left > 0;
+        }
+    }
+    const int dup[3] = {seqs[0], seqs[1], seqs[0]};
+    CHECK(eng_step_batch(eb, dup, 3, lb) != 0, "%s batch: a sequence listed twice must fail", what);
+    int rows = 0, exact = 0, flips = 0, am_same = 0;
+    double worst = 0;
+    for (int j = 0; j < STEPS; ++j) {
+        eng_mova_routes(eb, 1, NB);
+        CHECK(eng_step_batch(eb, seqs, NB, lb) == 0, "%s batch: eng_step_batch", what);
+        CHECK(eng_mova_routes_read(eb, NB, &bm[0][0], &bv[0][0], NULL, NULL) == 0, "%s batch: routes", what);
+        for (int i = 0; i < NB; ++i) {
+            const float* r = ref + ((size_t) i * STEPS + j) * V, *b = lb + (size_t) i * V;
+            ++rows;
+            exact += !memcmp(r, b, sizeof(float) * (size_t) V);
+            if (!same_choice(bm[i], rm[i][j], NSP, TK) || !same_choice(bv[i], rv[i][j], NSP, TKV)) { ++flips; continue; }
+            worst = fmax(worst, row_err(b, r, V));
+            am_same += argmax(b, V) == argmax(r, V);
+        }
+        for (int i = 0; i < NB; ++i) eng_push(eb, seqs[i], tf[i][j]);
+    }
+    eng_mova_routes(eb, 0, 0);
+    printf("%s batched decode: %d sequences x %d steps, %d of %d rows bit-equal to decoding alone, %d route flips, logit "
+           "error max %.2e (other rows), argmax equal %d\n", what, NB, STEPS, exact, rows, flips, worst, am_same);
+    CHECK(flips <= rows / 8, "%s batch: %d rows with different router choices", what, flips);
+    CHECK(worst < 2e-2, "%s batch: logit error %.3e against decoding alone", what, worst);
+    CHECK(am_same == rows - flips, "%s batch: argmax differs in %d rows", what, rows - flips - am_same);
+    CHECK(eng_prefill(eb, NB + 1, ids[0], 4) != 0 && eng_prefill(eb, 1, ids[0], CAP + 1) != 0, "%s batch: slot bounds", what);
+    eng_close(e1);
+    eng_close(eb);
+    free(ref);
+    free(lb);
+}
+
 // 8. MLA (a TransMLA conversion): the same random model with latent attention (ranks 64..128, one 128-dim RoPE key),
 // against the C reference: prompt scoring (one-pass latent attention) and decode (split-key + reduce), the cache size.
 static void test_mla(void) {
@@ -348,6 +436,7 @@ static void test_mla(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
+    test_batch(dir, "MLA");
 }
 
 int main(void) {
@@ -556,6 +645,7 @@ int main(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
+    test_batch(dir, "GQA");
     test_mla();
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

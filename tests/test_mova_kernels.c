@@ -400,27 +400,28 @@ static void test_misc(void) {
             }
         CHECK(!bc && !bv, "moe combine %d, value combine %d mismatches", bc, bv);
     }
-    {   // rope + KV + decode attention + gate: 4 query heads on 1 KV head, 3 cached positions, rows at 3 and 4
-        enum { nh = 4, nkv = 1, P = 5, T2 = 2 };
+    {   // rope + KV + decode attention + gate: 4 query heads on 1 KV head; two sequence slots (cache bases 0 and 5): row 0
+        // at position 3 of slot 0 (3 cached), row 1 at position 4 of slot 1 (4 cached)
+        enum { nh = 4, nkv = 1, P = 10, T2 = 2 };
         float q[T2 * nh * 128], k[T2 * nkv * 128], v[T2 * nkv * 128], g[T2 * nh * 128], o[T2 * nh * 128], qcopy[T2 * nh * 128];
         for (int i = 0; i < T2 * nh * 128; ++i) { q[i] = bfr(frand(&sd)); g[i] = bfr(frand(&sd) * 3); }
         for (int i = 0; i < T2 * nkv * 128; ++i) { k[i] = bfr(frand(&sd)); v[i] = bfr(frand(&sd)); }
         uint16_t Kc[P * 128], Vc[P * 128];
         memset(Kc, 0, sizeof Kc);
         memset(Vc, 0, sizeof Vc);
-        for (int i = 0; i < 3 * 128; ++i) { Kc[i] = f2bf((float) frand(&sd)); Vc[i] = f2bf((float) frand(&sd)); }
+        for (int i = 0; i < 9 * 128; ++i) { Kc[i] = f2bf((float) frand(&sd)); Vc[i] = f2bf((float) frand(&sd)); }
         float inv[64];
         for (int p = 0; p < 64; ++p) inv[p] = (float) pow(1e7, -2.0 * p / 128);
-        const RowInfo ri[2] = {{3, {0}}, {4, {0}}};
+        const RowInfo ri[2] = {{3, 0, {0}}, {4, 5, {0}}};
         memcpy(qcopy, q, sizeof q);
         double kc[P][128], vc[P][128];
-        for (int p = 0; p < 3; ++p) for (int e = 0; e < 128; ++e) { kc[p][e] = bf2f(Kc[p * 128 + e]); vc[p][e] = bf2f(Vc[p * 128 + e]); }
+        for (int p = 0; p < P; ++p) for (int e = 0; e < 128; ++e) { kc[p][e] = bf2f(Kc[p * 128 + e]); vc[p][e] = bf2f(Vc[p * 128 + e]); }
         const AttnArgs a = {nh, nkv, 3, 2, (float) (1 / sqrt(128.0))};
         RUN(kt_rope_attn(a, q, k, v, Kc, Vc, P, ri, inv, g, o, T2));
         // reference: rope, cache, causal attention, gate
         double qr[T2][nh][128];
         for (int t = 0; t < T2; ++t) {
-            const int pos = ri[t].pos;
+            const int pos = ri[t].pos, at = ri[t].kv0 + pos;
             for (int i = 0; i < 64; ++i) {
                 const double th = (double) (float) ((float) pos * inv[i]), cs = cos(th), sn = sin(th);
                 for (int h = 0; h < nh; ++h) {
@@ -429,25 +430,26 @@ static void test_misc(void) {
                     qr[t][h][i + 64] = bfr(x1 * cs + x0 * sn);
                 }
                 const double k0 = k[t * 128 + i], k1 = k[t * 128 + i + 64];
-                kc[pos][i] = bfr(k0 * cs - k1 * sn);
-                kc[pos][i + 64] = bfr(k1 * cs + k0 * sn);
+                kc[at][i] = bfr(k0 * cs - k1 * sn);
+                kc[at][i + 64] = bfr(k1 * cs + k0 * sn);
             }
-            for (int e = 0; e < 128; ++e) vc[pos][e] = v[t * 128 + e];
+            for (int e = 0; e < 128; ++e) vc[at][e] = v[t * 128 + e];
         }
         int bad = 0;
         for (int t = 0; t < T2; ++t)
             for (int h = 0; h < nh; ++h) {
                 double s[P], mx = -1e300, l = 0;
+                const int b = ri[t].kv0;
                 for (int p = 0; p <= ri[t].pos; ++p) {
                     double acc = 0;
-                    for (int e = 0; e < 128; ++e) acc += qr[t][h][e] * a.scale * kc[p][e];
+                    for (int e = 0; e < 128; ++e) acc += qr[t][h][e] * a.scale * kc[b + p][e];
                     s[p] = acc;
                     mx = fmax(mx, acc);
                 }
                 for (int p = 0; p <= ri[t].pos; ++p) l += exp(s[p] - mx);
                 for (int e = 0; e < 128; ++e) {
                     double acc = 0;
-                    for (int p = 0; p <= ri[t].pos; ++p) acc += exp(s[p] - mx) / l * vc[p][e];
+                    for (int p = 0; p <= ri[t].pos; ++p) acc += exp(s[p] - mx) / l * vc[b + p][e];
                     const double gx = g[t * nh * 128 + h * 128 + e] * 0.69314718055994531;
                     const double sp = bfr((fmax(gx, 0) + log1p(exp(-fabs(gx)))) / 0.69314718055994531);
                     if (!close_bf(o[t * nh * 128 + h * 128 + e], bfr(bfr(acc) * sp), 2e-6)) ++bad;
@@ -519,7 +521,7 @@ static void q8_free(KtKvQ8 kv) { free(kv.k); free(kv.v); free(kv.ks); free(kv.vs
 // within one ulp of its maximum, and every code within 1 of round(reference / scale).  Other positions untouched. --------
 static void test_rope_kv_q8(void) {
     unsigned sd = 31;
-    enum { nh = 8, nkv = 2, P = 6, T = 2 };
+    enum { nh = 8, nkv = 2, P = 12, T = 2 };
     float q[T * nh * 128], k[T * nkv * 128], v[T * nkv * 128];
     for (int i = 0; i < T * nh * 128; ++i) q[i] = bfr(frand(&sd));
     for (int i = 0; i < T * nkv * 128; ++i) { k[i] = bfr(frand(&sd) * (1 + i % 5)); v[i] = bfr(frand(&sd) * 0.3); }
@@ -531,7 +533,7 @@ static void test_rope_kv_q8(void) {
     for (int i = 0; i < P * nkv; ++i) Ks[i] = Vs[i] = -1;
     float inv[64];
     for (int p = 0; p < 64; ++p) inv[p] = (float) pow(1e7, -2.0 * p / 128);
-    const RowInfo ri[T] = {{2, {0}}, {5, {0}}};
+    const RowInfo ri[T] = {{2, 0, {0}}, {5, 6, {0}}};   // two sequence slots (cache bases 0 and 6)
     const AttnArgs a = {nh, nkv, 0, 1, (float) (1 / sqrt(128.0))};
     const KtKvQ8 kv = {K8, V8, Ks, Vs};
     int bad = 0, badk = 0, untouched = 0;
@@ -539,7 +541,7 @@ static void test_rope_kv_q8(void) {
     for (int t = 0; t < T; ++t)
         for (int h = 0; h < nkv; ++h) {
             double x[2][128];   // reference K (rotated, BF16) and V
-            const int pos = ri[t].pos;
+            const int pos = ri[t].pos, at = ri[t].kv0 + pos;
             for (int i = 0; i < 64; ++i) {
                 const double th = (double) (float) ((float) pos * inv[i]), cs = cos(th), sn = sin(th);
                 const double k0 = k[(t * nkv + h) * 128 + i], k1 = k[(t * nkv + h) * 128 + i + 64];
@@ -551,13 +553,13 @@ static void test_rope_kv_q8(void) {
                 double m = 0;
                 for (int e = 0; e < 128; ++e) m = fmax(m, fabs(x[which][e]));
                 const double sref = m > 0 ? m / 127.0 : 1.0;
-                const float s = (which ? Vs : Ks)[pos * nkv + h];
+                const float s = (which ? Vs : Ks)[at * nkv + h];
                 if (fabs(s - sref) > sref * (which ? 1e-6 : 1.0 / 128)) {
                     if (bad < 3) printf("  rope q8 %s t %d h %d: scale %.8g vs %.8g\n", which ? "V" : "K", t, h, s, sref);
                     ++bad;
                 }
                 for (int e = 0; e < 128; ++e) {
-                    const int code = (which ? V8 : K8)[(pos * nkv + h) * 128 + e];
+                    const int code = (which ? V8 : K8)[(at * nkv + h) * 128 + e];
                     // K: the reference may sit one BF16 ulp away from the GPU's rotation
                     const double slack = which ? 0 : fabs(x[0][e]) / 128.0 / s;
                     if (fabs(code - x[which][e] / s) > 0.5 + 1e-4 + slack + (which ? 0 : 0.5)) {
@@ -569,7 +571,7 @@ static void test_rope_kv_q8(void) {
             }
         }
     for (int p = 0; p < P; ++p) {
-        if (p == ri[0].pos || p == ri[1].pos) continue;
+        if (p == ri[0].kv0 + ri[0].pos || p == ri[1].kv0 + ri[1].pos) continue;
         for (int i = 0; i < nkv * 128; ++i) untouched += K8[p * nkv * 128 + i] != 0x55 || V8[p * nkv * 128 + i] != 0x55;
         for (int h = 0; h < nkv; ++h) untouched += Ks[p * nkv + h] != -1 || Vs[p * nkv + h] != -1;
     }
@@ -578,19 +580,20 @@ static void test_rope_kv_q8(void) {
     printf("rope into the 8-bit cache: %d rows x %d KV heads, %d mismatches\n", T, nkv, bad);
 }
 
-// ---- decode attention at a GQA 4 layout: several splits, rows at different positions; q8: on the 8-bit cache ---------
+// ---- decode attention at a GQA 4 layout: several splits, rows at different positions in different sequence slots (cache
+// bases kv0); q8: on the 8-bit cache --------------------------------------------------------------------------------------
 static void test_attn_decode(int q8) {
     unsigned sd = 21;
-    const int nh = 8, nkv = 2, NP = 301, T = 3, ns = 5;
-    const int pos[3] = {300, 299, 37};
+    const int nh = 8, nkv = 2, NP = 640, T = 3, ns = 5;
+    const int pos[3] = {300, 299, 37}, kv0[3] = {0, 310, 600};
     float* q = malloc(4 * (size_t) T * nh * 128), *g = malloc(4 * (size_t) T * nh * 128), *o = malloc(4 * (size_t) T * nh * 128);
     uint16_t* Kc = malloc(2 * (size_t) NP * nkv * 128), *Vc = malloc(2 * (size_t) NP * nkv * 128);
     for (int i = 0; i < T * nh * 128; ++i) { q[i] = bfr(frand(&sd) * 2); g[i] = bfr(frand(&sd) * 3); }
     for (int i = 0; i < NP * nkv * 128; ++i) { Kc[i] = f2bf((float) (frand(&sd) * 2)); Vc[i] = f2bf((float) frand(&sd)); }
     RowInfo ri[3];
     memset(ri, 0, sizeof ri);
-    for (int t = 0; t < T; ++t) ri[t].pos = pos[t];
-    const AttnArgs a = {nh, nkv, (NP + ns - 1) / ns, ns, (float) (1 / sqrt(128.0))};
+    for (int t = 0; t < T; ++t) { ri[t].pos = pos[t]; ri[t].kv0 = kv0[t]; }
+    const AttnArgs a = {nh, nkv, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0))};
     int bad = 0;
     KtKvQ8 kv = {0};
     if (q8) kv = q8_cache(Kc, Vc, NP, nkv);   // Kc / Vc: the values the kernel reads, for the reference
@@ -603,14 +606,14 @@ static void test_attn_decode(int q8) {
                 double mx = -1e300, l = 0;
                 for (int p = 0; p <= pos[t]; ++p) {
                     double acc = 0;
-                    for (int e = 0; e < 128; ++e) acc += (double) q[((size_t) t * nh + h) * 128 + e] * a.scale * bf2f(Kc[((size_t) p * nkv + kvh) * 128 + e]);
+                    for (int e = 0; e < 128; ++e) acc += (double) q[((size_t) t * nh + h) * 128 + e] * a.scale * bf2f(Kc[((size_t) (kv0[t] + p) * nkv + kvh) * 128 + e]);
                     s[p] = acc;
                     mx = fmax(mx, acc);
                 }
                 for (int p = 0; p <= pos[t]; ++p) l += exp(s[p] - mx);
                 for (int e = 0; e < 128; ++e) {
                     double acc = 0;
-                    for (int p = 0; p <= pos[t]; ++p) acc += exp(s[p] - mx) / l * bf2f(Vc[((size_t) p * nkv + kvh) * 128 + e]);
+                    for (int p = 0; p <= pos[t]; ++p) acc += exp(s[p] - mx) / l * bf2f(Vc[((size_t) (kv0[t] + p) * nkv + kvh) * 128 + e]);
                     const size_t i = ((size_t) t * nh + h) * 128 + e;
                     if (!close_bf(o[i], gated(acc, g[i]), 2e-6)) {
                         if (bad < 3) printf("  attn t %d h %d d %d: %.8g vs %.8g\n", t, h, e, o[i], gated(acc, g[i]));
@@ -633,13 +636,14 @@ static void test_attn_decode(int q8) {
 // probability within f32 noise of a BF16 rounding boundary can flip).  q8: on the 8-bit cache.
 static void test_attn_prefill(int q8) {
     unsigned sd = 11;
-    const int nh = 8, nkv = 2, P0 = 37, T = 45, NP = P0 + T;   // rows at positions P0 .. P0 + T - 1, keys 0 .. their own
+    const int nh = 8, nkv = 2, P0 = 37, T = 45, B = 19, NP = B + P0 + T;   // rows at positions P0 .. P0 + T - 1, keys 0 ..
+                                                                            // their own, of a slot at cache base B
     float* q = malloc(4 * (size_t) T * nh * 128), *g = malloc(4 * (size_t) T * nh * 128), *o = malloc(4 * (size_t) T * nh * 128);
     uint16_t* Kc = malloc(2 * (size_t) NP * nkv * 128), *Vc = malloc(2 * (size_t) NP * nkv * 128);
     for (int i = 0; i < T * nh * 128; ++i) { q[i] = bfr(frand(&sd) * 2); g[i] = bfr(frand(&sd) * 3); }
     for (int i = 0; i < NP * nkv * 128; ++i) { Kc[i] = f2bf((float) (frand(&sd) * 2)); Vc[i] = f2bf((float) frand(&sd)); }
     RowInfo* ri = calloc((size_t) T, sizeof(RowInfo));
-    for (int t = 0; t < T; ++t) ri[t].pos = P0 + t;
+    for (int t = 0; t < T; ++t) { ri[t].pos = P0 + t; ri[t].kv0 = B; }
     const AttnArgs a = {nh, nkv, 0, 1, (float) (1 / sqrt(128.0))};
     const int BK = kt_attn_key_tile();
     int bad = 0, badpairs = 0;
@@ -653,7 +657,7 @@ static void test_attn_prefill(int q8) {
                 const int bad0 = bad, kvh = h / (nh / nkv), pos = ri[t].pos;
                 for (int p = 0; p <= pos; ++p) {
                     double acc = 0;
-                    for (int e = 0; e < 128; ++e) acc += (double) bfr(q[((size_t) t * nh + h) * 128 + e] * a.scale) * bf2f(Kc[((size_t) p * nkv + kvh) * 128 + e]);
+                    for (int e = 0; e < 128; ++e) acc += (double) bfr(q[((size_t) t * nh + h) * 128 + e] * a.scale) * bf2f(Kc[((size_t) (B + p) * nkv + kvh) * 128 + e]);
                     s[p] = acc;
                 }
                 double O[128] = {0}, mr = -1e300, l = 0;
@@ -666,7 +670,7 @@ static void test_attn_prefill(int q8) {
                     for (int p = k0; p < k0 + BK && p <= pos; ++p) {
                         const double pv = exp(s[p] - mn);
                         l += pv;
-                        for (int e = 0; e < 128; ++e) O[e] += (double) bfr(pv) * bf2f(Vc[((size_t) p * nkv + kvh) * 128 + e]);
+                        for (int e = 0; e < 128; ++e) O[e] += (double) bfr(pv) * bf2f(Vc[((size_t) (B + p) * nkv + kvh) * 128 + e]);
                     }
                     mr = mn;
                 }
@@ -719,8 +723,8 @@ static void test_mla(void) {
             free(W); free(x); free(g); free(y);
         }
     }
-    {   // RoPE + latent cache write: 4 heads, r 96, rows at positions 3 and 4 of a 5-position cache
-        enum { nh = 4, r = 96, P = 5, T = 2 };
+    {   // RoPE + latent cache write: 4 heads, r 96, rows at positions 3 and 4 of two sequence slots (cache bases 0 and 5)
+        enum { nh = 4, r = 96, P = 10, T = 2 };
         float qr[T * nh * 128], kr[T * 128], c[T * r], q0[T * nh * 128];
         for (int i = 0; i < T * nh * 128; ++i) qr[i] = bfr(frand(&sd));
         for (int i = 0; i < T * 128; ++i) kr[i] = bfr(frand(&sd));
@@ -731,13 +735,13 @@ static void test_mla(void) {
         memset(Vc, 0, sizeof Vc);
         float inv[64];
         for (int p = 0; p < 64; ++p) inv[p] = (float) pow(1e7, -2.0 * p / 128);
-        const RowInfo ri[2] = {{3, {0}}, {4, {0}}};
+        const RowInfo ri[2] = {{3, 0, {0}}, {4, 5, {0}}};
         const MlaArgs a = {nh, r, 128, 1, (float) (1 / sqrt(128.0)), {0}};
         int bad = 0;
         if (kt_mla_rope(a, qr, kr, c, Kc, Vc, P, ri, inv, T)) ++fails;
         else
             for (int t = 0; t < T; ++t) {
-                const int pos = ri[t].pos;
+                const int pos = ri[t].pos, at = ri[t].kv0 + pos;
                 for (int i = 0; i < 64; ++i) {
                     const double th = (double) (float) ((float) pos * inv[i]), cs = cos(th), sn = sin(th);
                     for (int h = 0; h < nh; ++h) {
@@ -746,16 +750,16 @@ static void test_mla(void) {
                         bad += !close_bf(qr[t * nh * 128 + h * 128 + i + 64], bfr(x1 * cs + x0 * sn), 1e-6);
                     }
                     const double k0 = kr[t * 128 + i], k1 = kr[t * 128 + i + 64];
-                    bad += !close_bf(bf2f(Kc[pos * 128 + i]), bfr(k0 * cs - k1 * sn), 1e-6);
-                    bad += !close_bf(bf2f(Kc[pos * 128 + i + 64]), bfr(k1 * cs + k0 * sn), 1e-6);
+                    bad += !close_bf(bf2f(Kc[at * 128 + i]), bfr(k0 * cs - k1 * sn), 1e-6);
+                    bad += !close_bf(bf2f(Kc[at * 128 + i + 64]), bfr(k1 * cs + k0 * sn), 1e-6);
                 }
-                for (int e = 0; e < r; ++e) bad += bf2f(Vc[pos * r + e]) != c[t * r + e];
+                for (int e = 0; e < r; ++e) bad += bf2f(Vc[at * r + e]) != c[t * r + e];
             }
         CHECK(!bad, "MLA rope + latent cache write: %d mismatches", bad);
     }
-    for (int split = 0; split < 2; ++split) {   // latent attention: 32 heads, r 768; 1 split or 5
-        const int nh = 32, r = 768, NP = 301, T = 3, ns = split ? 5 : 1;
-        const int pos[3] = {300, 299, 37};
+    for (int split = 0; split < 2; ++split) {   // latent attention: 32 heads, r 768; 1 split or 5; rows in three slots
+        const int nh = 32, r = 768, NP = 640, T = 3, ns = split ? 5 : 1;
+        const int pos[3] = {300, 299, 37}, kv0[3] = {0, 310, 600};
         float* ql = malloc(4 * (size_t) T * nh * r), *qr = malloc(4 * (size_t) T * nh * 128), *ol = malloc(4 * (size_t) T * nh * r);
         uint16_t* Kc = malloc(2 * (size_t) NP * 128), *Vc = malloc(2 * (size_t) NP * r);
         for (int i = 0; i < T * nh * r; ++i) ql[i] = bfr(frand(&sd) * 0.3);
@@ -764,8 +768,8 @@ static void test_mla(void) {
         for (int i = 0; i < NP * r; ++i) Vc[i] = f2bf((float) frand(&sd));
         RowInfo ri[3];
         memset(ri, 0, sizeof ri);
-        for (int t = 0; t < T; ++t) ri[t].pos = pos[t];
-        const MlaArgs a = {nh, r, (NP + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
+        for (int t = 0; t < T; ++t) { ri[t].pos = pos[t]; ri[t].kv0 = kv0[t]; }
+        const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
         int bad = 0;
         if (kt_mla_attn(a, ql, qr, Kc, Vc, NP, ri, ol, T)) ++fails;
         else {
@@ -775,8 +779,8 @@ static void test_mla(void) {
                     double mx = -1e300, l = 0;
                     for (int p = 0; p <= pos[t]; ++p) {
                         double d = 0;
-                        for (int e = 0; e < r; ++e) d += (double) ql[((size_t) t * nh + h) * r + e] * bf2f(Vc[(size_t) p * r + e]);
-                        for (int e = 0; e < 128; ++e) d += (double) qr[((size_t) t * nh + h) * 128 + e] * bf2f(Kc[(size_t) p * 128 + e]);
+                        for (int e = 0; e < r; ++e) d += (double) ql[((size_t) t * nh + h) * r + e] * bf2f(Vc[(size_t) (kv0[t] + p) * r + e]);
+                        for (int e = 0; e < 128; ++e) d += (double) qr[((size_t) t * nh + h) * 128 + e] * bf2f(Kc[(size_t) (kv0[t] + p) * 128 + e]);
                         s[p] = d * a.scale;
                         mx = fmax(mx, s[p]);
                     }
@@ -784,7 +788,7 @@ static void test_mla(void) {
                     for (int p = 0; p <= pos[t]; ++p) {
                         const double e = exp(s[p] - mx);
                         l += e;
-                        for (int k = 0; k < r; ++k) acc[k] += e * bf2f(Vc[(size_t) p * r + k]);
+                        for (int k = 0; k < r; ++k) acc[k] += e * bf2f(Vc[(size_t) (kv0[t] + p) * r + k]);
                     }
                     for (int k = 0; k < r; ++k) {
                         const size_t i = ((size_t) t * nh + h) * r + k;
