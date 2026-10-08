@@ -199,7 +199,7 @@ static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char*
 // every row must agree bit for bit (a dense matvec adds each row's products in the same order for any row count), and
 // prompt caches must not depend on the prefill chunks either (a server's chunks start wherever a slot's cache reuse
 // ends).  Route flips are still counted and bounded, and argmax checked, so a failure says how far apart the rows are.
-static void test_batch(const char* dir, const char* what) {
+static void test_batch(const char* dir, const char* what, int expand_min) {
     enum { NB = 11, STEPS = 4, CAP = 256, CH = 50, NSP = 4, TK = 4, TKV = 2 };
     EngOpts o;
     memset(&o, 0, sizeof o);
@@ -207,6 +207,7 @@ static void test_batch(const char* dir, const char* what) {
     o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
     o.max_seqs = 1;
     o.kv_tokens = CAP;
+    o.mla_expand_min = expand_min;
     char err[512] = "";
     Eng* e1 = eng_open(&o, err, sizeof err);
     o.max_seqs = NB + 1;
@@ -391,7 +392,8 @@ static void test_mla(void) {
     int32_t* em = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TK), *ev = (int32_t*) malloc(sizeof(int32_t) * (size_t) N * NS * TKV);
     CHECK(mova_ref_forward(ref, ids, N - 1, 0, rl, rm, rv) == 0, "MLA reference forward");
     // Prompt rows: the CUDA engine decompresses the keys per head (kc_mla_prefill), and with NSLM_MLA_DEC_KEYS=0 attends
-    // absorbed as the Metal engine does; both against the reference (absorbed, in double).
+    // absorbed; both against the reference (absorbed, in double).  (Metal's eng_score expands the latent per head; its
+    // absorbed prompt rows are checked by the decode below.)
     const int cuda = strstr(eng_describe(e), "CUDA") != NULL;
     for (int path = 0; path < 1 + cuda; ++path) {
         Eng* es = e;
@@ -433,21 +435,34 @@ static void test_mla(void) {
         CHECK(am_same >= (N - 1) * 9 / 10, "MLA scoring%s: argmax equal in %d of %d rows", pn, am_same, N - 1);
         if (path) eng_close(es);
     }
-    const int P0 = 8;   // decode: prefill 8 rows (the split-key path), then one row at a time
-    CHECK(eng_prefill(e, 0, ids, P0) == 0, "MLA prefill");
+    // decode: prefill P0 rows, then one row at a time; prompts of 30 rows with the latent expanded (mla_expand_min 1)
+    // and in latent space (the default, for prompts this short)
     float* lg = (float*) malloc(sizeof(float) * (size_t) V);
-    double dworst = 0, dmean = 0;
-    int dsame = 0;
-    for (int t = P0 - 1; t < N - 1; ++t) {
-        CHECK(eng_step(e, 0, lg) == 0, "MLA step");
-        const double re = row_err(lg, rl + (size_t) t * V, V);
-        dworst = fmax(dworst, re);
-        dmean += re / (N - P0);
-        dsame += argmax(lg, V) == argmax(rl + (size_t) t * V, V);
-        eng_push(e, 0, ids[t + 1]);
+    EngOpts ox = o;
+    ox.mla_expand_min = 1;
+    ox.kv_format = ENG_KV_BF16;
+    Eng* ex = eng_open(&ox, err, sizeof err);
+    CHECK(ex != NULL, "MLA eng_open (expanded prompts): %s", err);
+    for (int pass = 0; pass < 3; ++pass) {
+        Eng* ed = pass == 2 ? ex : e;
+        const int P0 = pass ? 30 : 8;
+        if (!ed) continue;
+        CHECK(eng_prefill(ed, 0, ids, P0) == 0, "MLA prefill");
+        double dworst = 0, dmean = 0;
+        int dsame = 0;
+        for (int t = P0 - 1; t < N - 1; ++t) {
+            CHECK(eng_step(ed, 0, lg) == 0, "MLA step");
+            const double re = row_err(lg, rl + (size_t) t * V, V);
+            dworst = fmax(dworst, re);
+            dmean += re / (N - P0);
+            dsame += argmax(lg, V) == argmax(rl + (size_t) t * V, V);
+            eng_push(ed, 0, ids[t + 1]);
+        }
+        printf("MLA decode after a %d-row prompt%s: %d steps, logit error mean %.2e max %.2e, argmax equal %d\n", P0,
+               pass == 2 ? " (expanded)" : "", N - P0, dmean, dworst, dsame);
+        CHECK(dmean < 0.05 && dworst < 0.25, "MLA decode: logit error mean %.3e, max %.3e", dmean, dworst);
     }
-    printf("MLA decode: %d steps, logit error mean %.2e max %.2e, argmax equal %d\n", N - P0, dmean, dworst, dsame);
-    CHECK(dmean < 0.05 && dworst < 0.25, "MLA decode: logit error mean %.3e, max %.3e", dmean, dworst);
+    if (ex) eng_close(ex);
     // prompt lookup (multi-row verify forwards: split-key latent attention over several rows) must commit the tokens of
     // plain greedy decode
     {
@@ -490,7 +505,8 @@ static void test_mla(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
-    test_batch(dir, "MLA");
+    test_batch(dir, "MLA", 0);                // these prompts (< 256 rows): attention in latent space
+    test_batch(dir, "MLA expanded", 1);       // every prompt with the latent expanded per head
 }
 
 int main(void) {
@@ -699,7 +715,7 @@ int main(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
-    test_batch(dir, "GQA");
+    test_batch(dir, "GQA", 0);
     test_mla();
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

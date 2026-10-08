@@ -277,6 +277,17 @@ static void test_mm(void) {
 
 // ---- grouped norm, router, swiglu, combines, rope + KV + attention, embed, argmax ------------------------------------
 static void test_misc(void) {
+    {   // BF16 to f32 (the MLA prompt path's latent rows)
+        enum { N = 1000 };
+        uint16_t x[N];
+        float y[N];
+        unsigned s0 = 5;
+        for (int i = 0; i < N; ++i) x[i] = f2bf((float) (frand(&s0) * 100));
+        const int rc = kt_bf16_f32(x, y, N);
+        int bad = 0;
+        for (int i = 0; i < N && rc == 0; ++i) bad += y[i] != bf2f(x[i]);
+        CHECK(rc == 1 || (rc == 0 && !bad), "bf16 to f32: %d mismatches", bad);
+    }
     unsigned sd = 7;
     enum { d = 256, T = 3 };
     float x[T * d], y[T * d];
@@ -723,6 +734,27 @@ static void test_mla(void) {
             free(W); free(x); free(g); free(y);
         }
     }
+    for (int T = 20; T <= 37; T += 17) {   // per-head maps with W transposed [H][I][O], one x for all heads (q_lat^T c)
+        enum { H = 3, O = 128, I = 96 };
+        uint16_t* W = malloc(2 * (size_t) H * O * I);
+        float* x = malloc(4 * (size_t) T * I), *y = malloc(4 * (size_t) T * H * O);
+        for (int i = 0; i < H * O * I; ++i) W[i] = f2bf((float) (frand(&sd) * 0.1));
+        for (int i = 0; i < T * I; ++i) x[i] = bfr(frand(&sd) * 2);
+        const int rc = kt_heads_mm_t(H, O, I, W, x, I, 0, y, T);
+        if (rc == 1) { printf("per-head maps (transposed weights): not in this backend\n"); free(W); free(x); free(y); break; }
+        int bad = 0;
+        if (rc) ++fails;
+        else
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < H; ++h)
+                    for (int o = 0; o < O; ++o) {
+                        double s = 0;
+                        for (int i = 0; i < I; ++i) s += bf2f(W[((size_t) h * I + i) * O + o]) * (double) x[(size_t) t * I + i];
+                        bad += !close_bf(y[((size_t) t * H + h) * O + o], bfr(s), 2e-6);
+                    }
+        CHECK(!bad, "per-head maps, transposed weights (T %d): %d mismatches", T, bad);
+        free(W); free(x); free(y);
+    }
     {   // RoPE + latent cache write: 4 heads, r 96, rows at positions 3 and 4 of two sequence slots (cache bases 0 and 5)
         enum { nh = 4, r = 96, P = 10, T = 2 };
         float qr[T * nh * 128], kr[T * 128], c[T * r], q0[T * nh * 128];
@@ -896,6 +928,62 @@ static void test_mla(void) {
     }
 }
 
+// ---- MLA prompt attention with the latent expanded per head (k_mla_prefill): rows of one slot at a nonzero cache base,
+// heads not a multiple of anything, keys in one pass or three; the reference in double, outputs within 1 BF16 ulp except
+// at most 2 (row, head) pairs (an f32 exp near a rounding boundary) --------------------------------------------------
+static void test_mla_attn_x(void) {
+    unsigned sd = 41;
+    const int nh = 6, T = 45, P0 = 37, B = 19, NP = B + P0 + T, NK = P0 + T;   // rows at P0 .. P0 + T - 1
+    const size_t qn_n = (size_t) T * nh * 128, kv_n = (size_t) NK * nh * 128;
+    float* qn = malloc(4 * qn_n), *qr = malloc(4 * qn_n), *g = malloc(4 * qn_n), *o = malloc(4 * qn_n);
+    float* kn = malloc(4 * kv_n), *vn = malloc(4 * kv_n);
+    uint16_t* Kc = malloc(2 * (size_t) NP * 128);
+    for (size_t i = 0; i < qn_n; ++i) { qn[i] = bfr(frand(&sd)); qr[i] = bfr(frand(&sd)); g[i] = bfr(frand(&sd) * 3); }
+    for (size_t i = 0; i < kv_n; ++i) { kn[i] = bfr(frand(&sd) * 2); vn[i] = bfr(frand(&sd)); }
+    for (int i = 0; i < NP * 128; ++i) Kc[i] = f2bf((float) (frand(&sd) * 2));
+    RowInfo* ri = calloc((size_t) T, sizeof(RowInfo));
+    for (int t = 0; t < T; ++t) { ri[t].pos = P0 + t; ri[t].kv0 = B; }
+    const float scale = (float) (1 / sqrt(256.0));
+    const int kb1[2] = {0, NK}, kb3[4] = {0, 16, 50, NK};
+    for (int pass = 0; pass < 2; ++pass) {
+        const int rc = pass ? kt_mla_attn_x(nh, scale, kb3, 3, qn, qr, kn, vn, Kc, NP, ri, g, o, T)
+                            : kt_mla_attn_x(nh, scale, kb1, 1, qn, qr, kn, vn, Kc, NP, ri, g, o, T);
+        if (rc == 1) { printf("MLA prompt attention (expanded): not in this backend\n"); break; }
+        if (rc) { ++fails; break; }
+        int bad = 0, badpairs = 0;
+        double* s = malloc(sizeof(double) * NK);
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < nh; ++h) {
+                const int bad0 = bad, pos = ri[t].pos;
+                double mx = -1e300, l = 0;
+                for (int p = 0; p <= pos; ++p) {
+                    double d = 0;
+                    for (int e = 0; e < 128; ++e) d += (double) qn[((size_t) t * nh + h) * 128 + e] * kn[((size_t) p * nh + h) * 128 + e];
+                    for (int e = 0; e < 128; ++e) d += (double) qr[((size_t) t * nh + h) * 128 + e] * bf2f(Kc[(size_t) (B + p) * 128 + e]);
+                    s[p] = d * scale;
+                    mx = fmax(mx, s[p]);
+                }
+                for (int p = 0; p <= pos; ++p) l += exp(s[p] - mx);
+                for (int e = 0; e < 128; ++e) {
+                    double acc = 0;
+                    for (int p = 0; p <= pos; ++p) acc += exp(s[p] - mx) / l * vn[((size_t) p * nh + h) * 128 + e];
+                    const size_t i = ((size_t) t * nh + h) * 128 + e;
+                    if (!close_bf(o[i], gated(acc, g[i]), 2e-6)) {
+                        if (bad < 3) printf("  mla prefill t %d h %d d %d: %.8g vs %.8g\n", t, h, e, o[i], gated(acc, g[i]));
+                        ++bad;
+                    }
+                }
+                badpairs += bad > bad0;
+            }
+        free(s);
+        CHECK(badpairs <= 2, "MLA prompt attention (expanded, %d pass%s): %d (row, head) pairs off (%d outputs)", pass ? 3 : 1,
+              pass ? "es" : "", badpairs, bad);
+        printf("MLA prompt attention (expanded): %d rows x %d heads, %d key pass(es), %d (row, head) pairs off\n", T, nh,
+               pass ? 3 : 1, badpairs);
+    }
+    free(qn); free(qr); free(g); free(o); free(kn); free(vn); free(Kc); free(ri);
+}
+
 int main(void) {
     char err[256] = "";
     if (kt_open(err, sizeof err)) {
@@ -914,6 +1002,7 @@ int main(void) {
     test_attn_prefill(1);
     test_attn_decode(1);
     test_mla();
+    test_mla_attn_x();
     kt_close();
     printf("test_mova_kernels: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

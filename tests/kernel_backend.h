@@ -74,6 +74,9 @@ int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const Ro
 // MLA (a TransMLA conversion; nslm/mova_cfg.h).  Per-head maps (k_heads_mv): y[t][h][o] = bf16(W_h[o] . x_th) with W
 // BF16 [H][O][I] and x_th = x + t * xs + h * hs (floats); with g (same layout as y): bf16(that * bf16(softplus_ln2(g))).
 int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, const float* g, float* y, int T);
+// The same with W stored transposed, BF16 [H][I][O] (k_mm, prompt rows): y[t][h][o] = bf16(sum_i W_h[i][o] x_th[i]);
+// 1 where the backend lacks it
+int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T);
 // rope of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into Kc [npos][128], and the latent
 // c [T][r] into Vc [npos][r], at the rows' positions (k_mla_rope); the caches are updated
 int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
@@ -89,10 +92,18 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
 // decompressed keys and values
 int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos, const RowInfo* ri,
                    const uint16_t* Wql, const uint16_t* Wvu, const float* g, float* o, int T, int dec_keys, uint16_t* Kn, uint16_t* Vd);
+// MLA prompt attention over keys and values already expanded per head (Metal's k_mla_prefill): o[t][h*128+d] = bf16(bf16(sum_p softmax_p(scale (qn_th . kn_ph
+// + qr_th . kr_p)) vn_ph[d]) * bf16(softplus_ln2(g))) over p <= pos_t, from qn [T][n_head*128] (the heads' queries),
+// qr [T][n_head][128] (rotated), kn / vn [npos][n_head][128] and the RoPE keys Kc [npos][128] (BF16, at the rows'
+// kv0); the keys in nb passes [kb[i], kb[i + 1]) carrying the softmax state.  Returns 1 where the backend lacks it.
+int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                  const float* vn, const uint16_t* Kc, int npos, const RowInfo* ri, const float* g, float* o, int T);
 // fmt MF_BF16 (E) or MF_Q8 (q8, s8, b8): x[t] = row ids[t]
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x);
 int kt_argmax(const float* logits, int V, int n, int32_t* out);
+// y[i] = x[i] (BF16 to f32, k_bf16_f32); 1 where the backend lacks it
+int kt_bf16_f32(const uint16_t* x, float* y, int n);
 
 #ifdef __cplusplus
 }

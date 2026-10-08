@@ -24,6 +24,9 @@ typedef struct {
     int kv_format;             // ENG_KV_BF16 (0, the default: exact), or ENG_KV_Q8 (int8 with a scale per token and
                                // head: half the memory, for long contexts); an engine may only support BF16
                                // (eng_open then fails with "... not supported ...")
+    int mla_expand_min;        // MLA (Metal): a prefill of at least this many new tokens (0: 256) attends with the latent
+                               // expanded per head (long prompts: faster); shorter ones (chat turns over a long cached
+                               // context) in latent space, which skips expanding every cached position
 } EngOpts;
 enum { ENG_KV_BF16 = 0, ENG_KV_Q8 = 1 };
 

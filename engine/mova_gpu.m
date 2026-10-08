@@ -27,6 +27,7 @@
 #define MAX_SPLITS 32   // decode attention: at most this many key splits
 #endif
 #define MAX_LOGIT_ROWS 64        // LM head rows per pass (prompt scoring runs it in 64-row passes)
+#define MLP_KB 512               // MLA prompt rows: cached keys expanded per pass
 #define MAX_TILES (MAXP / MM_BN + 128)
 
 typedef struct {
@@ -48,6 +49,7 @@ typedef struct {
     int32_t* hist;
     int len, cap;
     int done;   // positions whose KV is computed (hist[0 .. done-1])
+    int expand; // MLA: this prefill's prompt rows attend with the latent expanded per head
 } Seq;
 
 struct Eng {
@@ -75,7 +77,9 @@ struct Eng {
     id<MTLBuffer> x, xn, q, k, v, gq, ao, ga, ua, aa, G, U, A, D, V, sh, logits, ids, ri, inv, part, inds, wts, vinds, vwts, am;
     id<MTLBuffer> perm, tiles, vperm, vtiles;   // grouped GEMM: pairs sorted by expert, tile tables (prompt chunks)
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
+    id<MTLBuffer> latf, kn, vn, mst, lst, ost;   // MLA prompt rows: latent rows (f32), expanded keys / values, softmax state
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
+    int expand, expand_min;               // MLA prompt rows: the latent expanded per head (a prefill of expand_min+ new rows)
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
@@ -459,6 +463,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         // rows x splits <= 1024 (encode_forward); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
         const uint64_t prow = c->mla && !getenv("NSLM_BATCH_GEMM") ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
         e->batch_gemm = getenv("NSLM_BATCH_GEMM") ? atoi(getenv("NSLM_BATCH_GEMM")) : 0;
+        e->expand = 1;
+        e->expand_min = o->mla_expand_min > 0 ? o->mla_expand_min : 256;
         if (e->batch_gemm && e->batch_gemm <= MV_MAXT) e->batch_gemm = MV_MAXT + 1;
         e->part = scratch(e, prow * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");
         if (c->mla) {
@@ -466,6 +472,14 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             e->qrp = scratch(e, (uint64_t) T * qd * 4, "MLA query RoPE parts");
             e->qlat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA absorbed queries");
             e->olat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA latent outputs");
+            e->latf = scratch(e, (uint64_t) MLP_KB * rmax * 4, "MLA latent rows (f32)");
+            e->kn = scratch(e, (uint64_t) (MLP_KB + MLPF_BK) * qd * 4, "MLA expanded keys");   // + a tile: finite
+            e->vn = scratch(e, (uint64_t) (MLP_KB + MLPF_BK) * qd * 4, "MLA expanded values");
+            memset(e->kn.contents, 0, e->kn.length);
+            memset(e->vn.contents, 0, e->vn.length);
+            e->mst = scratch(e, (uint64_t) T * c->n_head * 4, "MLA prompt softmax max");
+            e->lst = scratch(e, (uint64_t) T * c->n_head * 4, "MLA prompt softmax sums");
+            e->ost = scratch(e, (uint64_t) T * qd * 4, "MLA prompt attention state");
             if (pipe_(e, "k_mla_attn", 0, 0).maxTotalThreadsPerThreadgroup < 32 * MLAF_SG) {
                 snprintf(err, (size_t) errlen, "k_mla_attn: fewer than %d threads per threadgroup", 32 * MLAF_SG);
                 eng_close(e);
@@ -706,12 +720,13 @@ static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
-// The per-head maps for prompt rows: one GEMM per head (k_mm on its slice), with the gate when G is given.
-static void enc_heads_mm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
+// The per-head maps for prompt rows: one GEMM per head (k_mm on its slice), with the gate when G is given; tr: by
+// W_h transposed (read in place).
+static void enc_heads_gemm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T, int tr) {
     Eng* e = c->e;
-    const int H = W->slices, O = W->rows, I = W->cols;
+    const int H = W->slices, O = tr ? W->cols : W->rows, I = tr ? W->rows : W->cols;
     const MmArgs a = {I, O, T, xs, H * O, 1, G ? 2 : 0, 0};
-    cpipe(c, pipe_(e, "k_mm", MF_BF16, 1));
+    cpipe(c, pipe_(e, "k_mm", MF_BF16, tr ? 2 : 1));
     cbytes(c, 0, &a, sizeof a);
     cbuf(c, 2, W->b[0], 0);
     cbuf(c, 3, W->b[0], 0);
@@ -727,6 +742,49 @@ static void enc_heads_mm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
         crun(c, (uint64_t) (O + MM_BM - 1) / MM_BM, (uint64_t) (T + MM_BN - 1) / MM_BN, 1, 128);
     }
 }
+static void enc_heads_mm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
+    enc_heads_gemm(c, W, X, xs, hs, G, Y, T, 0);
+}
+
+// MLA attention of prompt rows (consecutive positions of one slot) with the latent expanded per head: per pass of
+// MLP_KB cached keys, the latent rows to f32, the heads' keys (q_lat^T c) and values (v_up c) as GEMMs, then
+// k_mla_prefill (the online softmax carried across passes; the last writes the gated output into ao).
+static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
+    const MovaCfg* g = &e->c;
+    Layer* L = &e->L[l];
+    const int r = L->mla_r, H = g->n_head;
+    const RowInfo* ri = (const RowInfo*) e->ri.contents;
+    const int nk = ri[T - 1].pos + 1;
+    const uint64_t kv0 = (uint64_t) ri[0].kv0;
+    for (int kb0 = 0; kb0 < nk; kb0 += MLP_KB) {
+        const int kb1 = kb0 + MLP_KB < nk ? kb0 + MLP_KB : nk;
+        const uint32_t n = (uint32_t) ((kb1 - kb0) * r);
+        cmd_group(c, MOVA_TG_ATTN_PROJ);
+        cpipe(c, pipe_(e, "k_bf16_f32", 0, 0));
+        cbuf(c, 0, e->Vc[l], (kv0 + (uint64_t) kb0) * r * 2);
+        cbuf(c, 1, e->latf, 0);
+        cbytes(c, 2, &n, 4);
+        [c->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        enc_heads_gemm(c, &L->ql, e->latf, r, 0, nil, e->kn, kb1 - kb0, 1);
+        enc_heads_mm(c, &L->vu, e->latf, r, 0, nil, e->vn, kb1 - kb0);
+        cmd_group(c, MOVA_TG_ATTN);
+        const MlpArgs a = {H, kb0, kb1, kb0 == 0, kb1 == nk, 1.0f / sqrtf((float) g->head_dim), T, 0};
+        cpipe(c, pipe_(e, "k_mla_prefill", 0, 0));
+        cbytes(c, 0, &a, sizeof a);
+        cbuf(c, 1, e->q, 0);
+        cbuf(c, 2, e->qrp, 0);
+        cbuf(c, 3, e->kn, 0);
+        cbuf(c, 4, e->vn, 0);
+        cbuf(c, 5, e->Kc[l], 0);
+        cbuf(c, 6, e->ri, 0);
+        cbuf(c, 7, e->mst, 0);
+        cbuf(c, 8, e->lst, 0);
+        cbuf(c, 9, e->ost, 0);
+        cbuf(c, 10, e->gq, 0);
+        cbuf(c, 11, e->ao, 0);
+        crun(c, (uint64_t) (T + 8 * MLPF_R - 1) / (8 * MLPF_R), (uint64_t) H, 1, 32 * MLPF_R);
+    }
+}
 
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v): the latent
 // c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write, latent attention (split-key +
@@ -739,10 +797,10 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     enc_dense(c, &L->ka_x, e->xn, d, e->lat, r, T, false);
     if (L->sparse) enc_dense(c, &L->ka_v, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(c, &L->kr, e->xn, d, e->k, g->mla_rope, T, false);
-    const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns;
+    const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns, xp = big && e->expand;
     void (*heads)(Cmd*, const MW*, id<MTLBuffer>, int, int, id<MTLBuffer>, id<MTLBuffer>, int) = big ? enc_heads_mm : enc_heads_mv;
     heads(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);   // prompt rows: GEMMs
-    heads(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);
+    if (!xp) heads(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);   // expanded: the keys instead
     cmd_group(c, MOVA_TG_ATTN);
     const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
     cpipe(c, pipe_(e, "k_mla_rope", 0, 0));
@@ -756,6 +814,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     cbuf(c, 7, e->inv, 0);
     const int nx = (H + 1) * 64 > r ? (H + 1) * 64 : r;
     [c->enc dispatchThreads:MTLSizeMake((NSUInteger) nx, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    if (xp) { encode_mla_prefill(e, c, l, T); return; }
     cpipe(c, pipe_(e, "k_mla_attn", 0, (r + MLAF_DC - 1) / MLAF_DC));
     cbytes(c, 0, &ma, sizeof ma);
     cbuf(c, 1, e->qlat, 0);
@@ -1019,6 +1078,7 @@ int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     int c = 0;
     while (c < s->done && c < n - 1 && s->hist[c] == ids[c]) ++c;
     s->len = s->done = c;
+    s->expand = n - 1 - c >= e->expand_min;
     for (int i = c; i < n; ++i) hist_push(s, ids[i]);
     if (reused) *reused = c;
     return 0;
@@ -1030,8 +1090,10 @@ int eng_prefill_next(Eng* e, int seq, int max_rows) {
     if (left <= 0) return 0;
     const int T = left < max_rows ? (left < MAX_ROWS ? left : MAX_ROWS) : (max_rows < MAX_ROWS ? max_rows : MAX_ROWS);
     e->prompt = 1;
+    e->expand = s->expand;
     const int rc = forward(e, seq, s->hist + s->done, T, s->done, T, NULL, NULL);
     e->prompt = 0;
+    e->expand = 1;
     if (rc) { s->len = s->done = 0; return -1; }   // no half-written KV
     s->done += T;
     return left - T;

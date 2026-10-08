@@ -291,6 +291,10 @@ static KvView mla_kv(void* K, void* V, int npos, int r) {
     kv.fmt = KV_BF16;
     return kv;
 }
+int kt_mla_attn_x(int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
+                  const float* vn, const uint16_t* Kc, int npos, const RowInfo* ri, const float* g, float* o, int T) {
+    return 1;   // Metal only so far
+}
 int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
                 const RowInfo* ri, const float* inv, int T) {
     const size_t qn = 4 * (size_t) T * a.n_head * 128, kn = 2 * (size_t) npos * 128, vn = 2 * (size_t) npos * a.r;
@@ -348,6 +352,8 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
     kc_embed(0, fmt, w, d, (const int32_t*) dev(ids, 4 * (size_t) n), dx, n);
     return done("kc_embed", x, dx, 4 * (size_t) n * d);
 }
+int kt_bf16_f32(const uint16_t* x, float* y, int n) { return 1; }   // Metal only so far
+int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) { return 1; }
 int kt_argmax(const float* logits, int V, int n, int32_t* out) {
     int32_t* d = (int32_t*) dev(NULL, 4 * (size_t) n);
     kc_argmax(0, (const float*) dev(logits, 4 * (size_t) V * n), d, V, n);
