@@ -7,7 +7,8 @@
 // GET /v1/models, GET /health, POST /v1/chat/completions, POST /v1/completions (stream or not).
 // Chat prompts: harness/chat_template.c (the model's chat_template.jinja, tools included).  Tool calls in the output
 // come back as OpenAI tool_calls (harness/tool_calls.c).  The thinking span is returned as reasoning_content.
-// Sampling defaults: IFM's model card (temperature 1.0, top_p 0.95); temperature 0 is greedy.
+// Sampling defaults: IFM's model card (temperature 1.0, top_p 0.95); temperature 0 is greedy.  reasoning_effort defaults
+// to low when a request names none (clients often do not send it).
 // One request at a time on one sequence slot; the KV cache of the previous request's common prefix is reused.
 // --kv q8: the 8-bit KV cache (long contexts in less memory; see engine_api.h).
 #include <math.h>
@@ -217,7 +218,7 @@ static char* chat_prompt(Json* req, const char** close_tag, const Json** tools_o
     const char* effort = str_or(req, "reasoning_effort", NULL);
     const Json* rs = jfield(req, "reasoning", J_OBJ);
     if (rs) effort = str_or(rs, "effort", effort);
-    effort = str_or(kw, "reasoning_effort", effort ? effort : "high");
+    effort = str_or(kw, "reasoning_effort", effort ? effort : "low");   // clients that send no effort get the short one
     if (!strcmp(effort, "minimal")) effort = "low";
     Json* messages = json_get(req, "messages");
     if (ct_normalize(messages, err, errlen)) return NULL;

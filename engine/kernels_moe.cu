@@ -796,6 +796,8 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
     // this thread's two rows (gq, gq + 8) and their positions; rows past T repeat the last
     const int ra = t0 + min(gq, nrows - 1), rb = t0 + min(gq + 8, nrows - 1);
     const int pa = ri[ra].pos, pb = ri[rb].pos;
+    const int plast = ri[t0 + nrows - 1].pos;   // the warp's last row: tiles past it are skipped by the whole warp (mma.sync and
+                                                // the shuffles need every lane; the mask handles each row)
     // Q fragments: 8 steps of 16 dims, bf16(q * scale)
     uint32_t qf[8][4];
     {
@@ -832,7 +834,7 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
             }
         }
         __syncthreads();
-        if (live && k0 <= max(pa, pb)) {
+        if (live && k0 <= plast) {
             // S = Q K^T: 8 key tiles of 8
             float S[8][4];
 #pragma unroll
