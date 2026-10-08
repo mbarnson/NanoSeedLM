@@ -255,9 +255,13 @@ int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const floa
     cudaMemcpyAsync(coef, Co, 2 * nb, cudaMemcpyDeviceToHost, g->st);
     cudaMemcpyAsync(ecode, Eo, nb, cudaMemcpyDeviceToHost, g->st);
     if (err) cudaMemcpyAsync(err, Ro, 4 * nb, cudaMemcpyDeviceToHost, g->st);
-    if (cudaStreamSynchronize(g->st) != cudaSuccess || cudaGetLastError() != cudaSuccess) {
-        snprintf(msg, (size_t) msglen, "GPU error: %s", cudaGetErrorString(cudaGetLastError()));
-        goto done;
+    {   // a block: the gotos above must not cross an initialisation (C++)
+        cudaError_t ce = cudaStreamSynchronize(g->st);
+        if (ce == cudaSuccess) ce = cudaGetLastError();
+        if (ce != cudaSuccess) {
+            snprintf(msg, (size_t) msglen, "GPU error: %s", cudaGetErrorString(ce));
+            goto done;
+        }
     }
     rc = 0;
 done:

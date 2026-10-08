@@ -846,7 +846,11 @@ int main(int argc, char** argv) {
 #endif
     const sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
     const int one = 1;
+#ifdef _WIN32   // Windows' SO_REUSEADDR lets another socket bind a port in use; exclusive use fails the bind instead
+    setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*) &one, sizeof one);
+#else
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*) &one, sizeof one);
+#endif
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;

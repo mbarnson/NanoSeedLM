@@ -32,7 +32,7 @@ typedef struct {
     int32_t* unit_slot;     // [units]: slot, or -1
     int32_t* slot_unit;     // [slots]: unit, or -1
     uint32_t* slot_last;    // [slots]: the admit tick of the last use
-    uint32_t* tick;         // [4]: the admit tick (from CACHE_TICK_BASE), -, -, the stream tick
+    uint32_t* tick;         // [4]: the admit tick (from CACHE_TICK_BASE), unused
     uint32_t* stats;        // [2]: hits, misses (a prefetching view of a pool counts apart)
     int32_t* jobs;          // [2 * per_layer]: (unit, slot) pairs queued by the last admit
     int32_t* njobs;         // [1]
@@ -45,10 +45,9 @@ typedef struct {
     uint64_t hits, misses;  // host-side statistics (not used by the kernels)
 } CachePool;
 #define CACHE_TICK_BASE 0x40000000u
-// rows x k selections inds[] of sparse layer sl.  flags: CACHE_STREAM (a prompt's pass over the layers: its misses
-// are cold), CACHE_PROTECT_PREV (never replace the units of the pool's previous admit: their layer may still be
-// computing beside a prefetch).
-enum { CACHE_STREAM = 1, CACHE_PROTECT_PREV = 2 };
+// rows x k selections inds[] of sparse layer sl.  flags: CACHE_PROTECT_PREV (never replace the units of the pool's
+// previous admit: their layer may still be computing beside a prefetch).
+enum { CACHE_PROTECT_PREV = 2 };
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int flags);
 // blocks: the copy's grid (fewer leave SMs to kernels running beside it on another stream)
 void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks);

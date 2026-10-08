@@ -312,7 +312,7 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
         return -1;
     }
     // initial residency and the slice tables
-    const uint32_t tick0[4] = {CACHE_TICK_BASE, 0, 0, 2};   // stream ticks from 3: never-used slots (0) qualify at once
+    const uint32_t tick0[4] = {CACHE_TICK_BASE, 0, 0, 0};
     int32_t* us = (int32_t*) malloc(4 * (size_t) units);
     int32_t* su = (int32_t*) malloc(4 * (size_t) p->slots);
     WSlice* tab = (WSlice*) calloc((size_t) units * (size_t) ntens, sizeof(WSlice));
@@ -476,6 +476,13 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     const MovaCfg* c = &e->c;
     if (c->n_head != ATTF_G * c->n_kv) {
         snprintf(err, (size_t) errlen, "attention: %d query heads per KV head, the prefill kernel is built for %d", c->n_head / c->n_kv, ATTF_G);
+        free(e);
+        return NULL;
+    }
+    // the kernels' and buffers' limits: experts per layer (shared-memory tables of 128), selections (MAXP, h_inds: 8)
+    if (c->n_exp > 128 || c->n_vexp > 128 || c->top_k < 1 || c->top_k > 8 || c->top_kv < 1 || c->top_kv > 8) {
+        snprintf(err, (size_t) errlen, "experts: %d / %d per layer, top %d / %d; the CUDA engine supports up to 128 and 8",
+                 c->n_exp, c->n_vexp, c->top_k, c->top_kv);
         free(e);
         return NULL;
     }
@@ -950,8 +957,9 @@ static int forward(Eng* e, const int32_t* tok, int T, int pos0, int h0, float* l
         !CK(cudaMemcpyAsync(e->ri, e->h_ri, (size_t) T * sizeof(RowInfo), cudaMemcpyHostToDevice, e->st)))
         return -1;
     // Forwards of up to MV_MAXT rows (decode, prompt-lookup verification) have no host round trip: they run as a CUDA
-    // graph, captured once per (rows, attention splits, head) and launched as one unit.
-    const int graph = T <= MV_MAXT && !e->timing_on && !e->no_graph;
+    // graph, captured once per (rows, attention splits, head) and launched as one unit.  The head is all rows or none
+    // (a head from row 0 < h0 < T would be baked into the graph).
+    const int graph = T <= MV_MAXT && !e->timing_on && !e->no_graph && (h0 == 0 || h0 >= T);
     if (graph) {
         const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, pos0 + T)) * 2 + (h0 < T));
         if (!e->graphs[key]) {
@@ -1026,7 +1034,7 @@ static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float
         const int pre = N > PREFETCH_ROWS;
         for (int l = 0; l < g->n_layer; ++l) {
             if (pre) {
-                if (l == 0 || l == g->first_sparse) prefetch_layer(e, g->first_sparse > l ? g->first_sparse : l);
+                if (l == 0) prefetch_layer(e, g->first_sparse);   // once: a second admit would race its copy's job list
                 if (l >= g->first_sparse) CK(cudaStreamWaitEvent(e->st, e->ev_ready[l], 0));
                 if (l + 1 < g->n_layer && l + 1 > g->first_sparse) prefetch_layer(e, l + 1);
             }

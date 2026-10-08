@@ -331,7 +331,8 @@ int main(void) {
         EngOpts o8 = o;
         o8.kv_format = ENG_KV_Q8;
         Eng* e8 = eng_open(&o8, err, sizeof err);
-        CHECK(e8 != NULL, "eng_open (Q8 KV): %s", err);
+        if (!e8 && strstr(err, "not supported")) printf("Q8 KV: skipped (%s)\n", err);   // a BF16-only engine (Metal)
+        else CHECK(e8 != NULL, "eng_open (Q8 KV): %s", err);
         if (e8) {
             double rel;
             const int diff = compare_engines(e, &o, ENG_KV_Q8, NULL, NULL, &st, V, &rel, "Q8 KV against BF16");

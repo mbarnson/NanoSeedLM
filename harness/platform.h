@@ -29,7 +29,7 @@ double self_cpu_s(void);        // CPU seconds used by this process
 
 typedef struct {
     double load1, load5, load15;   // -1 where the OS has no load average
-    int thermal;                   // macOS thermal state (0 nominal .. 3 critical); -1 elsewhere
+    int thermal;                   // -1: not tracked
     int low_power;
     char power[32];                // "AC", "Battery" or "unknown"
 } MachineState;

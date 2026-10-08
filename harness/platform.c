@@ -15,7 +15,6 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/ps/IOPSKeys.h>
 #include <IOKit/ps/IOPowerSources.h>
-#include <libkern/OSThermalNotification.h>
 #include <libproc.h>
 #include <mach/mach.h>
 #include <sys/resource.h>
@@ -188,9 +187,7 @@ MachineState machine_state(void) {
     double la[3] = {-1, -1, -1};
     getloadavg(la, 3);
     s.load1 = la[0]; s.load5 = la[1]; s.load15 = la[2];
-    // OSThermalNotificationLevel: normal 0, moderate 33, heavy 50, trapping 90, sleeping 100 -> 0 .. 3
-    const int tl = (int) OSThermalNotificationCurrentLevel();
-    s.thermal = tl <= 0 ? 0 : tl < 50 ? 1 : tl < 90 ? 2 : 3;
+    s.thermal = -1;
     s.low_power = 0;
     snprintf(s.power, sizeof s.power, "unknown");
     CFTypeRef info = IOPSCopyPowerSourcesInfo();

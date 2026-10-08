@@ -52,9 +52,9 @@ cmake --build build && ctest --test-dir build
 ```
 
 The binaries are in `out/bin` (macOS) or `build/bin` (Windows, Linux).  Both builds run the same tests from the same
-C sources; `test_mova_cfg` reads a model folder's `config.json` (macOS: `MOVA_DIR=...`; CMake:
-`-DNSLM_MODEL_DIR=...`, or set `NSLM_MODEL_DIR` before the first `win\build.bat`), and `test_affine` is skipped
-unless its MLX goldens exist.
+C sources; `test_mova_cfg` reads a model folder's `config.json` (macOS: `MOVA_DIR=...`; CMake: runs only with
+`-DNSLM_MODEL_DIR=...`, or set `NSLM_MODEL_DIR` before the first `win\build.bat`).  `make test` builds
+`test_affine`'s MLX goldens; the CMake builds have no MLX and skip it unless the goldens exist.
 
 If you want to test the MLX remote code, use the k2_horizon_model.py script included with the model on HuggingFace.
 

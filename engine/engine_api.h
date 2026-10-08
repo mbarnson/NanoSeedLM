@@ -22,6 +22,7 @@ typedef struct {
     int64_t kv_tokens;         // total KV capacity across all slots, in tokens
     int kv_format;             // ENG_KV_BF16 (0, the default: exact), or ENG_KV_Q8 (int8 with a scale per token and
                                // head: half the memory, for long contexts); an engine may only support BF16
+                               // (eng_open then fails with "... not supported ...")
 } EngOpts;
 enum { ENG_KV_BF16 = 0, ENG_KV_Q8 = 1 };
 

@@ -911,7 +911,7 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
 // ---- expert cache ------------------------------------------------------------------------------------------------------
 #define ADMIT_THREADS 1024
 __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count, int flags) {
-    const int stream = flags & CACHE_STREAM, prev = flags & CACHE_PROTECT_PREV ? (int) p.tick[0] : -1;
+    const int prev = flags & CACHE_PROTECT_PREV ? (int) p.tick[0] : -1;
     __shared__ int need[128];
     __shared__ int miss[128];
     __shared__ int nmiss;
@@ -923,10 +923,8 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
     __syncthreads();
     for (int i = tid; i < count; i += ADMIT_THREADS) need[inds[i]] = 1;
     __syncthreads();
-    // Ticks: normal uses count up from CACHE_TICK_BASE; a streaming admit (a prompt's scan over the layers) marks its
-    // misses with a small stream tick instead, so they are the first victims of any later admit - except the current
-    // and the previous stream tick's, whose layers may still be computing.  A scan then cannot flush the working set.
-    const uint32_t now = p.tick[0] + 1, st = p.tick[3] + 1, mark = stream ? st : now;
+    // Ticks count up from CACHE_TICK_BASE; never-used slots (0) are the oldest.
+    const uint32_t now = p.tick[0] + 1;
     // one thread per expert of the layer: hits are touched; misses are listed in expert order (a ballot per warp)
     const int isneed = tid < p.per_layer && need[tid];
     const int s0 = isneed ? p.unit_slot[sl * p.per_layer + tid] : -1, ismiss = isneed && s0 < 0;
@@ -943,7 +941,6 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
         const int nm = wmiss[0] + wmiss[1] + wmiss[2] + wmiss[3], nn = wneed[0] + wneed[1] + wneed[2] + wneed[3];
         nmiss = nm;
         p.tick[0] = now;
-        if (stream) p.tick[3] = st;
         p.stats[1] += (uint32_t) nm;
         p.stats[0] += (uint32_t) (nn - nm);
         *p.njobs = nm;
@@ -955,7 +952,7 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
         int bs = 0x7FFFFFFF;
         for (int s = tid; s < p.slots; s += ADMIT_THREADS) {
             const uint32_t l = p.slot_last[s];
-            if (l != now && l != mark && (int) l != prev && (!stream || l >= CACHE_TICK_BASE || l + 1 < st) && l < best) { best = l; bs = s; }
+            if (l != now && (int) l != prev && l < best) { best = l; bs = s; }
         }
         for (int o = 16; o > 0; o >>= 1) {
             const uint32_t b2 = __shfl_xor_sync(FULL, best, o);
@@ -978,7 +975,7 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
             if (old >= 0) p.unit_slot[old] = -1;
             p.slot_unit[bs] = u;
             p.unit_slot[u] = bs;
-            p.slot_last[bs] = mark;
+            p.slot_last[bs] = now;
             p.jobs[2 * m] = u;
             p.jobs[2 * m + 1] = bs;
             uint8_t* base = p.vram + (uint64_t) bs * p.unit_bytes;

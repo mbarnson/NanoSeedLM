@@ -1,5 +1,5 @@
 // harness/tokenizer.c - byte-level BPE from an HF tokenizer.json (see tokenizer.h), in C on ICU's C API.
-// Pipeline (as harness/tokenizer.m): added tokens are split out first (leftmost, longest match, never normalized); each
+// Pipeline (as tokenizer.m was): added tokens are split out first (leftmost, longest match, never normalized); each
 // remaining segment is NFC-normalized, split by the pre-tokenizer regex (ICU, the same engine and pattern string as
 // NSRegularExpression), mapped byte-to-unicode (GPT-2 byte level), and merged by BPE rank.  No BOS is added by the
 // tokenizer itself.
@@ -13,10 +13,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+
 #include "json.h"
 
 #if defined(_WIN32)
 #include <icu.h>
+#elif !defined(__APPLE__)   // Linux: ICU's headers map the names to the library's versioned symbols (u_strFromUTF8_74)
+#include <unicode/unorm2.h>
+#include <unicode/uregex.h>
+#include <unicode/ustring.h>
 #else
 typedef uint16_t UChar;
 typedef int UErrorCode;
@@ -33,7 +39,7 @@ int32_t unorm2_normalize(const UNormalizer2* n, const UChar* src, int32_t len, U
 URegularExpression* uregex_open(const UChar* pat, int32_t len, uint32_t flags, UParseError* pe, UErrorCode* e);
 void uregex_close(URegularExpression* r);
 void uregex_setText(URegularExpression* r, const UChar* text, int32_t len, UErrorCode* e);
-int uregex_findNext(URegularExpression* r, UErrorCode* e);
+int8_t uregex_findNext(URegularExpression* r, UErrorCode* e);   // UBool
 int32_t uregex_start(URegularExpression* r, int32_t group, UErrorCode* e);
 int32_t uregex_end(URegularExpression* r, int32_t group, UErrorCode* e);
 #endif
@@ -272,6 +278,7 @@ struct Tok {
     size_t cache_n, cache_cap;
     int bos;
     int err_bad;
+    pthread_mutex_t mu;   // tok_encode: the regex's text and the BPE cache are shared state (a server encodes on many threads)
 };
 
 typedef struct {
@@ -436,6 +443,7 @@ void tok_close(Tok* t) {
     free(t->added);
     free(t->cache_ids);
     if (t->re) uregex_close(t->re);
+    pthread_mutex_destroy(&t->mu);
     free(t);
 }
 
@@ -450,6 +458,7 @@ Tok* tok_open(const char* path, char* err, int errlen) {
     fclose(f);
     js[got] = 0;
     Tok* t = (Tok*) calloc(1, sizeof(Tok));
+    pthread_mutex_init(&t->mu, NULL);
     map_init(&t->vocab, 300000);
     map_init(&t->cache, 1 << 16);
     Ld l = {t, NULL, 0, {0}, 0};
@@ -500,6 +509,13 @@ Tok* tok_open(const char* path, char* err, int errlen) {
 }
 
 int tok_bos(Tok* t) { return t->bos; }
+static int encode_locked(Tok* t, const char* text, int add_bos, int32_t* out, int cap);
+int tok_encode(Tok* t, const char* text, int add_bos, int32_t* out, int cap) {
+    pthread_mutex_lock(&t->mu);
+    const int n = encode_locked(t, text, add_bos, out, cap);
+    pthread_mutex_unlock(&t->mu);
+    return n;
+}
 
 // BPE of one pre-token (UTF-8 bytes): ids appended to out.  Merges the lowest-rank adjacent pair, every occurrence
 // left to right, until none applies (as HF).  Returns the count, or -1 if a byte has no symbol.
@@ -587,14 +603,16 @@ static int encode_plain(Tok* t, const char* seg, size_t len, int32_t* out, int c
         if (m < 0) { k = -1; break; }
         for (int i = 0; i < m; ++i) { if (k < cap) out[k] = ids[i]; ++k; }
     }
-    uregex_setText(t->re, NULL, 0, &ue);   // the regex must not keep the freed text
+    static const UChar empty[1] = {0};
+    UErrorCode e3 = U_ZERO_ERROR;
+    uregex_setText(t->re, empty, 0, &e3);   // the regex must not keep the freed text (ICU rejects NULL)
     free(ids);
     free(w);
     free(nf);
     return k;
 }
 
-int tok_encode(Tok* t, const char* text, int add_bos, int32_t* out, int cap) {
+static int encode_locked(Tok* t, const char* text, int add_bos, int32_t* out, int cap) {
     const size_t len = strlen(text);
     int n = 0;
     size_t seg = 0, i = 0;

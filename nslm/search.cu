@@ -273,9 +273,13 @@ static int run(NslmGpu* g, const float* w, int rows, int cols, const float* shbu
     cudaMemcpyAsync(seed, So, 2 * nb, cudaMemcpyDeviceToHost, g->st);
     cudaMemcpyAsync(nib, No, 2 * nb, cudaMemcpyDeviceToHost, g->st);
     if (err) cudaMemcpyAsync(err, Eo, 4 * nb, cudaMemcpyDeviceToHost, g->st);
-    if (cudaStreamSynchronize(g->st) != cudaSuccess || cudaGetLastError() != cudaSuccess) {
-        snprintf(msg, (size_t) msglen, "GPU error: %s", cudaGetErrorString(cudaGetLastError()));
-        goto done;
+    {   // a block: the gotos above must not cross an initialisation (C++)
+        cudaError_t ce = cudaStreamSynchronize(g->st);
+        if (ce == cudaSuccess) ce = cudaGetLastError();
+        if (ce != cudaSuccess) {
+            snprintf(msg, (size_t) msglen, "GPU error: %s", cudaGetErrorString(ce));
+            goto done;
+        }
     }
     rc = 0;
 done:

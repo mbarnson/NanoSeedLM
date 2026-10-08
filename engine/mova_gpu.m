@@ -279,6 +279,10 @@ static void make_resident(Eng* e) {
 
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     @autoreleasepool {
+        if (o->kv_format != ENG_KV_BF16) {   // engine_api.h: an engine may support only BF16; say so, never ignore it
+            snprintf(err, (size_t) errlen, "KV format %d not supported by the Metal engine (BF16 only)", o->kv_format);
+            return NULL;
+        }
         Eng* e = (Eng*) calloc(1, sizeof *e);
         e->buffers = [NSMutableArray new];
         e->pipes = [NSMutableDictionary new];

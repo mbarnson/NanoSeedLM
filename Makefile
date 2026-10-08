@@ -123,8 +123,9 @@ $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 test-mlx:
 	$(PY) tools/test_nanoseedlm_k2.py
 
-# test_affine exits 77 (skipped) without its MLX goldens; test_mova_cfg needs MOVA_DIR (a model folder)
-test: $(TESTS)
+# the MLX goldens of test_affine are built first (macOS has MLX); test_mova_cfg needs MOVA_DIR (a model folder).  A test
+# that exits 77 is skipped.
+test: $(TESTS) $(OUT)/test/affine/index.txt
 	@for t in $(TESTS); do echo "== $$t"; $$t; r=$$?; if [ $$r -eq 77 ]; then echo "(skipped)"; elif [ $$r -ne 0 ]; then exit 1; fi; done; echo "all tests passed"
 
 clean:
