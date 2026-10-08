@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
     o.model_dir = model;
     o.resource_dir = res;
     o.max_seqs = 1;
+    o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
     o.kv_tokens = n + 64;
     Eng* e = eng_open(&o, err, sizeof err);
     if (!e) { fprintf(stderr, "eng_open: %s\n", err); return 1; }

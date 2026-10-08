@@ -139,6 +139,48 @@ static int argmax(const float* l, int V) {
     return b;
 }
 
+static void set_env(const char* k, const char* v) {   // v = NULL: unset
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+
+// A second engine opened with one setting changed (env k = v, and the KV format) runs the same scoring and decoding as
+// e; returns the number of differing logits and tokens and the largest relative logit difference.  Twice: the second
+// round starts from caches the first one left.
+static int compare_engines(Eng* e, const EngOpts* o0, int kv_format, const char* k, const char* v, uint64_t* st, int V,
+                           double* rel, const char* what) {
+    EngOpts o = *o0;
+    o.kv_format = kv_format;
+    char err[512] = "";
+    if (k) set_env(k, v);
+    Eng* e2 = eng_open(&o, err, sizeof err);
+    if (k) set_env(k, NULL);
+    if (!e2) { printf("FAIL: eng_open (%s): %s\n", what, err); ++fails; return -1; }
+    printf("%s: %s\n", what, eng_describe(e2));
+    const int NP = 300, cnt = 40, seq = 0;
+    int32_t* pid = (int32_t*) malloc(sizeof(int32_t) * NP);
+    for (int i = 0; i < NP; ++i) pid[i] = (int32_t) (rng_u32(st) % (uint32_t) V);
+    float* la = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+    float* lb = (float*) malloc(sizeof(float) * (size_t) cnt * V);
+    int32_t ga[32], gb[32];
+    int diff = 0;
+    *rel = 0;
+    for (int round = 0; round < 2; ++round) {
+        CHECK(eng_score(e, 0, pid, NP - cnt, cnt, la) == 0 && eng_score(e2, 0, pid, NP - cnt, cnt, lb) == 0, "scoring");
+        for (size_t i = 0; i < (size_t) cnt * V; ++i) diff += la[i] != lb[i];
+        for (int t = 0; t < cnt; ++t) *rel = fmax(*rel, row_err(lb + (size_t) t * V, la + (size_t) t * V, V));
+        CHECK(eng_prefill(e, 0, pid, NP / 2) == 0 && eng_generate(e, &seq, 1, 32, ENG_MODE_AR, ga, NULL) == 0, "decode");
+        CHECK(eng_prefill(e2, 0, pid, NP / 2) == 0 && eng_generate(e2, &seq, 1, 32, ENG_MODE_AR, gb, NULL) == 0, "decode");
+        diff += memcmp(ga, gb, sizeof ga) != 0;
+    }
+    free(pid); free(la); free(lb);
+    eng_close(e2);
+    return diff;
+}
+
 int main(void) {
     const char* dir = "out/test/engine_model";
     char err[512] = "";
@@ -254,41 +296,34 @@ int main(void) {
     CHECK(eng_prefill_cached(e, 0, ids, 36, &reused) == 0 && reused == 29, "cached prefill reused %d", reused);
     CHECK(eng_len(e, 0) == 36, "length after cached prefill");
 
-    // 6. weight placement must not change results: an engine allowed to keep only part of the experts in fast memory
-    // (NSLM_EXPERT_VRAM_MB; engines with unified memory ignore it) scores and decodes exactly as this one does
+    // 6. placement must not change results: an engine allowed to keep only part of the experts (NSLM_EXPERT_VRAM_MB)
+    // or of the KV cache (NSLM_KV_VRAM_MB) in fast memory scores and decodes exactly as this one does (engines with
+    // unified memory ignore both)
     {
-#ifdef _WIN32
-        _putenv_s("NSLM_EXPERT_VRAM_MB", "13");
-#else
-        setenv("NSLM_EXPERT_VRAM_MB", "13", 1);
-#endif
-        Eng* e2 = eng_open(&o, err, sizeof err);
-#ifdef _WIN32
-        _putenv_s("NSLM_EXPERT_VRAM_MB", "");
-#else
-        unsetenv("NSLM_EXPERT_VRAM_MB");
-#endif
-        CHECK(e2 != NULL, "eng_open (small expert cache): %s", err);
-        if (e2) {
-            printf("%s\n", eng_describe(e2));
-            const int NP = 300, cnt = 40;
-            int32_t* pid = (int32_t*) malloc(sizeof(int32_t) * NP);
-            for (int i = 0; i < NP; ++i) pid[i] = (int32_t) (rng_u32(&st) % (uint32_t) V);
-            float* la = (float*) malloc(sizeof(float) * (size_t) cnt * V);
-            float* lb = (float*) malloc(sizeof(float) * (size_t) cnt * V);
-            int32_t ga[32], gb[32];
-            int diff = 0;
-            for (int round = 0; round < 2; ++round) {   // twice: the second time the small cache starts warm, differently
-                CHECK(eng_score(e, 0, pid, NP - cnt, cnt, la) == 0 && eng_score(e2, 0, pid, NP - cnt, cnt, lb) == 0, "scoring");
-                for (size_t i = 0; i < (size_t) cnt * V; ++i) diff += la[i] != lb[i];
-                CHECK(eng_prefill(e, 0, pid, NP / 2) == 0 && eng_generate(e, &seq, 1, 32, ENG_MODE_AR, ga, NULL) == 0, "decode");
-                CHECK(eng_prefill(e2, 0, pid, NP / 2) == 0 && eng_generate(e2, &seq, 1, 32, ENG_MODE_AR, gb, NULL) == 0, "decode");
-                diff += memcmp(ga, gb, sizeof ga) != 0;
-            }
-            printf("small expert cache: %d differences from the full one\n", diff);
-            CHECK(diff == 0, "a smaller expert cache changed the results");
-            free(pid); free(la); free(lb);
-            eng_close(e2);
+        double rel;
+        int diff = compare_engines(e, &o, ENG_KV_BF16, "NSLM_EXPERT_VRAM_MB", "13", &st, V, &rel, "small expert cache");
+        printf("small expert cache: %d differences\n", diff);
+        CHECK(diff == 0, "a smaller expert cache changed the results");
+        diff = compare_engines(e, &o, ENG_KV_BF16, "NSLM_KV_VRAM_MB", "1", &st, V, &rel, "KV mostly in host memory");
+        printf("KV mostly in host memory: %d differences\n", diff);
+        CHECK(diff == 0, "KV placement changed the results");
+    }
+
+    // 7. the 8-bit KV cache: close to BF16 (its rounding is of BF16's size), and placement-invariant itself
+    {
+        EngOpts o8 = o;
+        o8.kv_format = ENG_KV_Q8;
+        Eng* e8 = eng_open(&o8, err, sizeof err);
+        CHECK(e8 != NULL, "eng_open (Q8 KV): %s", err);
+        if (e8) {
+            double rel;
+            const int diff = compare_engines(e, &o, ENG_KV_Q8, NULL, NULL, &st, V, &rel, "Q8 KV against BF16");
+            printf("Q8 KV against BF16 KV: %d values differ, relative logit difference max %.2e\n", diff, rel);
+            CHECK(rel < 0.05, "Q8 KV: relative logit difference %.3e", rel);
+            const int d2 = compare_engines(e8, &o8, ENG_KV_Q8, "NSLM_KV_VRAM_MB", "0.5", &st, V, &rel, "Q8 KV mostly in host memory");
+            printf("Q8 KV mostly in host memory: %d differences\n", d2);
+            CHECK(d2 == 0, "Q8 KV placement changed the results");
+            eng_close(e8);
         }
     }
 

@@ -1,13 +1,14 @@
 // harness/nslm-chat.c - single-turn chat with K2-Horizon-MoVA through the engine, streaming the reply to stdout.
 //
 //   nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N]
-//             [--system TEXT] [--effort high|medium|low] [--print-ids] "prompt text"
+//             [--system TEXT] [--effort high|medium|low] [--kv bf16|q8] [--ctx N] [--print-ids] "prompt text"
 //
 // The prompt is MoVA's chat_template.jinja rendered for an optional system message and one user message, with the
 // generation prompt (reasoning effort high = <ifm|think>, the template's default).  temp 0 = greedy (arg max, ties to
 // the lowest id); temp > 0 = the MLX reference sampler's pick(): p ~ exp((l - l_max) / T) in double, splitmix64 seeded
 // with --seed, u = (z >> 11) 2^-53 * sum, the first index whose cumulative sum exceeds u.  Stops at
-// <|ifm|endoftext|> (1) or <|ifm|im_end|> (250019).  Timing goes to stderr.
+// <|ifm|endoftext|> (1) or <|ifm|im_end|> (250019).  Timing goes to stderr.  --kv q8: the 8-bit KV cache (long
+// contexts); --ctx: the KV capacity (default: the prompt and the reply).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +50,7 @@ static size_t utf8_complete(const unsigned char* b, size_t n) {
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     const char *model = NULL, *res = "out/res", *system = NULL, *effort = "high", *prompt = NULL;
-    int max_tokens = 512, print_ids = 0;
+    int max_tokens = 512, print_ids = 0, kvq8 = 0, ctx = 0;
     double temp = 0;
     uint64_t seed = 0;
     for (int i = 1; i < argc; ++i) {
@@ -63,6 +64,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--seed") && has_val) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--system") && has_val) system = argv[++i];
         else if (!strcmp(a, "--effort") && has_val) effort = argv[++i];
+        else if (!strcmp(a, "--kv") && has_val) kvq8 = !strcmp(argv[++i], "q8");
+        else if (!strcmp(a, "--ctx") && has_val) ctx = atoi(argv[++i]);
         else if (a[0] == '-' && a[1] == '-') { fprintf(stderr, "unknown or incomplete option %s\n", a); return usage(); }
         else if (!prompt) prompt = a;
         else return usage();
@@ -106,7 +109,8 @@ int main(int argc, char** argv) {
     o.model_dir = model;
     o.resource_dir = res;
     o.max_seqs = 1;
-    o.kv_tokens = n + max_tokens + 64;
+    o.kv_tokens = ctx > n + max_tokens ? ctx : n + max_tokens + 64;
+    o.kv_format = kvq8 ? ENG_KV_Q8 : ENG_KV_BF16;
     const double tl = now_s();
     Eng* e = eng_open(&o, err, sizeof err);
     if (!e) { fprintf(stderr, "eng_open: %s\n", err); return 1; }

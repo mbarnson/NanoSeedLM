@@ -1,7 +1,8 @@
-// nslm/search_gpu.h - the P = 3 seed search on the GPU (nslm/search.metal + nslm/search_metal.m): the same search as
-// nslm/lib_search.c for every block of a tensor.  Tables are built per column group on the GPU (float-float, or exact
-// emulated double for fragile seeds; the CPU uses double); a least-squares lower bound skips seeds that cannot beat a
-// block's best; surviving candidates use the CPU's exact f32 expressions (no fast math, no contraction).
+// nslm/search_gpu.h - the P = 3 seed search on the GPU (Metal: nslm/search.metal + nslm/search_metal.m; CUDA:
+// nslm/search.cu): the same search as nslm/lib_search.c for every block of a tensor.  Tables are built per column
+// group on the GPU (Metal: float-float, or exact emulated double for fragile seeds; CUDA: IEEE double; the CPU uses
+// double); a least-squares lower bound skips seeds that cannot beat a block's best; surviving candidates use the CPU's
+// exact f32 expressions (no fast math, no contraction).
 // SearchArgs is shared with the Metal compiler.
 #pragma once
 #ifdef __METAL_VERSION__
@@ -33,9 +34,13 @@ typedef struct {
 
 #ifndef __METAL_VERSION__
 #include "search.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 typedef struct NslmGpu NslmGpu;
-// metallib: the search library (out/res/search.metallib).  NULL and a message on failure.
-NslmGpu* nslm_gpu_open(const char* metallib, char* err, int errlen);
+// library: the Metal build's search library (out/res/search.metallib; CUDA links its kernels and ignores it).  NULL
+// and a message on failure.
+NslmGpu* nslm_gpu_open(const char* library, char* err, int errlen);
 // One tensor w[rows][cols] (cols a multiple of 8): seed / nib / err in row-major block order ([r][cols / 8]).
 // sh: sqrt(h) per input channel (cols floats), or NULL for the unweighted search.  Returns 0 on success.
 int nslm_gpu_search(NslmGpu* g, const float* w, int rows, int cols, const float* sh, int bias, const SearchOpts* o,
@@ -45,4 +50,7 @@ int nslm_gpu_search(NslmGpu* g, const float* w, int rows, int cols, const float*
 int nslm_gpu_search_block(NslmGpu* g, const float* w8, int rows, const float a[64], int bias, const SearchOpts* o,
                           uint16_t* seed, uint16_t* nib, float* err, char* msg, int msglen);
 void nslm_gpu_close(NslmGpu* g);
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -27,7 +27,7 @@ find_package(CUDAToolkit REQUIRED)
 if(MSVC)
   set(COMPAT_DIR ${CMAKE_SOURCE_DIR}/win/compat)
   # /fp:precise without /fp:contract: no FMA contraction in host code.  /utf-8: sources and string literals are UTF-8.
-  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8> $<$<COMPILE_LANGUAGE:C,CXX>:/fp:precise>
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8> $<$<COMPILE_LANGUAGE:C,CXX>:/fp:precise> $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/W3> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4244> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4267>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/wd4305> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4996> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4146>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/FI${COMPAT_DIR}/posix_compat.h>
@@ -79,19 +79,43 @@ add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/c
             $<IF:$<BOOL:${APPLE}>,harness/telemetry.m,harness/telemetry_nvml.c>)
 target_include_directories(nslm_harness PUBLIC harness)
 if(WIN32)
-  target_link_libraries(nslm_harness PUBLIC nslm icu shell32)
+  target_link_libraries(nslm_harness PUBLIC nslm icu shell32 bcrypt ws2_32)
 elseif(APPLE)
   target_link_libraries(nslm_harness PUBLIC nslm icucore "-framework CoreFoundation" "-framework IOKit")
 else()
   target_link_libraries(nslm_harness PUBLIC nslm icuuc icui18n)
 endif()
 
-foreach(t nslm-chat nslm-mova-refcheck nslm-mova-bench nslm-mova-routes)
+foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke
+          nslm-mova-refcheck nslm-mova-routes)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()
+
+# ---- the compressor's GPU seed search (bit-identical to the C reference: no FMA contraction) -------------------------
+add_library(nslm_search_gpu STATIC nslm/search.cu nslm/search4.cu)
+target_include_directories(nslm_search_gpu PUBLIC nslm)
+target_link_libraries(nslm_search_gpu PUBLIC nslm CUDA::cudart_static)
+target_compile_options(nslm_search_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+add_executable(test_search4_gpu tests/test_search4_gpu.c)
+target_link_libraries(test_search4_gpu nslm_search_gpu)
+add_test(NAME test_search4_gpu COMMAND test_search4_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_executable(test_search_gpu tests/test_search_gpu.c)
+target_link_libraries(test_search_gpu nslm_search_gpu)
+add_test(NAME test_search_gpu COMMAND test_search_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# the compressor: seed search (nslm-moe), the packer, the bits probe
+add_executable(nslm-moe nslm/moe.c)
+target_link_libraries(nslm-moe nslm_search_gpu)
+add_executable(nslm-mova-pack nslm/mova_pack.c)
+target_link_libraries(nslm-mova-pack nslm)
+add_executable(nslm-bits-probe nslm/bits_probe.c)
+target_link_libraries(nslm-bits-probe nslm)
 
 # ---- engine tests (the same sources the Metal build runs) -----------------------------------------------------------
 add_executable(test_engine tests/test_engine.c)
 target_link_libraries(test_engine nslm_engine)
 add_test(NAME test_engine COMMAND test_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_executable(test_serve_splitter tests/test_serve_splitter.c)
+target_link_libraries(test_serve_splitter nslm_engine nslm_harness)
+add_test(NAME test_serve_splitter COMMAND test_serve_splitter WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

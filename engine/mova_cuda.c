@@ -73,9 +73,14 @@ struct Eng {
     MW embed, norm, head;
     uint32_t* stab;     // per-seed 24-bit stream table (SEED4)
     uint32_t* stab32;   // 32-bit stream table (SEED4P4)
-    uint16_t* Kc;       // [n_layer][kv_cap][n_kv * 128]
-    uint16_t* Vc;
-    int64_t kv_cap;
+    // KV cache (kernels_cuda.h KvView): positions [0, kv_nv) of every layer in VRAM, the rest in mapped host memory; a
+    // prompt stages the host rows of the layer it computes in kv_stage
+    int kv_fmt;
+    int64_t kv_cap, kv_nv;
+    uint64_t kv_row, kv_srow;   // bytes per position and layer: values (K or V), scales (K or V; Q8)
+    uint8_t *kv_vk, *kv_vv, *kv_hk, *kv_hv, *kv_sk, *kv_sv;   // VRAM, host (device addresses), staging: values
+    float *kv_vks, *kv_vvs, *kv_hks, *kv_hvs, *kv_sks, *kv_svs;   // ... scales (Q8)
+    int kv_staged;   // the layer whose host rows kv_stage holds for the running prompt pass, or -1
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
     int32_t *ids, *inds, *vinds, *am, *perm, *vperm, *ntiles, *vntiles;
@@ -333,6 +338,73 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
     return 0;
 }
 
+// The KV cache: as many positions of every layer in VRAM as the budget allows (every token reads all of its context,
+// so a GB of KV in VRAM saves far more than a GB of expert cache beyond its minimum, NSLM_EXPERT_MIN_MB), the rest in
+// pinned host memory, plus one layer's staging for prompts.  NSLM_KV_VRAM_MB sets the VRAM share explicitly.
+static int place_kv(Eng* e, char* err, int errlen) {
+    const MovaCfg* c = &e->c;
+    const uint64_t per = (e->kv_row + e->kv_srow) * 2;   // K and V, one layer, one position
+    const uint64_t all = per * (uint64_t) c->n_layer;
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    const char* rs = getenv("NSLM_VRAM_RESERVE_MB");
+    const char* em = getenv("NSLM_EXPERT_MIN_MB");
+    const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 512) << 20, emin = (uint64_t) (em ? atoll(em) : 6144) << 20;
+    const uint64_t avail = fr > reserve + emin ? fr - reserve - emin : 0;
+    int64_t nv = e->kv_cap;
+    const char* kvm = getenv("NSLM_KV_VRAM_MB");
+    if (kvm) nv = (int64_t) (((uint64_t) (atof(kvm) * 1048576.0)) / all);
+    else if (all * (uint64_t) e->kv_cap > avail) {
+        // VRAM rows + one layer's staging of the rest must fit: nv * all + (cap - nv) * per <= avail
+        const uint64_t st = per * (uint64_t) e->kv_cap;
+        nv = avail > st ? (int64_t) ((avail - st) / (all - per)) : 0;
+    }
+    if (nv > e->kv_cap) nv = e->kv_cap;
+    if (nv < 0) nv = 0;
+    e->kv_nv = nv;
+    e->kv_staged = -1;
+    const uint64_t nh = (uint64_t) (e->kv_cap - nv), L = (uint64_t) c->n_layer;
+    if (nv) {
+        e->kv_vk = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_row * L, &e->mem.kv);
+        e->kv_vv = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_row * L, &e->mem.kv);
+        if (e->kv_srow) {
+            e->kv_vks = (float*) dalloc(e, (uint64_t) nv * e->kv_srow * L, &e->mem.kv);
+            e->kv_vvs = (float*) dalloc(e, (uint64_t) nv * e->kv_srow * L, &e->mem.kv);
+        }
+        if (!e->kv_vk || !e->kv_vv || (e->kv_srow && (!e->kv_vks || !e->kv_vvs))) {
+            snprintf(err, (size_t) errlen, "KV cache (%lld positions in VRAM): out of GPU memory", (long long) nv);
+            return -1;
+        }
+    }
+    if (nh) {
+        void* dp = NULL;
+        uint8_t* h[4] = {NULL, NULL, NULL, NULL};
+        const uint64_t sz[4] = {nh * e->kv_row * L, nh * e->kv_row * L, nh * e->kv_srow * L, nh * e->kv_srow * L};
+        for (int i = 0; i < 4; ++i) {
+            if (!sz[i]) continue;
+            h[i] = (uint8_t*) halloc(e, sz[i]);
+            if (!h[i] || !CK(cudaHostGetDevicePointer(&dp, h[i], 0))) {
+                snprintf(err, (size_t) errlen, "KV cache: cannot pin %.2f GB of host memory", sz[i] / 1e9);
+                return -1;
+            }
+            e->mem.staging += (int64_t) sz[i];
+            h[i] = (uint8_t*) dp;
+        }
+        e->kv_hk = h[0]; e->kv_hv = h[1]; e->kv_hks = (float*) h[2]; e->kv_hvs = (float*) h[3];
+        e->kv_sk = (uint8_t*) dalloc(e, nh * e->kv_row, &e->mem.kv);
+        e->kv_sv = (uint8_t*) dalloc(e, nh * e->kv_row, &e->mem.kv);
+        if (e->kv_srow) {
+            e->kv_sks = (float*) dalloc(e, nh * e->kv_srow, &e->mem.kv);
+            e->kv_svs = (float*) dalloc(e, nh * e->kv_srow, &e->mem.kv);
+        }
+        if (!e->kv_sk || !e->kv_sv || (e->kv_srow && (!e->kv_sks || !e->kv_svs))) {
+            snprintf(err, (size_t) errlen, "KV staging: out of GPU memory");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 // The two pools share the VRAM left after everything else (NSLM_VRAM_RESERVE_MB stays free; NSLM_EXPERT_VRAM_MB caps
 // it), split by the pools' byte totals.
 static int build_pools(Eng* e, char* err, int errlen) {
@@ -463,10 +535,9 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     // KV caches
     const int kvd = c->n_kv * c->head_dim;
     e->kv_cap = o->kv_tokens > 0 ? o->kv_tokens : 32768;
-    const uint64_t kvl = (uint64_t) e->kv_cap * kvd * 2;
-    e->Kc = (uint16_t*) dalloc(e, kvl * (uint64_t) c->n_layer, &e->mem.kv);
-    e->Vc = (uint16_t*) dalloc(e, kvl * (uint64_t) c->n_layer, &e->mem.kv);
-    if (!e->Kc || !e->Vc) { snprintf(err, (size_t) errlen, "KV cache (%lld tokens): out of GPU memory", (long long) e->kv_cap); eng_close(e); return NULL; }
+    e->kv_fmt = o->kv_format == ENG_KV_Q8 ? KV_Q8 : KV_BF16;
+    e->kv_row = (uint64_t) kvd * (e->kv_fmt == KV_Q8 ? 1 : 2);
+    e->kv_srow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
     // scratch
     const int T = MAX_ROWS, d = c->d, qd = c->n_head * c->head_dim, ffmax = c->ff_dense > c->ff_exp ? c->ff_dense : c->ff_exp;
     e->x = (float*) scratch(e, (uint64_t) T * d * 4);
@@ -537,6 +608,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         eng_close(e);
         return NULL;
     }
+    if (place_kv(e, err, errlen)) { eng_close(e); return NULL; }
     // experts last: they take the VRAM that is left
     if (build_pools(e, err, errlen)) { eng_close(e); return NULL; }
     {
@@ -661,13 +733,55 @@ static int attn_splits(int T, int max_ctx) {
     return ns < 1 ? 1 : ns;
 }
 
+// Layer l's KV cache: VRAM rows, then the host rows, or their staged copy while a prompt pass computes the layer.
+static KvView kv_view(Eng* e, int l) {
+    KvView v;
+    memset(&v, 0, sizeof v);
+    v.fmt = e->kv_fmt;
+    v.nv = (int32_t) e->kv_nv;
+    const uint64_t nv = (uint64_t) e->kv_nv, nh = (uint64_t) (e->kv_cap - e->kv_nv);
+    v.a.k = e->kv_vk + nv * e->kv_row * (uint64_t) l;
+    v.a.v = e->kv_vv + nv * e->kv_row * (uint64_t) l;
+    if (e->kv_fmt == KV_Q8) {
+        v.a.ks = (float*) ((uint8_t*) e->kv_vks + nv * e->kv_srow * (uint64_t) l);
+        v.a.vs = (float*) ((uint8_t*) e->kv_vvs + nv * e->kv_srow * (uint64_t) l);
+    }
+    if (!nh) return v;
+    if (e->kv_staged == l) {
+        v.b.k = e->kv_sk; v.b.v = e->kv_sv; v.b.ks = e->kv_sks; v.b.vs = e->kv_svs;
+        return v;
+    }
+    v.b.k = e->kv_hk + nh * e->kv_row * (uint64_t) l;
+    v.b.v = e->kv_hv + nh * e->kv_row * (uint64_t) l;
+    if (e->kv_fmt == KV_Q8) {
+        v.b.ks = (float*) ((uint8_t*) e->kv_hks + nh * e->kv_srow * (uint64_t) l);
+        v.b.vs = (float*) ((uint8_t*) e->kv_hvs + nh * e->kv_srow * (uint64_t) l);
+    }
+    return v;
+}
+// Copy host rows [r0, r1) (row 0 = position kv_nv) of layer l into the staging buffer (in) or back (out).
+static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
+    if (r1 <= r0) return 0;
+    const uint64_t nh = (uint64_t) (e->kv_cap - e->kv_nv);
+    const enum cudaMemcpyKind kd = cudaMemcpyDeviceToDevice;   // the host rows are mapped: device addresses
+    uint8_t* hs[4] = {e->kv_hk + nh * e->kv_row * (uint64_t) l, e->kv_hv + nh * e->kv_row * (uint64_t) l,
+                      e->kv_srow ? (uint8_t*) e->kv_hks + nh * e->kv_srow * (uint64_t) l : NULL,
+                      e->kv_srow ? (uint8_t*) e->kv_hvs + nh * e->kv_srow * (uint64_t) l : NULL};
+    uint8_t* ss[4] = {e->kv_sk, e->kv_sv, (uint8_t*) e->kv_sks, (uint8_t*) e->kv_svs};
+    for (int i = 0; i < 4; ++i) {
+        if (!hs[i]) continue;
+        const uint64_t rb = i < 2 ? e->kv_row : e->kv_srow, off = (uint64_t) r0 * rb, len = (uint64_t) (r1 - r0) * rb;
+        if (!CK(cudaMemcpyAsync(in ? ss[i] + off : hs[i] + off, in ? hs[i] + off : ss[i] + off, len, kd, e->st))) return -1;
+    }
+    return 0;
+}
+
 // Layer l for T rows: hidden states X [T][d] (updated in place), rows RI (positions), keys up to max_ctx.
 static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int max_ctx) {
     const MovaCfg* g = &e->c;
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim;
     const int big = T > MV_MAXT;
     AttnArgs aa = {g->n_head, g->n_kv, 128, attn_splits(T, max_ctx), 1.0f / sqrtf((float) g->head_dim)};
-    const uint64_t kvl = (uint64_t) e->kv_cap * kvd;
     Layer* L = &e->L[l];
     tgroup(e, MOVA_TG_EMBED_NORM);
     kc_gnorm(e->st, d, g->eps, X, (const uint16_t*) L->ln1.w0.p[0], e->xn, T);
@@ -692,11 +806,10 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
     }
     tgroup(e, MOVA_TG_ATTN);
-    uint16_t* Kl = e->Kc + kvl * (uint64_t) l;
-    uint16_t* Vl = e->Vc + kvl * (uint64_t) l;
-    kc_rope_kv(e->st, e->q, e->k, e->v, Kl, Vl, RI, e->inv, g->n_head, g->n_kv, T);
-    if (big) kc_attn_prefill(e->st, aa, e->q, Kl, Vl, RI, e->gq, e->ao, T);
-    else kc_attn(e->st, aa, e->q, Kl, Vl, RI, e->part, e->gq, e->ao, T);
+    const KvView kv = kv_view(e, l);
+    kc_rope_kv(e->st, e->q, e->k, e->v, kv, RI, e->inv, g->n_head, g->n_kv, T);
+    if (big) kc_attn_prefill(e->st, aa, e->q, kv, RI, e->gq, e->ao, T);
+    else kc_attn(e->st, aa, e->q, kv, RI, e->part, e->gq, e->ao, T);
     tgroup(e, MOVA_TG_ATTN_PROJ);
     enc_dense(e, &L->o, e->ao, qd, X, d, T, 1);
     tgroup(e, MOVA_TG_EMBED_NORM);
@@ -872,9 +985,20 @@ static int forward_lm(Eng* e, const int32_t* ids, int n, int pos0, int h0, float
                 if (l >= g->first_sparse) CK(cudaStreamWaitEvent(e->st, e->ev_ready[l], 0));
                 if (l + 1 < g->n_layer && l + 1 > g->first_sparse) prefetch_layer(e, l + 1);
             }
+            // host KV rows: this pass reads rows [0, p0 - nv) and writes [p0 - nv, p1 - nv); staged while the layer runs
+            const int64_t p0 = pos0 + s0, p1 = p0 + N, hr0 = p0 > e->kv_nv ? p0 - e->kv_nv : 0, hr1 = p1 - e->kv_nv;
+            const int stage = hr1 > 0;
+            if (stage) {
+                if (kv_stage_copy(e, l, 0, hr0, 1)) return -1;
+                e->kv_staged = l;
+            }
             for (int c0 = 0; c0 < N; c0 += MAX_ROWS) {
                 const int T = N - c0 < MAX_ROWS ? N - c0 : MAX_ROWS;
-                if (encode_layer(e, l, T, e->x_all + (size_t) c0 * d, e->ri_all + c0, pos0 + s0 + c0 + T)) return -1;
+                if (encode_layer(e, l, T, e->x_all + (size_t) c0 * d, e->ri_all + c0, pos0 + s0 + c0 + T)) { e->kv_staged = -1; return -1; }
+            }
+            if (stage) {
+                e->kv_staged = -1;
+                if (kv_stage_copy(e, l, hr0, hr1, 0)) return -1;
             }
         }
         // the head for this range's rows at or after h0

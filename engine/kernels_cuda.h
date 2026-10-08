@@ -49,6 +49,21 @@ void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* i
 // blocks: the copy's grid (fewer leave SMs to kernels running beside it on another stream)
 void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks);
 
+// ---- the KV cache: per layer, positions [0, nv) in segment a and [nv, ...) in segment b (row 0 of b = position nv) ----
+// Rows hold n_kv heads of 128 values: BF16, or Q8 (int8 with one f32 scale per row and head: x = q * scale, scale =
+// max|x| / 127).  Segments live in VRAM or mapped host memory; a prompt stages b in VRAM for the layer it computes.
+enum { KV_BF16 = 0, KV_Q8 = 1 };
+typedef struct {
+    void* k;
+    void* v;
+    float* ks;   // Q8: [rows][n_kv]
+    float* vs;
+} KvSeg;
+typedef struct {
+    KvSeg a, b;
+    int32_t nv, fmt;
+} KvView;
+
 // x[t][:] = the embedding row of ids[t] (BF16 or Q8)
 void kc_embed(cudaStream_t s, int fmt, WSlice w, int d, const int32_t* ids, float* x, int T);
 // grouped RMSNorm (2 groups)
@@ -83,14 +98,13 @@ void kc_router(cudaStream_t s, RouterArgs a, const uint16_t* W, const uint16_t* 
 void kc_swiglu(cudaStream_t s, const float* g, const float* u, float* a, int n);
 void kc_moe_combine(cudaStream_t s, const float* D, const float* w, const float* shared, float* x, int d, int k, int T);
 void kc_vcombine(cudaStream_t s, const float* V, const float* w, float* v, int d, int k, int T);
-void kc_rope_kv(cudaStream_t s, float* q, const float* k, const float* v, uint16_t* Kc, uint16_t* Vc, const RowInfo* ri,
-                const float* inv, int n_head, int n_kv, int T);
+void kc_rope_kv(cudaStream_t s, float* q, const float* k, const float* v, KvView kv, const RowInfo* ri, const float* inv,
+                int n_head, int n_kv, int T);
 // split-key attention (rows <= MV_MAXT, or any T) + reduce with the softplus output gate
-void kc_attn(cudaStream_t s, AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc, const RowInfo* ri,
-             float* part, const float* g, float* o, int T);
+void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, float* part, const float* g, float* o,
+             int T);
 // prefill attention: causal, tiles of keys shared by a KV head's query heads, the gate fused
-void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
-                     const RowInfo* ri, const float* g, float* o, int T);
+void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T);
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n);
 
 #ifdef __cplusplus

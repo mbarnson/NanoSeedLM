@@ -599,12 +599,46 @@ __global__ void k_vcombine(const float* V, const float* w, float* v, int d, int 
     for (int j = 0; j < k; ++j) s += bfr(silu_bf(V[((size_t) t * k + j) * d + c]) * bfr(w[t * k + j]));
     v[(size_t) t * d + c] = bfr(s);
 }
-// RoPE (non-traditional halves) on q in place and k into the cache; v into the cache.  Caches BF16 [cap][n_kv * 128].
-__global__ void k_rope_kv(float* q, const float* k, const float* v, uint16_t* Kc, uint16_t* Vc, const RowInfo* ri,
-                          const float* inv, int n_head, int n_kv) {
-    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x), t = (int) blockIdx.y;
-    const int head = i / 64, p = i % 64;
-    if (head >= n_head && head >= n_kv) return;
+// ---- KV cache access (kernels_cuda.h KvView) ---------------------------------------------------------------------------
+static __device__ __forceinline__ KvSeg kv_seg(const KvView& kv, int pos, int* row) {
+    if (pos < kv.nv) { *row = pos; return kv.a; }
+    *row = pos - kv.nv;
+    return kv.b;
+}
+static __device__ __forceinline__ float4 i8x4(uint32_t u, float s) {
+    return make_float4((float) (int8_t) (u & 255u) * s, (float) (int8_t) ((u >> 8) & 255u) * s, (float) (int8_t) ((u >> 16) & 255u) * s,
+                       (float) (int8_t) (u >> 24) * s);
+}
+// 4 values (dims d0 .. d0 + 3) of K or V at (pos, head)
+static __device__ __forceinline__ float4 kv_load4(const KvView& kv, int is_v, int pos, int kvh, int n_kv, int d0) {
+    int row;
+    const KvSeg sg = kv_seg(kv, pos, &row);
+    const size_t off = ((size_t) row * n_kv + kvh) * ATT_HD + d0;
+    if (kv.fmt == KV_BF16) {
+        const uint2 u = *(const uint2*) ((const uint16_t*) (is_v ? sg.v : sg.k) + off);
+        return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000u), __uint_as_float(u.y << 16),
+                           __uint_as_float(u.y & 0xFFFF0000u));
+    }
+    return i8x4(*(const uint32_t*) ((const int8_t*) (is_v ? sg.v : sg.k) + off), (is_v ? sg.vs : sg.ks)[(size_t) row * n_kv + kvh]);
+}
+// 8 values (dims d8 .. d8 + 7) as BF16 bits (Q8: the dequantized value rounded to BF16)
+static __device__ __forceinline__ uint4 kv_load8_bf(const KvView& kv, int is_v, int pos, int kvh, int n_kv, int d8) {
+    int row;
+    const KvSeg sg = kv_seg(kv, pos, &row);
+    const size_t off = ((size_t) row * n_kv + kvh) * ATT_HD + d8;
+    if (kv.fmt == KV_BF16) return *(const uint4*) ((const uint16_t*) (is_v ? sg.v : sg.k) + off);
+    const uint2 u = *(const uint2*) ((const int8_t*) (is_v ? sg.v : sg.k) + off);
+    const float s = (is_v ? sg.vs : sg.ks)[(size_t) row * n_kv + kvh];
+    const float4 lo = i8x4(u.x, s), hi = i8x4(u.y, s);
+    return make_uint4(pack_bf2(lo.x, lo.y), pack_bf2(lo.z, lo.w), pack_bf2(hi.x, hi.y), pack_bf2(hi.z, hi.w));
+}
+
+// RoPE (non-traditional halves) on q in place and k into the cache; v into the cache.  Block = one head (64 threads,
+// thread p rotates the pair p, p + 64).  Q8: the row's scale from the block's max |value|.
+__global__ void __launch_bounds__(64) k_rope_kv(float* q, const float* k, const float* v, KvView kv, const RowInfo* ri,
+                                                const float* inv, int n_head, int n_kv) {
+    __shared__ float red[2][2];
+    const int head = (int) blockIdx.x, p = threadIdx.x, t = (int) blockIdx.y;
     const int pos = ri[t].pos;
     const float th = (float) pos * inv[p];
     float sn, cs;
@@ -615,24 +649,42 @@ __global__ void k_rope_kv(float* q, const float* k, const float* v, uint16_t* Kc
         qh[p] = bfr(a * cs - b * sn);
         qh[p + 64] = bfr(b * cs + a * sn);
     }
-    if (head < n_kv) {
-        const float* kh = k + (size_t) t * n_kv * ATT_HD + head * ATT_HD;
-        const float a = kh[p], b = kh[p + 64];
-        uint16_t* kc = Kc + (size_t) pos * n_kv * ATT_HD + head * ATT_HD;
-        kc[p] = tobf(a * cs - b * sn);
-        kc[p + 64] = tobf(b * cs + a * sn);
-        const float* vh = v + (size_t) t * n_kv * ATT_HD + head * ATT_HD;
-        uint16_t* vc = Vc + (size_t) pos * n_kv * ATT_HD + head * ATT_HD;
-        vc[p] = tobf(vh[p]);
-        vc[p + 64] = tobf(vh[p + 64]);
+    if (head >= n_kv) return;   // uniform over the block
+    const float* kh = k + (size_t) t * n_kv * ATT_HD + head * ATT_HD;
+    const float* vh = v + (size_t) t * n_kv * ATT_HD + head * ATT_HD;
+    const float k0 = kh[p] * cs - kh[p + 64] * sn, k1 = kh[p + 64] * cs + kh[p] * sn, v0 = vh[p], v1 = vh[p + 64];
+    int row;
+    const KvSeg sg = kv_seg(kv, pos, &row);
+    const size_t off = ((size_t) row * n_kv + head) * ATT_HD;
+    if (kv.fmt == KV_BF16) {
+        uint16_t* kc = (uint16_t*) sg.k + off;
+        uint16_t* vc = (uint16_t*) sg.v + off;
+        kc[p] = tobf(k0);
+        kc[p + 64] = tobf(k1);
+        vc[p] = tobf(v0);
+        vc[p + 64] = tobf(v1);
+        return;
     }
+    float mk = fmaxf(fabsf(k0), fabsf(k1)), mv = fmaxf(fabsf(v0), fabsf(v1));
+    for (int o = 16; o > 0; o >>= 1) { mk = fmaxf(mk, __shfl_xor_sync(FULL, mk, o)); mv = fmaxf(mv, __shfl_xor_sync(FULL, mv, o)); }
+    if ((p & 31) == 0) { red[p >> 5][0] = mk; red[p >> 5][1] = mv; }
+    __syncthreads();
+    mk = fmaxf(red[0][0], red[1][0]);
+    mv = fmaxf(red[0][1], red[1][1]);
+    const float sk = mk > 0 ? mk / 127.0f : 1.0f, sv = mv > 0 ? mv / 127.0f : 1.0f;
+    int8_t* kc = (int8_t*) sg.k + off;
+    int8_t* vc = (int8_t*) sg.v + off;
+    kc[p] = (int8_t) __float2int_rn(k0 / sk);
+    kc[p + 64] = (int8_t) __float2int_rn(k1 / sk);
+    vc[p] = (int8_t) __float2int_rn(v0 / sv);
+    vc[p + 64] = (int8_t) __float2int_rn(v1 / sv);
+    if (p == 0) { sg.ks[(size_t) row * n_kv + head] = sk; sg.vs[(size_t) row * n_kv + head] = sv; }
 }
 
 // ---- attention ---------------------------------------------------------------------------------------------------------
 // Split-key attention: block (split, kv head, row); warp = one of the ATT_SG query heads of the KV head; lanes hold 4
 // dims each.  Partials [row][head][split] = (m, l, acc[128]).
-__global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
-                                                      const RowInfo* ri, float* part) {
+__global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q, KvView kv, const RowInfo* ri, float* part) {
     const int split = (int) blockIdx.x, kvh = (int) blockIdx.y, t = (int) blockIdx.z;
     const int lane = threadIdx.x & 31, sgi = threadIdx.x >> 5;
     const int qh = kvh * (a.n_head / a.n_kv) + sgi;
@@ -644,22 +696,15 @@ __global__ void __launch_bounds__(32 * ATT_SG) k_attn(AttnArgs a, const float* q
     const float4 qv = make_float4(qr[0] * a.scale, qr[1] * a.scale, qr[2] * a.scale, qr[3] * a.scale);
     float m = -INFINITY, l = 0;
     float4 acc = make_float4(0, 0, 0, 0);
-    const int stride = a.n_kv * ATT_HD;
-    const uint16_t* kb = Kc + kvh * ATT_HD + lane * 4;
-    const uint16_t* vb = Vc + kvh * ATT_HD + lane * 4;
     for (int p = p0; p < p1; p += ATT_KU) {
         float s[ATT_KU];
         float4 vf[ATT_KU];
 #pragma unroll
         for (int u = 0; u < ATT_KU; ++u) {
             const int pu = min(p + u, p1 - 1);
-            const uint2 kk = *(const uint2*) (kb + (size_t) pu * stride);
-            const uint2 vv = *(const uint2*) (vb + (size_t) pu * stride);
-            const float4 kv = make_float4(__uint_as_float(kk.x << 16), __uint_as_float(kk.x & 0xFFFF0000u),
-                                          __uint_as_float(kk.y << 16), __uint_as_float(kk.y & 0xFFFF0000u));
-            vf[u] = make_float4(__uint_as_float(vv.x << 16), __uint_as_float(vv.x & 0xFFFF0000u), __uint_as_float(vv.y << 16),
-                                __uint_as_float(vv.y & 0xFFFF0000u));
-            s[u] = dot4(qv, kv);
+            const float4 kf = kv_load4(kv, 0, pu, kvh, a.n_kv, lane * 4);
+            vf[u] = kv_load4(kv, 1, pu, kvh, a.n_kv, lane * 4);
+            s[u] = dot4(qv, kf);
         }
         float mx = m;
 #pragma unroll
@@ -716,15 +761,14 @@ __global__ void k_attn_reduce(AttnArgs a, const float* part, const float* g, flo
 #define FA_BK 64
 #define FA_KLD (ATT_HD + 8)    // Ks [key][dim] row stride (BF16)
 #define FA_VLD (FA_BK + 8)     // Vt [dim][key] row stride
-__global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
-                                                                 const RowInfo* ri, const float* g, float* o, int T) {
+__global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, const float* q, KvView kv, const RowInfo* ri,
+                                                                 const float* g, float* o, int T) {
     __shared__ __align__(16) uint16_t Ks[FA_BK * FA_KLD];
     __shared__ __align__(16) uint16_t Vt[ATT_HD * FA_VLD];
     const int kvh = (int) blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, h = kvh * ATTF_G + w;
     const int gq = lane >> 2, t4 = lane & 3;
     const int t0 = (int) blockIdx.x * FA_ROWS, nrows = min(FA_ROWS, T - t0);
     const int kend = ri[t0 + nrows - 1].pos + 1;
-    const int stride = a.n_kv * ATT_HD;
     // this thread's two rows (gq, gq + 8) and their positions; rows past T repeat the last
     const int ra = t0 + min(gq, nrows - 1), rb = t0 + min(gq + 8, nrows - 1);
     const int pa = ri[ra].pos, pb = ri[rb].pos;
@@ -752,8 +796,8 @@ __global__ void __launch_bounds__(32 * ATTF_G) k_attn_prefill_tc(AttnArgs a, con
             const int key = e / (ATT_HD / 8), d8 = (e % (ATT_HD / 8)) * 8, p = k0 + key;
             uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
             if (p < kend) {
-                kk = *(const uint4*) (Kc + (size_t) p * stride + kvh * ATT_HD + d8);
-                vv = *(const uint4*) (Vc + (size_t) p * stride + kvh * ATT_HD + d8);
+                kk = kv_load8_bf(kv, 0, p, kvh, a.n_kv, d8);
+                vv = kv_load8_bf(kv, 1, p, kvh, a.n_kv, d8);
             }
             *(uint4*) &Ks[key * FA_KLD + d8] = kk;
             const uint32_t vw[4] = {vv.x, vv.y, vv.z, vv.w};
@@ -1014,18 +1058,17 @@ void kc_moe_combine(cudaStream_t s, const float* D, const float* w, const float*
 void kc_vcombine(cudaStream_t s, const float* V, const float* w, float* v, int d, int k, int T) {
     k_vcombine<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(V, w, v, d, k);
 }
-void kc_rope_kv(cudaStream_t s, float* q, const float* k, const float* v, uint16_t* Kc, uint16_t* Vc, const RowInfo* ri,
-                const float* inv, int n_head, int n_kv, int T) {
-    k_rope_kv<<<dim3((unsigned) n_head, (unsigned) T), 64, 0, s>>>(q, k, v, Kc, Vc, ri, inv, n_head, n_kv);
+void kc_rope_kv(cudaStream_t s, float* q, const float* k, const float* v, KvView kv, const RowInfo* ri, const float* inv,
+                int n_head, int n_kv, int T) {
+    k_rope_kv<<<dim3((unsigned) n_head, (unsigned) T), 64, 0, s>>>(q, k, v, kv, ri, inv, n_head, n_kv);
 }
-void kc_attn(cudaStream_t s, AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc, const RowInfo* ri,
-             float* part, const float* g, float* o, int T) {
-    k_attn<<<dim3((unsigned) a.n_splits, (unsigned) a.n_kv, (unsigned) T), 32 * ATT_SG, 0, s>>>(a, q, Kc, Vc, ri, part);
+void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, float* part, const float* g, float* o,
+             int T) {
+    k_attn<<<dim3((unsigned) a.n_splits, (unsigned) a.n_kv, (unsigned) T), 32 * ATT_SG, 0, s>>>(a, q, kv, ri, part);
     k_attn_reduce<<<dim3((unsigned) a.n_head, (unsigned) T), ATT_HD, 0, s>>>(a, part, g, o);
 }
-void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, const uint16_t* Kc, const uint16_t* Vc,
-                     const RowInfo* ri, const float* g, float* o, int T) {
-    k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS - 1) / FA_ROWS, (unsigned) a.n_kv), 32 * ATTF_G, 0, s>>>(a, q, Kc, Vc, ri, g, o, T);
+void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T) {
+    k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS - 1) / FA_ROWS, (unsigned) a.n_kv), 32 * ATTF_G, 0, s>>>(a, q, kv, ri, g, o, T);
 }
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int stream) {
     k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count, stream);

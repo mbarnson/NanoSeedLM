@@ -24,11 +24,18 @@ typedef struct {
 
 #ifndef __METAL_VERSION__
 #include "search4.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 typedef struct Nslm4Gpu Nslm4Gpu;
-Nslm4Gpu* nslm4_gpu_open(const char* metallib, char* err, int errlen);
+// library: the Metal build's search4.metallib (the CUDA build links the kernel and ignores it).
+Nslm4Gpu* nslm4_gpu_open(const char* library, char* err, int errlen);
 // One tensor w[rows][cols] (cols a multiple of 8): seed / coef / ecode / err in row-major block order ([r][cols / 8]).
 // sh: sqrt(h) per input channel (cols floats), or NULL for 1.  Returns 0 on success.
 int nslm4_gpu_search(Nslm4Gpu* g, const float* w, int rows, int cols, const float* sh, int bias, const Search4Opts* o,
                      uint16_t* seed, uint16_t* coef, uint8_t* ecode, float* err, char* msg, int msglen);
 void nslm4_gpu_close(Nslm4Gpu* g);
+#ifdef __cplusplus
+}
+#endif
 #endif

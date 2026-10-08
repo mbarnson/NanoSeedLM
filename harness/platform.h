@@ -14,6 +14,9 @@ void plat_init(int* argc, char*** argv);
 double now_s(void);   // monotonic seconds
 // The whole file, NUL-terminated (*len without the NUL); NULL if unreadable.  The caller frees.
 char* plat_slurp(const char* path, size_t* len);
+uint64_t plat_random_u64(void);   // from the OS's random source
+// The whole file mapped read-only (*len bytes); NULL if unreadable.  Lives for the process.
+const void* plat_map(const char* path, size_t* len);
 
 typedef struct {
     double phys_footprint_mb;       // current physical footprint (macOS: phys_footprint; Windows: private working set)

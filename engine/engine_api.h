@@ -20,7 +20,10 @@ typedef struct {
     const char* resource_dir;  // directory holding kernels_moe.metallib
     int max_seqs;              // sequence slots, ids 0..max_seqs-1
     int64_t kv_tokens;         // total KV capacity across all slots, in tokens
+    int kv_format;             // ENG_KV_BF16 (0, the default: exact), or ENG_KV_Q8 (int8 with a scale per token and
+                               // head: half the memory, for long contexts); an engine may only support BF16
 } EngOpts;
+enum { ENG_KV_BF16 = 0, ENG_KV_Q8 = 1 };
 
 typedef struct {
     int64_t tokens;      // tokens committed

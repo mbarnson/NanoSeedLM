@@ -1,7 +1,7 @@
 // harness/nslm-mova-bench.c - speed and memory footprint of one MoVA configuration on one pre-tokenized prompt.
 //
 //   nslm-mova-bench --model DIR [--res out/res] (--ids FILE | --text FILE --ctx N) [--bucket NAME] [--decode 256]
-//                   [--repeats 5] [--timing]
+//                   [--repeats 5] [--warmup 1] [--kv bf16|q8] [--timing]
 //
 // --ids: int32 prompt ids (tools/mova_export.py bench).  --text FILE --ctx N builds the same matched-bench prompt
 // here: BOS + the text's tokens + one chat question, exactly N tokens.  One sequence slot, KV sized for prompt +
@@ -12,6 +12,7 @@
 //   decode tok/s  (decode - 1) / (first new token -> last)
 // Memory: engine accounting (weights, stream table, KV, scratch, staging), GPU memory in use, process footprint.
 // Machine state before and after; other processes' CPU and the GPU's busy share.
+// --warmup 0 skips the warm-up run (long prompts); --kv q8 runs the 8-bit KV cache.
 // --timing: one extra prefill + 64-token decode with per-kernel-group GPU timing (eng_mova_timing).
 #include <math.h>
 #include <stdio.h>
@@ -83,6 +84,7 @@ int main(int argc, char** argv) {
     o.model_dir = model;
     o.resource_dir = opt(argc, argv, "--res", "out/res");
     o.max_seqs = 1;
+    o.kv_format = !strcmp(opt(argc, argv, "--kv", "bf16"), "q8") ? ENG_KV_Q8 : ENG_KV_BF16;
     o.kv_tokens = n + ndec + 64;
     MachineState ms0 = machine_state();
     print_machine_state("start_", ms0);
@@ -95,7 +97,10 @@ int main(int argc, char** argv) {
     int32_t* out = (int32_t*) malloc(sizeof(int32_t) * (size_t) ndec);
     double ttft[64], pre[64], dec[64];
     int seq = 0;
-    if (eng_prefill(e, 0, p, n) || eng_generate(e, &seq, 1, ndec, ENG_MODE_AR, out, NULL)) { fprintf(stderr, "warm-up failed\n"); return 3; }
+    if (atoi(opt(argc, argv, "--warmup", "1")) && (eng_prefill(e, 0, p, n) || eng_generate(e, &seq, 1, ndec, ENG_MODE_AR, out, NULL))) {
+        fprintf(stderr, "warm-up failed\n");
+        return 3;
+    }
     const double cpu0 = host_cpu_busy_s(), self0 = self_cpu_s();
     TelemMark tm = telem_mark();
     const long long g0 = telem_self_gpu_ns();

@@ -8,6 +8,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <bcrypt.h>
 #include <psapi.h>
 #include <shellapi.h>
 #elif defined(__APPLE__)
@@ -22,6 +23,11 @@
 #else
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #endif
 
 char* plat_slurp(const char* path, size_t* len) {
@@ -40,6 +46,24 @@ char* plat_slurp(const char* path, size_t* len) {
 
 #if defined(_WIN32)
 
+const void* plat_map(const char* path, size_t* len) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz;
+    GetFileSizeEx(f, &sz);
+    HANDLE m = sz.QuadPart ? CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL) : NULL;
+    CloseHandle(f);
+    if (!m) return NULL;
+    const void* p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(m);
+    if (p && len) *len = (size_t) sz.QuadPart;
+    return p;
+}
+uint64_t plat_random_u64(void) {
+    uint64_t v = 0;
+    BCryptGenRandom(NULL, (PUCHAR) &v, sizeof v, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return v;
+}
 void plat_init(int* argc, char*** argv) {
     SetConsoleOutputCP(CP_UTF8);
     int n = 0;
@@ -100,6 +124,28 @@ MachineState machine_state(void) {
 
 #else   // macOS and Linux
 
+const void* plat_map(const char* path, size_t* len) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    fstat(fd, &st);
+    void* m = st.st_size ? mmap(NULL, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (m == MAP_FAILED) return NULL;
+    if (len) *len = (size_t) st.st_size;
+    return m;
+}
+uint64_t plat_random_u64(void) {
+    uint64_t v = 0;
+#if defined(__APPLE__)
+    arc4random_buf(&v, sizeof v);
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) { if (fread(&v, sizeof v, 1, f) != 1) v = 0; fclose(f); }
+    if (!v) v = (uint64_t) time(NULL) * 0x9E3779B97F4A7C15ull;
+#endif
+    return v;
+}
 void plat_init(int* argc, char*** argv) { (void) argc; (void) argv; }
 double now_s(void) {
     struct timespec ts;
