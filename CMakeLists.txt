@@ -30,8 +30,7 @@ if(MSVC)
                       $<$<COMPILE_LANGUAGE:C,CXX>:/W3> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4244> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4267>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/wd4305> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4996> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4146>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/FI${COMPAT_DIR}/posix_compat.h>
-                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FI${COMPAT_DIR}/posix_compat.h>)
+                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE NOMINMAX WIN32_LEAN_AND_MEAN)
   add_library(nslm_compat STATIC win/compat/posix_compat.c)
   target_include_directories(nslm_compat PUBLIC ${COMPAT_DIR})
@@ -66,4 +65,26 @@ foreach(t chat_template tool_calls)
   add_executable(test_${t} tests/test_${t}.c harness/chat_template.c harness/tool_calls.c)
   target_link_libraries(test_${t} nslm)
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endforeach()
+
+# ---- the CUDA engine ------------------------------------------------------------------------------------------------
+add_library(nslm_engine STATIC engine/mova_cuda.c engine/kernels_moe.cu)
+target_include_directories(nslm_engine PUBLIC engine nslm)
+target_link_libraries(nslm_engine PUBLIC nslm CUDA::cudart_static)
+set_target_properties(nslm_engine PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+# ---- the tools ------------------------------------------------------------------------------------------------------
+add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c)
+target_include_directories(nslm_harness PUBLIC harness)
+if(WIN32)
+  target_link_libraries(nslm_harness PUBLIC nslm icu shell32)
+elseif(APPLE)
+  target_link_libraries(nslm_harness PUBLIC nslm icucore "-framework CoreFoundation" "-framework IOKit")
+else()
+  target_link_libraries(nslm_harness PUBLIC nslm icuuc icui18n)
+endif()
+
+foreach(t nslm-chat)
+  add_executable(${t} harness/${t}.c)
+  target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()

@@ -31,6 +31,8 @@
 #include <direct.h>
 #include <sys/stat.h>
 #define mkdir(path, mode) _mkdir(path)
+#define stat _stat64     // 64-bit sizes: shards are larger than 2 GB
+#define fstat _fstat64
 #define rmdir _rmdir
 
 #if !defined(__clang__) && !defined(__GNUC__)
