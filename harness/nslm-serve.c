@@ -19,6 +19,7 @@
 // new request restores the longest saved prefix of its prompt that beats its slot's own, a few blocks per scheduler
 // step, and computes the rest.  Default directory: ~/.cache/nslm/kv (Windows: %LOCALAPPDATA%/nslm/kv).
 // --kv q8: the 8-bit KV cache (long contexts in less memory; see engine_api.h).
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -62,7 +63,7 @@ typedef int sock_t;
 
 #define CHUNK 16          // tokens per streamed update
 #define FIRST_CHUNK 4     // a short first update, so the first token arrives early
-#define PREFILL_CHUNK 256 // prompt rows per scheduler step: decoding slots wait at most one chunk
+#define PREFILL_CHUNK 256 // prompt rows per scheduler step while other slots decode (alone: the engine's most)
 #define RESTORE_BLOCKS 4  // cold-cache blocks restored per scheduler step
 #define MAX_BODY (16 << 20)      // a request body (a full 64k-token context is well under 1 MB of text)
 #define MAX_CONNS 64             // connections served at once; more are answered 503 and closed
@@ -516,17 +517,19 @@ static void slot_push(Slot* s, int32_t t) {
     if (s->len == s->cap) { s->cap = 2 * s->cap + 1024; s->hist = (int32_t*) realloc(s->hist, sizeof(int32_t) * (size_t) s->cap); }
     s->hist[s->len++] = t;
 }
-// The idle slot whose cache shares the longest prefix with ids (ties: the least recently used), or -1.
+// The idle slot sharing the longest prefix with ids (ties: least recently used); -1 when none is idle, or when a slot
+// being saved shares a block more (wait for the writer rather than recompute or restore part of it).
 static int pick_slot(const int32_t* ids, int n) {
-    int best = -1, bl = -1;
+    int best = -1, bl = -1, sl = 0;
     for (int i = 0; i < g_max_seqs; ++i) {
         const Slot* s = &g_slots[i];
-        if (s->job || s->saving) continue;
+        if (s->job) continue;
         int c = 0;
         while (c < s->len && c < n && s->hist[c] == ids[c]) ++c;
+        if (s->saving) { if (c > sl) sl = c; continue; }
         if (c > bl || (c == bl && s->used < g_slots[best].used)) { best = i; bl = c; }
     }
-    return best;
+    return sl >= bl + KVD_BLOCK ? -1 : best;
 }
 static void release(Job* j) {   // under g_lock: the scheduler is done with j; a long enough cache goes to the writer
     if (j->slot >= 0) {
@@ -653,7 +656,7 @@ static void* scheduler(void* arg) {
                 else { pj->cached = c; pj->restored = c > before ? c - before : 0; }
             }
         } else if (pj) {
-            const int left = eng_prefill_next(g_eng, pj->slot, PREFILL_CHUNK);
+            const int left = eng_prefill_next(g_eng, pj->slot, n ? PREFILL_CHUNK : INT_MAX);
             pthread_mutex_lock(&g_lock);
             if (left < 0) { g_slots[pj->slot].len = 0; pj->failed = pj->done = true; pthread_cond_broadcast(&pj->cv); }
             else if (left == 0) { pj->prefilled = true; pj->t_prefill = now_s(); }

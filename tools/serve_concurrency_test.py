@@ -8,8 +8,9 @@ Checks, with streaming chat requests of mixed sampling parameters (greedy, tempe
     not depend on what else runs), and the concurrent streams overlap in time;
   - max_tokens ends a request with finish_reason "length" after exactly that many tokens;
   - a client that disconnects mid-stream frees its slot: afterwards --n requests at once still all complete;
-  - --cold (a server with the cold cache on): a long greedy request, then --n others that take every slot, then the long
-    one again: its prompt comes back from disk (>= 2048 cached tokens) and its text is the same.
+  - --cold (a server with the cold cache on): a long greedy request, at once again (its cache reused while it is being
+    saved), then --n others that take every slot, then the long one again: its prompt comes back from disk (>= 2048
+    cached tokens) and its text is the same.
 Exit status 0 when every check passes.
 """
 import argparse
@@ -141,8 +142,12 @@ def main():
                         for k in range(240))
         long = {"messages": [{"role": "user", "content": text + "\nWhich door holds lantern number 42?"}], "max_tokens": 24,
                 "temperature": 0, "reasoning_effort": "low", "stream": True, "stream_options": {"include_usage": True}}
-        x = {}
+        x, z = {}, {}
         stream(a.url, long, x)
+        stream(a.url, long, z)   # at once, while the writer saves its slot: that slot's cache, not a partial restore
+        cached = z["usage"]["prompt_tokens_details"]["cached_tokens"] if z.get("usage") else -1
+        check(cached >= x["usage"]["prompt_tokens"] - 256,
+              f"repeat during the save: {cached} of {x['usage']['prompt_tokens']} prompt tokens reused")
         time.sleep(3.0)   # the writer saves it
         run_all(a.url, [request(i + 3, max_tokens=8) for i in range(a.n)])   # every slot reused
         y = {}
