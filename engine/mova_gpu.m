@@ -326,11 +326,11 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         const int ok = t->kind == MOVA_K_EXPERTS ? 1
                        : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
                           t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4 || w->fmt == MF_SEED4P4))
-                       : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8 || w->fmt == MF_SEED4P4)
+                       : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8 || w->fmt == MF_SEED4P4 || w->fmt == MF_SEED6P8)
                        : w->fmt != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
         if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, w->fmt); return -1; }
         e->n_seed4 += w->fmt == MF_SEED4;
-        e->n_seed4p4 += w->fmt == MF_SEED4P4;
+        e->n_seed4p4 += w->fmt == MF_SEED4P4 || w->fmt == MF_SEED6P8;   // both read the 32-bit stream table
         return 0;
     }
     return from_ckpt(e, t, w, err, errlen);
@@ -748,7 +748,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             e->seqs[s].cap = 1024;
             e->seqs[s].hist = (int32_t*) malloc(sizeof(int32_t) * 1024);
         }
-        const char* fm[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
+        const char* fm[6] = {"bf16", "seed4", "q8", "q4", "seed4p4", "seed6p8"};
         char mla[48] = "";
         if (c->mla) snprintf(mla, sizeof mla, ", MLA latent %d (+%d RoPE)", rmax, c->mla_rope);
         snprintf(e->desc, sizeof e->desc, "mova engine: experts %s/%s/%s, attention %s, value experts %s, embed %s, head %s%s%s",
@@ -788,9 +788,9 @@ void eng_mem(Eng* e, EngMem* m) { *m = e->mem; m->gpu_allocated = (int64_t) e->d
 
 // y (+)= W x.  Dense: rows of slice 0 for T tokens (T <= 8).  Gather: P pairs, slice sel[p], input row p / xdiv.
 // The seed stream table for a tensor's format, and SEED4P4's exponent codes (stream 3).
-static id<MTLBuffer> stab_for(Eng* e, const MW* W) { return W->fmt == MF_SEED4P4 ? e->stab32 : e->stab; }
+static id<MTLBuffer> stab_for(Eng* e, const MW* W) { return W->fmt == MF_SEED4P4 || W->fmt == MF_SEED6P8 ? e->stab32 : e->stab; }
 static void bind_nibbles(Cmd* c, const MW* W, int index) {
-    if (W->fmt == MF_SEED4P4) [c->enc setBuffer:W->b[3] offset:W->o[3] atIndex:(NSUInteger) index];
+    if (W->fmt == MF_SEED4P4 || W->fmt == MF_SEED6P8) [c->enc setBuffer:W->b[3] offset:W->o[3] atIndex:(NSUInteger) index];
     else [c->enc setBuffer:c->e->stab offset:0 atIndex:(NSUInteger) index];   // unused
 }
 static void enc_mv_bind(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuffer> Y, int ys, int T, bool add, id<MTLBuffer> sel, int P,
@@ -1182,7 +1182,8 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
         cbuf(c, 5, e->ids, 0);
         cbuf(c, 6, e->x, 0);
         cbuf(c, 7, e->stab32, 0);
-        cbuf(c, 8, e->embed.fmt == MF_SEED4P4 ? e->embed.b[3] : e->embed.b[0], e->embed.fmt == MF_SEED4P4 ? e->embed.o[3] : 0);
+        const bool ecodes = e->embed.fmt == MF_SEED4P4 || e->embed.fmt == MF_SEED6P8;
+        cbuf(c, 8, ecodes ? e->embed.b[3] : e->embed.b[0], ecodes ? e->embed.o[3] : 0);
         [c->enc dispatchThreads:MTLSizeMake((NSUInteger) d, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     int ns = (max_ctx + 127) / 128;

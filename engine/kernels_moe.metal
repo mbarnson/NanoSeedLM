@@ -10,7 +10,7 @@ using namespace metal;
 
 // Weight formats (per tensor): BF16; MLX affine Q8 / Q4, group 64, dequantized to BF16 as mx.dequantize does;
 // SEED4 / SEED4P4: LFSR seeds, expanded from the per-seed stream table.
-enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4 };   // = NS_* (nslm/model_st.h)
+enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6P8 = 5 };   // = NS_* (nslm/model_st.h)
 #define MV_MAXT 8          // dense matvec: tokens per weight-row load
 #define MV_ROWS 8          // simdgroups per matvec threadgroup
 #ifndef MV_NR_SEED
@@ -241,6 +241,19 @@ kernel void k_embed(constant int& d [[buffer(0)]], device const ushort* W [[buff
         }
         const float sc = as_type<float>(uint(((device const int*) B)[0] + (int) ((EN[k >> 1] >> ((k & 1) * 4)) & 15) + 127) << 23) * (1.0f / 32767.0f);
         v = bfr(((((cs[0] * q0) + (cs[1] * q1)) + (cs[2] * q2)) + (cs[3] * q3)) * sc);
+    } else if (FC_FMT == MF_SEED6P8) {
+        const ulong k = row * (ulong) (d / 8) + c / 8;
+        const uint s = W[k], gs = G[s], lo = s | (gs << 16), s2 = gs >> 16, g2 = G[s2], lo2 = s2 | (g2 << 16), i = c % 8;
+        const uint cw = ((device const uint*) S)[k];
+        float is = 0.0f;
+        for (uint p = 0; p < 8; ++p) {
+            const uint kk = 8 * i + p + 1;   // 1 .. 64
+            const uint bits = kk <= 16 ? extract_bits(lo, kk, 16u) : kk <= 32 ? extract_bits(gs, kk - 16, 16u)
+                            : kk <= 48 ? extract_bits(lo2, kk - 32, 16u) : extract_bits(g2, kk - 48, 16u);
+            is = is + (as_type<float>(0x4B000000u | bits) - 8421376.0f) * float((int) (cw << (28 - 4 * p)) >> 28);
+        }
+        const float sc = as_type<float>(uint(((device const int*) B)[0] + (int) ((EN[k >> 1] >> ((k & 1) * 4)) & 15) + 127) << 23) * (1.0f / 32767.0f);
+        v = bfr(is * sc);
     } else if (FC_FMT == MF_Q8) {
         const uint w = QW[(row * (ulong) d + c) / 4];
         const float q = (float) ((w >> (8 * (c % 4))) & 255u);
@@ -340,6 +353,26 @@ static inline float seed4_dot(thread const float (&v)[32], uint cw, int e, float
     return e2 * ((((q0 * d0 + q1 * d1) + q2 * d2) + q3 * d3) + (((q0 + q1) + q2) + q3) * xm);
 }
 static inline int seed4_ecode(device const uchar* EN, ulong k) { return (EN[k >> 1] >> ((k & 1) * 4)) & 15; }
+// SEED6P8, 6.5-bit P = 8 blocks (nslm/search8.h): 64 states; states 33..64 are states 1..32 of the seed s2 = state 32
+// = G[s] >> 16, so two stream-table words give them all.  seed8_dot as seed4_dot with 8 coefficients (32-bit word).
+static inline void seed8_states(uint s, device const uint* G, thread float (&v)[64]) {
+    const uint g = G[s], s2 = g >> 16, g2 = G[s2], lo = s | (g << 16), lo2 = s2 | (g2 << 16);
+    for (short k = 1; k <= 16; ++k) v[k - 1] = as_type<float>(insert_bits(0x3F800000u, lo >> k, 7u, 16u));
+    for (short k = 17; k <= 32; ++k) v[k - 1] = as_type<float>(insert_bits(0x3F800000u, g >> (k - 16), 7u, 16u));
+    for (short k = 1; k <= 16; ++k) v[31 + k] = as_type<float>(insert_bits(0x3F800000u, lo2 >> k, 7u, 16u));
+    for (short k = 17; k <= 32; ++k) v[31 + k] = as_type<float>(insert_bits(0x3F800000u, g2 >> (k - 16), 7u, 16u));
+}
+static inline float seed8_dot(thread const float (&v)[64], uint cw, int e, float4 x0, float4 x1, float xm) {
+    const float e2 = as_type<float>(uint(e + 127 + 16) << 23);
+    float r = 0.0f, qs = 0.0f;
+    for (short p = 0; p < 8; ++p) {
+        const float q = as_type<float>(0x4B000000u | (extract_bits(cw, uint(4 * p), 4u) ^ 8u)) - 8388616.0f;
+        const float d = dot(x0, float4(v[p], v[8 + p], v[16 + p], v[24 + p])) + dot(x1, float4(v[32 + p], v[40 + p], v[48 + p], v[56 + p]));
+        r += q * d;
+        qs += q;
+    }
+    return e2 * (r + qs * xm);
+}
 
 // One lane's share of row `row` . x for one token (T = 1), every format: the k_mv arithmetic (seed4 two-op states,
 // Q4 in MLX's qmv form, BF16 / Q8 dequantized as mx.dequantize).  The caller sums the lanes.
@@ -347,6 +380,19 @@ static inline float mv_lane(short fmt, device const uchar* W, device const ushor
                             int eb, ulong row, int K, device const float* xb, uint lane, device const uchar* EN) {
     const int nbk = K / 8;
     float acc = 0;
+    if (fmt == MF_SEED6P8) {
+        device const ushort* seeds = (device const ushort*) W;
+        device const uint* cws = (device const uint*) S;
+        for (int j = (int) lane; j < nbk; j += 32) {
+            const ulong k = row * (ulong) nbk + j;
+            float v[64];
+            seed8_states(seeds[k], G, v);
+            device const float4* xr = (device const float4*) (xb + (ulong) j * 8);
+            const float4 x0 = xr[0], x1 = xr[1];
+            acc += seed8_dot(v, cws[k], eb + seed4_ecode(EN, k), x0, x1, -1.5f * dot(x0 + x1, float4(1.0f)));
+        }
+        return acc * (1.0f / 32767.0f);
+    }
     if (fmt == MF_SEED4P4) {
         device const ushort* seeds = (device const ushort*) W;
         if (MV_SEED_BPL == 2 && nbk % 64 == 0) {   // two adjacent blocks per lane: 4-byte seed / coefficient loads, one
@@ -469,7 +515,7 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
     for (int i = 0; i < NR; ++i) for (int t = 0; t < MV_MAXT; ++t) acc[i][t] = 0;
     device const float* xb = x + (ulong) (gather ? p0 / a.xdiv : 0) * a.xs;
     if (nt == 1 && NR == 1) {   // one token (decode, gather): the shared per-lane arithmetic
-        const int ebs = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 ? ((device const int*) B)[slice] : 0;
+        const int ebs = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[slice] : 0;
         const float s = simd_sum(mv_lane(FC_FMT, W, S, B, G, ebs, row[0], a.K, xb, lane, EN));
         if (lane == 0) {
             device float* yo = y + (ulong) p0 * a.ys + r0;
@@ -504,6 +550,23 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
                 }
             }
         }
+        for (int i = 0; i < NR; ++i) for (int t = 0; t < nt; ++t) acc[i][t] *= (1.0f / 32767.0f);
+    } else if (FC_FMT == MF_SEED6P8) {   // T > 1: one state expansion per block for every token
+        device const ushort* seeds = (device const ushort*) W;
+        device const uint* cws = (device const uint*) S;
+        const int eb = ((device const int*) B)[slice];
+        for (int j = (int) lane; j < nbk; j += 32)
+            for (int i = 0; i < NR; ++i) {
+                const ulong k = row[i] * (ulong) nbk + j;
+                float v[64];
+                seed8_states(seeds[k], G, v);
+                const int e = eb + seed4_ecode(EN, k);
+                for (int t = 0; t < nt; ++t) {
+                    device const float4* xr = (device const float4*) (xb + (ulong) t * a.xs + (ulong) j * 8);
+                    const float4 x0 = xr[0], x1 = xr[1];
+                    acc[i][t] += seed8_dot(v, cws[k], e, x0, x1, -1.5f * dot(x0 + x1, float4(1.0f)));
+                }
+            }
         for (int i = 0; i < NR; ++i) for (int t = 0; t < nt; ++t) acc[i][t] *= (1.0f / 32767.0f);
     } else if (FC_FMT == MF_SEED4P4) {   // T > 1: one state expansion per block for every token
         device const ushort* seeds = (device const ushort*) W;
@@ -622,10 +685,32 @@ static inline void seed4p4_block(device const uchar* W, device const ushort* S, 
     const float sc = as_type<float>(uint(ebias + seed4_ecode(EN, k) + 127) << 23) * (1.0f / 32767.0f);
     for (short i = 0; i < 8; ++i) w[i] = ((((c[4 * i] * q0) + (c[4 * i + 1] * q1)) + (c[4 * i + 2] * q2)) + (c[4 * i + 3] * q3)) * sc;
 }
+// SEED6P8 block j of row `row`: centred states, isum * fl(R32 2^e); states 33..64 from s2 = state 32
+static inline void seed6p8_block(device const uchar* W, device const ushort* S, device const uint* G, ulong row, int K, int j,
+                                 int ebias, device const uchar* EN, thread float (&w)[8]) {
+    const int nbk = K / 8;
+    const ulong k = row * (ulong) nbk + j;
+    const uint s = ((device const ushort*) W)[k], cw = ((device const uint*) S)[k];
+    const uint g = G[s], lo = s | (g << 16), s2 = g >> 16, g2 = G[s2], lo2 = s2 | (g2 << 16);
+    float c[64];
+    for (short kk = 1; kk <= 16; ++kk) c[kk - 1] = as_type<float>(0x4B000000u | extract_bits(lo, (uint) kk, 16u)) - 8421376.0f;
+    for (short kk = 17; kk <= 32; ++kk) c[kk - 1] = as_type<float>(0x4B000000u | extract_bits(g, (uint) (kk - 16), 16u)) - 8421376.0f;
+    for (short kk = 1; kk <= 16; ++kk) c[31 + kk] = as_type<float>(0x4B000000u | extract_bits(lo2, (uint) kk, 16u)) - 8421376.0f;
+    for (short kk = 17; kk <= 32; ++kk) c[31 + kk] = as_type<float>(0x4B000000u | extract_bits(g2, (uint) (kk - 16), 16u)) - 8421376.0f;
+    float q[8];
+    for (short p = 0; p < 8; ++p) q[p] = float((int) (cw << (28 - 4 * p)) >> 28);
+    const float sc = as_type<float>(uint(ebias + seed4_ecode(EN, k) + 127) << 23) * (1.0f / 32767.0f);
+    for (short i = 0; i < 8; ++i) {
+        float is = 0.0f;
+        for (short p = 0; p < 8; ++p) is = is + c[8 * i + p] * q[p];   // exact: |partial sums| < 2^21
+        w[i] = is * sc;
+    }
+}
 static inline void tile_weights(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, device const uint* G,
                                 int slice, ulong row, int K, int j, int ebias, threadgroup float* dst, device const uchar* EN) {
     float w[8];
-    if (fmt == MF_SEED4P4) seed4p4_block(W, S, G, row, K, j, ebias, EN, w);
+    if (fmt == MF_SEED6P8) seed6p8_block(W, S, G, row, K, j, ebias, EN, w);
+    else if (fmt == MF_SEED4P4) seed4p4_block(W, S, G, row, K, j, ebias, EN, w);
     else if (fmt == MF_SEED4) {
         const int nbk = K / 8;
         const ushort s = ((device const ushort*) W)[row * (ulong) nbk + j];
@@ -659,7 +744,7 @@ kernel void k_mm(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffe
     int slice = 0, start = 0, count;
     if (grouped) { const MmTile tl = tiles[tg.y]; slice = tl.slice; start = tl.start; count = tl.count; }
     else { start = (int) tg.y * MM_BN; count = min(MM_BN, a.T - start); }
-    const int ebias = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 ? ((device const int*) B)[slice] : 0;
+    const int ebias = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[slice] : 0;
     simdgroup_float8x8 acc[2][2];
     for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
     const int sr = (int) (sgi / 2) * 16, sn = (int) (sgi % 2) * 16;   // this simdgroup's 16 x 16 sub-tile
