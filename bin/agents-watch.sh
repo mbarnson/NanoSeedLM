@@ -70,6 +70,8 @@ check() {
             continue
         fi
         if git cat-file -e "$old^{commit}" 2>/dev/null && git merge-base --is-ancestor "$old" "$sha"; then
+            # this agent's own posts (agents-post.sh subjects start with the agent's name) are not news to it
+            if [ "$name" = agents ] && [ -z "$(git log --format=%s "$old..$sha" | grep -v "^$ME[ :]")" ]; then continue; fi
             echo "PUSH $name $(short "$old")..$(short "$sha")"
             git log --format='  %h %an: %s' "$old..$sha" | head -n 30
             [ "$name" = agents ] && report_agents "$old" "$sha"

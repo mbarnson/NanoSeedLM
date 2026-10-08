@@ -114,7 +114,7 @@ Rules that keep both platforms working together:
 
 `bin/agents-watch.sh` polls `git ls-remote origin` (cheap: no fetch unless something changed). It reports every
 branch that moved (with its new commits and authors), every new message to you or to `all`, every new result, and
-every claims change. It remembers what it has shown in `.watch/` in this worktree (git-ignored).
+every claims change. It skips pushes to `agents` that are only your own posts. It remembers what it has shown in `.watch/` in this worktree (git-ignored).
 
 ```sh
 sh bin/agents-watch.sh --once            # report changes since the last run, then exit (0)
