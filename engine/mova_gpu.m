@@ -235,7 +235,8 @@ static int from_model(Eng* e, const char* name, MW* w, char* err, int errlen) {
     return 0;
 }
 
-// BF16 from the checkpoint (slices > 1: the stacked experts, slice names from mova_slice_name).
+// BF16 from the checkpoint (slices > 1: the stacked experts, slice names from mova_slice_name; MLA's per-head maps are
+// one 3-D tensor).
 static int from_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen) {
     if (!e->ck && !(e->ck = mova_ckpt_open(e->model_dir, err, errlen))) return -1;
     *w = (MW){0};
@@ -243,6 +244,13 @@ static int from_ckpt(Eng* e, const MovaTensor* t, MW* w, char* err, int errlen) 
     const uint64_t one = (uint64_t) t->rows * t->cols * 2;
     id<MTLBuffer> b = alloc_k(e, one * (uint64_t) t->slices, t->name, &e->mem.weights);
     if (!b) { snprintf(err, (size_t) errlen, "%s: out of memory", t->name); return -1; }
+    if (t->kind == MOVA_K_HEADS) {
+        const uint16_t* src = mova_ckpt_bf16_3d(e->ck, t->name, t->slices, t->rows, t->cols, err, errlen);
+        if (!src) return -1;
+        memcpy(b.contents, src, one * (uint64_t) t->slices);
+        w->b[0] = b;
+        return 0;
+    }
     char nm[128];
     for (int s = 0; s < t->slices; ++s) {
         const uint16_t* src = mova_ckpt_bf16(e->ck, mova_slice_name(t, s, nm, sizeof nm), t->rows, t->cols, err, errlen);
@@ -435,7 +443,9 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->ids = scratch(e, (uint64_t) T * 4, "ids");
         e->ri = scratch(e, (uint64_t) T * sizeof(RowInfo), "rowinfo");
         e->inv = scratch(e, 64 * 4, "invfreq");
-        e->part = scratch(e, (uint64_t) 1024 * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");   // rows x splits<=1024
+        // rows x splits <= 1024 (encode_forward); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
+        const uint64_t prow = c->mla ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
+        e->part = scratch(e, prow * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");
         if (c->mla) {
             e->lat = scratch(e, (uint64_t) T * rmax * 4, "MLA latent");
             e->qrp = scratch(e, (uint64_t) T * qd * 4, "MLA query RoPE parts");

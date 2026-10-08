@@ -167,6 +167,20 @@ static void lin1(const MovaRef* r, const NsTensor* t, int slice, const float* x,
 MovaRef* mova_ref_open(const char* dir, int threads, char* err, int errlen) {
     MovaRef* r = (MovaRef*) calloc(1, sizeof *r);
     if (mova_cfg_load(&r->c, dir, err, errlen) || ns_open(&r->nm, dir, err, errlen)) { free(r); return NULL; }
+    if (r->c.mla) {   // the MLA tensors are read without further checks: all present, BF16, of their shapes
+        MovaTensor* mt = NULL;
+        const int n = mova_tensors(&r->c, &mt);
+        int bad = 0;
+        for (int i = 0; i < n && !bad; ++i) {
+            if (mt[i].kind != MOVA_K_HEADS && !strstr(mt[i].name, ".mla.")) continue;
+            const NsTensor* t = ns_find(&r->nm, mt[i].name);
+            bad = !t || t->enc != NS_BF16 || t->slices != mt[i].slices || t->rows != mt[i].rows || t->cols != mt[i].cols;
+            if (bad) snprintf(err, (size_t) errlen, "%s: missing, not BF16, or not %d x %d x %d", mt[i].name, mt[i].slices,
+                              mt[i].rows, mt[i].cols);
+        }
+        free(mt);
+        if (bad) { ns_close(&r->nm); free(r); return NULL; }
+    }
     r->threads = threads > 0 ? threads : 1;
     for (uint32_t s = 0; s < 65536; ++s) { r->g24[s] = lfsr_stream24((uint16_t) s); r->g32[s] = lfsr_stream32((uint16_t) s); }
     for (int p = 0; p < 64; ++p) r->inv[p] = (float) pow((double) r->c.rope_theta, -2.0 * p / (double) r->c.head_dim);

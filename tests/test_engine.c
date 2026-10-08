@@ -20,6 +20,7 @@
 #include "lfsr.h"
 #include "model_st.h"
 #include "mova_cfg.h"
+#include "mova_ckpt.h"
 #include "mova_ext.h"
 #include "mova_ref.h"
 
@@ -88,7 +89,8 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
     return 0;
 }
 
-static int write_model(const char* dir, const char* config, char* err, int errlen) {
+// skip: leave out the tensors whose names contain it (NULL: none)
+static int write_model(const char* dir, const char* config, const char* skip, char* err, int errlen) {
     mkdir("out", 0755);
     mkdir("out/test", 0755);
     mkdir(dir, 0755);
@@ -103,18 +105,22 @@ static int write_model(const char* dir, const char* config, char* err, int errle
     MovaTensor* mt = NULL;
     const int n = mova_tensors(&c, &mt);
     NsSpec* sp = (NsSpec*) calloc((size_t) n, sizeof(NsSpec));
+    int m = 0;
     for (int i = 0; i < n; ++i) {
-        const int k = mt[i].kind;
-        sp[i].name = mt[i].name;
-        sp[i].enc = k == MOVA_K_EXPERTS ? NS_SEED4P4 : k == MOVA_K_VEXPERTS ? NS_Q4
+        if (skip && strstr(mt[i].name, skip)) continue;
+        mt[m] = mt[i];
+        const int k = mt[m].kind;
+        sp[m].name = mt[m].name;
+        sp[m].enc = k == MOVA_K_EXPERTS ? NS_SEED4P4 : k == MOVA_K_VEXPERTS ? NS_Q4
                   : (k == MOVA_K_NORM || k == MOVA_K_ROUTER || k == MOVA_K_ROUTER_BIAS || k == MOVA_K_HEADS) ? NS_BF16
-                  : strstr(mt[i].name, ".mla.") ? NS_BF16 : NS_Q8;   // MLA tensors: BF16, as exported (no *.weight name)
-        sp[i].slices = mt[i].slices;
-        sp[i].rows = mt[i].rows;
-        sp[i].cols = mt[i].cols;
+                  : strstr(mt[m].name, ".mla.") ? NS_BF16 : NS_Q8;   // MLA tensors: BF16, as exported (no *.weight name)
+        sp[m].slices = mt[m].slices;
+        sp[m].rows = mt[m].rows;
+        sp[m].cols = mt[m].cols;
+        ++m;
     }
     Gen g = {sp, mt};
-    const int rc = ns_write(dir, sp, n, 64ull << 20, NULL, fill, &g, err, errlen);
+    const int rc = ns_write(dir, sp, m, 64ull << 20, NULL, fill, &g, err, errlen);
     free(sp);
     free(mt);
     return rc;
@@ -195,8 +201,44 @@ static void test_mla(void) {
     sprintf(config, "{\"mla_ranks\": [%d, %d, %d, %d, %d], \"mla_rope_dim\": 128,%s", ranks[0], ranks[1], ranks[2], ranks[3],
             ranks[4], CONFIG + 1);
     char err[512] = "";
-    if (write_model(dir, config, err, sizeof err)) { ++fails; printf("FAIL: MLA model folder: %s\n", err); free(config); return; }
+    if (write_model(dir, config, NULL, err, sizeof err)) { ++fails; printf("FAIL: MLA model folder: %s\n", err); free(config); return; }
+    // A folder without one layer's per-head query map: the reference and the engine must refuse it, naming the tensor
+    {
+        const char* bad = "out/test/engine_model_mla_missing";
+        if (write_model(bad, config, "layers.2.self_attn.mla.q_lat", err, sizeof err)) { ++fails; printf("FAIL: %s\n", err); }
+        else {
+            MovaRef* rb = mova_ref_open(bad, 1, err, sizeof err);
+            CHECK(!rb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA reference without q_lat: %s", rb ? "opened" : err);
+            if (rb) mova_ref_close(rb);
+            EngOpts ob;
+            memset(&ob, 0, sizeof ob);
+            ob.model_dir = bad;
+            ob.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
+            ob.max_seqs = 1;
+            ob.kv_tokens = 64;
+            Eng* eb = eng_open(&ob, err, sizeof err);
+            CHECK(!eb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA engine without q_lat: %s", eb ? "opened" : err);
+            if (eb) eng_close(eb);
+        }
+    }
     free(config);
+    // The per-head maps are stacked 3-D BF16 tensors [n_head][rows][cols], as the conversion exports them: the engine
+    // maps them from the folder (as from the real converted model's model-mla-delta.safetensors), and the checkpoint
+    // reader (the packer's, and the engine's fallback) reads them whole
+    {
+        MovaCkpt* ck = mova_ckpt_open(dir, err, sizeof err);
+        NsModel nm;
+        CHECK(ck && ns_open(&nm, dir, err, sizeof err) == 0, "MLA folder as a checkpoint: %s", err);
+        if (ck) {
+            const char* nm1 = "model.layers.1.self_attn.mla.q_lat";
+            const uint16_t* w3 = mova_ckpt_bf16_3d(ck, nm1, 8, ranks[1], 128, err, sizeof err);
+            const NsTensor* t = ns_find(&nm, nm1);
+            CHECK(w3 && t && t->slices == 8 && !memcmp(w3, t->s[0].p, (size_t) 8 * ranks[1] * 128 * 2), "3-D read of %s: %s", nm1, err);
+            CHECK(!mova_ckpt_bf16(ck, nm1, ranks[1], 128, err, sizeof err), "a 3-D tensor read as 2-D");
+            ns_close(&nm);
+            mova_ckpt_close(ck);
+        }
+    }
     MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
     if (!ref) { ++fails; printf("FAIL: MLA reference: %s\n", err); return; }
     EngOpts o;
@@ -265,6 +307,21 @@ static void test_mla(void) {
     }
     printf("MLA decode: %d steps, logit error mean %.2e max %.2e, argmax equal %d\n", N - P0, dmean, dworst, dsame);
     CHECK(dmean < 0.05 && dworst < 0.25, "MLA decode: logit error mean %.3e, max %.3e", dmean, dworst);
+    // prompt lookup (multi-row verify forwards: split-key latent attention over several rows) must commit the tokens of
+    // plain greedy decode
+    {
+        int32_t rep[40], ar[24], pl[24];
+        for (int i = 0; i < 40; ++i) rep[i] = ids[i % 10];
+        const int seq = 0;
+        EngStats sp;
+        memset(&sp, 0, sizeof sp);
+        CHECK(eng_prefill(e, 0, rep, 40) == 0 && eng_generate(e, &seq, 1, 24, ENG_MODE_AR, ar, NULL) == 0, "MLA AR generate");
+        CHECK(eng_prefill(e, 0, rep, 40) == 0 && eng_generate(e, &seq, 1, 24, ENG_MODE_PL, pl, &sp) == 0, "MLA PL generate");
+        CHECK(!memcmp(ar, pl, sizeof ar), "MLA: prompt lookup committed different tokens than greedy decode");
+        printf("MLA prompt lookup: %lld forwards for 24 tokens, %lld of %lld proposals accepted\n", (long long) sp.forwards,
+               (long long) sp.accepted, (long long) sp.proposals);
+        CHECK(sp.accepted > 0, "MLA prompt lookup: no proposal accepted, so no multi-row verify was tested");
+    }
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
@@ -273,7 +330,7 @@ static void test_mla(void) {
 int main(void) {
     const char* dir = "out/test/engine_model";
     char err[512] = "";
-    if (write_model(dir, CONFIG, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
+    if (write_model(dir, CONFIG, NULL, err, sizeof err)) { printf("FAIL: model folder: %s\n", err); return 1; }
     MovaRef* ref = mova_ref_open(dir, 8, err, sizeof err);
     if (!ref) { printf("FAIL: reference: %s\n", err); return 1; }
     EngOpts o;
