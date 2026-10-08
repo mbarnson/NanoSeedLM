@@ -88,3 +88,8 @@ foreach(t nslm-chat)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()
+
+# ---- engine tests (the same sources the Metal build runs) -----------------------------------------------------------
+add_executable(test_engine tests/test_engine.c)
+target_link_libraries(test_engine nslm_engine)
+add_test(NAME test_engine COMMAND test_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
