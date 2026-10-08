@@ -84,7 +84,7 @@ else()
   target_link_libraries(nslm_harness PUBLIC nslm icuuc icui18n)
 endif()
 
-foreach(t nslm-chat)
+foreach(t nslm-chat nslm-mova-refcheck)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()

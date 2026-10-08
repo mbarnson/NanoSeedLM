@@ -5,10 +5,8 @@ rem   win\build.bat test       build and run the tests
 rem Set NSLM_MODEL_DIR to a model folder before the first build to enable the tests that read one.
 setlocal
 rem (no paths inside parenthesised blocks: the ")" of "Program Files (x86)" would close them)
-if defined VSINSTALLDIR goto :havevs
 set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-call :findvs || exit /b 1
-:havevs
+if not defined VSINSTALLDIR call :findvs || exit /b 1
 cd /d "%~dp0.."
 if not exist build\build.ninja (
   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNSLM_MODEL_DIR=%NSLM_MODEL_DIR%" || exit /b 1

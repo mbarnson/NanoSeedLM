@@ -598,7 +598,17 @@ static int encode_forward(Eng* e, int T, int max_ctx, int h0) {
     if (ns < 1) ns = 1;
     AttnArgs aa = {g->n_head, g->n_kv, 128, ns, 1.0f / sqrtf((float) g->head_dim)};
     const uint64_t kvl = (uint64_t) e->kv_cap * kvd;
-    for (int l = 0; l < g->n_layer; ++l) {
+    const char* dump = getenv("MOVA_DUMP");   // debugging: append x (T x d f32) at every layer start and at the end
+    for (int l = 0; l <= g->n_layer; ++l) {
+        if (dump) {
+            float* hx = (float*) malloc(sizeof(float) * (size_t) T * d);
+            cudaMemcpyAsync(hx, e->x, sizeof(float) * (size_t) T * d, cudaMemcpyDeviceToHost, e->st);
+            cudaStreamSynchronize(e->st);
+            FILE* f = fopen(dump, "ab");
+            if (f) { fwrite(hx, 4, (size_t) T * d, f); fclose(f); }
+            free(hx);
+        }
+        if (l == g->n_layer) break;
         Layer* L = &e->L[l];
         tgroup(e, MOVA_TG_EMBED_NORM);
         kc_gnorm(e->st, d, g->eps, e->x, (const uint16_t*) L->ln1.w0.p[0], e->xn, T);

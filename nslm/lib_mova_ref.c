@@ -17,6 +17,7 @@ struct MovaRef {
     MovaCfg c;
     NsModel nm;
     int threads;
+    int attn_prefill;   // the prefill kernels' attention rounding (mova_ref_attn_rounding)
     uint32_t g24[65536], g32[65536];   // stream tables (lfsr_stream24 / lfsr_stream32)
     float inv[64];
 };
@@ -177,6 +178,7 @@ void mova_ref_close(MovaRef* r) {
     free(r);
 }
 int mova_ref_vocab(const MovaRef* r) { return r->c.vocab; }
+void mova_ref_attn_rounding(MovaRef* r, int prefill) { r->attn_prefill = prefill; }
 
 static const NsTensor* T_(const MovaRef* r, const char* fmt, int l) {
     char nm[160];
@@ -281,16 +283,20 @@ static void* att_worker(void* arg) {
         if (it >= a->n * c->n_head) break;
         const int t = it / c->n_head, h = it % c->n_head, kh = h / grp;
         const float* qr = a->q + (size_t) t * qd + h * 128;
+        const int pf = a->r->attn_prefill;
+        float qs[128];   // prefill: S = bf16(q * scale) K^T
+        for (int d = 0; d < 128; ++d) qs[d] = pf ? bfr(qr[d] * (float) scale) : qr[d];
         double m = -INFINITY;
         for (int p = 0; p <= t; ++p) {
             const float* kr = a->kc + (size_t) p * kvd + kh * 128;
             double v = 0;
-            for (int d = 0; d < 128; ++d) v += (double) qr[d] * kr[d];
-            s[p] = v * scale;
+            for (int d = 0; d < 128; ++d) v += (double) qs[d] * kr[d];
+            s[p] = pf ? v : v * scale;
             if (s[p] > m) m = s[p];
         }
         double l = 0;
         for (int p = 0; p <= t; ++p) { s[p] = exp(s[p] - m); l += s[p]; }
+        if (pf) for (int p = 0; p <= t; ++p) s[p] = bfr((float) s[p]);   // O += bf16(P) V; the row sum from unrounded P
         for (int d = 0; d < 128; ++d) {
             double acc = 0;
             for (int p = 0; p <= t; ++p) acc += s[p] * a->vc[(size_t) p * kvd + kh * 128 + d];
@@ -334,7 +340,13 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
         for (int t = 0; t < n; ++t) { row_f32(r, E, 0, ids[t], row); memcpy(x + (size_t) t * d, row, sizeof(float) * (size_t) d); }
         free(row);
     }
-    for (int l = 0; l < c->n_layer; ++l) {
+    const char* dump = getenv("MOVA_REF_DUMP");   // debugging: x (n x d f32) at every layer start and at the end
+    for (int l = 0; l <= c->n_layer; ++l) {
+        if (dump) {
+            FILE* f = fopen(dump, "ab");
+            if (f) { fwrite(x, 4, (size_t) n * d, f); fclose(f); }
+        }
+        if (l == c->n_layer) break;
         const int sparse = l >= c->first_sparse;
         gnorm(r, x, T_(r, "model.layers.%d.input_layernorm.weight", l), xn, n);
         {

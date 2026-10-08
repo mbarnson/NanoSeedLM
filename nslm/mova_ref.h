@@ -13,6 +13,10 @@ typedef struct MovaRef MovaRef;
 MovaRef* mova_ref_open(const char* model_dir, int threads, char* err, int errlen);
 void mova_ref_close(MovaRef* r);
 int mova_ref_vocab(const MovaRef* r);
+// Attention rounding: 0 = the decode kernels' (f32 q * scale and probabilities), 1 = the prefill kernels' (MLX's
+// prefill points: bf16(q * scale), bf16(P) against the row max, the row sum unrounded).  The engines take the prefill
+// kernels for forwards of more than 8 rows.
+void mova_ref_attn_rounding(MovaRef* r, int prefill);
 // Logits (BF16 values, as the engines store them) for rows [h0, n) of ids[0..n-1]: logits[(t - h0) * vocab ..].
 // Router choices per row and sparse layer go to mlp_sel [n][n_sparse][top_k] and val_sel [n][n_sparse][top_kv] when
 // non-NULL.  0 on success.
