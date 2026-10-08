@@ -908,15 +908,16 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
 
 // ---- expert cache ------------------------------------------------------------------------------------------------------
 #define ADMIT_THREADS 1024
-__global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count, int stream) {
+__global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count, int flags) {
+    const int stream = flags & CACHE_STREAM, prev = flags & CACHE_PROTECT_PREV ? (int) p.tick[0] : -1;
     __shared__ int need[128];
     __shared__ int miss[128];
     __shared__ int nmiss;
     __shared__ uint32_t bv[32];
     __shared__ int bi[32];
+    __shared__ int wmiss[4], wneed[4];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     if (tid < 128) need[tid] = 0;
-    if (tid == 0) nmiss = 0;
     __syncthreads();
     for (int i = tid; i < count; i += ADMIT_THREADS) need[inds[i]] = 1;
     __syncthreads();
@@ -924,21 +925,26 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
     // misses with a small stream tick instead, so they are the first victims of any later admit - except the current
     // and the previous stream tick's, whose layers may still be computing.  A scan then cannot flush the working set.
     const uint32_t now = p.tick[0] + 1, st = p.tick[3] + 1, mark = stream ? st : now;
-    // hits: touch; misses: listed in expert order
+    // one thread per expert of the layer: hits are touched; misses are listed in expert order (a ballot per warp)
+    const int isneed = tid < p.per_layer && need[tid];
+    const int s0 = isneed ? p.unit_slot[sl * p.per_layer + tid] : -1, ismiss = isneed && s0 < 0;
+    if (isneed && s0 >= 0) p.slot_last[s0] = now;
+    const uint32_t mb = __ballot_sync(FULL, ismiss), nb = __ballot_sync(FULL, isneed);
+    if (lane == 0 && w < 4) { wmiss[w] = __popc(mb); wneed[w] = __popc(nb); }
+    __syncthreads();
+    if (ismiss) {
+        int before = __popc(mb & ((1u << lane) - 1u));
+        for (int k = 0; k < w; ++k) before += wmiss[k];
+        miss[before] = tid;
+    }
     if (tid == 0) {
-        for (int x = 0; x < p.per_layer; ++x) {
-            if (!need[x]) continue;
-            const int u = sl * p.per_layer + x, s = p.unit_slot[u];
-            if (s >= 0) p.slot_last[s] = now;
-            else miss[nmiss++] = x;
-        }
+        const int nm = wmiss[0] + wmiss[1] + wmiss[2] + wmiss[3], nn = wneed[0] + wneed[1] + wneed[2] + wneed[3];
+        nmiss = nm;
         p.tick[0] = now;
         if (stream) p.tick[3] = st;
-        p.tick[2] += (uint32_t) nmiss;   // tick[1], tick[2]: hit and miss counts
-        int nneed = 0;
-        for (int x = 0; x < p.per_layer; ++x) nneed += need[x];
-        p.tick[1] += (uint32_t) (nneed - nmiss);
-        *p.njobs = nmiss;
+        p.stats[1] += (uint32_t) nm;
+        p.stats[0] += (uint32_t) (nn - nm);
+        *p.njobs = nm;
     }
     __syncthreads();
     for (int m = 0; m < nmiss; ++m) {
@@ -947,7 +953,7 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
         int bs = 0x7FFFFFFF;
         for (int s = tid; s < p.slots; s += ADMIT_THREADS) {
             const uint32_t l = p.slot_last[s];
-            if (l != now && l != mark && (!stream || l >= CACHE_TICK_BASE || l + 1 < st) && l < best) { best = l; bs = s; }
+            if (l != now && l != mark && (int) l != prev && (!stream || l >= CACHE_TICK_BASE || l + 1 < st) && l < best) { best = l; bs = s; }
         }
         for (int o = 16; o > 0; o >>= 1) {
             const uint32_t b2 = __shfl_xor_sync(FULL, best, o);
@@ -1094,8 +1100,8 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T) {
     k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS * FA_RG - 1) / (FA_ROWS * FA_RG), (unsigned) a.n_kv), 32 * ATTF_G * FA_RG, 0, s>>>(a, q, kv, ri, g, o, T);
 }
-void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int stream) {
-    k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count, stream);
+void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int flags) {
+    k_cache_admit<<<1, ADMIT_THREADS, 0, s>>>(*p, sl, inds, count, flags);
 }
 void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks) { k_cache_copy<<<(unsigned) blocks, 512, 0, s>>>(*p); }
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n) {
