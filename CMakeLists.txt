@@ -86,7 +86,7 @@ else()
   target_link_libraries(nslm_harness PUBLIC nslm icuuc icui18n)
 endif()
 
-foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke
+foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke nslm-mova-kbench
           nslm-mova-refcheck nslm-mova-routes)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
