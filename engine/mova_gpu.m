@@ -77,7 +77,8 @@ struct Eng {
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     int mla_hg;                           // MLA: query heads per latent-attention threadgroup (pipeline limit)
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
-    int batch_gemm;                       // NSLM_BATCH_GEMM: a decode step of more than MV_MAXT rows in one forward (GEMMs)
+    int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
+                                          // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
     EngMem mem;
     Seq* seqs;                            // slot s: KV cache rows s * slot_cap ..
@@ -458,7 +459,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->inv = scratch(e, 64 * 4, "invfreq");
         // rows x splits <= 1024 (encode_forward); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
         const uint64_t prow = c->mla && !getenv("NSLM_BATCH_GEMM") ? (uint64_t) MV_MAXT * MAX_SPLITS : 1024;
-        e->batch_gemm = getenv("NSLM_BATCH_GEMM") != NULL;
+        e->batch_gemm = getenv("NSLM_BATCH_GEMM") ? atoi(getenv("NSLM_BATCH_GEMM")) : 0;
+        if (e->batch_gemm && e->batch_gemm <= MV_MAXT) e->batch_gemm = MV_MAXT + 1;
         e->part = scratch(e, prow * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4, "attn partials");
         if (c->mla) {
             e->lat = scratch(e, (uint64_t) T * rmax * 4, "MLA latent");
@@ -1081,7 +1083,7 @@ int eng_push(Eng* e, int seq, int32_t tok) {
 // The pending tokens of seqs[0..n-1] (ready()) in forwards of up to MV_MAXT rows (the decode kernels compute each row
 // as a one-row forward does): logits (n x vocab) and / or arg max (n).
 static int step_rows(Eng* e, const int* seqs, int n, float* logits, int32_t* am) {
-    const int per = e->batch_gemm ? MAX_LOGIT_ROWS : MV_MAXT;
+    const int per = e->batch_gemm && n >= e->batch_gemm ? MAX_LOGIT_ROWS : MV_MAXT;
     for (int i0 = 0; i0 < n; i0 += per) {
         const int T = n - i0 < per ? n - i0 : per;
         int32_t tok[MAX_LOGIT_ROWS];
