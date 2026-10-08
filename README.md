@@ -121,6 +121,22 @@ on both.  A discrete GPU usually has less memory than the 22.8 GB model, so:
   is about BF16's size (KL against the reference rises from 0.005 to 0.010 on a short text).  Contexts above roughly
   100k tokens need `--kv q8` on a 64 GB PC: a 200k-token BF16 cache alone is 39 GB.
 
+Measured on an RTX 4080 (16 GB, PCIe 4.0 x16), Ryzen 7 5800X3D, 64 GB DDR4, Windows 11, CUDA 13.1, with the
+[prepared model](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-NSLM-p4mx-q4v) (`nslm-mova-bench --text
+holmes.txt --ctx N --decode 256`; quality with `nslm-mova-score` on the
+[BF16 reference log-probs](https://huggingface.co/datasets/txgsync/K2-Horizon-MoVA-36B-A4B-bf16-ref-logprobs)):
+
+| | RTX 4080 (CUDA) | M4 Max (Metal) |
+|---|---|---|
+| decode, 1k context | 63.9 tok/s | 50.9 tok/s |
+| decode, 4k context | 59.1 tok/s | 48.0 tok/s |
+| prefill, 1k / 4k prompt | 1432 / 1907 tok/s | |
+| KLD against BF16, held-out / chat | 0.0260 / 0.0124 | 0.0260 / 0.0126 |
+| 188k-token prompt, `--kv q8` | 572 s prefill, 1.1 tok/s decode; passes a needle-in-a-haystack check | |
+
+Past a few tens of thousands of tokens this model's 48 full-attention layers make the KV cache the limit: every token
+reads all of it, and on a 16 GB card most of it then sits behind PCIe.
+
 Environment knobs: `NSLM_VRAM_RESERVE_MB` (VRAM left free, default 512), `NSLM_EXPERT_MIN_MB` (VRAM kept for experts
 when the KV cache is large, default 6144), `NSLM_KV_VRAM_MB`, `NSLM_EXPERT_VRAM_MB` (fix the shares),
 `NSLM_CACHE_STATS=1` (expert cache hits at exit), `NSLM_NO_GRAPH=1`.
