@@ -1028,6 +1028,46 @@ int eng_fork(Eng* e, int dst, int src) { (void) e; return dst == src ? 0 : -1; }
 void eng_free(Eng* e, int seq) { Seq* s = seq_of(e, seq); if (s) s->len = s->done = 0; }
 int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len : 0; }
 
+// A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (8-bit cache) their scales.
+static void kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
+    const MovaCfg* c = &e->c;
+    const uint64_t r0 = (uint64_t) (seq * e->slot_cap + p0), n = (uint64_t) (p1 - p0);
+    for (int l = 0; l < c->n_layer; ++l) {
+        const uint64_t kr = c->mla ? (uint64_t) c->mla_rope * 2 : (uint64_t) c->n_kv * c->head_dim * (e->kv_q8 ? 1 : 2);
+        const uint64_t vr = c->mla ? (uint64_t) e->L[l].mla_r * 2 : kr, sr = e->kv_q8 ? (uint64_t) c->n_kv * 4 : 0;
+        id<MTLBuffer> b[4] = {e->Kc[l], e->Vc[l], e->Ks[l], e->Vs[l]};
+        const uint64_t rb[4] = {kr, vr, sr, sr};
+        for (int i = 0; i < 4; ++i) {
+            if (!rb[i]) continue;
+            uint8_t* d = (uint8_t*) b[i].contents + r0 * rb[i];
+            if (out) memcpy(h, d, n * rb[i]); else memcpy(d, h, n * rb[i]);
+            h += n * rb[i];
+        }
+    }
+}
+int64_t eng_kv_bytes(Eng* e) {
+    const MovaCfg* c = &e->c;
+    int64_t b = 0;
+    for (int l = 0; l < c->n_layer; ++l)
+        b += c->mla ? 2 * (int64_t) (c->mla_rope + e->L[l].mla_r) : 2 * (int64_t) c->n_kv * (e->kv_q8 ? c->head_dim + 4 : 2 * c->head_dim);
+    return b;
+}
+int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst) {
+    const Seq* s = seq_of(e, seq);
+    if (!s || p0 < 0 || p1 < p0 || p1 > s->done) return -1;
+    kv_copy(e, seq, p0, p1, (uint8_t*) dst, 1);
+    return 0;
+}
+int eng_kv_write(Eng* e, int seq, const int32_t* ids, int p0, int p1, const void* src) {
+    Seq* s = seq_of(e, seq);
+    if (!s || p0 < 0 || p0 > s->done || p1 < p0 || p1 > e->slot_cap) return -1;
+    kv_copy(e, seq, p0, p1, (uint8_t*) src, 0);
+    s->len = 0;
+    for (int i = 0; i < p1; ++i) hist_push(s, ids[i]);
+    s->done = p1;
+    return 0;
+}
+
 int eng_step(Eng* e, int seq, float* logits) { return eng_step_batch(e, &seq, 1, logits); }
 int eng_push(Eng* e, int seq, int32_t tok) {
     Seq* s = seq_of(e, seq);

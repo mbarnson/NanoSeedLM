@@ -89,6 +89,14 @@ int eng_push(Eng* e, int seq, int32_t tok);
 // for seqs[i], as eng_step gives that sequence alone (Metal: bit for bit).
 int eng_step_batch(Eng* e, const int* seqs, int n, float* logits);
 
+// A slot's KV cache as bytes (saving it to disk): eng_kv_bytes is the size of one position over all layers.
+// eng_kv_read copies cached positions [p0, p1) of slot seq to dst; it may run on another thread while the slot is idle.
+// eng_kv_write fills positions [p0, p1) (p0 <= the slot's cached positions) from src, with the history ids[0 .. p1):
+// the slot then holds p1 tokens, all cached.  Bytes are only meaningful to the same engine, model and KV format.
+int64_t eng_kv_bytes(Eng* e);
+int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst);
+int eng_kv_write(Eng* e, int seq, const int32_t* ids, int p0, int p1, const void* src);
+
 // Teacher-forced scoring: for j in [0, count), logits[j * vocab ..] are the full-vocabulary logits predicting
 // ids[from + j] from ids[0 .. from + j - 1].  Uses slot `seq` as scratch.
 int eng_score(Eng* e, int seq, const int32_t* ids, int from, int count, float* logits);

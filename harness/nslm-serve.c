@@ -2,6 +2,7 @@
 //
 //   nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080]
 //              [--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]
+//              [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048]
 //   nslm-serve --render REQUEST.json     print the prompt a chat request renders to, and exit
 //
 // GET /v1/models, GET /health, POST /v1/chat/completions, POST /v1/completions (stream or not).
@@ -13,6 +14,10 @@
 // tokens each; default: as many as free memory holds), the idle slot whose cache shares the longest prefix with the
 // prompt.  Every scheduler step computes one prompt chunk of one slot and one decode step of every decoding slot, each
 // sampled with its own parameters and seed: a request's tokens do not depend on what else runs (Metal: bit for bit).
+// The cold cache (harness/kv_disk.h; --kv-disk-gb 0: off): a request that ends with at least --kv-disk-min cached
+// tokens has its slot's cache saved to disk in blocks of 256 tokens (by a writer thread, the slot held meanwhile); a
+// new request restores the longest saved prefix of its prompt that beats its slot's own, a few blocks per scheduler
+// step, and computes the rest.  Default directory: ~/.cache/nslm/kv (Windows: %LOCALAPPDATA%/nslm/kv).
 // --kv q8: the 8-bit KV cache (long contexts in less memory; see engine_api.h).
 #include <math.h>
 #include <signal.h>
@@ -48,6 +53,7 @@ typedef int sock_t;
 #include "chat_template.h"
 #include "engine_api.h"
 #include "json.h"
+#include "kv_disk.h"
 #include "model_st.h"
 #include "mova_cfg.h"
 #include "platform.h"
@@ -57,6 +63,7 @@ typedef int sock_t;
 #define CHUNK 16          // tokens per streamed update
 #define FIRST_CHUNK 4     // a short first update, so the first token arrives early
 #define PREFILL_CHUNK 256 // prompt rows per scheduler step: decoding slots wait at most one chunk
+#define RESTORE_BLOCKS 4  // cold-cache blocks restored per scheduler step
 #define MAX_BODY (16 << 20)      // a request body (a full 64k-token context is well under 1 MB of text)
 #define MAX_CONNS 64             // connections served at once; more are answered 503 and closed
 #define READ_DEADLINE_S 60.0     // a request must arrive whole within this
@@ -69,6 +76,8 @@ static Eng* g_eng;
 static Tok* g_tok;
 static int g_ctx = 65536;
 static int g_max_seqs = 1;
+static KvDisk* g_kvd;      // the cold cache, or NULL
+static int g_kv_min = 2048;
 static int g_verbose = 1;
 
 // ---- JSON building ----
@@ -287,7 +296,7 @@ typedef struct {
     Buf reasoning, content;         // content: everything after the thinking span, tool markup included
     size_t content_sent;            // bytes of content already streamed
     const char* finish;
-    int prompt_tokens, completion_tokens, cached_tokens;
+    int prompt_tokens, completion_tokens, cached_tokens, restored_tokens;
     double prefill_s, decode_s, ttft_s;
 } Gen;
 
@@ -472,6 +481,8 @@ typedef struct Job {
     uint64_t rng;
     int32_t* out;                     // generated tokens (the end token excluded), up to max_tokens
     int nout, cached, slot;
+    int rs_next, rs_end, restored;    // cold-cache blocks still to restore [rs_next, rs_end); tokens restored
+    uint8_t (*h)[32];                 // the prompt's block hashes (cold cache)
     bool prefilled, done, eos, failed, cancel, released;
     double t_admit, t_prefill;
     pthread_cond_t cv;                // signalled with new tokens, at the end and on release
@@ -479,14 +490,22 @@ typedef struct Job {
 } Job;
 typedef struct {
     Job* job;                         // NULL: idle
+    bool saving;                      // the writer is saving its cache to disk (not idle)
     int32_t* hist;                    // the tokens the slot's cache holds (as far as the server knows)
     int len, cap;
     uint64_t used;                    // last admission: ties go to the least recently used slot
 } Slot;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // queue, slots, jobs
-static pthread_cond_t g_wake = PTHREAD_COND_INITIALIZER;     // the scheduler: a job queued or cancelled
+static pthread_cond_t g_wake = PTHREAD_COND_INITIALIZER;     // the scheduler: a job queued or cancelled, a slot saved
 static Job* g_queue;
 static Slot* g_slots;
+typedef struct Save {   // a slot's blocks [b0, nb) for the writer (the tokens of blocks [0, nb))
+    int slot, b0, nb;
+    int32_t* ids;
+    struct Save* next;
+} Save;
+static Save* g_saves;
+static pthread_cond_t g_saves_cv = PTHREAD_COND_INITIALIZER;
 
 static void slot_set(Slot* s, const int32_t* t, int n) {
     if (n > s->cap) { s->cap = n + 1024; s->hist = (int32_t*) realloc(s->hist, sizeof(int32_t) * (size_t) s->cap); }
@@ -502,17 +521,63 @@ static int pick_slot(const int32_t* ids, int n) {
     int best = -1, bl = -1;
     for (int i = 0; i < g_max_seqs; ++i) {
         const Slot* s = &g_slots[i];
-        if (s->job) continue;
+        if (s->job || s->saving) continue;
         int c = 0;
         while (c < s->len && c < n && s->hist[c] == ids[c]) ++c;
         if (c > bl || (c == bl && s->used < g_slots[best].used)) { best = i; bl = c; }
     }
     return best;
 }
-static void release(Job* j) {   // under g_lock: the scheduler is done with j
-    if (j->slot >= 0) g_slots[j->slot].job = NULL;
+static void release(Job* j) {   // under g_lock: the scheduler is done with j; a long enough cache goes to the writer
+    if (j->slot >= 0) {
+        Slot* s = &g_slots[j->slot];
+        s->job = NULL;
+        const int cached = j->prefilled && !j->failed ? s->len - 1 : 0, nb = cached / KVD_BLOCK;   // the last token: pending
+        if (g_kvd && cached >= g_kv_min && nb > 0) {
+            Save* v = (Save*) calloc(1, sizeof *v);
+            v->slot = j->slot;
+            v->nb = nb;
+            v->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) nb * KVD_BLOCK);
+            memcpy(v->ids, s->hist, sizeof(int32_t) * (size_t) nb * KVD_BLOCK);
+            s->saving = true;
+            Save** q = &g_saves;
+            while (*q) q = &(*q)->next;
+            *q = v;
+            pthread_cond_signal(&g_saves_cv);
+        }
+    }
     j->released = true;
     pthread_cond_broadcast(&j->cv);
+}
+
+// The writer: saves slots' blocks not yet on disk, then frees the slot.
+static void* writer(void* arg) {
+    (void) arg;
+    const int64_t bb = eng_kv_bytes(g_eng) * KVD_BLOCK;
+    void* buf = malloc((size_t) bb);
+    for (;;) {
+        pthread_mutex_lock(&g_lock);
+        while (!g_saves) pthread_cond_wait(&g_saves_cv, &g_lock);
+        Save* v = g_saves;
+        g_saves = v->next;
+        pthread_mutex_unlock(&g_lock);
+        uint8_t (*h)[32] = (uint8_t (*)[32]) malloc(32 * (size_t) v->nb);
+        kvd_hashes(g_kvd, v->ids, v->nb, h);
+        int saved = 0;
+        for (int b = kvd_count(g_kvd, h, v->nb); b < v->nb; ++b, ++saved)
+            if (eng_kv_read(g_eng, v->slot, b * KVD_BLOCK, (b + 1) * KVD_BLOCK, buf) || kvd_store(g_kvd, h[b], v->ids + (size_t) b * KVD_BLOCK, buf)) break;
+        if (g_verbose && saved)
+            fprintf(stderr, "nslm-serve: cold cache: saved %d blocks of slot %d (%d tokens); %.2f GB on disk\n", saved, v->slot,
+                    v->nb * KVD_BLOCK, kvd_used(g_kvd) / 1e9);
+        free(h);
+        pthread_mutex_lock(&g_lock);
+        g_slots[v->slot].saving = false;
+        pthread_cond_signal(&g_wake);
+        pthread_mutex_unlock(&g_lock);
+        free(v->ids);
+        free(v);
+    }
+    return NULL;
 }
 static int sample_job(Job* j, const float* l, int V) {
     if (j->temperature > 0) return sample_row(l, V, j->temperature, j->top_p, j->top_k, j->min_p, &j->rng);
@@ -528,6 +593,7 @@ static void* scheduler(void* arg) {
     int* seqs = (int*) malloc(sizeof(int) * (size_t) g_max_seqs);
     int32_t* tok = (int32_t*) malloc(sizeof(int32_t) * (size_t) g_max_seqs);
     Job** dec = (Job**) malloc(sizeof(Job*) * (size_t) g_max_seqs);
+    void* blk = g_kvd ? malloc((size_t) (eng_kv_bytes(g_eng) * KVD_BLOCK)) : NULL;
     uint64_t tick = 0;
     for (;;) {
         pthread_mutex_lock(&g_lock);
@@ -550,7 +616,14 @@ static void* scheduler(void* arg) {
             s->used = ++tick;
             j->t_admit = now_s();
             slot_set(s, j->ids, j->n);
-            if (eng_prefill_begin(g_eng, si, j->ids, j->n, &j->cached)) { s->len = 0; j->failed = j->done = true; pthread_cond_broadcast(&j->cv); }
+            if (eng_prefill_begin(g_eng, si, j->ids, j->n, &j->cached)) { s->len = 0; j->failed = j->done = true; pthread_cond_broadcast(&j->cv); continue; }
+            const int nb = (j->n - 1) / KVD_BLOCK;   // the prompt's blocks before its last token
+            if (g_kvd && nb > j->cached / KVD_BLOCK) {
+                j->h = (uint8_t (*)[32]) malloc(32 * (size_t) nb);
+                kvd_hashes(g_kvd, j->ids, nb, j->h);
+                const int have = kvd_count(g_kvd, j->h, nb);
+                if (have * KVD_BLOCK > j->cached) { j->rs_next = j->cached / KVD_BLOCK; j->rs_end = have; }
+            }
         }
         // this step: one prompt chunk of the earliest admitted slot still prefilling, one decode step of the others
         Job* pj = NULL;
@@ -567,7 +640,19 @@ static void* scheduler(void* arg) {
             continue;
         }
         pthread_mutex_unlock(&g_lock);
-        if (pj) {
+        if (pj && pj->rs_next < pj->rs_end) {   // cold-cache blocks first, then the prompt's rest
+            int b = pj->rs_next, ok = 1;
+            for (int k = 0; k < RESTORE_BLOCKS && b < pj->rs_end && ok; ++k, ++b)
+                ok = !kvd_load(g_kvd, pj->h[b], pj->ids + (size_t) b * KVD_BLOCK, blk) &&
+                     !eng_kv_write(g_eng, pj->slot, pj->ids, b * KVD_BLOCK, (b + 1) * KVD_BLOCK, blk);
+            pj->rs_next = ok ? b : pj->rs_end;   // a block that fails to load ends the restore there
+            if (pj->rs_next == pj->rs_end) {
+                const int before = pj->cached;
+                int c = 0;
+                if (eng_prefill_begin(g_eng, pj->slot, pj->ids, pj->n, &c)) { pthread_mutex_lock(&g_lock); pj->failed = pj->done = true; pthread_cond_broadcast(&pj->cv); pthread_mutex_unlock(&g_lock); }
+                else { pj->cached = c; pj->restored = c > before ? c - before : 0; }
+            }
+        } else if (pj) {
             const int left = eng_prefill_next(g_eng, pj->slot, PREFILL_CHUNK);
             pthread_mutex_lock(&g_lock);
             if (left < 0) { g_slots[pj->slot].len = 0; pj->failed = pj->done = true; pthread_cond_broadcast(&pj->cv); }
@@ -671,7 +756,9 @@ static bool run_generation(Conn* c, Gen* g, const int32_t* ids, int n) {
     g->prefill_s = j.prefilled ? j.t_prefill - j.t_admit : 0;
     g->decode_s = j.prefilled ? t1 - j.t_prefill : 0;
     g->completion_tokens = seen;
+    g->restored_tokens = j.restored;
     pthread_cond_destroy(&j.cv);
+    free(j.h);
     free(j.out);
     free(raw);
     return ok;
@@ -839,8 +926,8 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     if (g_verbose) {
         char ncalls[32] = "";
         if (calls) snprintf(ncalls, sizeof ncalls, " (%d calls)", calls->n);
-        fprintf(stderr, "nslm-serve: prompt %5d tok (%5d cached) %7.1f ms | gen %5d tok %7.2f s = %5.1f tok/s | ttft %6.1f ms | %s%s\n",
-                g.prompt_tokens, g.cached_tokens, g.prefill_s * 1e3, g.completion_tokens, g.decode_s,
+        fprintf(stderr, "nslm-serve: prompt %5d tok (%5d cached, %5d from disk) %7.1f ms | gen %5d tok %7.2f s = %5.1f tok/s | ttft %6.1f ms | %s%s\n",
+                g.prompt_tokens, g.cached_tokens, g.restored_tokens, g.prefill_s * 1e3, g.completion_tokens, g.decode_s,
                 g.decode_s > 0 ? g.completion_tokens / g.decode_s : 0.0, g.ttft_s * 1e3, ok ? g.finish : "ENGINE ERROR", ncalls);
     }
     if (!ok) {
@@ -1011,7 +1098,8 @@ int main(int argc, char** argv) {
     if (opt_flag(argc, argv, "--quiet")) g_verbose = 0;
     if (!model || g_ctx < 64) {
         fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
-                        "[--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]\n       nslm-serve --render REQUEST.json\n");
+                        "[--ctx 65536] [--max-seqs N] [--kv bf16|q8] [--model-id ID] [--quiet]\n"
+                        "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048]\n       nslm-serve --render REQUEST.json\n");
         return 2;
     }
     char base[256];
@@ -1060,6 +1148,26 @@ int main(int argc, char** argv) {
         for (int k = 0; k < g_max_seqs; ++k) eng_free(g_eng, k);
     }
     g_slots = (Slot*) calloc((size_t) g_max_seqs, sizeof(Slot));
+    const double kv_gb = atof(opt(argc, argv, "--kv-disk-gb", "32"));
+    g_kv_min = atoi(opt(argc, argv, "--kv-disk-min", "2048"));
+    if (kv_gb > 0) {
+        char kdir[1100], kerr[256] = "";
+        const char* la = getenv("LOCALAPPDATA");   // Windows
+        if (la) snprintf(kdir, sizeof kdir, "%s/nslm/kv", la);
+        else snprintf(kdir, sizeof kdir, "%s/.cache/nslm/kv", getenv("HOME") ? getenv("HOME") : ".");
+        snprintf(kdir, sizeof kdir, "%s", opt(argc, argv, "--kv-disk", kdir));
+        uint8_t fp[32];
+        if (kvd_fingerprint(model, eng_describe(g_eng), eng_kv_bytes(g_eng), fp))
+            fprintf(stderr, "nslm-serve: cold cache off (cannot fingerprint the model folder)\n");
+        else if (!(g_kvd = kvd_open(kdir, (uint64_t) (kv_gb * 1e9), fp, (uint64_t) eng_kv_bytes(g_eng) * KVD_BLOCK, kerr, sizeof kerr)))
+            fprintf(stderr, "nslm-serve: cold cache off: %s\n", kerr);
+        else {
+            fprintf(stderr, "nslm-serve: cold cache %s: %.2f of %.0f GB used, sequences of %d+ tokens, %.1f MB per %d-token block\n",
+                    kdir, kvd_used(g_kvd) / 1e9, kv_gb, g_kv_min, eng_kv_bytes(g_eng) * KVD_BLOCK / 1e6, KVD_BLOCK);
+            pthread_t wr;
+            if (pthread_create(&wr, NULL, writer, NULL)) { fprintf(stderr, "nslm-serve: cannot start the cold-cache writer\n"); return 1; }
+        }
+    }
     pthread_t sched;
     if (pthread_create(&sched, NULL, scheduler, NULL)) { fprintf(stderr, "nslm-serve: cannot start the scheduler\n"); return 1; }
 #ifdef _WIN32

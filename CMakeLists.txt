@@ -88,7 +88,7 @@ target_link_libraries(nslm_engine PUBLIC nslm CUDA::cudart_static)
 set_target_properties(nslm_engine PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 # ---- the tools ------------------------------------------------------------------------------------------------------
-add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c
+add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c harness/kv_disk.c
             $<IF:$<BOOL:${APPLE}>,harness/telemetry.m,harness/telemetry_nvml.c>)
 target_include_directories(nslm_harness PUBLIC harness)
 if(WIN32)
@@ -142,6 +142,9 @@ set_tests_properties(test_tokenizer PROPERTIES SKIP_RETURN_CODE 77)
 if(NSLM_MODEL_DIR)
   set_tests_properties(test_tokenizer PROPERTIES ENVIRONMENT "MOVA_DIR=${NSLM_MODEL_DIR}")
 endif()
+add_executable(test_kv_disk tests/test_kv_disk.c)
+target_link_libraries(test_kv_disk nslm_harness)
+add_test(NAME test_kv_disk COMMAND test_kv_disk WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_serve_splitter tests/test_serve_splitter.c)
 target_link_libraries(test_serve_splitter nslm_engine nslm_harness)
 add_test(NAME test_serve_splitter COMMAND test_serve_splitter WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

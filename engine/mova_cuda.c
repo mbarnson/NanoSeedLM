@@ -1306,6 +1306,50 @@ int eng_fork(Eng* e, int dst, int src) { (void) e; return dst == src ? 0 : -1; }
 void eng_free(Eng* e, int seq) { Seq* s = seq_of(e, seq); if (s) s->len = s->done = 0; }
 int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len : 0; }
 
+// A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (Q8) their scales; positions
+// below kv_nv are in VRAM, the rest in mapped host memory.
+static int kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
+    const int64_t r0 = seq * e->slot_cap + p0, r1 = r0 + (p1 - p0), nv = e->kv_nv;
+    const uint64_t nh = (uint64_t) (e->kv_cap - nv), sr = e->kv_srow;
+    for (int l = 0; l < e->c.n_layer; ++l) {
+        uint8_t* va[4] = {e->kv_vk ? e->kv_vk + (uint64_t) nv * e->kv_row * l : NULL, e->kv_vv ? e->kv_vv + (uint64_t) nv * e->kv_voff[l] : NULL,
+                          sr && e->kv_vks ? (uint8_t*) e->kv_vks + (uint64_t) nv * sr * l : NULL, sr && e->kv_vvs ? (uint8_t*) e->kv_vvs + (uint64_t) nv * sr * l : NULL};
+        uint8_t* ha[4] = {e->kv_hk ? e->kv_hk + nh * e->kv_row * l : NULL, e->kv_hv ? e->kv_hv + nh * e->kv_voff[l] : NULL,
+                          sr && e->kv_hks ? (uint8_t*) e->kv_hks + nh * sr * l : NULL, sr && e->kv_hvs ? (uint8_t*) e->kv_hvs + nh * sr * l : NULL};
+        const uint64_t rb[4] = {e->kv_row, e->kv_vrow[l], sr, sr};
+        for (int i = 0; i < 4; ++i) {
+            if (!rb[i]) continue;
+            const int64_t m = r1 < nv ? r1 : nv, a = r0 > nv ? r0 : nv;   // VRAM rows [r0, m), host rows [a, r1)
+            if (r0 < m) {
+                uint8_t* d = va[i] + (uint64_t) r0 * rb[i];
+                if (!CK(cudaMemcpy(out ? h : d, out ? d : h, (uint64_t) (m - r0) * rb[i], cudaMemcpyDefault))) return -1;
+                h += (uint64_t) (m - r0) * rb[i];
+            }
+            if (a < r1) {
+                uint8_t* d = ha[i] + (uint64_t) (a - nv) * rb[i];
+                if (!CK(cudaMemcpy(out ? h : d, out ? d : h, (uint64_t) (r1 - a) * rb[i], cudaMemcpyDefault))) return -1;
+                h += (uint64_t) (r1 - a) * rb[i];
+            }
+        }
+    }
+    return 0;
+}
+int64_t eng_kv_bytes(Eng* e) { return (int64_t) ((e->kv_row + 2 * e->kv_srow) * (uint64_t) e->c.n_layer + e->kv_vsum); }
+int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst) {
+    const Seq* s = seq_of(e, seq);
+    if (!s || p0 < 0 || p1 < p0 || p1 > s->done) return -1;
+    return kv_copy(e, seq, p0, p1, (uint8_t*) dst, 1);
+}
+int eng_kv_write(Eng* e, int seq, const int32_t* ids, int p0, int p1, const void* src) {
+    Seq* s = seq_of(e, seq);
+    if (!s || p0 < 0 || p0 > s->done || p1 < p0 || p1 > e->slot_cap) return -1;
+    if (kv_copy(e, seq, p0, p1, (uint8_t*) src, 0)) return -1;
+    s->len = 0;
+    for (int i = 0; i < p1; ++i) hist_push(s, ids[i]);
+    s->done = p1;
+    return 0;
+}
+
 int eng_step(Eng* e, int seq, float* logits) { return eng_step_batch(e, &seq, 1, logits); }
 int eng_push(Eng* e, int seq, int32_t tok) {
     Seq* s = seq_of(e, seq);

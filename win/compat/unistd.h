@@ -38,6 +38,7 @@ int nslm_mkdir(const char* path, int mode);
 #define access _access
 #define isatty _isatty
 #define fileno _fileno
+#define fsync _commit
 #define sysconf nslm_sysconf
 #define _SC_NPROCESSORS_ONLN 84
 #define _SC_CLK_TCK 2

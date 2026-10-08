@@ -7,7 +7,9 @@ Checks, with streaming chat requests of mixed sampling parameters (greedy, tempe
   - each request alone, then all of them at once: every request's text is the same both times (a request's tokens do
     not depend on what else runs), and the concurrent streams overlap in time;
   - max_tokens ends a request with finish_reason "length" after exactly that many tokens;
-  - a client that disconnects mid-stream frees its slot: afterwards --n requests at once still all complete.
+  - a client that disconnects mid-stream frees its slot: afterwards --n requests at once still all complete;
+  - --cold (a server with the cold cache on): a long greedy request, then --n others that take every slot, then the long
+    one again: its prompt comes back from disk (>= 2048 cached tokens) and its text is the same.
 Exit status 0 when every check passes.
 """
 import argparse
@@ -96,6 +98,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--n", type=int, default=6, help="concurrent requests (<= the server's --max-seqs to overlap fully)")
+    ap.add_argument("--cold", action="store_true", help="check the cold (disk) KV cache; --n >= the server's --max-seqs")
     a = ap.parse_args()
     fails = 0
 
@@ -133,6 +136,21 @@ def main():
     outs = run_all(a.url, [request(i, max_tokens=24) for i in range(a.n)])
     check(all(x["done"] for x in outs) and max(x["times"][0] for x in outs) < min(x["times"][-1] for x in outs),
           f"after a client disconnect: {a.n} requests at once all complete, overlapping (its slot was freed)")
+    if a.cold:
+        text = " ".join(f"Item {k}: the {['red', 'green', 'blue', 'amber'][k % 4]} lantern number {k * 7 % 101} hangs by door {k}."
+                        for k in range(240))
+        long = {"messages": [{"role": "user", "content": text + "\nWhich door holds lantern number 42?"}], "max_tokens": 24,
+                "temperature": 0, "reasoning_effort": "low", "stream": True, "stream_options": {"include_usage": True}}
+        x = {}
+        stream(a.url, long, x)
+        time.sleep(3.0)   # the writer saves it
+        run_all(a.url, [request(i + 3, max_tokens=8) for i in range(a.n)])   # every slot reused
+        y = {}
+        stream(a.url, long, y)
+        cached = y["usage"]["prompt_tokens_details"]["cached_tokens"] if y.get("usage") else -1
+        check(x["usage"]["prompt_tokens"] >= 2048 and cached >= 2048,
+              f"cold cache: {cached} of {x['usage']['prompt_tokens']} prompt tokens restored after every slot was reused")
+        check((x["reasoning"], x["text"]) == (y["reasoning"], y["text"]), "cold cache: the same text as computed")
     print("serve_concurrency_test:", "FAIL" if fails else "PASS")
     return 1 if fails else 0
 

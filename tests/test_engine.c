@@ -290,6 +290,27 @@ static void test_batch(const char* dir, const char* what) {
     CHECK(am_same == rows - flips, "%s batch: argmax differs in %d rows", what, rows - flips - am_same);
     CHECK(!exact_engine || exact == rows, "%s batch: %d of %d rows differ from decoding alone", what, rows - exact, rows);
     CHECK(eng_prefill(eb, NB + 1, ids[0], 4) != 0 && eng_prefill(eb, 1, ids[0], CAP + 1) != 0, "%s batch: slot bounds", what);
+    {   // a slot's cache copied out (eng_kv_read) and into another slot (eng_kv_write): that slot then reuses it and
+        // decodes as the original sequence did alone
+        const int i = 5, P = 128, src = seqs[i];
+        void* kv = malloc((size_t) eng_kv_bytes(eb) * P);
+        int reused = -1, left;
+        void* hi = (char*) kv + (size_t) eng_kv_bytes(eb) * (P / 2);   // positions [P / 2, P) (the layout is per layer)
+        CHECK(eng_kv_bytes(eb) > 0 && eng_kv_read(eb, src, 0, P / 2, kv) == 0 && eng_kv_read(eb, src, P / 2, P, hi) == 0,
+              "%s batch: eng_kv_read", what);
+        CHECK(eng_kv_read(eb, src, 0, CAP, kv) != 0, "%s batch: eng_kv_read past the cache", what);
+        CHECK(eng_kv_write(eb, 0, ids[i], 0, P / 2, kv) == 0 && eng_len(eb, 0) == P / 2, "%s batch: eng_kv_write", what);
+        CHECK(eng_kv_write(eb, 0, ids[i], P / 2 + 1, P, hi) != 0, "%s batch: eng_kv_write past the cache", what);
+        CHECK(eng_kv_write(eb, 0, ids[i], P / 2, P, hi) == 0, "%s batch: eng_kv_write", what);
+        CHECK(eng_prefill_begin(eb, 0, ids[i], len[i], &reused) == 0 && reused == P, "%s batch: reuse of a written cache (%d)", what, reused);
+        while ((left = eng_prefill_next(eb, 0, CH)) > 0) {}
+        CHECK(left == 0 && eng_step(eb, 0, lb) == 0, "%s batch: step after eng_kv_write", what);
+        const double re = row_err(lb, ref + (size_t) i * STEPS * V, V);
+        const int same = !memcmp(lb, ref + (size_t) i * STEPS * V, sizeof(float) * (size_t) V);
+        printf("%s cache copied between slots: %s (logit error %.2e)\n", what, same ? "bit-equal" : "differs", re);
+        CHECK(exact_engine ? same : re < 2e-2, "%s batch: a copied cache decodes differently (error %.3e)", what, re);
+        free(kv);
+    }
     eng_close(e1);
     eng_close(eb);
     free(ref);

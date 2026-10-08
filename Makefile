@@ -23,7 +23,7 @@ PY        ?= python3
 NSLM_LIB  := $(wildcard nslm/lib_*.c)
 NSLM_HDRS := $(wildcard nslm/*.h)
 ENGINE    := engine/mova_gpu.m nslm/lib_model_st.c nslm/lib_json.c nslm/lib_mova_cfg.c nslm/lib_mova_ckpt.c nslm/lib_moe.c nslm/lib_format.c nslm/lib_sha256.c
-HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c
+HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harness/tool_calls.c harness/kv_disk.c
 HARN_HDRS := $(wildcard harness/*.h)
 ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h
 
@@ -98,7 +98,7 @@ $(BIN)/nslm-bits-probe: nslm/bits_probe.c $(LIB_O) $(NSLM_HDRS)
 $(BIN)/test_%: tests/test_%.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(LIB_O) -o $@ -lm -lpthread
-$(BIN)/test_chat_template $(BIN)/test_tool_calls $(BIN)/test_tokenizer: $(BIN)/test_%: tests/test_%.c $(HARN_O) $(LIB_O) tests/data/template_golden.json
+$(BIN)/test_chat_template $(BIN)/test_tool_calls $(BIN)/test_tokenizer $(BIN)/test_kv_disk: $(BIN)/test_%: tests/test_%.c $(HARN_O) $(LIB_O) tests/data/template_golden.json
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(HARN_O) $(LIB_O) $(HLIBS) -o $@ -lm
 $(BIN)/test_engine: tests/test_engine.c $(ENG_O) $(LIB_O) $(ENG_HDRS) $(RES)/kernels_moe.metallib
