@@ -3,3 +3,5 @@ out/
 *.metallib
 __pycache__/
 .DS_Store
+build/
+out/

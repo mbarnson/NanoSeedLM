@@ -7,8 +7,10 @@
 
 #define MAGIC 12582912.0f   // 1.5 * 2^23: (x + MAGIC) - MAGIC rounds to nearest even for |x| < 2^22
 
+#ifdef __clang__
 typedef float f4 __attribute__((ext_vector_type(4)));
 typedef int32_t i4 __attribute__((ext_vector_type(4)));
+#endif
 
 static int seedtab_one(SeedTab* t, int s, const float* sh) {
     memset(t, 0, sizeof *t);
@@ -157,6 +159,7 @@ void nslm_search_ref(const SeedTab* tab, const float* w, int nb, int bias, const
     }
 }
 
+#ifdef __clang__
 // ---- Clang vectors: 4 blocks per lane group, NG groups per tile kept in L1, the seed loop outside ------------------
 
 #define NG 8   // groups per tile (32 blocks)
@@ -231,6 +234,12 @@ void nslm_search_vec(const SeedTab* tab, const float* w, int nb, int bias, const
             }
     }
 }
+#else   // no Clang vectors (MSVC): the scalar reference, which the vector version must equal bit for bit
+void nslm_search_vec(const SeedTab* tab, const float* w, int nb, int bias, const SearchOpts* o, uint16_t* seed,
+                     uint16_t* nib, float* err, const float* sh) {
+    nslm_search_ref(tab, w, nb, bias, o, seed, nib, err, sh);
+}
+#endif
 
 float nslm_candidate_err(const SeedTab* T, const float* x, float wn, int e) {
     float b0 = 0, b1 = 0, b2 = 0;
