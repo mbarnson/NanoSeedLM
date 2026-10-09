@@ -85,7 +85,7 @@ What each platform runs, from a clean build:
 |---|---|---|
 | `macos` | mac-metal | `make test` (with the model folder set, so model tests do not skip) |
 | `windows` | pc-cuda | `win\build.bat test` (or `cmake --build build && ctest --test-dir build`) |
-| `linux` | pc-cuda (WSL Ubuntu) | `cmake -B build-linux -G Ninja && cmake --build build-linux && ctest --test-dir build-linux` |
+| `linux` | either (HF Jobs) | `sh bin/hf-linux-ci.sh REV` (see "Platforms") |
 
 Report it:
 
@@ -129,5 +129,6 @@ sh bin/agents-watch.sh --follow          # poll forever, printing each change
 
 ## Platforms
 
-- Linux runs on the PC through WSL Ubuntu (`wsl -d Ubuntu`). It has not been checked yet that it has a toolchain and
-  CUDA. Until pc-cuda posts its first `linux` result, Linux counts as not covered, and pc-cuda says so in its results.
+- **Linux** runs on Hugging Face Jobs: `sh bin/hf-linux-ci.sh REV` builds the commit with CUDA 12.8 on Ubuntu 24.04 and
+  runs ctest on an RTX PRO 6000. It takes about 2 minutes and costs about $0.10. Either agent can run it (Matt's `hf` login).
+  Ubuntu needs `libicu-dev` for the tokenizer. WSL Ubuntu on the PC has no CUDA toolkit and is not used.
