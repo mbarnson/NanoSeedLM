@@ -997,6 +997,19 @@ kernel void k_attn_reduce(constant AttnArgs& a [[buffer(0)]], device const float
 // Per-head maps (q_rope_mix, q_lat, v_up): simdgroup = (output row o, head h, token t); lanes stride the input; f32 sums.
 // y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] . x) * bf16(softplus_ln2(g[t][h][o]))).
 // Grid (O * 32, H, T), threadgroups of 256.
+// A stacked [H][O][I] SEED4P4 per-head map decoded to BF16 (search4.h's decoded weights: bf16(R32 2^e isum)), a block
+// of 8 per thread: the expanded prompt path's GEMM operands, decoded once per forward instead of once per key tile.
+kernel void k_heads_deq(device const uchar* W [[buffer(0)]], device const ushort* S [[buffer(1)]], device const ushort* B [[buffer(2)]],
+                        device const uint* G [[buffer(3)]], device const uchar* EN [[buffer(4)]], device ushort* out [[buffer(5)]],
+                        constant int4& a [[buffer(6)]], uint b [[thread_position_in_grid]]) {
+    const int O = a.x, I = a.y, nbk = I / 8;
+    if ((int) b >= a.z * O * nbk) return;
+    const ulong row = b / (uint) nbk;
+    const int j = (int) (b % (uint) nbk);
+    float w[8];
+    seed4p4_block(W, S, G, row, I, j, ((device const int*) B)[row / (ulong) O], EN, w);
+    for (int i = 0; i < 8; ++i) out[(ulong) b * 8 + i] = tobf(w[i]);
+}
 kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const float* x [[buffer(2)]],
                        device const float* g [[buffer(3)]], device float* y [[buffer(4)]], device const ushort* S [[buffer(5)]],
                        device const ushort* B [[buffer(6)]], device const uint* G [[buffer(7)]], device const uchar* EN [[buffer(8)]],

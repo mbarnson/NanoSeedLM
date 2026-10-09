@@ -85,6 +85,7 @@ struct Eng {
     id<MTLBuffer> perm, tiles, vperm, vtiles;   // grouped GEMM: pairs sorted by expert, tile tables (prompt chunks)
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     id<MTLBuffer> latf, kn, vn, mst, lst, ost;   // MLA prompt rows: latent rows (f32), expanded keys / values, softmax state
+    id<MTLBuffer> qlf, vuf, kaxf, kavf, krf, qmf;   // MLA prompt rows: a seed layer's tensors decoded to BF16 (k_heads_deq)
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
     int expand, expand_min;               // MLA prompt rows: the latent expanded per head (Seq.xend)
     int gpu_cores;                        // the GPU's cores (IORegistry gpu-core-count; 0: unknown)
@@ -694,6 +695,16 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             e->qlat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA absorbed queries");
             e->olat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA latent outputs");
             e->latf = scratch(e, (uint64_t) MLP_KB * rmax * 4, "MLA latent rows (f32)");
+            int packed = 0;
+            for (int l = 0; l < c->n_layer; ++l) packed |= e->L[l].ql.fmt == MF_SEED4P4 || e->L[l].ka_x.fmt == MF_SEED4P4;
+            if (packed) {   // seed MLA tensors: decoded once per prompt forward for the GEMMs (not once per row tile)
+                e->qlf = scratch(e, (uint64_t) c->n_head * rmax * 128 * 2, "MLA q_lat (BF16)");
+                e->vuf = scratch(e, (uint64_t) c->n_head * rmax * 128 * 2, "MLA v_up (BF16)");
+                e->kaxf = scratch(e, (uint64_t) rmax * c->d * 2, "MLA kv_a_x (BF16)");
+                e->kavf = scratch(e, (uint64_t) rmax * c->n_kv * c->head_dim * 2, "MLA kv_a_v (BF16)");
+                e->krf = scratch(e, (uint64_t) c->mla_rope * c->d * 2, "MLA k_rope_proj (BF16)");
+                e->qmf = scratch(e, (uint64_t) c->n_head * c->mla_rope * c->head_dim * 2, "MLA q_rope_mix (BF16)");
+            }
             e->kn = scratch(e, (uint64_t) (MLP_KB + MLPF_BK) * qd * 4, "MLA expanded keys");   // + a tile: finite
             e->vn = scratch(e, (uint64_t) (MLP_KB + MLPF_BK) * qd * 4, "MLA expanded values");
             memset(e->kn.contents, 0, e->kn.length);
@@ -959,7 +970,8 @@ static void enc_heads_gemm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs,
     // one head's streams: BF16 values; Q8 / Q4 codes with a BF16 scale and bias per 64; SEED4P4 seeds, coefficients
     // (2 bytes a block of 8), an int32 exponent bias, exponent codes (a nibble a block)
     const uint64_t n = (uint64_t) O * I, sd = W->fmt == MF_SEED4P4;
-    const uint64_t cb = W->fmt == MF_BF16 ? 2 * n : W->fmt == MF_Q8 ? n : sd ? n / 4 : n / 2, sb = sd ? n / 4 : n / 64 * 2;
+    const uint64_t cb = W->fmt == MF_BF16 ? 2 * n : W->fmt == MF_Q8 ? n : sd ? n / 4 : n / 2;
+    const uint64_t sb = sd ? n / 4 : n / 64 * 2;
     const uint64_t bb = sd ? 4 : sb;
     cpipe(c, pipe_(e, "k_mm", W->fmt, tr ? 2 : 1));
     cbytes(c, 0, &a, sizeof a);
@@ -985,10 +997,33 @@ static void enc_heads_mm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
 // MLA attention of prompt rows (consecutive positions of one slot) with the latent expanded per head: per pass of
 // MLP_KB cached keys, the latent rows to f32, the heads' keys (q_lat^T c) and values (v_up c) as GEMMs, then
 // k_mla_prefill (the online softmax carried across passes; the last writes the gated output into ao).
+// A SEED4P4 per-head map decoded to BF16 into Y (k_heads_deq): a BF16 MW over Y, for the expansion GEMMs (Q8 / Q4 decode
+// faster inside the GEMM than they load as BF16)
+static MW heads_bf16(Eng* e, Cmd* c, const MW* W, id<MTLBuffer> Y) {
+    const int32_t a[4] = {W->rows, W->cols, W->slices, 0};
+    const uint32_t nb = (uint32_t) W->slices * (uint32_t) W->rows * (uint32_t) W->cols / 8;
+    cpipe(c, pipe_(e, "k_heads_deq", 0, 0));
+    cbuf(c, 0, W->b[0], W->o[0]);
+    cbuf(c, 1, W->b[1] ? W->b[1] : W->b[0], W->o[1]);
+    cbuf(c, 2, W->b[2] ? W->b[2] : W->b[0], W->o[2]);
+    cbuf(c, 3, stab_for(e, W), 0);
+    bind_nibbles(c, W, 4);
+    cbuf(c, 5, Y, 0);
+    cbytes(c, 6, a, sizeof a);
+    [c->enc dispatchThreads:MTLSizeMake(nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    MW f = *W;
+    f.fmt = MF_BF16;
+    f.b[0] = Y; f.o[0] = 0;
+    f.b[1] = f.b[2] = f.b[3] = nil; f.o[1] = f.o[2] = f.o[3] = 0;
+    return f;
+}
 static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
     const MovaCfg* g = &e->c;
     Layer* L = &e->L[l];
     const int r = L->mla_r, H = g->n_head;
+    MW ql = L->ql, vu = L->vu;   // seed maps: decoded once here, not per key tile
+    if (ql.fmt == MF_SEED4P4) { cmd_group(c, MOVA_TG_ATTN_PROJ); ql = heads_bf16(e, c, &L->ql, e->qlf); }
+    if (vu.fmt == MF_SEED4P4) { cmd_group(c, MOVA_TG_ATTN_PROJ); vu = heads_bf16(e, c, &L->vu, e->vuf); }
     const RowInfo* ri = (const RowInfo*) e->ri.contents;
     const int nk = ri[T - 1].pos + 1;
     const uint64_t kv0 = (uint64_t) ri[0].kv0;
@@ -1003,8 +1038,8 @@ static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
         cbytes(c, 2, &n, 4);
         if (e->kv_fmt >= ENG_KV_FP8) { cbuf(c, 3, e->Vs[l], (kv0 + (uint64_t) kb0) * kv_srow(e, r)); cbytes(c, 4, &len, 4); }
         [c->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        enc_heads_gemm(c, &L->ql, e->latf, r, 0, nil, e->kn, kb1 - kb0, 1);
-        enc_heads_mm(c, &L->vu, e->latf, r, 0, nil, e->vn, kb1 - kb0);
+        enc_heads_gemm(c, &ql, e->latf, r, 0, nil, e->kn, kb1 - kb0, 1);
+        enc_heads_mm(c, &vu, e->latf, r, 0, nil, e->vn, kb1 - kb0);
         cmd_group(c, MOVA_TG_ATTN);
         const MlpArgs a = {H, kb0, kb1, kb0 == 0, kb1 == nk, 1.0f / sqrtf((float) g->head_dim), T, 0};
         cpipe(c, pipe_(e, "k_mla_prefill", e->kv_fmt, 0));
@@ -1048,12 +1083,17 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
         if (L->sparse) enc_cap(e, c, e->v, kvd, kvd, T, cb + (uint64_t) d);
         enc_cap(e, c, e->q, qd, qd, T, cb + (uint64_t) (d + kvd));
     }
-    enc_dense(c, &L->ka_x, e->xn, d, e->lat, r, T, false);
-    if (L->sparse) enc_dense(c, &L->ka_v, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
-    enc_dense(c, &L->kr, e->xn, d, e->k, g->mla_rope, T, false);
     const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns, xp = big && e->expand;
+    MW kax = L->ka_x, kav = L->ka_v, kr = L->kr, qm = L->qm;   // prompt rows: seed tensors decoded once (heads_bf16)
+    if (big && kax.fmt == MF_SEED4P4) kax = heads_bf16(e, c, &L->ka_x, e->kaxf);
+    if (big && L->sparse && kav.fmt == MF_SEED4P4) kav = heads_bf16(e, c, &L->ka_v, e->kavf);
+    if (big && kr.fmt == MF_SEED4P4) kr = heads_bf16(e, c, &L->kr, e->krf);
+    if (big && qm.fmt == MF_SEED4P4) qm = heads_bf16(e, c, &L->qm, e->qmf);
+    enc_dense(c, &kax, e->xn, d, e->lat, r, T, false);
+    if (L->sparse) enc_dense(c, &kav, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
+    enc_dense(c, &kr, e->xn, d, e->k, g->mla_rope, T, false);
     void (*heads)(Cmd*, const MW*, id<MTLBuffer>, int, int, id<MTLBuffer>, id<MTLBuffer>, int) = big ? enc_heads_mm : enc_heads_mv;
-    heads(c, &L->qm, e->q, qd, g->head_dim, nil, e->qrp, T);   // prompt rows: GEMMs
+    heads(c, &qm, e->q, qd, g->head_dim, nil, e->qrp, T);   // prompt rows: GEMMs
     if (!xp) heads(c, &L->ql, e->q, qd, g->head_dim, nil, e->qlat, T);   // expanded: the keys instead
     cmd_group(c, MOVA_TG_ATTN);
     const MlaArgs ma = {H, r, 128, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
