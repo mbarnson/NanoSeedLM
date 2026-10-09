@@ -231,10 +231,25 @@ holmes.txt --decode 256`; the one-pass kernel is the earlier `k_mla_attn` with p
 The KV cache places MLA's per-layer latent widths in VRAM and host memory as it does GQA's rows. Decode is still
 slower than GQA's mostly because it streams the MLA projections (945 MB per token at rank 768 in BF16).
 
-`nslm-mova-pack --mla q8` (or `q4`) packs the MLA projections and per-head maps as affine Q8 / Q4 instead of BF16
-(Metal; the CUDA engine refuses such per-head maps until it has them). J768 with p4mx-q4v seeds, held-out KLD over 31
-windows: BF16 projections 0.2199 (23.56 GB), Q8 0.2206 (23.12 GB), Q4 0.2471 (22.88 GB); Q8 with the `fp4` cache
-0.2246. Prefill and decode speed are unchanged with Q8.
+`nslm-mova-pack --mla q8` (or `q4`) packs the MLA projections and per-head maps as affine Q8 / Q4 instead of BF16.
+`--mla p4` packs them as P = 4 seeds (4.5 bits a weight, as Q4), searched like the experts' with activation weighting:
+`nslm-mova-mlacapture` sums each projection input's squares over the calibration text (the engine's MLA capture,
+`mova_ext.h`), `nslm-moe --scope mla --p4` searches every projection (per-head maps head by head; 536 s for all 472M
+weights on an M4 Max), and `--mla-blk4` points the packer at the blocks (`--mla-q8 NAMES` keeps some in Q8). J768 with
+p4mx-q4v seeds, held-out KLD over 31 windows:
+
+| MLA projections | Folder | KLD | top-1 agreement |
+|---|---|---|---|
+| BF16 | 23.56 GB | 0.2199 | 80.35% |
+| Q8 | 23.12 GB | 0.2206 | 80.35% |
+| P = 4 seeds | 22.88 GB | 0.2296 | 79.91% |
+| Q4 | 22.88 GB | 0.2471 | 79.00% |
+| P = 4 seeds, `v_up` in Q8 | 22.96 GB | 0.2250 | |
+
+At Q4's size, the seeds keep about two thirds of what Q4 loses. With the `fp4` cache: Q8 0.2246, seeds 0.2335. On
+Metal, prefill and decode with Q8 or seed projections run as with BF16 (prompt forwards decode a seed layer's MLA
+tensors to BF16 once instead of in every GEMM tile; decode with seeds is about 4% slower than with Q8). The CUDA engine
+runs Q8 / Q4 per-head maps and refuses seed ones for now.
 
 On Metal, long prompts (256 or more new tokens) attend with the latent expanded per head, as CUDA's prompt rows do:
 `k_mla_prefill` over `q · (q_latᵀ c) + q_rope · k_rope` with values `v_up c`, the keys expanded 512 cached positions at a
