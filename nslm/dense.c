@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "gptq.h"
 #include "linalg.h"
 #include "mova_cfg.h"
 #include "mova_ckpt.h"
@@ -83,33 +84,6 @@ static double* read_h(int l, int s, int dim) {   // H / rows, double
     return h;
 }
 
-// W[r][c1:] -= sum_k E[r][k] U[c0 + k][c1:], rows split across threads
-typedef struct { float* W; const float* E; const double* U; int cols, c0, ne, c1, r0, r1; } FbJob;
-static void* fb_worker(void* arg) {
-    FbJob* j = (FbJob*) arg;
-    for (int r = j->r0; r < j->r1; ++r) {
-        float* wr = j->W + (size_t) r * j->cols;
-        const float* er = j->E + (size_t) r * 128;
-        for (int k = 0; k < j->ne; ++k) {
-            const float ek = er[k];
-            const double* ur = j->U + (size_t) (j->c0 + k) * j->cols;
-            for (int c = j->c1; c < j->cols; ++c) wr[c] -= ek * (float) ur[c];
-        }
-    }
-    return NULL;
-}
-static void feedback(float* W, const float* E, const double* U, int R, int cols, int c0, int ne, int c1) {
-    enum { NT = 12 };
-    pthread_t th[NT];
-    FbJob jb[NT];
-    const int per = (R + NT - 1) / NT;
-    for (int i = 0; i < NT; ++i) {
-        jb[i] = (FbJob) {W, E, U, cols, c0, ne, c1, i * per < R ? i * per : R, (i + 1) * per < R ? (i + 1) * per : R};
-        pthread_create(&th[i], NULL, fb_worker, &jb[i]);
-    }
-    for (int i = 0; i < NT; ++i) pthread_join(th[i], NULL);
-}
-
 static int fwrite16(const uint32_t* c, size_t n, FILE* f) {   // P = 4: 16-bit coefficient words on disk
     uint16_t* h = malloc(2 * n);
     for (size_t k = 0; k < n; ++k) h[k] = (uint16_t) c[k];
@@ -132,6 +106,12 @@ static int gpu_search(Nslm4Gpu* g4, Nslm8Gpu* g8, const float* w, int rows, int 
 }
 static void decode_block(uint16_t s, uint32_t c, int e, uint16_t bf[8]) {
     if (g_p8) nslm8_decode_block(s, c, e, bf); else nslm4_decode_block(s, (uint16_t) c, e, bf);
+}
+typedef struct { Nslm4Gpu* g4; Nslm8Gpu* g8; } Gpus;
+static int gptq_search(void* ctx, const float* w, int rows, int cols, const float* A, int bias, uint16_t* seed, uint32_t* coef,
+                       uint8_t* ec, char* err, int errlen) {
+    const Gpus* g = (const Gpus*) ctx;
+    return gpu_search(g->g4, g->g8, w, rows, cols, NULL, A, bias, seed, coef, ec, err, errlen);
 }
 
 static int search_tensor(Nslm4Gpu* g4, Nslm8Gpu* g8, const MovaTensor* t) {
@@ -169,51 +149,11 @@ static int search_tensor(Nslm4Gpu* g4, Nslm8Gpu* g8, const MovaTensor* t) {
         double* U = malloc(sizeof(double) * (size_t) C * C);
         double used = 0;
         if (nslm_gptq_factor(h, C, g_damp, U, &used)) { fprintf(stderr, "%s: H + damp not positive definite\n", base); return -1; }
-        float* w8 = malloc(sizeof(float) * (size_t) R * 8), *E = malloc(sizeof(float) * (size_t) R * 128);
-        uint16_t* sg = malloc(2 * (size_t) R);
-        uint32_t* cg = malloc(4 * (size_t) R);
-        uint8_t* eg = malloc((size_t) R);
-        for (int bb = 0; bb < ng && !rc; bb += 16) {   // 128-column batches (lazy feedback)
-            const int b1 = bb + 16 < ng ? bb + 16 : ng, c0 = bb * 8, c1 = b1 * 8;
-            for (int b = bb; b < b1 && !rc; ++b) {
-                const int cb = b * 8;
-                double T[64];
-                float A[64];
-                nslm_upper8_inverse(U + (size_t) cb * C + cb, C, T);
-                for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) A[i * 8 + j] = (float) T[j * 8 + i];
-                for (int r = 0; r < R; ++r) memcpy(w8 + (size_t) r * 8, W + (size_t) r * C + cb, sizeof(float) * 8);
-                if ((rc = gpu_search(g4, g8, w8, R, 8, NULL, A, bias, sg, cg, eg, err, sizeof err))) break;
-                for (int r = 0; r < R; ++r) {
-                    seed[(size_t) r * ng + b] = sg[r];
-                    coef[(size_t) r * ng + b] = cg[r];
-                    ec[(size_t) r * ng + b] = eg[r];
-                    uint16_t bf[8];
-                    decode_block(sg[r], cg[r], bias + eg[r], bf);
-                    double d[8];
-                    for (int c = 0; c < 8; ++c) d[c] = (double) w8[(size_t) r * 8 + c] - nslm4_bf2f(bf[c]);
-                    float* er = E + (size_t) r * 128 + (cb - c0);
-                    for (int k = 0; k < 8; ++k) {   // E = (W_B - Q_B) T
-                        double a = 0;
-                        for (int c = 0; c <= k; ++c) a += d[c] * T[c * 8 + k];
-                        er[k] = (float) a;
-                    }
-                }
-                // within the batch: the next groups of this batch take this group's error
-                if (cb + 8 < c1) {
-                    for (int r = 0; r < R; ++r) {
-                        float* wr = W + (size_t) r * C;
-                        const float* er = E + (size_t) r * 128 + (cb - c0);
-                        for (int k = 0; k < 8; ++k) {
-                            const float ek = er[k];
-                            const double* ur = U + (size_t) (cb + k) * C;
-                            for (int c = cb + 8; c < c1; ++c) wr[c] -= ek * (float) ur[c];
-                        }
-                    }
-                }
-            }
-            if (!rc && c1 < C) feedback(W, E, U, R, C, c0, c1 - c0, c1);
-        }
-        free(U); free(w8); free(E); free(sg); free(cg); free(eg);
+        Gpus gp = {g4, g8};
+        const NslmGptq q = {gptq_search, decode_block, &gp, 12};
+        const double* Uc = U;
+        rc = nslm_gptq(&q, 1, R, C, &W, &Uc, &bias, &seed, &coef, &ec, err, sizeof err);
+        free(U);
     }
     if (rc) { fprintf(stderr, "%s: %s\n", base, err); return -1; }
     double se = 0, sw = 0, wse = 0, wsw = 0;
