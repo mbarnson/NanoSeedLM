@@ -19,8 +19,10 @@ JOBS=${JOBS:-"moe3 dense3 dense4"}
 WORKERS=${WORKERS:-8}
 MOE_EXTRA=${MOE_EXTRA:-}
 DENSE_EXTRA=${DENSE_EXTRA:-}
-LOG=${LOG:-$OUT/log}   # per-GPU logs (one directory per job when jobs share OUT)
-mkdir -p "$LOG"
+LOG=${LOG:-$OUT/log}   # per-GPU logs (one directory per job when jobs share OUT); written locally, copied at the end
+FINAL_LOG=$LOG
+LOG=/tmp/seedbank-log
+mkdir -p "$LOG" "$FINAL_LOG"
 if ! command -v cmake >/dev/null || [ ! -e /usr/include/unicode/unorm2.h ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cmake libicu-dev python3-pip >/dev/null 2>&1
@@ -77,4 +79,6 @@ done
 rc=0
 for p in "${pids[@]}"; do wait "$p" || rc=1; done
 grep -h "^== " "$LOG"/gpu*.log
+tail -n 3 "$LOG"/gpu*.log
+cp -r "$LOG"/. "$FINAL_LOG"/
 exit $rc
