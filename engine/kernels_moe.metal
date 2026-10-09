@@ -144,11 +144,8 @@ static inline float e4m3_dec(uint c) {
     return c & 0x80u ? -v : v;
 }
 static inline float e8m0_dec(uint s) { return as_type<float>(s << 23); }   // 2^(s - 127), s in 1 .. 254
-static inline float e2m1_dec(uint n) {
-    const uint k = n & 7u;   // 0, 0.5, 1, 1.5, 2, 3, 4, 6
-    const float v = k < 4u ? (float) k * 0.5f : (float) (1u << ((k >> 1) - 1u)) * ((k & 1u) ? 1.5f : 1.0f);
-    return n & 8u ? -v : v;
-}
+constant float E2M1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+static inline float e2m1_dec(uint n) { return E2M1[n & 15u]; }
 static inline uint e4m3_enc_abs(float a) {
     if (!(a < 448.0f)) return 0x7Eu;
     if (a < 0x1p-6f) return (uint) rint(a * 512.0f);
@@ -212,8 +209,8 @@ static inline uint4 kv_get8(short fmt, int lh, device const uchar* C, device con
         const float s = e4m3_dec(S[lh / 32 + e / 16]);
         for (int i = 0; i < 8; ++i) v[i] = e2m1_dec(w >> (4 * i)) * s;
     }
-    uint4 o;
-    for (int i = 0; i < 4; ++i) o[i] = (uint) tobf(v[2 * i]) | (uint) tobf(v[2 * i + 1]) << 16;
+    uint4 o;   // exact in BF16: the top halves
+    for (int i = 0; i < 4; ++i) o[i] = as_type<uint>(v[2 * i]) >> 16 | (as_type<uint>(v[2 * i + 1]) & 0xFFFF0000u);
     return o;
 }
 static inline float silu_bf(float g) {   // nn.silu on a BF16 tensor: g * sigmoid(g), each op rounded to BF16
