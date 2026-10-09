@@ -1095,7 +1095,7 @@ kernel void k_attn_reduce(constant AttnArgs& a [[buffer(0)]], device const float
 // Per-head maps (q_rope_mix, q_lat, v_up): simdgroup = (output row o, head h, token t); lanes stride the input; f32 sums.
 // y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] . x) * bf16(softplus_ln2(g[t][h][o]))).
 // Grid (O * 32, H, T), threadgroups of 256.
-// A stacked [H][O][I] SEED4P4 per-head map decoded to BF16 (search4.h's decoded weights: bf16(R32 2^e isum)), a block
+// A stacked [H][O][I] SEED4P4 (a.w 0) or SEED6P8 (a.w 1) per-head map decoded to BF16 (bf16(R32 2^e isum)), a block
 // of 8 per thread: the expanded prompt path's GEMM operands, decoded once per forward instead of once per key tile.
 kernel void k_heads_deq(device const uchar* W [[buffer(0)]], device const ushort* S [[buffer(1)]], device const ushort* B [[buffer(2)]],
                         device const uint* G [[buffer(3)]], device const uchar* EN [[buffer(4)]], device ushort* out [[buffer(5)]],
@@ -1105,7 +1105,8 @@ kernel void k_heads_deq(device const uchar* W [[buffer(0)]], device const ushort
     const ulong row = b / (uint) nbk;
     const int j = (int) (b % (uint) nbk);
     float w[8];
-    seed4p4_block(W, S, G, row, I, j, ((device const int*) B)[row / (ulong) O], EN, w);
+    if (a.w) seed6p8_block(W, S, G, row, I, j, ((device const int*) B)[row / (ulong) O], EN, w);
+    else seed4p4_block(W, S, G, row, I, j, ((device const int*) B)[row / (ulong) O], EN, w);
     for (int i = 0; i < 8; ++i) out[(ulong) b * 8 + i] = tobf(w[i]);
 }
 kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const float* x [[buffer(2)]],
@@ -1116,8 +1117,8 @@ kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W 
     const int R = a.pad[0] > 1 ? a.pad[0] : 1, L = 32 / R, h = (int) gid.y, t = (int) gid.z;
     const int o = (int) gid.x / 32 * R + (int) lane / L, ln = (int) lane % L;
     if ((int) gid.x / 32 * R >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
-    // FC_FMT: BF16, Q8, Q4 or SEED4P4 (stacked [H][O][I]: row h * O + o; SEED4P4's exponent bias per head in B)
-    const int eb = FC_FMT == MF_SEED4P4 ? ((device const int*) B)[h] : 0;
+    // FC_FMT: BF16, Q8, Q4, SEED4P4 or SEED6P8 (stacked [H][O][I]: row h * O + o; the seeds' exponent bias per head in B)
+    const int eb = FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[h] : 0;
     device const float* xv = x + (ulong) t * a.xs + (ulong) h * a.hs;
     const ulong row = (ulong) h * a.O + (ulong) min(o, a.O - 1);
     float s;
@@ -1134,6 +1135,15 @@ kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W 
                 device const float4* xr = (device const float4*) (xv + (ulong) j * 8);
                 const float4 x0 = xr[0], x1 = xr[1];
                 acc += seed4_dot(v, (uint) S[k], eb + seed4_ecode(EN, k), x0, x1, -1.5f * dot(x0 + x1, float4(1.0f))) * (1.0f / 32767.0f);
+                continue;
+            } else if (FC_FMT == MF_SEED6P8) {   // mv_lane's P = 8 form
+                const ulong k = row * (ulong) (a.I / 8) + j;
+                float v[64];
+                seed8_states(((device const ushort*) W)[k], G, v);
+                device const float4* xr = (device const float4*) (xv + (ulong) j * 8);
+                const float4 x0 = xr[0], x1 = xr[1];
+                acc += seed8_dot(v, ((device const uint*) S)[k], eb + seed4_ecode(EN, k), x0, x1, -1.5f * dot(x0 + x1, float4(1.0f))) *
+                       (1.0f / 32767.0f);
                 continue;
             } else if (FC_FMT == MF_Q4) {
                 const ulong gi = (row * (ulong) a.I + (ulong) j * 8) / 64;

@@ -503,6 +503,12 @@ int kt_argmax(const float* logits, int V, int n, int32_t* out) {
 }
 // SEED4P4 per-head maps as the engine runs them: decode rows (T <= 8, tr 0) inline in k_heads_mv; prompt rows from the
 // map decoded to BF16 once (kc_heads_deq), then the BF16 GEMM (tr 0) or k_mla_decomp's transposed reads (tr 1)
+int kt_heads_seed8(int tr, int H, int O, int I, const uint16_t* seeds, const uint32_t* coefs, const int32_t* ebias,
+                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    (void) tr; (void) H; (void) O; (void) I; (void) seeds; (void) coefs; (void) ebias; (void) ecodes; (void) x; (void) xs; (void) hs;
+    (void) g; (void) y; (void) T;
+    return 1;   // no SEED6P8 kernels yet
+}
 int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
     const int rows = tr ? I : O, cols = tr ? O : I;

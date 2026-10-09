@@ -873,14 +873,17 @@ static void test_mla(void) {
             }
         printf("per-head maps in Q8 / Q4: decode, prompt GEMMs and transposed reads checked\n");
     }
-    {   // per-head maps in SEED4P4 (nslm/search4.h): against the scalar sum over the exact weights
-        enum { H = 3 };
+    for (int p8 = 0; p8 <= 1; ++p8) {   // per-head maps in SEED4P4 (search4.h) / SEED6P8 (searchp.h): against the scalar sum
+        enum { H = 3 };                  // over the exact weights
+        const int P = p8 ? 8 : 4;
+        const char* fn = p8 ? "SEED6P8" : "SEED4P4";
         static const struct { int O, I, T, tr, gate; } C[5] = {{96, 128, 3, 0, 0}, {128, 192, 5, 0, 1}, {128, 192, 37, 0, 1},
                                                                {128, 192, 37, 1, 0}, {6144, 128, 2, 0, 1}};
         for (int cs = 0; cs < 5; ++cs) {
             const int O = C[cs].O, I = C[cs].I, T = C[cs].T, tr = C[cs].tr, rows = tr ? I : O, cols = tr ? O : I;
             const size_t n = (size_t) O * I, nb = n / 8;
             uint16_t* seed = malloc(2 * nb * H), *cf = malloc(2 * nb * H);
+            uint32_t* cf8 = malloc(4 * nb * H);
             double* Wd = malloc(sizeof(double) * n * H);   // the exact weights (the engine's seed decode is unrounded)
             uint8_t* ec = calloc(nb * H / 2, 1);
             int32_t eb[H];
@@ -888,26 +891,29 @@ static void test_mla(void) {
             for (size_t k = 0; k < nb * H; ++k) {
                 seed[k] = (uint16_t) (1 + (k * 7919u) % 65535u);
                 cf[k] = (uint16_t) ((k * 104729u) & 0xFFFF);
+                cf8[k] = (uint32_t) (k * 2654435761u);
                 ec[k / 2] |= (uint8_t) (((k * 31u) % 4u) << (4 * (k & 1)));
             }
             for (int h = 0; h < H; ++h)
                 for (size_t b = 0; b < nb; ++b) {
                     const size_t k = h * nb + b;
-                    uint16_t st[32];
-                    lfsr_states(seed[k], 32, st);
+                    uint16_t st[64];
+                    lfsr_states(seed[k], 8 * P, st);
                     const double sc = (double) NSLM_R32 * pow(2.0, eb[h] + ((ec[k / 2] >> (4 * (k & 1))) & 15));
                     for (int c = 0; c < 8; ++c) {
                         double v = 0;
-                        for (int p = 0; p < 4; ++p) v += ((double) st[4 * c + p] - 32768) * (double) nslm4_q(cf[k], p);
+                        for (int p = 0; p < P; ++p)
+                            v += ((double) st[P * c + p] - 32768) * (double) (p8 ? (int32_t) (cf8[k] << (28 - 4 * p)) >> 28 : nslm4_q(cf[k], p));
                         Wd[h * n + b * 8 + c] = sc * v;
                     }
                 }
             float* x = malloc(4 * (size_t) T * H * I), *g = malloc(4 * (size_t) T * H * O), *y = malloc(4 * (size_t) T * H * O);
             for (int i = 0; i < T * H * I; ++i) x[i] = bfr(frand(&sd) * 2);
             for (int i = 0; i < T * H * O; ++i) g[i] = bfr(frand(&sd) * 3);
-            const int rc = kt_heads_seed(tr, H, O, I, seed, cf, eb, ec, x, H * I, I, C[cs].gate ? g : NULL, y, T);
+            const int rc = p8 ? kt_heads_seed8(tr, H, O, I, seed, cf8, eb, ec, x, H * I, I, C[cs].gate ? g : NULL, y, T)
+                              : kt_heads_seed(tr, H, O, I, seed, cf, eb, ec, x, H * I, I, C[cs].gate ? g : NULL, y, T);
             int bad = 0;
-            if (rc == 1) { printf("per-head maps in SEED4P4: not in this backend\n"); free(seed); free(cf); free(Wd); free(ec); free(x); free(g); free(y); break; }
+            if (rc == 1) { printf("per-head maps in %s: not in this backend\n", fn); free(seed); free(cf); free(cf8); free(Wd); free(ec); free(x); free(g); free(y); break; }
             if (rc) ++fails;
             else
                 for (int t = 0; t < T; ++t)
@@ -925,12 +931,12 @@ static void test_mla(void) {
                             const size_t yi = ((size_t) t * H + h) * O + o;
                             bad += !close_bf(y[yi], C[cs].gate ? gated(acc, g[yi]) : bfr(acc), 2e-6);
                         }
-            CHECK(!bad, "per-head maps SEED4P4 (O %d, I %d, T %d%s%s): %d mismatches", O, I, T, tr ? ", transposed" : "",
+            CHECK(!bad, "per-head maps %s (O %d, I %d, T %d%s%s): %d mismatches", fn, O, I, T, tr ? ", transposed" : "",
                   C[cs].gate ? ", gate" : "", bad);
             (void) rows; (void) cols;
-            free(seed); free(cf); free(Wd); free(ec); free(x); free(g); free(y);
+            free(seed); free(cf); free(cf8); free(Wd); free(ec); free(x); free(g); free(y);
         }
-        printf("per-head maps in SEED4P4: decode, prompt GEMMs and transposed reads checked\n");
+        printf("per-head maps in %s: decode, prompt GEMMs and transposed reads checked\n", fn);
     }
     {   // RoPE + latent cache write: 4 heads, r 96, rows at positions 3 and 4 of two sequence slots (cache bases 0 and 5)
         enum { nh = 4, r = 96, P = 10, T = 2 };

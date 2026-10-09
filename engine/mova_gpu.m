@@ -325,7 +325,7 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         }
         const int ok = t->kind == MOVA_K_EXPERTS ? 1
                        : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
-                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4 || w->fmt == MF_SEED4P4))
+                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4 || w->fmt == MF_SEED4P4 || w->fmt == MF_SEED6P8))
                        : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8 || w->fmt == MF_SEED4P4 || w->fmt == MF_SEED6P8)
                        : w->fmt != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
         if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, w->fmt); return -1; }
@@ -705,7 +705,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             e->olat = scratch(e, (uint64_t) T * c->n_head * rmax * 4, "MLA latent outputs");
             e->latf = scratch(e, (uint64_t) MLP_KB * rmax * 4, "MLA latent rows (f32)");
             int packed = 0;
-            for (int l = 0; l < c->n_layer; ++l) packed |= e->L[l].ql.fmt == MF_SEED4P4 || e->L[l].ka_x.fmt == MF_SEED4P4;
+            for (int l = 0; l < c->n_layer; ++l) {
+                const Layer* L = &e->L[l];
+                const MW* m[6] = {&L->ql, &L->vu, &L->ka_x, &L->ka_v, &L->kr, &L->qm};
+                for (int i = 0; i < 6; ++i) packed |= m[i]->fmt == MF_SEED4P4 || m[i]->fmt == MF_SEED6P8;
+            }
             if (packed) {   // seed MLA tensors: decoded once per prompt forward for the GEMMs (not once per row tile)
                 e->qlf = scratch(e, (uint64_t) c->n_head * rmax * 128 * 2, "MLA q_lat (BF16)");
                 e->vuf = scratch(e, (uint64_t) c->n_head * rmax * 128 * 2, "MLA v_up (BF16)");
@@ -981,9 +985,9 @@ static void enc_heads_gemm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs,
     const MmArgs a = {I, O, T, xs, H * O, 1, G ? 2 : 0, 0};
     // one head's streams: BF16 values; Q8 / Q4 codes with a BF16 scale and bias per 64; SEED4P4 seeds, coefficients
     // (2 bytes a block of 8), an int32 exponent bias, exponent codes (a nibble a block)
-    const uint64_t n = (uint64_t) O * I, sd = W->fmt == MF_SEED4P4;
+    const uint64_t n = (uint64_t) O * I, sd = W->fmt == MF_SEED4P4 || W->fmt == MF_SEED6P8;
     const uint64_t cb = W->fmt == MF_BF16 ? 2 * n : W->fmt == MF_Q8 ? n : sd ? n / 4 : n / 2;
-    const uint64_t sb = sd ? n / 4 : n / 64 * 2;
+    const uint64_t sb = W->fmt == MF_SEED6P8 ? n / 2 : sd ? n / 4 : n / 64 * 2;   // SEED6P8: 4-byte coefficient words
     const uint64_t bb = sd ? 4 : sb;
     cpipe(c, pipe_(e, "k_mm", W->fmt, tr ? 2 : 1));
     cbytes(c, 0, &a, sizeof a);
@@ -1009,10 +1013,11 @@ static void enc_heads_mm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
 // MLA attention of prompt rows (consecutive positions of one slot) with the latent expanded per head: per pass of
 // MLP_KB cached keys, the latent rows to f32, the heads' keys (q_lat^T c) and values (v_up c) as GEMMs, then
 // k_mla_prefill (the online softmax carried across passes; the last writes the gated output into ao).
-// A SEED4P4 per-head map decoded to BF16 into Y (k_heads_deq): a BF16 MW over Y, for the expansion GEMMs (Q8 / Q4 decode
+static int seedp(int fmt) { return fmt == MF_SEED4P4 || fmt == MF_SEED6P8; }   // the per-block seed formats (32-bit table)
+// A SEED4P4 / SEED6P8 per-head map decoded to BF16 into Y (k_heads_deq): a BF16 MW over Y, for the expansion GEMMs (Q8 / Q4 decode
 // faster inside the GEMM than they load as BF16)
 static MW heads_bf16(Eng* e, Cmd* c, const MW* W, id<MTLBuffer> Y) {
-    const int32_t a[4] = {W->rows, W->cols, W->slices, 0};
+    const int32_t a[4] = {W->rows, W->cols, W->slices, W->fmt == MF_SEED6P8};
     const uint32_t nb = (uint32_t) W->slices * (uint32_t) W->rows * (uint32_t) W->cols / 8;
     cpipe(c, pipe_(e, "k_heads_deq", 0, 0));
     cbuf(c, 0, W->b[0], W->o[0]);
@@ -1034,8 +1039,8 @@ static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
     Layer* L = &e->L[l];
     const int r = L->mla_r, H = g->n_head;
     MW ql = L->ql, vu = L->vu;   // seed maps: decoded once here, not per key tile
-    if (ql.fmt == MF_SEED4P4) { cmd_group(c, MOVA_TG_ATTN_PROJ); ql = heads_bf16(e, c, &L->ql, e->qlf); }
-    if (vu.fmt == MF_SEED4P4) { cmd_group(c, MOVA_TG_ATTN_PROJ); vu = heads_bf16(e, c, &L->vu, e->vuf); }
+    if (seedp(ql.fmt)) { cmd_group(c, MOVA_TG_ATTN_PROJ); ql = heads_bf16(e, c, &L->ql, e->qlf); }
+    if (seedp(vu.fmt)) { cmd_group(c, MOVA_TG_ATTN_PROJ); vu = heads_bf16(e, c, &L->vu, e->vuf); }
     const RowInfo* ri = (const RowInfo*) e->ri.contents;
     const int nk = ri[T - 1].pos + 1;
     const uint64_t kv0 = (uint64_t) ri[0].kv0;
@@ -1113,10 +1118,10 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     }
     const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns, xp = big && e->expand;
     MW kax = L->ka_x, kav = L->ka_v, kr = L->kr, qm = L->qm;   // prompt rows: seed tensors decoded once (heads_bf16)
-    if (big && kax.fmt == MF_SEED4P4) kax = heads_bf16(e, c, &L->ka_x, e->kaxf);
-    if (big && L->sparse && kav.fmt == MF_SEED4P4) kav = heads_bf16(e, c, &L->ka_v, e->kavf);
-    if (big && kr.fmt == MF_SEED4P4) kr = heads_bf16(e, c, &L->kr, e->krf);
-    if (big && qm.fmt == MF_SEED4P4) qm = heads_bf16(e, c, &L->qm, e->qmf);
+    if (big && seedp(kax.fmt)) kax = heads_bf16(e, c, &L->ka_x, e->kaxf);
+    if (big && L->sparse && seedp(kav.fmt)) kav = heads_bf16(e, c, &L->ka_v, e->kavf);
+    if (big && seedp(kr.fmt)) kr = heads_bf16(e, c, &L->kr, e->krf);
+    if (big && seedp(qm.fmt)) qm = heads_bf16(e, c, &L->qm, e->qmf);
     enc_dense(c, &kax, e->xn, d, e->lat, r, T, false);
     if (L->sparse) enc_dense(c, &kav, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(c, &kr, e->xn, d, e->k, g->mla_rope, T, false);

@@ -89,6 +89,9 @@ int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const ui
 // exponent codes [H][rows][cols / 8] as nibbles (low first).  1 where a backend lacks it.
 int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T);
+// The same with W in SEED6P8 (nslm/searchp.h, P = 8: 32-bit coefficient words).  1 where a backend lacks it.
+int kt_heads_seed8(int tr, int H, int O, int I, const uint16_t* seeds, const uint32_t* coefs, const int32_t* ebias,
+                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T);
 // rope of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into Kc [npos][128], and the latent
 // c [T][r] into Vc [npos][r], at the rows' positions (k_mla_rope); the caches are updated
 int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,
