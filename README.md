@@ -253,7 +253,8 @@ differences over the same windows: GPTQ - AW -0.0014 +/- 0.0009, `v_up` in Q8 -0
 | P = 4 seeds (AW), `v_up` in Q8 | 22.96 GB | 0.2250 | |
 
 `v_up`'s share is spread over the layers: in Q8 for layers 0-23 only (`--mla-q8 v_up@0-23`, 22.92 GB) -0.0021, for
-24-47 only -0.0016, for all -0.0039 (paired against GPTQ seeds).
+24-47 only -0.0016, for all -0.0039 (paired against GPTQ seeds). So `--mla p4` keeps `v_up` in Q8 by default
+(`--mla-q8 none`: every MLA tensor as seeds).
 
 At Q4's size, the seeds keep about two thirds of what Q4 loses. With the `fp4` cache: Q8 0.2246, seeds 0.2335. On
 Metal, prefill and decode with Q8 or seed projections run as with BF16 (prompt forwards decode a seed layer's MLA

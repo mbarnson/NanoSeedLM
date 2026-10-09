@@ -2,7 +2,8 @@
 //
 //   nslm-mova-pack --model DIR --config CONFIG --out DIR [--blk DIR] [--blk4 DIR] [--q4 PARTS|--rest4]
 //                  [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] [--threads 16]
-//   --mla-q8: MLA tensors kept in Q8 while the rest take --mla, comma-separated, each optionally for layers A-B (v_up@0-23)
+//   --mla-q8: MLA tensors kept in Q8 while the rest take --mla, comma-separated, each optionally for layers A-B (v_up@0-23);
+//             default with --mla p4: v_up (held-out KLD -0.0039 for 80 MB on J768), "none" for all seeds
 //                  [--shard-gb 4.5] [--loader tools/nanoseedlm_k2.py]
 //
 //   CONFIG  routed experts                                                  needs
@@ -338,7 +339,9 @@ int main(int argc, char** argv) {
                       : !strcmp(mla, "bf16") ? NS_BF16 : -1;
     if (mla_enc < 0) { fprintf(stderr, "--mla: bf16, q8, q4 or p4\n"); return 2; }
     if (mla_enc == NS_SEED4P4 && !opt(argc, argv, "--mla-blk4", NULL)) { fprintf(stderr, "--mla p4 needs --mla-blk4 DIR\n"); return 2; }
-    const char* mla_q8 = opt(argc, argv, "--mla-q8", "");   // MLA tensors kept in Q8 (mova_mla_keep_q8)
+    // MLA tensors kept in Q8 (mova_mla_keep_q8); seeds keep v_up in Q8 unless told otherwise ("none")
+    const char* mla_q8 = opt(argc, argv, "--mla-q8", mla_enc == NS_SEED4P4 ? "v_up" : "");
+    if (!strcmp(mla_q8, "none")) mla_q8 = "";
     if ((gup4d || p4mx || p4mxbf) && !opt(argc, argv, "--blk4", NULL)) { fprintf(stderr, "--config %s needs --blk4\n", config); return 2; }
     if ((mx || gu4d || gup4d) && !blk) { fprintf(stderr, "--config %s needs --blk\n", config); return 2; }
     char err[512] = "";
