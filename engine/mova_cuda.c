@@ -862,6 +862,9 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
              fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt],
              e->kv_fmt == KV_Q8 ? ", KV q8" : e->kv_fmt == KV_FP8 ? ", KV fp8" : e->kv_fmt == KV_FP4 ? ", KV fp4" : "", mla, e->pm.slots, e->pv.slots, (c->n_layer - c->first_sparse) * c->n_exp,
              (c->n_layer - c->first_sparse) * c->n_vexp);
+    fprintf(stderr, "mova CUDA KV: %lld positions in VRAM, %lld positions in host; %llu bytes per position; %d sequences\n",
+            (long long) e->kv_nv, (long long) (e->kv_cap - e->kv_nv),
+            (unsigned long long) kv_all(e), e->nseqs);
     return e;
 }
 
