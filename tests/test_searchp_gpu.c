@@ -1,4 +1,4 @@
-// tests/test_searchp_gpu.c - the P = 3 / 8 Metal search (nslm/searchp.metal) against the scalar C reference
+// tests/test_searchp_gpu.c - the P = 3 / 8 GPU search (nslm/searchp.metal, nslm/searchp.cu) against the scalar C reference
 // (nslmp_search_ref), sqrt(h) and full-transform modes: identical seed, coefficients, exponent code and error bits.
 #include <math.h>
 #include <stdio.h>
@@ -14,6 +14,7 @@ int main(void) {
     {
         char err[512];
         NslmPGpu* g = nslmp_gpu_open("out/res/searchp.metallib", err, sizeof err);
+        if (!g && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); return 77; }   // a machine without a GPU
         if (!g) { printf("FAIL: %s\n", err); return 1; }
         const int rows = 600, cols = 24, ng = cols / 8, NS = 512, bias = -22;
         unsigned sd = 13;

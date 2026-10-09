@@ -24,7 +24,7 @@ int nslm4_gptq(Nslm4SearchA search, void* ctx, int ns, int R, int C, float* cons
     Ctx4 c = {search, ctx};
     const NslmGptq q = {search32, decode4, &c, 1};
     const size_t nb = (size_t) R * (C / 8);
-    uint32_t** c32 = malloc(sizeof(uint32_t*) * (size_t) (ns > 0 ? ns : 1));
+    uint32_t** c32 = calloc((size_t) (ns > 0 ? ns : 1), sizeof(uint32_t*));
     for (int s = 0; s < ns; ++s) c32[s] = malloc(4 * nb);
     const int rc = nslm_gptq(&q, ns, R, C, W, U, bias, seed, c32, ecode, err, errlen);
     for (int s = 0; s < ns; ++s) {

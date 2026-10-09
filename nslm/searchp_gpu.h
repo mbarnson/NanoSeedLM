@@ -25,6 +25,9 @@ typedef struct {
 
 #ifndef __METAL_VERSION__
 #include "searchp.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 typedef struct NslmPGpu NslmPGpu;
 NslmPGpu* nslmp_gpu_open(const char* metallib, char* err, int errlen);
 // One tensor w[rows][cols] (cols a multiple of 8) in P = 3 or 8 blocks: seed / coef / ecode / err in row-major block
@@ -33,4 +36,7 @@ NslmPGpu* nslmp_gpu_open(const char* metallib, char* err, int errlen);
 int nslmp_gpu_search(NslmPGpu* g, int P, const float* w, int rows, int cols, const float* sh, const float* A, int bias,
                      const Search4Opts* o, uint16_t* seed, uint32_t* coef, uint8_t* ecode, float* err, char* msg, int msglen);
 void nslmp_gpu_close(NslmPGpu* g);
+#ifdef __cplusplus
+}
+#endif
 #endif
