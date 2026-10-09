@@ -1,7 +1,7 @@
 // nslm/moe.c - nslm-moe: activation-weighted SeedLM seed search over MoVA's routed and value expert matrices (one
 // block file per (layer, projection)), and their expansion to BF16 safetensors.
 //
-//   nslm-moe --model DIR --act FILE --out DIR [--scope gu|gud|d|v|dv|all|mla] [--workers 4] [--n0 64] [--layers A-B]
+//   nslm-moe --model DIR --act FILE --out DIR [--scope gu|gud|d|v|dv|all|mla] [--workers 4] [--n0 64] [--layers A-B] [--shard I/N]
 //            [--res DIR] [--seeds 65535] [--weighting plain|w2] [--experts A-B] [--no-prune] [--p4]
 //       writes OUT/L{l}_{proj}.blk (.blk4 with --p4), proj = gate_proj|up_proj|down_proj|v_experts, so all scopes can
 //       share one directory; --res holds search.metallib / search4.metallib (default out/res); --weighting w2 weights
@@ -624,6 +624,14 @@ int main(int argc, char** argv) {
             if (p >= P_KAX && nslm_moe_index_lookup(g_index, nm, file, sizeof file)) continue;   // kv_a_v: MoVA layers only
             items[n++] = (JobItem){l, p};
         }
+    int si = 0, sn = 1;   // --shard I/N: jobs I, I + N, ... (one process per GPU)
+    if (opt(argc, argv, "--shard", NULL) && (sscanf(opt(argc, argv, "--shard", NULL), "%d/%d", &si, &sn) != 2 || sn < 1 || si < 0 || si >= sn)) {
+        fprintf(stderr, "--shard I/N with 0 <= I < N\n");
+        return 2;
+    }
+    int m = 0;
+    for (int i = si; i < n; i += sn) items[m++] = items[i];
+    n = m;
     const int workers = atoi(opt(argc, argv, "--workers", "4"));
     Jobs j = {items, n, 0, out, lib, &o, n0, !has_flag(argc, argv, "--no-prune"), 0, 0, -1};
     if (opt(argc, argv, "--experts", NULL)) sscanf(opt(argc, argv, "--experts", NULL), "%d-%d", &j.e0, &j.e1);

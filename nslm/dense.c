@@ -4,7 +4,7 @@
 // exponent code in each nibble word, no code stream).
 //
 //   nslm-dense --model DIR --xtx DIR --out DIR --mode aw|gptq [--codec p3|p4|p8] [--parts amhe] [--workers 4]
-//              [--seeds 65535] [--damp 0.01] [--res out/res] [--only SUBSTR]
+//              [--seeds 65535] [--damp 0.01] [--res out/res] [--only SUBSTR] [--shard I/N]
 //
 // --xtx: tools/mova_capture_dense.py's L<l>_<site>.bin (site 0 attention input, 1 o_proj input, 2 MLP input, 3 the MLP
 // down_proj input; L<n_layers>_0 the LM head input).  aw: the search weighted by h = diag(H) / rows (as nslm-moe).
@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
     if (!model || !g_out || !mode || (strcmp(mode, "aw") && strcmp(mode, "gptq")) || (!g_xtx && strcmp(parts, "e")) || workers < 1 || workers > 32 ||
         has_flag(argc, argv, "-h")) {
         fprintf(stderr, "usage: nslm-dense --model DIR --xtx DIR --out DIR --mode aw|gptq [--codec p3|p4|p8] [--parts amhe] [--workers 4] [--seeds 65535] "
-                        "[--damp 0.01] [--res out/res] [--only SUBSTR]\n");
+                        "[--damp 0.01] [--res out/res] [--only SUBSTR] [--shard I/N]\n");
         return 2;
     }
     g_gptq = !strcmp(mode, "gptq");
@@ -245,6 +245,14 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i)   // largest first, so the LM head and embedding do not finish last
         for (int k = i + 1; k < n; ++k)
             if ((double) sel[k].rows * sel[k].cols > (double) sel[i].rows * sel[i].cols) { MovaTensor x = sel[i]; sel[i] = sel[k]; sel[k] = x; }
+    int si = 0, sn = 1;   // --shard I/N: tensors I, I + N, ... of the largest-first list (one process per GPU)
+    if (opt(argc, argv, "--shard", NULL) && (sscanf(opt(argc, argv, "--shard", NULL), "%d/%d", &si, &sn) != 2 || sn < 1 || si < 0 || si >= sn)) {
+        fprintf(stderr, "--shard I/N with 0 <= I < N\n");
+        return 2;
+    }
+    int m = 0;
+    for (int i = si; i < n; i += sn) sel[m++] = sel[i];
+    n = m;
     printf("%d tensors, codec %s, mode %s, %d seeds, %d workers\n", n, codec, mode, g_o.n_seeds, workers);
     Jobs j = {sel, n, 0, 0};
     pthread_t th[32];
