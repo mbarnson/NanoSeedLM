@@ -8,7 +8,7 @@ and paste between agents.
 
 | Agent | Machine | Owns (edits without asking) | Tests it can run |
 |---|---|---|---|
-| `pc-cuda` | Windows 11, RTX 4080 16 GB, Ryzen 7 5800X3D, 64 GB | `engine/mova_cuda.c`, `engine/kernels_moe.cu`, `engine/kernels_cuda.h`, `nslm/*.cu`, `tests/kernel_backend_cuda.c`, `win/` | `windows` (MSVC + CUDA); `linux` through WSL Ubuntu (not yet set up: see "Platforms") |
+| `pc-cuda` | Windows 11, RTX 4080 16 GB, Ryzen 7 5800X3D, 64 GB | `engine/mova_cuda.c`, `engine/kernels_moe.cu`, `engine/kernels_cuda.h`, `nslm/*.cu`, `tests/kernel_backend_cuda.c`, `win/` | `windows` (MSVC + CUDA); `linux` (HF Jobs, either agent) |
 | `mac-metal` | M4 Max | `engine/mova_gpu.m`, `engine/kernels_moe.metal`, `nslm/*.metal`, `nslm/*_metal.m`, `tests/kernel_backend_metal.m` | `macos` (Metal) |
 
 **Shared files** are everything else: `engine/engine_api.h`, `engine/mova_ext.h`, `nslm/` (C), `harness/`, `tests/`
