@@ -1,21 +1,27 @@
 # SPDX-License-Identifier: MIT
-"""NanoSeedLM for MLX: K2-Horizon with SeedLM P=4 expert weights, decoded on the GPU.
+"""NanoSeedLM for MLX: K2-Horizon with SeedLM weights, decoded on the GPU; GQA or calibrated TransMLA attention.
 
 mlx-lm loads this file through config.json "model_file" (trust_remote_code). It needs the K2-Horizon model
 (mlx_lm.models.k2_horizon, provided by oMLX).
 
-Block: 8 weights from a 16-bit LFSR seed (K=16, taps 0,1,3,12), 4 int4 coefficients and a 4-bit exponent code.
-With S[c][p] = state(4c+p+1) - 32768: w_c = bf16(R32 * 2^(exp_bias+code) * sum_p S[c][p] * q_p), R32 = fl(1/32767).
+Block: 8 weights from a 16-bit LFSR seed (K=16, taps 0,1,3,12), P int4 coefficients and a 4-bit exponent code (P = 3,
+4 or 8). With S[c][p] = state(Pc+p+1) - 32768: w_c = bf16(R32 * 2^(exp_bias+code) * sum_p S[c][p] * q_p), R32 = fl(1/32767).
+
+MLA (config mla_ranks): per layer the cache holds the latent c (rank r_l) and one 128-dim RoPE key per token instead of
+8 x 128 keys and values:
+  c        = kv_a_x x (+ kv_a_v v, v from the value experts; layers 0-2 fold v_proj into kv_a_x)
+  k_rope   = RoPE(k_rope_proj x)
+  scores_a = (q_lat_a q_a) . c + RoPE(q_rope_mix_a q_a) . k_rope,  scale 128^-0.5 as the original
+  o_a      = v_up_a (sum_t p_t c_t), then the softplus gate and o_proj.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_unflatten
+from mlx_lm.models.base import scaled_dot_product_attention
 from mlx_lm.models.switch_layers import SwitchGLU
 
 try:
@@ -75,6 +81,29 @@ inline float block_dot(uint g, const device uint16_t* seeds, const device uint32
             isum += as_type<float>(insert_bits(0x3F800000u, src, 7u, 16u)) * q[p];
         }
         isum -= qs;
+        if (w) w[c] = isum * sc;
+        if (xv) d += isum * xv[c];
+    }
+    return d * sc;
+}
+// P = 3 (SEED4: 16-bit nibble words, the exponent code in bits 0-3, q_p in bits 4p+4 .. 4p+7; read as int16 to pick
+// this overload, codes unused; MLX may pass the 1-element placeholder as constant): states 1..24, exact as above.
+template <typename C>
+inline float block_dot(uint g, const device uint16_t* seeds, const device int16_t* coefs, C codes,
+                       const device uint32_t* table, thread const float* xv, int bias, thread float* w) {
+    uint s = seeds[g], nw = uint(ushort(coefs[g]));
+    float sc = ldexp(R32, bias + int(nw & 15u) + 16);
+    uint t = table[s], lo = s | (t << 16);
+    float q0 = float(int(nw << 24) >> 28), q1 = float(int(nw << 20) >> 28), q2 = float(int(nw << 16) >> 28);
+    float qs = 1.5f * ((q0 + q1) + q2);
+    float d = 0.0f;
+    for (uint c = 0; c < 8; ++c) {
+        float v[3];
+        for (uint p = 0; p < 3; ++p) {
+            uint k = 3 * c + p + 1;
+            v[p] = as_type<float>(insert_bits(0x3F800000u, k <= 16 ? lo >> k : t >> (k - 16), 7u, 16u));
+        }
+        float isum = ((v[0] * q0 + v[1] * q1) + v[2] * q2) - qs;
         if (w) w[c] = isum * sc;
         if (xv) d += isum * xv[c];
     }
@@ -356,17 +385,23 @@ def _unsort(y, order, shape):
     return y[inverse].reshape(shape + y.shape[-1:])
 
 
-class SeedSwitchLinear(nn.Module):
-    """mlx-lm's SwitchLinear with SeedLM P=4 weights."""
+def _seed_params(m: nn.Module, slices: int, rows: int, cols: int, p: int):
+    """A module's seed streams: P = 4 16-bit coefficient words, P = 8 32-bit, P = 3 the SEED4 nibble words as int16
+    (exponent codes inside; codes is a placeholder)."""
+    if cols % BK:
+        raise ValueError(f"SeedLM in MLX needs input_dims divisible by {BK}")
+    m.seeds = mx.zeros((slices, rows, cols // 8), mx.uint16)
+    m.coefs = mx.zeros((slices, rows, cols // 8), {3: mx.int16, 4: mx.uint16, 8: mx.uint32}[p])
+    m.codes = mx.zeros((1,) if p == 3 else (slices, rows, cols // 16), mx.uint8)
+    m.exp_bias = mx.zeros((slices,), mx.int32)
 
-    def __init__(self, input_dims: int, output_dims: int, num_experts: int):
+
+class SeedSwitchLinear(nn.Module):
+    """mlx-lm's SwitchLinear with SeedLM P=4 (or P=3) weights."""
+
+    def __init__(self, input_dims: int, output_dims: int, num_experts: int, p: int = 4):
         super().__init__()
-        if input_dims % BK:
-            raise ValueError(f"SeedLM P=4 in MLX needs input_dims divisible by {BK}")
-        self.seeds = mx.zeros((num_experts, output_dims, input_dims // 8), mx.uint16)
-        self.coefs = mx.zeros((num_experts, output_dims, input_dims // 8), mx.uint16)
-        self.codes = mx.zeros((num_experts, output_dims, input_dims // 16), mx.uint8)
-        self.exp_bias = mx.zeros((num_experts,), mx.int32)
+        _seed_params(self, num_experts, output_dims, input_dims, p)
         self.input_dims, self.output_dims = input_dims, output_dims
 
     def _seeds(self):
@@ -394,16 +429,11 @@ class SeedSwitchLinear(nn.Module):
 
 
 class SeedLinear(nn.Module):
-    """nn.Linear (no bias) with SeedLM P=4 (or P=8: 32-bit coefficient words) weights: a one-expert SeedSwitchLinear."""
+    """nn.Linear (no bias) with SeedLM P=3 / 4 / 8 weights: a one-expert SeedSwitchLinear."""
 
-    def __init__(self, input_dims: int, output_dims: int, p8: bool = False):
+    def __init__(self, input_dims: int, output_dims: int, p: int = 4):
         super().__init__()
-        if input_dims % BK:
-            raise ValueError(f"SeedLM P=4 in MLX needs input_dims divisible by {BK}")
-        self.seeds = mx.zeros((1, output_dims, input_dims // 8), mx.uint16)
-        self.coefs = mx.zeros((1, output_dims, input_dims // 8), mx.uint32 if p8 else mx.uint16)
-        self.codes = mx.zeros((1, output_dims, input_dims // 16), mx.uint8)
-        self.exp_bias = mx.zeros((1,), mx.int32)
+        _seed_params(self, 1, output_dims, input_dims, p)
         self.input_dims, self.output_dims = input_dims, output_dims
 
     def __call__(self, x):
@@ -415,17 +445,32 @@ class SeedLinear(nn.Module):
 
 
 class SeedEmbedding(nn.Module):
-    """nn.Embedding with SeedLM P=4 (or P=8) rows, decoded per token."""
+    """nn.Embedding with SeedLM P=3 / 4 / 8 rows, decoded per token."""
 
-    def __init__(self, num_embeddings: int, dims: int, p8: bool = False):
+    def __init__(self, num_embeddings: int, dims: int, p: int = 4):
         super().__init__()
-        self.seeds = mx.zeros((1, num_embeddings, dims // 8), mx.uint16)
-        self.coefs = mx.zeros((1, num_embeddings, dims // 8), mx.uint32 if p8 else mx.uint16)
-        self.codes = mx.zeros((1, num_embeddings, dims // 16), mx.uint8)
-        self.exp_bias = mx.zeros((1,), mx.int32)
+        _seed_params(self, 1, num_embeddings, dims, p)
 
     def __call__(self, ids):
         return embed_rows(ids, self.seeds, self.coefs, self.codes, self.exp_bias)
+
+
+class SeedHeads(nn.Module):
+    """Per-head maps y[b, a, l] = W_a x[b, a, l] (MLA's q_lat, q_rope_mix, v_up) with seed weights: the heads are the
+    experts, the (head, token) pairs head-major (sorted)."""
+
+    def __init__(self, heads: int, input_dims: int, output_dims: int, p: int = 4):
+        super().__init__()
+        _seed_params(self, heads, output_dims, input_dims, p)
+        self.input_dims, self.output_dims = input_dims, output_dims
+
+    def __call__(self, x):
+        b, a, l, k = x.shape
+        xs = x.transpose(1, 0, 2, 3).reshape(-1, k)
+        idx = mx.repeat(mx.arange(a, dtype=mx.uint32), b * l)
+        parts = (self.seeds, self.coefs, self.codes, self.exp_bias)
+        y = gather_matvec(xs, idx, *parts) if xs.shape[0] <= MATVEC_MAX_PAIRS else gather_gemm(xs, idx, *parts)
+        return y.reshape(a, b, l, self.output_dims).transpose(1, 0, 2, 3)
 
 
 class SeedSwitchGLU(SwitchGLU):
@@ -473,7 +518,67 @@ class SeedSparseMoeBlock(getattr(_k2, "SparseMoeBlock", nn.Module)):
 
 @dataclass
 class ModelArgs(_k2.ModelArgs):
-    pass
+    mla_ranks: list = field(default_factory=list)   # MLA: the latent rank per layer (empty: GQA)
+    mla_rope_dim: int = 128
+
+
+def _lin(w, x):
+    """x W^T for an MLA projection: a BF16 array [out, in] or a SeedLinear."""
+    return w(x) if isinstance(w, nn.Module) else x @ w.T
+
+
+def _heads(w, x):
+    """W_a x[b, a, l] for a per-head map: a BF16 array [heads, out, in] or SeedHeads."""
+    return w(x) if isinstance(w, nn.Module) else mx.einsum("aoi,bali->balo", w, x)
+
+
+class MLA(nn.Module):
+    """One layer's MLA tensors (BF16 arrays, or seed modules after Model.sanitize)."""
+
+    def __init__(self, args: ModelArgs, rank: int, mova: bool):
+        super().__init__()
+        nh, hd, d = args.num_attention_heads, args.head_dim, args.hidden_size
+        self.kv_a_x = mx.zeros((rank, d))
+        if mova:
+            self.kv_a_v = mx.zeros((rank, args.num_key_value_heads * hd))
+        self.k_rope_proj = mx.zeros((args.mla_rope_dim, d))
+        self.q_rope_mix = mx.zeros((nh, args.mla_rope_dim, hd))
+        self.q_lat = mx.zeros((nh, rank, hd))
+        self.v_up = mx.zeros((nh, hd, rank))
+
+
+class MLAAttention(_k2.Attention):
+    def __init__(self, args: ModelArgs, mova: bool, rank: int):
+        super().__init__(args, mova)
+        del self.k_proj
+        if not mova:
+            del self.v_proj
+        self.mla = MLA(args, rank, mova)
+
+    def __call__(self, x: mx.array, mask: mx.array | None = None, cache=None) -> mx.array:
+        b, L, _ = x.shape
+        m = self.mla
+        q = self.q_proj(x).reshape(b, L, self.n_heads, -1).transpose(0, 2, 1, 3)       # [B, heads, L, 128]
+        c = _lin(m.kv_a_x, x)                                                           # [B, L, r]
+        if self.mova:
+            c = c + _lin(m.kv_a_v, self._values(x))
+        kr = _lin(m.k_rope_proj, x)[:, None]                                            # [B, 1, L, 128]
+        qr = _heads(m.q_rope_mix, q)
+        ql = _heads(m.q_lat, q)
+        offset = cache.offset if cache is not None else 0
+        qr = self.rope(qr, offset=offset)
+        kr = self.rope(kr, offset=offset)
+        lat = c[:, None].astype(x.dtype)                                                # [B, 1, L, r]
+        if cache is not None:
+            kr, lat = cache.update_and_fetch(kr, lat)                                   # cache: 128 + r per token
+        keys = mx.concatenate([lat, kr], axis=-1)
+        queries = mx.concatenate([ql, qr], axis=-1)
+        out = scaled_dot_product_attention(queries, keys, lat, cache=cache, scale=self.scale, mask=mask)
+        out = _heads(m.v_up, out).transpose(0, 2, 1, 3)                                 # [B, L, heads, 128]
+        if "gate_proj" in self:
+            gate = _k2.softplus_beta_ln2(self.gate_proj(x)).reshape(b, L, self.n_heads, -1)
+            out = out * gate
+        return self.o_proj(out.reshape(b, L, -1))
 
 
 def _module(root: nn.Module, path: str) -> nn.Module:
@@ -484,26 +589,47 @@ def _module(root: nn.Module, path: str) -> nn.Module:
 
 
 class Model(_k2.Model):
-    """K2-Horizon whose tensors with NAME.seeds become SeedSwitchLinear (expert stacks), SeedLinear or SeedEmbedding."""
+    """K2-Horizon (GQA, or MLA with config mla_ranks) whose tensors with NAME.seeds become SeedSwitchLinear (expert
+    stacks), SeedLinear, SeedEmbedding or SeedHeads (MLA per-head maps)."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__(args)
+        if args.mla_ranks:
+            if len(args.mla_ranks) != args.num_hidden_layers:
+                raise ValueError(f"mla_ranks has {len(args.mla_ranks)} entries for {args.num_hidden_layers} layers")
+            for i, layer in enumerate(self.model.layers):
+                layer.self_attn = MLAAttention(args, getattr(layer.self_attn, "mova", False), args.mla_ranks[i])
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})
         for p in seeded:
+            if p + ".nibbles" in weights:   # SEED4 (P = 3): the nibble words carry the exponent codes
+                weights[p + ".coefs"] = weights.pop(p + ".nibbles").view(mx.int16)
+                weights[p + ".codes"] = mx.zeros((1,), mx.uint8)
             if p + ".codes" not in weights:
-                raise ValueError(f"{p}: only SeedLM P=4 / P=8 tensors load in MLX")
+                raise ValueError(f"{p}: only SeedLM P=3 / P=4 / P=8 tensors load in MLX")
             weights[p + ".weight"] = mx.zeros((0,))   # the stack exists: K2's sanitize must not rebuild it
         weights = super().sanitize(weights)
+        for i, layer in enumerate(self.model.layers):
+            if isinstance(layer.self_attn, MLAAttention):   # TransMLA drops k_proj (and v_proj where values are not experts)
+                weights.pop(f"model.layers.{i}.self_attn.k_proj.weight", None)
+                if not layer.self_attn.mova:
+                    weights.pop(f"model.layers.{i}.self_attn.v_proj.weight", None)
         for p in seeded:
             weights.pop(p + ".weight")
             e, n, kb = weights[p + ".seeds"].shape
-            p8 = weights[p + ".coefs"].dtype == mx.uint32
+            pp = {mx.int16: 3, mx.uint16: 4, mx.uint32: 8}[weights[p + ".coefs"].dtype]
+            parent, _, attr = p.rpartition(".")
+            if parent and isinstance(_module(self, parent), MLA):
+                setattr(_module(self, parent), attr, SeedLinear(kb * 8, n, pp) if e == 1 else SeedHeads(e, kb * 8, n, pp))
+                continue
             m = _module(self, p)
-            if hasattr(m, "num_experts") and not p8:
-                new = SeedSwitchLinear(kb * 8, n, e)
+            if hasattr(m, "num_experts") and pp != 8:
+                new = SeedSwitchLinear(kb * 8, n, e, pp)
             elif isinstance(m, nn.Embedding) and e == 1:
-                new = SeedEmbedding(n, kb * 8, p8)
+                new = SeedEmbedding(n, kb * 8, pp)
             elif isinstance(m, nn.Linear) and e == 1 and "bias" not in m:
-                new = SeedLinear(kb * 8, n, p8)
+                new = SeedLinear(kb * 8, n, pp)
             else:
                 raise ValueError(f"{p}: seed weights need a SwitchLinear, bias-free Linear or Embedding module")
             self.update_modules(tree_unflatten([(p, new)]))
