@@ -291,6 +291,29 @@ static void test_misc(void) {
         for (int i = 0; i < N && rc == 0; ++i) bad += y[i] != bf2f(x[i]);
         CHECK(rc == 1 || (rc == 0 && !bad), "bf16 to f32: %d mismatches", bad);
     }
+    {   // X^T X per block of D columns (the MLA capture for GPTQ), added to H's lower 32 x 32 tiles; the rest unchanged
+        enum { T = 37, D = 64, NB = 3, XS = NB * D + 5 };
+        static float x[T * XS], h[NB * D * D], h0[NB * D * D];
+        unsigned s1 = 9;
+        for (int i = 0; i < T * XS; ++i) x[i] = (float) frand(&s1);
+        for (int i = 0; i < NB * D * D; ++i) h[i] = h0[i] = (float) frand(&s1);
+        const int rc = kt_xtx(x, T, XS, D, NB, h);
+        int bad = 0;
+        for (int b = 0; b < NB && rc == 0; ++b)
+            for (int i = 0; i < D; ++i)
+                for (int j = 0; j < D; ++j) {
+                    const size_t k = ((size_t) b * D + i) * D + j;
+                    if (i / 32 < j / 32) { bad += h[k] != h0[k]; continue; }
+                    double acc = h0[k], mag = fabs(h0[k]);
+                    for (int t = 0; t < T; ++t) {
+                        const double p = (double) x[t * XS + b * D + i] * x[t * XS + b * D + j];
+                        acc += p; mag += fabs(p);
+                    }
+                    bad += fabs(h[k] - acc) > 1e-6 * mag;
+                }
+        if (rc == 1) printf("X^T X: not on this backend\n");
+        CHECK(rc == 1 || (rc == 0 && !bad), "X^T X: %d mismatches", bad);
+    }
     unsigned sd = 7;
     enum { d = 256, T = 3 };
     float x[T * d], y[T * d];

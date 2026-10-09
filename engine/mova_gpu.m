@@ -94,6 +94,8 @@ struct Eng {
     id<MTLBuffer> cap_buf;                // this forward's (f32), [layer][x d | v kvd | q qd | o n_head * rmax]
     double* cap_sum;                      // all forwards'
     int64_t cap_rows, cap_ld;
+    id<MTLBuffer> cap_xtx;                // capture mode 2: X^T X sums (f32), [layer][x d^2 | v kvd^2 | q H hd^2 | o H rmax^2]
+    int64_t cap_xld;
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
@@ -1073,6 +1075,16 @@ static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
 // c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write, latent attention (split-key +
 // reduce for decode, one pass for prompt chunks), then v_up with the gate into ao.
 // MLA capture: the per-column sums of squares of X (T rows of n floats, row stride xs) into cap_buf at float offset off
+// Capture mode 2: X^T X of nb blocks of D columns (bs apart; T rows of stride xs) onto cap_xtx at float offset off
+// (k_xtx: the lower 32 x 32 tiles; eng_mla_capture_xtx mirrors them)
+static void enc_xtx(Eng* e, Cmd* c, id<MTLBuffer> X, int D, int nb, int xs, int bs, int T, uint64_t off) {
+    const int32_t a[4] = {D, T, xs, bs};
+    cpipe(c, pipe_(e, "k_xtx", 0, 0));
+    cbuf(c, 0, X, 0);
+    cbuf(c, 1, e->cap_xtx, off * 4);
+    cbytes(c, 2, a, sizeof a);
+    crun(c, (uint64_t) D / 32, (uint64_t) D / 32, (uint64_t) nb, 128);
+}
 static void enc_cap(Eng* e, Cmd* c, id<MTLBuffer> X, int n, int xs, int T, uint64_t off) {
     const int32_t a[4] = {n, T, xs, 0};
     cpipe(c, pipe_(e, "k_sumsq", 0, 0));
@@ -1091,6 +1103,12 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
         enc_cap(e, c, e->xn, d, d, T, cb);
         if (L->sparse) enc_cap(e, c, e->v, kvd, kvd, T, cb + (uint64_t) d);
         enc_cap(e, c, e->q, qd, qd, T, cb + (uint64_t) (d + kvd));
+        if (e->cap_on == 2) {
+            const uint64_t xb = (uint64_t) l * (uint64_t) e->cap_xld;
+            enc_xtx(e, c, e->xn, d, 1, d, 0, T, xb);
+            if (L->sparse) enc_xtx(e, c, e->v, kvd, 1, kvd, 0, T, xb + (uint64_t) d * d);
+            enc_xtx(e, c, e->q, g->head_dim, H, qd, g->head_dim, T, xb + (uint64_t) d * d + (uint64_t) kvd * kvd);
+        }
     }
     const int big = (T > MV_MAXT || e->prompt) && !e->decode_rows, nsp = big ? 1 : ns, xp = big && e->expand;
     MW kax = L->ka_x, kav = L->ka_v, kr = L->kr, qm = L->qm;   // prompt rows: seed tensors decoded once (heads_bf16)
@@ -1140,6 +1158,9 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     }
     cmd_group(c, MOVA_TG_ATTN_PROJ);
     if (e->cap_on) enc_cap(e, c, e->olat, H * r, H * r, T, cb + (uint64_t) (d + kvd + qd));
+    if (e->cap_on == 2)
+        enc_xtx(e, c, e->olat, r, H, H * r, r, T,
+                (uint64_t) l * (uint64_t) e->cap_xld + (uint64_t) d * d + (uint64_t) kvd * kvd + (uint64_t) H * g->head_dim * g->head_dim);
     heads(c, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
     (void) kvd;
 }
@@ -1625,10 +1646,23 @@ int eng_score(Eng* e, int seq, const int32_t* ids, int from, int count, float* l
 
 int eng_mla_capture(Eng* e, int on) {
     const MovaCfg* c = &e->c;
-    if (!c->mla) return -1;
-    if (on && !e->cap_on) {
-        int rmax = 0;
-        for (int l = 0; l < c->n_layer; ++l) if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+    if (!c->mla || on < 0 || on > 2) return -1;
+    if (on && on != e->cap_on) {   // a new capture (fresh sums)
+        int rmax = 0, r32 = 1;
+        for (int l = 0; l < c->n_layer; ++l) { if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r; r32 &= e->L[l].mla_r % 32 == 0; }
+        const int64_t kvd = (int64_t) c->n_kv * c->head_dim;
+        if (on == 2) {   // X^T X (k_xtx: widths in whole 32 x 32 tiles)
+            if (!r32 || c->d % 32 || kvd % 32 || c->head_dim % 32) return -1;
+            e->cap_xld = (int64_t) c->d * c->d + kvd * kvd + (int64_t) c->n_head * ((int64_t) c->head_dim * c->head_dim + (int64_t) rmax * rmax);
+            const uint64_t nx = (uint64_t) c->n_layer * (uint64_t) e->cap_xld * 4;
+            if (!e->cap_xtx || e->cap_xtx.length < nx) {
+                if (e->cap_xtx && e->residency) [e->residency removeAllocation:e->cap_xtx];
+                e->cap_xtx = [e->dev newBufferWithLength:nx options:MTLResourceStorageModeShared];
+                if (!e->cap_xtx) return -1;
+                if (e->residency) { [e->residency addAllocation:e->cap_xtx]; [e->residency commit]; }
+            }
+            memset(e->cap_xtx.contents, 0, nx);
+        }
         e->cap_ld = (int64_t) c->d + (int64_t) c->n_kv * c->head_dim + (int64_t) c->n_head * c->head_dim + (int64_t) c->n_head * rmax;
         const uint64_t n = (uint64_t) c->n_layer * (uint64_t) e->cap_ld;
         e->cap_buf = [e->dev newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
@@ -1640,6 +1674,21 @@ int eng_mla_capture(Eng* e, int on) {
         e->cap_rows = 0;
     }
     e->cap_on = on;
+    return 0;
+}
+int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) {
+    const MovaCfg* c = &e->c;
+    if (!c->mla || e->cap_on != 2 || !e->cap_xtx || l < 0 || l >= c->n_layer || site < 0 || site > 3) return -1;
+    const int64_t d = c->d, kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head, r = e->L[l].mla_r;
+    const int64_t dim = site == 0 ? d : site == 1 ? kvd : site == 2 ? hd : r, nb = site < 2 ? 1 : H;
+    const int64_t off = site == 0 ? 0 : site == 1 ? d * d : site == 2 ? d * d + kvd * kvd : d * d + kvd * kvd + H * hd * hd;
+    const float* s = (const float*) e->cap_xtx.contents + l * e->cap_xld + off;
+    for (int64_t b = 0; b < nb; ++b) {   // the lower triangle, mirrored
+        const float* sb = s + b * dim * dim;
+        float* hb = h + b * dim * dim;
+        for (int64_t i = 0; i < dim; ++i)
+            for (int64_t j = 0; j <= i; ++j) hb[i * dim + j] = hb[j * dim + i] = sb[i * dim + j];
+    }
     return 0;
 }
 int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {

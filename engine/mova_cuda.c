@@ -1612,7 +1612,7 @@ static void route_collect(Eng* e, int T) {
 }
 int eng_mla_capture(Eng* e, int on) {   // mova_ext.h
     const MovaCfg* c = &e->c;
-    if (!c->mla) return -1;
+    if (!c->mla || on == 2) return -1;   // 2: X^T X, Metal only so far
     if (on && !e->cap_on) {
         int rmax = 0;
         for (int l = 0; l < c->n_layer; ++l) if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
@@ -1641,6 +1641,7 @@ int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double*
     if (rows) *rows = e->cap_rows;
     return 0;
 }
+int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) { return -1; }   // mova_ext.h: Metal only so far
 int eng_mova_routes_read(Eng* e, int rows, int32_t* mlp, int32_t* val, float* mlp_sel, float* val_sel) {
     if (!e->route_on || rows > e->route_rows) return -1;
     const MovaCfg* c = &e->c;

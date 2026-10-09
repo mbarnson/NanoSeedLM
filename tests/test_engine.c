@@ -585,6 +585,44 @@ static void test_mla(void) {
             printf("MLA capture: %lld rows; sums in one call vs chunks of 7: worst relative difference %.2e\n", (long long) rows[0], worst);
             CHECK(rows[0] == 39 && rows[1] == 39, "MLA capture rows %lld, %lld", (long long) rows[0], (long long) rows[1]);
             CHECK(!zero && !vbad && worst < 1e-4, "MLA capture: %d empty sums, %d bad value-expert sums, difference %.3e", zero, vbad, worst);
+            // mode 2 adds each input's X^T X (GPTQ): symmetric, its diagonal the sums above, the same in chunks of 7
+            static float hx[2][8 * 320 * 320];
+            double wd = 0, wc = 0;
+            int asym = 0, nox = 0;
+            eng_mla_capture(ec, 0);
+            const int xtx = eng_mla_capture(ec, 2) == 0;
+            if (!xtx) printf("MLA capture X^T X: not in this engine\n");
+            for (int l = 0; l < NL && xtx; ++l)
+                for (int site = 0; site < 4; ++site) {
+                    const int dim = site == 0 ? D : site == 1 ? KV : site == 2 ? 128 : ranks[l], nb = site < 2 ? 1 : 8;
+                    const size_t n = (size_t) nb * dim * dim;
+                    const double* sums = a[0][l] + (site == 0 ? 0 : site == 1 ? D : site == 2 ? D + KV : D + KV + Q);
+                    if (site == 1 && l == 0) continue;   // dense layer: no value experts
+                    for (int pass = 0; pass < 2; ++pass) {
+                        eng_mla_capture(ec, 0);
+                        eng_mla_capture(ec, 2);
+                        eng_free(ec, 0);
+                        if (pass == 0) CHECK(eng_prefill(ec, 0, ids, 40) == 0, "MLA X^T X prefill");
+                        else {
+                            CHECK(eng_prefill_begin(ec, 0, ids, 40, NULL) == 0, "MLA X^T X prefill_begin");
+                            while (eng_prefill_next(ec, 0, 7) > 0) {}
+                        }
+                        if (eng_mla_capture_xtx(ec, l, site, hx[pass])) { ++nox; break; }
+                    }
+                    double sc = 0;
+                    for (size_t i = 0; i < n; ++i) sc = fmax(sc, fabs(hx[0][i]));
+                    for (size_t i = 0; i < n; ++i) wc = fmax(wc, fabs(hx[1][i] - hx[0][i]) / sc);
+                    for (int b = 0; b < nb; ++b) {
+                        const float* h = hx[0] + (size_t) b * dim * dim;
+                        for (int i = 0; i < dim; ++i) {
+                            wd = fmax(wd, fabs(h[i * dim + i] - sums[b * dim + i]) / fmax(sums[b * dim + i], 1e-30));
+                            for (int j = 0; j < i; ++j) asym += h[i * dim + j] != h[j * dim + i];
+                        }
+                    }
+                }
+            if (xtx) printf("MLA capture X^T X: diagonal vs sums %.2e, one call vs chunks of 7 %.2e, %d asymmetric\n", wd, wc, asym);
+            CHECK(!xtx || (!nox && !asym && wd < 1e-4 && wc < 1e-4), "MLA capture X^T X: %d unread, %d asymmetric, diagonal %.3e, chunks %.3e",
+                  nox, asym, wd, wc);
         }
         if (ec) eng_close(ec);
     }

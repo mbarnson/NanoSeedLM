@@ -1313,6 +1313,38 @@ kernel void k_sumsq(device const float* x [[buffer(0)]], device float* s [[buffe
     for (int t = 0; t < a.y; ++t) { const float v = x[(ulong) t * a.z + c]; acc += v * v; }
     s[c] += acc;
 }
+// MLA capture for GPTQ: H[b] += X_b^T X_b, X_b the T x D block b of x (row stride a.z, blocks a.w apart; a.x = D, a.y = T),
+// on H's lower-triangle 32 x 32 tiles.  Grid (D / 32, D / 32, blocks) threadgroups of 4 simdgroups (16 x 16 each); 8 rows
+// at a time staged in threadgroup memory (rows past T as zeros), f32 simdgroup matrices accumulating onto H.
+kernel void k_xtx(device const float* x [[buffer(0)]], device float* H [[buffer(1)]], constant int4& a [[buffer(2)]],
+                  uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                  ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (tg.y < tg.x) return;   // upper tiles: the transposes of lower ones
+    const int D = a.x, T = a.y, i0 = (int) tg.y * 32, j0 = (int) tg.x * 32, si = (sg / 2) * 16, sj = (sg % 2) * 16;
+    device const float* xb = x + (ulong) tg.z * (ulong) a.w;
+    device float* hb = H + (ulong) tg.z * (ulong) D * (ulong) D;
+    threadgroup float xi[8 * 32], xj[8 * 32];
+    simdgroup_float8x8 acc[2][2], A[2], B[2];
+    for (short u = 0; u < 2; ++u)
+        for (short v = 0; v < 2; ++v) simdgroup_load(acc[u][v], hb + (ulong) (i0 + si + 8 * u) * D + j0 + sj + 8 * v, (ulong) D);
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int k = tid; k < 256; k += 128) {
+            const int t = t0 + k / 32, c = k % 32;
+            xi[k] = t < T ? xb[(ulong) t * a.z + i0 + c] : 0.0f;
+            xj[k] = t < T ? xb[(ulong) t * a.z + j0 + c] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short u = 0; u < 2; ++u) {
+            simdgroup_load(A[u], xi + si + 8 * u, 32, ulong2(0, 0), true);   // A[i][t] = x[t][i]
+            simdgroup_load(B[u], xj + sj + 8 * u, 32);
+        }
+        for (short u = 0; u < 2; ++u)
+            for (short v = 0; v < 2; ++v) simdgroup_multiply_accumulate(acc[u][v], A[u], B[v], acc[u][v]);
+    }
+    for (short u = 0; u < 2; ++u)
+        for (short v = 0; v < 2; ++v) simdgroup_store(acc[u][v], hb + (ulong) (i0 + si + 8 * u) * D + j0 + sj + 8 * v, (ulong) D);
+}
 // y[i] = value i of n / len consecutive cache rows of len values (format FC_FMT; codes C and scales S from the first row)
 kernel void k_kv_f32(device const uchar* C [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
                      device const uchar* S [[buffer(3)]], constant uint& len [[buffer(4)]], uint i [[thread_position_in_grid]]) {

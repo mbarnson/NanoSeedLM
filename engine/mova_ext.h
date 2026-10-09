@@ -21,8 +21,13 @@ int eng_mova_routes_read(Eng* e, int rows, int32_t* mlp, int32_t* val, float* ml
 // attention input: kv_a_x, k_rope_proj), v [n_kv * head_dim] (the value experts' output on MoVA layers: kv_a_v; zeros
 // on dense layers), q [n_head * head_dim] (the heads' queries: q_rope_mix, q_lat), o [n_head * r] (the latent
 // outputs: v_up), and the rows summed.  0, or -1 (not an MLA model, or an engine without it).
+// eng_mla_capture(e, 2) also sums each input's X^T X (the GPTQ seed search; on the GPU, 4 (d^2 + kvd^2 + n_head
+// (head_dim^2 + r^2)) bytes a layer); eng_mla_capture_xtx copies layer l's, symmetric, f32: site 0 x [d][d], 1 v [kvd][kvd]
+// (zeros on dense layers), 2 q [n_head][head_dim][head_dim] (each head's query), 3 o [n_head][r][r] (each head's latent
+// output).  -1 when not captured (or an engine without it).
 int eng_mla_capture(Eng* e, int on);
 int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows);
+int eng_mla_capture_xtx(Eng* e, int l, int site, float* h);
 
 // Per-kernel GPU timing: while on, forwards run one command buffer per kernel group
 // and accumulate GPU seconds per group; eng_mova_timing_read copies MOVA_TG_N doubles.

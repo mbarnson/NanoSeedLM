@@ -673,6 +673,20 @@ int kt_bf16_f32(const uint16_t* x, float* y, int n) {
     memcpy(y, yb.contents, 4 * (size_t) n);
     return 0;
 }
+int kt_xtx(const float* x, int T, int xs, int D, int nb, float* H) {
+    const size_t hn = 4 * (size_t) nb * D * D;
+    id<MTLBuffer> xb = buf(x, 4 * ((size_t) (T - 1) * xs + (size_t) nb * D)), hb = buf(H, hn);
+    const int32_t a2[4] = {D, T, xs, D}, *a = a2;   // blocks cannot capture arrays
+    id<MTLComputePipelineState> pp = pipe_("k_xtx", 0, 0);
+    if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
+            [e setComputePipelineState:pp]; [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:hb offset:0 atIndex:1];
+            [e setBytes:a length:16 atIndex:2];
+            [e dispatchThreadgroups:MTLSizeMake((NSUInteger) D / 32, (NSUInteger) D / 32, (NSUInteger) nb) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }))
+        return -1;
+    memcpy(H, hb.contents, hn);
+    return 0;
+}
 int kt_argmax(const float* logits, int V, int n, int32_t* out) {
     id<MTLBuffer> lb = buf(logits, 4 * (size_t) V * n), ob = buf(NULL, 4 * (size_t) n);
     const int32_t vv = V;

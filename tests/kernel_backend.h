@@ -133,6 +133,10 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
 int kt_argmax(const float* logits, int V, int n, int32_t* out);
 // y[i] = x[i] (BF16 to f32, k_bf16_f32); 1 where the backend lacks it
 int kt_bf16_f32(const uint16_t* x, float* y, int n);
+// X^T X (k_xtx, the MLA capture for GPTQ): H[b][i][j] += sum_t x[t * xs + b * D + i] x[t * xs + b * D + j] over T rows, for
+// nb blocks of D columns (D a multiple of 32), on H's lower 32 x 32 tiles (i / 32 >= j / 32); the rest of H unchanged.
+// 1 where a backend lacks it.
+int kt_xtx(const float* x, int T, int xs, int D, int nb, float* H);
 
 #ifdef __cplusplus
 }
