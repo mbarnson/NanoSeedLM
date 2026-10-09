@@ -109,18 +109,11 @@ struct Eng {
 
 static id<MTLBuffer> alloc_k(Eng* e, uint64_t bytes, const char* label, int64_t* kind) {
     bytes = (bytes + 255) & ~255ull;
-    id<MTLBuffer> b;
-    if (kind == &e->mem.kv) {   // the KV cache: anonymous memory, whose pages are committed as positions are written
-        // (newBufferWithLength commits all of it: 8.6 GB for 4 idle 64k-token slots, against 0.5 GB this way)
-        const uint64_t n = (bytes + NS_PAGE - 1) & ~(uint64_t) (NS_PAGE - 1);
-        void* p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-        b = p == MAP_FAILED ? nil : [e->dev newBufferWithBytesNoCopy:p length:n options:MTLResourceStorageModeShared
-                                                        deallocator:^(void* q, NSUInteger m) { munmap(q, m); }];
-    } else b = [e->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = [e->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     if (!b) return nil;
     b.label = [NSString stringWithUTF8String:label];
     [e->buffers addObject:b];
-    *kind += (int64_t) (kind == &e->mem.kv ? bytes : b.length);   // KV: its size before rounding to pages
+    *kind += (int64_t) b.length;
     return b;
 }
 static id<MTLBuffer> scratch(Eng* e, uint64_t bytes, const char* label) { return alloc_k(e, bytes, label, &e->mem.scratch); }
