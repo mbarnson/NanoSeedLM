@@ -599,17 +599,22 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
                 [e dispatchThreads:MTLSizeMake((size_t) (O + R - 1) / R * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }))
             return -1;
-    } else {
+    } else {   // prompt rows, as the engine: the map decoded to BF16 once (k_heads_deq), then the BF16 GEMMs
+        const int32_t da2[4] = {tr ? I : O, tr ? O : I, H, 0}, *da = da2;   // the stored [H][rows][cols]; blocks cannot capture arrays
+        id<MTLBuffer> wb = buf(NULL, 2 * nb * 8 * H);
         const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
-        id<MTLComputePipelineState> pm = pipe_("k_mm", MF_SEED4P4, tr ? 2 : 1);
-        if (!pm || run(^(id<MTLComputeCommandEncoder> e) {
+        id<MTLComputePipelineState> pd = pipe_("k_heads_deq", 0, 0), pm = pipe_("k_mm", MF_BF16, tr ? 2 : 1);
+        if (!pd || !pm || run(^(id<MTLComputeCommandEncoder> e) {
+                [e setComputePipelineState:pd];
+                [e setBuffer:sb offset:0 atIndex:0]; [e setBuffer:cb offset:0 atIndex:1]; [e setBuffer:eb offset:0 atIndex:2];
+                [e setBuffer:tab offset:0 atIndex:3]; [e setBuffer:nb4 offset:0 atIndex:4]; [e setBuffer:wb offset:0 atIndex:5];
+                [e setBytes:da length:sizeof da2 atIndex:6];
+                [e dispatchThreads:MTLSizeMake(nb * H, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [e setComputePipelineState:pm]; [e setBytes:&m length:sizeof m atIndex:0];
-                [e setBuffer:xb offset:0 atIndex:6]; [e setBuffer:tab offset:0 atIndex:7]; [e setBuffer:xb offset:0 atIndex:8];
+                for (int i = 2; i <= 9; ++i) if (i != 4 && i != 5) [e setBuffer:wb offset:0 atIndex:(NSUInteger) i];
                 for (int h = 0; h < H; ++h) {
-                    [e setBuffer:sb offset:(NSUInteger) (h * nb * 2) atIndex:1];
-                    [e setBuffer:cb offset:(NSUInteger) (h * nb * 2) atIndex:2];
-                    [e setBuffer:eb offset:(NSUInteger) (h * 4) atIndex:3];
-                    [e setBuffer:nb4 offset:(NSUInteger) (h * nb / 2) atIndex:9];
+                    [e setBuffer:wb offset:(NSUInteger) (h * nb * 16) atIndex:1];
                     [e setBuffer:xb offset:(NSUInteger) h * hs * 4 atIndex:4];
                     [e setBuffer:yb offset:(NSUInteger) h * O * 4 atIndex:5];
                     [e setBuffer:(g ? gb : yb) offset:(NSUInteger) h * O * 4 atIndex:10];
