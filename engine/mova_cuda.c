@@ -91,7 +91,8 @@ struct Eng {
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
     float *lat, *qrp, *qlat, *olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
-    uint16_t *qmf, *qlf, *vuf;        // MLA prompt rows: seed per-head maps decoded to BF16 once per forward (kc_heads_deq)
+    uint16_t *qmf, *qlf, *vuf;        // MLA prompt rows: per-head maps decoded to BF16 once per forward (kc_heads_deq): seeds
+                                      // for every use, Q8 / Q4 q_lat and v_up for the expansion (k_mla_decomp)
     int cap_on;                       // MLA capture (mova_ext.h): per layer, column sums of squares of the projections' inputs
     float *cap_buf, *cap_host;        // this forward's sums [layer][x d | v kvd | q qd | o n_head * rmax] (device), a host copy
     double* cap_sum;                  // all forwards'
@@ -709,14 +710,16 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->qrp = (float*) scratch(e, (uint64_t) T * qd * 4);
         e->qlat = (float*) scratch(e, (uint64_t) T * c->n_head * rmax * 4);
         e->olat = (float*) scratch(e, (uint64_t) T * c->n_head * rmax * 4);
-        int hseeds = 0;
-        for (int l = 0; l < c->n_layer; ++l)
+        int hseeds = 0, hq = 0;
+        for (int l = 0; l < c->n_layer; ++l) {
             hseeds |= e->L[l].qm.fmt == MF_SEED4P4 || e->L[l].ql.fmt == MF_SEED4P4 || e->L[l].vu.fmt == MF_SEED4P4;
-        if (hseeds) {   // seed per-head maps: decoded once per prompt forward for the GEMMs and the decompression
-            e->qmf = (uint16_t*) scratch(e, (uint64_t) c->n_head * c->mla_rope * c->head_dim * 2);
+            hq |= e->L[l].ql.fmt != MF_BF16 || e->L[l].vu.fmt != MF_BF16;
+        }
+        if (hseeds || hq) {   // per-head maps decoded once per prompt forward: seeds for the GEMMs too, all for the expansion
+            if (hseeds) e->qmf = (uint16_t*) scratch(e, (uint64_t) c->n_head * c->mla_rope * c->head_dim * 2);
             e->qlf = (uint16_t*) scratch(e, (uint64_t) c->n_head * rmax * 128 * 2);
             e->vuf = (uint16_t*) scratch(e, (uint64_t) c->n_head * rmax * 128 * 2);
-            if (!e->qmf || !e->qlf || !e->vuf) {
+            if ((hseeds && !e->qmf) || !e->qlf || !e->vuf) {
                 snprintf(err, (size_t) errlen, "MLA scratch: out of GPU memory");
                 eng_close(e);
                 return NULL;
@@ -1023,10 +1026,11 @@ static void xtx_fold(Eng* e, int l) {
         }
 }
 
-// A SEED4P4 per-head map decoded to BF16 into Y (kc_heads_deq), as a BF16 MW over Y; any other map as it is
-static MW heads_bf16(Eng* e, const MW* W, uint16_t* Y) {
-    if (W->fmt != MF_SEED4P4) return *W;
-    kc_heads_deq(e->st, W->w0, e->stab32, W->slices, W->rows, W->cols, Y);
+// A per-head map decoded to BF16 into Y (kc_heads_deq), as a BF16 MW over Y: SEED4P4 maps, and (all) Q8 / Q4 ones too;
+// any other map as it is
+static MW heads_bf16(Eng* e, const MW* W, uint16_t* Y, int all) {
+    if (W->fmt == MF_BF16 || (W->fmt != MF_SEED4P4 && !all)) return *W;
+    kc_heads_deq(e->st, W->fmt, W->w0, e->stab32, W->slices, W->rows, W->cols, Y);
     MW f = *W;
     f.fmt = MF_BF16;
     memset(&f.w0, 0, sizeof f.w0);
@@ -1056,8 +1060,8 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     }
     const int big = T > MV_MAXT || e->prompt;
     // prompt rows: seed per-head maps decoded to BF16 once here (not per row or key tile)
-    const MW qm = big ? heads_bf16(e, &L->qm, e->qmf) : L->qm, ql = big ? heads_bf16(e, &L->ql, e->qlf) : L->ql;
-    const MW vu = big ? heads_bf16(e, &L->vu, e->vuf) : L->vu;
+    const MW qm = big ? heads_bf16(e, &L->qm, e->qmf, 0) : L->qm, ql = big ? heads_bf16(e, &L->ql, e->qlf, 0) : L->ql;
+    const MW vu = big ? heads_bf16(e, &L->vu, e->vuf, 0) : L->vu;
     enc_dense(e, &L->ka_x, e->xn, d, e->lat, r, T, 0);
     if (L->sparse) enc_dense(e, &L->ka_v, e->v, kvd, e->lat, r, T, 1);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0);
@@ -1068,11 +1072,13 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
         const KvView kv = kv_view(e, l);
         kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
         const int pos0 = max_ctx - T, kv0 = e->cur_kv0;   // consecutive positions of one slot
+        // Q8 / Q4 q_lat and v_up: decoded to BF16 once here, not per key tile of the decompression (seeds already are)
+        const MW qld = heads_bf16(e, &ql, e->qlf, 1), vud = heads_bf16(e, &vu, e->vuf, 1);
         for (int kb0 = 0; kb0 < max_ctx; kb0 += e->dec_keys) {
             const int kb1 = max_ctx - kb0 < e->dec_keys ? max_ctx : kb0 + e->dec_keys;
             // the keys before this chunk stay decompressed while one layer's chunks follow each other (layer-major)
             const int lo = kb0 == 0 && e->dec_l == l && e->dec_kv0 == kv0 ? (e->dec_n < pos0 ? e->dec_n : pos0) : kb0;
-            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, ql.fmt, ql.w0, vu.fmt, vu.w0,
+            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, qld.fmt, qld.w0, vud.fmt, vud.w0,
                           e->dec_k, e->dec_v);
             e->dec_l = kb0 == 0 ? l : -1;
             e->dec_kv0 = kv0;

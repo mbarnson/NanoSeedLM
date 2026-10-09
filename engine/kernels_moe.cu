@@ -1216,9 +1216,10 @@ __global__ void __launch_bounds__(128) k_mla_reduce(MlaArgs a, const float* part
 
 // A SEED4P4 per-head map [H][O][I] (exponent bias per head in W.p[2]) decoded to BF16, out [H][O][I]: the prefill GEMM's
 // seed weights (tile_weights) rounded to BF16, once per prompt forward for the GEMMs and k_mla_decomp.  A thread a block.
-__global__ void k_heads_deq(WSlice W, const uint32_t* G, int O, int I, int nbt, uint16_t* out) {
+__global__ void k_heads_deq(int fmt, WSlice W, const uint32_t* G, int O, int I, int nbt, uint16_t* out) {
     const int b = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (b >= nbt) return;
+    if (fmt != MF_SEED4P4) { *(uint4*) (out + (size_t) b * 8) = welem8(fmt, W, (size_t) b * 8); return; }   // Q8 / Q4: exact BF16
     const int nbk = I / 8, row = b / nbk, j = b - row * nbk;
     WSlice ws = W;
     ws.eb = ((const int32_t*) W.p[2])[row / O];
@@ -2121,9 +2122,9 @@ void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const uint32_t* G
     if (T > MV_MAXT && !kc_heads_mm(s, a, fmt, W, x, g, y, T)) return;   // more rows than a matvec takes: the GEMM
     k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, fmt, W, G, x, g ? g : x, y);
 }
-void kc_heads_deq(cudaStream_t s, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out) {
+void kc_heads_deq(cudaStream_t s, int fmt, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out) {
     const int nbt = H * O * (I / 8);
-    k_heads_deq<<<(unsigned) ((nbt + 255) / 256), 256, 0, s>>>(W, G, O, I, nbt, out);
+    k_heads_deq<<<(unsigned) ((nbt + 255) / 256), 256, 0, s>>>(fmt, W, G, O, I, nbt, out);
 }
 void kc_xtx(cudaStream_t s, const float* X, int D, int nb, int xs, int bs, int T, float* H) {
     k_xtx<<<dim3((unsigned) D / 32, (unsigned) D / 32, (unsigned) nb), 128, 0, s>>>(X, D, T, xs, bs, H);

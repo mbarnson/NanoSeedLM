@@ -520,7 +520,7 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
         return done("kc_heads_mv (SEED4P4)", y, dy, yn);
     }
     uint16_t* d = (uint16_t*) dev(NULL, 2 * n);
-    kc_heads_deq(0, w, g_stab32, H, rows, cols, d);
+    kc_heads_deq(0, MF_SEED4P4, w, g_stab32, H, rows, cols, d);
     if (!tr) {
         WSlice b;
         memset(&b, 0, sizeof b);

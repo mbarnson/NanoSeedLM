@@ -124,9 +124,9 @@ void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, cons
 // (y's layout): bf16(that * bf16(softplus_ln2(g)))
 // SEED4P4: W.p = seeds, coefficients, exponent biases [H] (int32, device), exponent codes; G the 32-bit stream table.
 void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const uint32_t* G, const float* x, const float* g, float* y, int T);
-// A SEED4P4 per-head map [H][O][I] (W as kc_heads_mv's) decoded to BF16 into out [H][O][I] (the prefill GEMM's seed
-// weights rounded to BF16)
-void kc_heads_deq(cudaStream_t s, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out);
+// A per-head map [H][O][I] in fmt (W as kc_heads_mv's) decoded to BF16 into out [H][O][I]: SEED4P4 as the prefill GEMM's
+// seed weights rounded to BF16; Q8 / Q4 exactly (bf16(scale x code + bias))
+void kc_heads_deq(cudaStream_t s, int fmt, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out);
 // H[b] += X_b^T X_b on the lower 32 x 32 tiles of nb blocks of D columns (X_b at column b * bs; T rows of stride xs;
 // D a multiple of 32; H[b] at b * D * D): the GPTQ capture
 void kc_xtx(cudaStream_t s, const float* X, int D, int nb, int xs, int bs, int T, float* H);
