@@ -119,7 +119,8 @@ static int add(NsModel* m, const NsModel* src, const Ref* refs, int nr, const ch
     t.enc = enc; t.slices = (int) S; t.rows = (int) R; t.cols = (int) C;
     for (int s = 0; s < 4 && SUF[enc][s]; ++s) {
         char nm[160];
-        snprintf(nm, sizeof nm, "%s%s", base, SUF[enc][s]);
+        const int bare = !s && !strcmp(name, base);   // an affine tensor not named *.weight: its codes are named X
+        snprintf(nm, sizeof nm, "%s%s", base, bare ? "" : SUF[enc][s]);
         const Ref* r = lookup(refs, nr, nm);
         const uint64_t want = ns_stream_len(enc, t.slices, t.rows, t.cols, s);
         if (!r || strcmp(r->e->dtype, DT[enc][s]) || r->e->end - r->e->begin != want) {
@@ -183,6 +184,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
                 char k[176];
                 snprintf(k, sizeof k, "%s.weight", base);
                 const Ref* w = lookup(refs, nr, k);
+                if (!w && (w = lookup(refs, nr, base))) snprintf(logical, sizeof logical, "%s", base);   // codes named X
                 C *= 64;
                 const int64_t bits = w && w->e->ndim >= 1 ? w->e->shape[w->e->ndim - 1] * 32 / C : 0;
                 if (bits != 4 && bits != 8) { snprintf(err, (size_t) errlen, "%s: not affine Q4 or Q8", base); free(refs); goto done; }
@@ -276,7 +278,9 @@ int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, cons
             const size_t L = strlen(t[i].name);
             if (t[i].enc == NS_BF16) snprintf(e->name, sizeof e->name, "%s", t[i].name);
             else if (L > 7 && ends(t[i].name, ".weight")) snprintf(e->name, sizeof e->name, "%.*s%s", (int) (L - 7), t[i].name, SUF[t[i].enc][s]);
-            else { snprintf(err, (size_t) errlen, "%s: an encoded tensor must be named *.weight", t[i].name); free(ents); return -1; }
+            else if (t[i].enc == NS_Q8 || t[i].enc == NS_Q4)   // a name without .weight (MLA projections): X, X.scales, X.biases
+                snprintf(e->name, sizeof e->name, "%s%s", t[i].name, s ? SUF[t[i].enc][s] : "");
+            else { snprintf(err, (size_t) errlen, "%s: a seed-encoded tensor must be named *.weight", t[i].name); free(ents); return -1; }
             e->dtype = DT[t[i].enc][s];
             ent_shape(e, &t[i], s);
             e->len = len;

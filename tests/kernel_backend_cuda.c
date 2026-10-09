@@ -355,6 +355,8 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
 }
 int kt_bf16_f32(const uint16_t* x, float* y, int n) { return 1; }   // Metal only so far
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) { return 1; }
+int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
+               const float* x, int xs, int hs, const float* g, float* y, int T) { return 1; }   // Metal only so far
 // An FP8 / FP4 MLA cache (nslm/kvq.h: the RoPE key all FP8; the latent FP8, or FP4 past its first KVQ_FP4_LEAD values),
 // codes and scales on the device, split in two segments at npos / 2 as mla_kv
 static int mla_lead_(int fmt, int r) { return fmt == KV_FP4 && r > KVQ_FP4_LEAD ? KVQ_FP4_LEAD : r; }

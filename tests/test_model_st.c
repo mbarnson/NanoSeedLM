@@ -30,6 +30,8 @@ static const NsSpec SPECS[] = {
     {"model.layers.3.self_attn.v_experts.weight", NS_Q4, 3, 64, 128},
     {"model.layers.3.mlp.shared_experts.up_proj.weight", NS_BF16, 2, 32, 64},
     {"lm_head.weight", NS_Q8, 1, 1000, 128},
+    {"model.layers.3.self_attn.mla.kv_a_x", NS_Q8, 1, 64, 128},     // encoded, not named *.weight (MLA projections)
+    {"model.layers.3.self_attn.mla.q_lat", NS_Q4, 4, 64, 128},
 };
 #define NSPEC ((int) (sizeof SPECS / sizeof SPECS[0]))
 

@@ -1,6 +1,7 @@
 // nslm/mova_pack.c - nslm-mova-pack: writes a NanoSeedLM model folder for K2-Horizon MoVA (nslm/model_st.h).
 //
-//   nslm-mova-pack --model DIR --config CONFIG --out DIR [--blk DIR] [--blk4 DIR] [--q4 PARTS|--rest4] [--threads 16]
+//   nslm-mova-pack --model DIR --config CONFIG --out DIR [--blk DIR] [--blk4 DIR] [--q4 PARTS|--rest4] [--mla bf16|q8|q4]
+//                  [--threads 16]
 //                  [--shard-gb 4.5] [--loader tools/nanoseedlm_k2.py]
 //
 //   CONFIG  routed experts                                                  needs
@@ -16,7 +17,8 @@
 // Value experts, attention, shared / dense MLPs, embedding and LM head are Q8, or Q4 for the parts named in --q4
 // (v value experts, a attention, m shared / dense MLPs, h LM head; --rest4 = vamh; the embedding is always Q8);
 // routers are BF16 holding their Q8 round trip (the router needs BF16 operands); norms and router biases are BF16.
-// MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported; such a folder is
+// MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported, or Q8 / Q4
+// with --mla (per-head maps quantized per head along their input dim); such a folder is
 // for the NanoSeedLM engine (no MLX loader reads MLA yet, so config.json gets no "model_file").
 // Q8/Q4 are MLX's affine g64 (affine.h).  The folder also gets config.json (with MLX's "quantization" and, for seeds,
 // "model_file": the MLX loader), the tokenizer and template files of DIR, and the loader.
@@ -87,7 +89,10 @@ static void* qworker(void* arg) {
         const int k = atomic_fetch_add(&j->next, 1);
         if (k >= items) break;
         const int slice = t->slices > 1 ? k : 0;
-        const uint16_t* w = mova_ckpt_bf16(j->c->ck, mova_slice_name(t, slice, name, sizeof name), t->rows, t->cols, err, sizeof err);
+        const uint16_t* w = t->kind == MOVA_K_HEADS   // MLA's per-head maps: one stacked 3-D tensor
+            ? mova_ckpt_bf16_3d(j->c->ck, t->name, t->slices, t->rows, t->cols, err, sizeof err)
+            : mova_ckpt_bf16(j->c->ck, mova_slice_name(t, slice, name, sizeof name), t->rows, t->cols, err, sizeof err);
+        if (w && t->kind == MOVA_K_HEADS) w += (size_t) slice * t->rows * t->cols;
         if (!w) { fprintf(stderr, "%s\n", err); atomic_store(&j->failed, 1); break; }
         const int r0 = t->slices > 1 ? 0 : k * chunk, nr = t->slices > 1 ? t->rows : (t->rows - r0 < chunk ? t->rows - r0 : chunk);
         const size_t e0 = (size_t) slice * t->rows * t->cols + (size_t) r0 * t->cols;   // first element
@@ -308,13 +313,13 @@ static int write_config(const char* model, const char* out, const NsSpec* t, int
 }
 
 int main(int argc, char** argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);   // (_IOLBF with size 0 fails fast in MSVC's CRT)
     const char* model = opt(argc, argv, "--model", NULL), *config = opt(argc, argv, "--config", NULL);
     const char* out = opt(argc, argv, "--out", NULL), *blk = opt(argc, argv, "--blk", NULL);
     const char* loader = opt(argc, argv, "--loader", "tools/nanoseedlm_k2.py");
     if (!model || !config || !out) {
         fprintf(stderr, "usage: nslm-mova-pack --model DIR --config q8mx|q4mx|nslmmx|gu4d|gup4d|p4mx|p4mxbf [--blk DIR] [--blk4 DIR] "
-                        "[--q4 vamh|--rest4] --out DIR [--threads N] [--shard-gb 4.5] [--loader FILE]\n");
+                        "[--q4 vamh|--rest4] [--mla bf16|q8|q4] --out DIR [--threads N] [--shard-gb 4.5] [--loader FILE]\n");
         return 2;
     }
     const int q8mx = !strcmp(config, "q8mx"), q4mx = !strcmp(config, "q4mx"), mx = !strcmp(config, "nslmmx"),
@@ -322,6 +327,9 @@ int main(int argc, char** argv) {
               p4mxbf = !strcmp(config, "p4mxbf");
     if (!(q8mx || q4mx || mx || gu4d || gup4d || p4mx || p4mxbf)) { fprintf(stderr, "unknown --config %s\n", config); return 2; }
     const char* q4parts = has_flag(argc, argv, "--rest4") ? "vamh" : opt(argc, argv, "--q4", "");
+    const char* mla = opt(argc, argv, "--mla", "bf16");   // the MLA projections (and per-head maps)
+    const int mla_enc = !strcmp(mla, "q8") ? NS_Q8 : !strcmp(mla, "q4") ? NS_Q4 : !strcmp(mla, "bf16") ? NS_BF16 : -1;
+    if (mla_enc < 0) { fprintf(stderr, "--mla: bf16, q8 or q4\n"); return 2; }
     if ((gup4d || p4mx || p4mxbf) && !opt(argc, argv, "--blk4", NULL)) { fprintf(stderr, "--config %s needs --blk4\n", config); return 2; }
     if ((mx || gu4d || gup4d) && !blk) { fprintf(stderr, "--config %s needs --blk\n", config); return 2; }
     char err[512] = "";
@@ -347,9 +355,10 @@ int main(int argc, char** argv) {
             else if (gup4d && !strcmp(t->proj, "down_proj")) enc = NS_BF16;   // decoded from the P = 4 blocks
             else if (mx || strcmp(t->proj, "down_proj")) enc = NS_SEED4;
             break;
-        case MOVA_K_ROUTER: case MOVA_K_NORM: case MOVA_K_ROUTER_BIAS: case MOVA_K_HEADS: enc = NS_BF16; break;
+        case MOVA_K_ROUTER: case MOVA_K_NORM: case MOVA_K_ROUTER_BIAS: enc = NS_BF16; break;
+        case MOVA_K_HEADS: enc = mla_enc; break;
         case MOVA_K_VEXPERTS: case MOVA_K_LINEAR: case MOVA_K_EMBED: case MOVA_K_HEAD: {
-            if (strstr(t->name, ".mla.")) { enc = NS_BF16; break; }   // MLA projections (no *.weight name to quantize)
+            if (strstr(t->name, ".mla.")) { enc = mla_enc; break; }   // MLA projections: --mla
             // --q4 PARTS: v value experts, a attention, m shared / dense MLPs, h LM head (--rest4 = vamh)
             const int part = t->kind == MOVA_K_VEXPERTS ? 'v' : t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 0
                            : strstr(t->name, "self_attn") ? 'a' : 'm';

@@ -229,8 +229,12 @@ holmes.txt --decode 256`; the one-pass kernel is the earlier `k_mla_attn` with p
 | decode, 1k / 4k / 8k context | 37.7 / 32.1 / 20.0 | 54.1 / 51.2 / 47.7 | 61.2 / 58.6 / 50.6 |
 
 The KV cache places MLA's per-layer latent widths in VRAM and host memory as it does GQA's rows. Decode is still
-slower than GQA's mostly because it streams the BF16 MLA projections (945 MB per token at rank 768). Not yet: packed
-(Q8 / seed) MLA tensors (the MLA projections stay BF16).
+slower than GQA's mostly because it streams the MLA projections (945 MB per token at rank 768 in BF16).
+
+`nslm-mova-pack --mla q8` (or `q4`) packs the MLA projections and per-head maps as affine Q8 / Q4 instead of BF16
+(Metal; the CUDA engine refuses such per-head maps until it has them). J768 with p4mx-q4v seeds, held-out KLD over 31
+windows: BF16 projections 0.2199 (23.56 GB), Q8 0.2206 (23.12 GB), Q4 0.2471 (22.88 GB); Q8 with the `fp4` cache
+0.2246. Prefill and decode speed are unchanged with Q8.
 
 On Metal, long prompts (256 or more new tokens) attend with the latent expanded per head, as CUDA's prompt rows do:
 `k_mla_prefill` over `q · (q_latᵀ c) + q_rope · k_rope` with values `v_up c`, the keys expanded 512 cached positions at a

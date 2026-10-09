@@ -536,6 +536,44 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
     memcpy(x, xb.contents, 4 * (size_t) n * d);
     return 0;
 }
+int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
+               const float* x, int xs, int hs, const float* g, float* y, int T) {
+    const size_t n = (size_t) O * I, cb = fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : n / 2, sb = n / 64 * 2;
+    const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
+    id<MTLBuffer> wb = buf(codes, cb * H), sbuf = buf(scales, fmt == MF_BF16 ? 0 : sb * H), bbuf = buf(biases, fmt == MF_BF16 ? 0 : sb * H),
+                  xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
+    if (T <= MV_MAXT && !tr) {   // the decode matvec
+        const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+        id<MTLComputePipelineState> pp = pipe_("k_heads_mv", fmt, 0);
+        if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
+                [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
+                [e setBuffer:wb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
+                [e setBuffer:yb offset:0 atIndex:4]; [e setBuffer:sbuf offset:0 atIndex:5]; [e setBuffer:bbuf offset:0 atIndex:6];
+                [e dispatchThreads:MTLSizeMake((size_t) O * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }))
+            return -1;
+    } else {   // prompt rows: a GEMM per head (tr: W_h read transposed)
+        const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
+        id<MTLComputePipelineState> pm = pipe_("k_mm", fmt, tr ? 2 : 1);
+        if (!pm || run(^(id<MTLComputeCommandEncoder> e) {
+                [e setComputePipelineState:pm]; [e setBytes:&m length:sizeof m atIndex:0];
+                for (int i = 6; i <= 9; ++i) [e setBuffer:wb offset:0 atIndex:(NSUInteger) i];
+                for (int h = 0; h < H; ++h) {
+                    [e setBuffer:wb offset:(NSUInteger) (h * cb) atIndex:1];
+                    [e setBuffer:(fmt == MF_BF16 ? wb : sbuf) offset:(NSUInteger) (fmt == MF_BF16 ? 0 : h * sb) atIndex:2];
+                    [e setBuffer:(fmt == MF_BF16 ? wb : bbuf) offset:(NSUInteger) (fmt == MF_BF16 ? 0 : h * sb) atIndex:3];
+                    [e setBuffer:xb offset:(NSUInteger) h * hs * 4 atIndex:4];
+                    [e setBuffer:yb offset:(NSUInteger) h * O * 4 atIndex:5];
+                    [e setBuffer:(g ? gb : yb) offset:(NSUInteger) h * O * 4 atIndex:10];
+                    [e dispatchThreadgroups:MTLSizeMake((O + MM_BM - 1) / MM_BM, (T + MM_BN - 1) / MM_BN, 1)
+                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+            }))
+            return -1;
+    }
+    memcpy(y, yb.contents, yn);
+    return 0;
+}
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) {
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     id<MTLBuffer> wb = buf(W, 2 * (size_t) H * O * I), xb = buf(x, xn), yb = buf(NULL, yn);
