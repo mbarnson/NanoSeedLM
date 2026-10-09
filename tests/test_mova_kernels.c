@@ -844,8 +844,14 @@ static void test_mla(void) {
                     for (int h = 0; h < H; ++h)
                         for (int o = 0; o < O; ++o) {
                             double acc = 0;
-                            for (int i = 0; i < I; ++i)
-                                acc += Wd[h * n + (tr ? (size_t) i * O + o : (size_t) o * I + i)] * (double) x[(size_t) t * H * I + h * I + i];
+                            for (int i = 0; i < I; ++i) {
+                                // decode rows (T <= 8): the exact weights (the matvec decodes unrounded); prompt rows and
+                                // transposed reads: search4.h's decoded weights, bf16(R32 2^e isum) (engines decode a seed
+                                // map to BF16 once per prompt forward)
+                                const double wx = Wd[h * n + (tr ? (size_t) i * O + o : (size_t) o * I + i)];
+                                const double wv = T <= 8 && !tr ? wx : (double) bfr((float) wx);
+                                acc += wv * (double) x[(size_t) t * H * I + h * I + i];
+                            }
                             const size_t yi = ((size_t) t * H + h) * O + o;
                             bad += !close_bf(y[yi], C[cs].gate ? gated(acc, g[yi]) : bfr(acc), 2e-6);
                         }

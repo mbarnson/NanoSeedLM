@@ -91,6 +91,11 @@ struct Eng {
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
     float *lat, *qrp, *qlat, *olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
+    uint16_t *qmf, *qlf, *vuf;        // MLA prompt rows: seed per-head maps decoded to BF16 once per forward (kc_heads_deq)
+    int cap_on;                       // MLA capture (mova_ext.h): per layer, column sums of squares of the projections' inputs
+    float *cap_buf, *cap_host;        // this forward's sums [layer][x d | v kvd | q qd | o n_head * rmax] (device), a host copy
+    double* cap_sum;                  // all forwards'
+    int64_t cap_rows, cap_ld;
     // MLA prompt rows (kc_mla_prefill): decompressed keys and values of up to dec_keys positions ([key][n_head][128]
     // BF16), the softmax state across key blocks, and which keys the buffers hold: [0, dec_n) of layer dec_l in the slot
     // at cache row dec_kv0 (dec_l -1: none).  Any forward that is not a prompt's, and any cache write, forgets them.
@@ -198,7 +203,10 @@ static int upload_dense(Eng* e, const NsTensor* t, MW* w, char* err, int errlen)
     for (int s = 0; s < 4; ++s) {
         const NsStream* st = &t->s[s];
         if (!st->len) continue;
-        if ((t->enc == MF_SEED4 || t->enc == MF_SEED4P4) && s == 2) { memcpy(&w->w0.eb, st->p, 4); continue; }
+        if ((t->enc == MF_SEED4 || t->enc == MF_SEED4P4) && s == 2) {   // exponent biases: the first in the WSlice; per-head
+            memcpy(&w->w0.eb, st->p, 4);                                 // maps (slices > 1) also get all of them in p[2]
+            if (t->slices == 1) continue;
+        }
         void* d = dalloc(e, st->len, &e->mem.weights);
         if (!d || !CK(cudaMemcpy(d, st->p, st->len, cudaMemcpyHostToDevice))) {
             snprintf(err, (size_t) errlen, "%s: out of GPU memory", t->name);
@@ -502,6 +510,11 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
     const MovaTensor* t = mova_find(all, n, name);
     if (!t) { snprintf(err, (size_t) errlen, "no logical tensor %s", name); return -1; }
     const NsTensor* nt = ns_find(&e->nm, name);
+    if (!nt && strstr(name, ".mla.")) {   // MLA projections: NAME, or NAME.weight when seed-encoded (nslm-mova-pack --mla p4)
+        char wn[256];
+        snprintf(wn, sizeof wn, "%s.weight", name);
+        nt = ns_find(&e->nm, wn);
+    }
     if (!nt) return upload_ckpt(e, t, w, err, errlen);
     if (nt->slices != t->slices || nt->rows != t->rows || nt->cols != t->cols) {
         snprintf(err, (size_t) errlen, "%s: shape %d x %d x %d, expected %d x %d x %d", name, nt->slices, nt->rows, nt->cols,
@@ -511,7 +524,7 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
     const int f = nt->enc;
     const int ok = t->kind == MOVA_K_EXPERTS ? 1
                    : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
-                      t->kind == MOVA_K_HEADS) ? f == MF_BF16 || (t->kind == MOVA_K_HEADS && (f == MF_Q8 || f == MF_Q4) && nt->cols % 64 == 0)
+                      t->kind == MOVA_K_HEADS) ? f == MF_BF16 || (t->kind == MOVA_K_HEADS && (((f == MF_Q8 || f == MF_Q4) && nt->cols % 64 == 0) || f == MF_SEED4P4))
                    : t->kind == MOVA_K_EMBED ? (f == MF_BF16 || f == MF_Q8)
                    : f != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
     if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, f); return -1; }
@@ -598,6 +611,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         LOAD(&L->sd, "model.layers.%d.mlp.shared_experts.down_proj.weight", l);
         seeds += L->eg.fmt == MF_SEED4 || L->ed.fmt == MF_SEED4;
         seeds4 += L->eg.fmt == MF_SEED4P4 || L->eu.fmt == MF_SEED4P4 || L->ed.fmt == MF_SEED4P4;
+        seeds4 += L->ka_x.fmt == MF_SEED4P4 || L->ka_v.fmt == MF_SEED4P4 || L->kr.fmt == MF_SEED4P4 || L->qm.fmt == MF_SEED4P4 ||
+                  L->ql.fmt == MF_SEED4P4 || L->vu.fmt == MF_SEED4P4;
     }
 #undef LOAD
     free(all);
@@ -689,6 +704,19 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->qrp = (float*) scratch(e, (uint64_t) T * qd * 4);
         e->qlat = (float*) scratch(e, (uint64_t) T * c->n_head * rmax * 4);
         e->olat = (float*) scratch(e, (uint64_t) T * c->n_head * rmax * 4);
+        int hseeds = 0;
+        for (int l = 0; l < c->n_layer; ++l)
+            hseeds |= e->L[l].qm.fmt == MF_SEED4P4 || e->L[l].ql.fmt == MF_SEED4P4 || e->L[l].vu.fmt == MF_SEED4P4;
+        if (hseeds) {   // seed per-head maps: decoded once per prompt forward for the GEMMs and the decompression
+            e->qmf = (uint16_t*) scratch(e, (uint64_t) c->n_head * c->mla_rope * c->head_dim * 2);
+            e->qlf = (uint16_t*) scratch(e, (uint64_t) c->n_head * rmax * 128 * 2);
+            e->vuf = (uint16_t*) scratch(e, (uint64_t) c->n_head * rmax * 128 * 2);
+            if (!e->qmf || !e->qlf || !e->vuf) {
+                snprintf(err, (size_t) errlen, "MLA scratch: out of GPU memory");
+                eng_close(e);
+                return NULL;
+            }
+        }
         if (!e->lat || !e->qrp || !e->qlat || !e->olat) {
             snprintf(err, (size_t) errlen, "MLA scratch: out of GPU memory");
             eng_close(e);
@@ -857,6 +885,7 @@ void eng_close(Eng* e) {
     if (e->ck) mova_ckpt_close(e->ck);
     if (e->seqs) for (int s = 0; s < e->nseqs; ++s) free(e->seqs[s].hist);
     free(e->seqs);
+    free(e->cap_sum); free(e->cap_host);
     free(e->kv_vrow); free(e->kv_voff); free(e->kv_vsrow); free(e->kv_vsoff);
     free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
     free(e);
@@ -966,7 +995,17 @@ static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
 // MLA per-head maps (kc_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by G (y's layout)
 static void enc_heads_mv(Eng* e, const MW* W, const float* X, int xs, int hs, const float* G, float* Y, int T) {
     const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != NULL, {0}};
-    if (!e->prompt || kc_heads_mm(e->st, a, W->fmt, W->w0, X, G, Y, T)) kc_heads_mv(e->st, a, W->fmt, W->w0, X, G, Y, T);
+    if (!e->prompt || kc_heads_mm(e->st, a, W->fmt, W->w0, X, G, Y, T)) kc_heads_mv(e->st, a, W->fmt, W->w0, stab_for(e, W), X, G, Y, T);
+}
+// A SEED4P4 per-head map decoded to BF16 into Y (kc_heads_deq), as a BF16 MW over Y; any other map as it is
+static MW heads_bf16(Eng* e, const MW* W, uint16_t* Y) {
+    if (W->fmt != MF_SEED4P4) return *W;
+    kc_heads_deq(e->st, W->w0, e->stab32, W->slices, W->rows, W->cols, Y);
+    MW f = *W;
+    f.fmt = MF_BF16;
+    memset(&f.w0, 0, sizeof f.w0);
+    f.w0.p[0] = Y;
+    return f;
 }
 
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v), as Metal's
@@ -977,12 +1016,21 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     const Layer* L = &e->L[l];
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim, r = L->mla_r, H = g->n_head;
     tgroup(e, MOVA_TG_ATTN_PROJ);
+    float* cb = e->cap_on ? e->cap_buf + (uint64_t) l * (uint64_t) e->cap_ld : NULL;   // capture: this layer's sums
+    if (cb) {
+        kc_sumsq(e->st, e->xn, d, T, d, cb);
+        if (L->sparse) kc_sumsq(e->st, e->v, kvd, T, kvd, cb + d);
+        kc_sumsq(e->st, e->q, qd, T, qd, cb + d + kvd);
+    }
+    const int big = T > MV_MAXT || e->prompt;
+    // prompt rows: seed per-head maps decoded to BF16 once here (not per row or key tile)
+    const MW qm = big ? heads_bf16(e, &L->qm, e->qmf) : L->qm, ql = big ? heads_bf16(e, &L->ql, e->qlf) : L->ql;
+    const MW vu = big ? heads_bf16(e, &L->vu, e->vuf) : L->vu;
     enc_dense(e, &L->ka_x, e->xn, d, e->lat, r, T, 0);
     if (L->sparse) enc_dense(e, &L->ka_v, e->v, kvd, e->lat, r, T, 1);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0);
-    enc_heads_mv(e, &L->qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
-    const int big = T > MV_MAXT || e->prompt;
-    if (big && e->dec_keys && e->expand) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
+    enc_heads_mv(e, &qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
+    if (big && e->dec_keys && e->expand && !cb) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
         tgroup(e, MOVA_TG_ATTN);
         const MlaArgs ma = {H, r, 128, 1, 1.0f / sqrtf((float) g->head_dim), {0}};
         const KvView kv = kv_view(e, l);
@@ -992,7 +1040,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
             const int kb1 = max_ctx - kb0 < e->dec_keys ? max_ctx : kb0 + e->dec_keys;
             // the keys before this chunk stay decompressed while one layer's chunks follow each other (layer-major)
             const int lo = kb0 == 0 && e->dec_l == l && e->dec_kv0 == kv0 ? (e->dec_n < pos0 ? e->dec_n : pos0) : kb0;
-            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, L->ql.fmt, L->ql.w0, L->vu.fmt, L->vu.w0,
+            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, ql.fmt, ql.w0, vu.fmt, vu.w0,
                           e->dec_k, e->dec_v);
             e->dec_l = kb0 == 0 ? l : -1;
             e->dec_kv0 = kv0;
@@ -1003,7 +1051,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
         tgroup(e, MOVA_TG_ATTN_PROJ);
         return;
     }
-    enc_heads_mv(e, &L->ql, e->q, qd, g->head_dim, NULL, e->qlat, T);
+    enc_heads_mv(e, &ql, e->q, qd, g->head_dim, NULL, e->qlat, T);
     tgroup(e, MOVA_TG_ATTN);
     // decode: twice the GQA splits (keys in parts of >= 64), at most MAX_SPLITS: one block holds all of a row's heads
     // (kc_mla_attn).  64 splits measured no faster at 8k (RTX 4080: the reduce's cost doubled).  A row's split count
@@ -1013,8 +1061,9 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     const KvView kv = kv_view(e, l);
     kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
     kc_mla_attn(e->st, ma, e->qlat, e->qrp, kv, RI, e->part, e->olat, T);
+    if (cb) kc_sumsq(e->st, e->olat, H * r, T, H * r, cb + d + kvd + qd);
     tgroup(e, MOVA_TG_ATTN_PROJ);
-    enc_heads_mv(e, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
+    enc_heads_mv(e, &vu, e->olat, H * r, r, e->gq, e->ao, T);
 }
 
 // Layer l for T rows: hidden states X [T][d] (updated in place), rows RI (positions), keys up to max_ctx.
@@ -1247,6 +1296,14 @@ static int forward_lm(Eng* e, int seq, const int32_t* ids, int n, int pos0, int 
     e->in_lm = !(e->route_on || n <= MV_MAXT);
     const int rc = forward_lm_body(e, seq, ids, n, pos0, h0, logits_out);
     e->prompt = e->in_lm = 0;
+    if (!rc && e->cap_on) {   // MLA capture: this forward's sums into the totals
+        const uint64_t nn = (uint64_t) e->c.n_layer * (uint64_t) e->cap_ld;
+        if (!CK(cudaStreamSynchronize(e->st)) || !CK(cudaMemcpy(e->cap_host, e->cap_buf, nn * 4, cudaMemcpyDeviceToHost)) ||
+            !CK(cudaMemset(e->cap_buf, 0, nn * 4)))
+            return -1;
+        for (uint64_t i = 0; i < nn; ++i) e->cap_sum[i] += e->cap_host[i];
+        e->cap_rows += n;
+    }
     return rc;
 }
 static int forward_lm_body(Eng* e, int seq, const int32_t* ids, int n, int pos0, int h0, float* logits_out) {
@@ -1353,7 +1410,7 @@ int eng_prefill_next(Eng* e, int seq, int max_rows) {
     if (left <= 0) return 0;
     int T = left < max_rows ? left : max_rows;
     if (s->done < s->xend && s->done + T > s->xend) T = s->xend - s->done;   // a forward on one side of xend
-    e->expand = s->done < s->xend;
+    e->expand = s->done < s->xend && !e->cap_on;
     const int rc = forward_lm(e, seq, s->hist + s->done, T, s->done, T, NULL);
     e->expand = 1;
     if (rc) { s->len = s->done = 0; return -1; }   // no half-written KV
@@ -1553,10 +1610,36 @@ static void route_collect(Eng* e, int T) {
         }
     }
 }
-int eng_mla_capture(Eng* e, int on) { (void) e; (void) on; return -1; }   // mova_ext.h: not in this engine yet
+int eng_mla_capture(Eng* e, int on) {   // mova_ext.h
+    const MovaCfg* c = &e->c;
+    if (!c->mla) return -1;
+    if (on && !e->cap_on) {
+        int rmax = 0;
+        for (int l = 0; l < c->n_layer; ++l) if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+        e->cap_ld = (int64_t) c->d + (int64_t) c->n_kv * c->head_dim + (int64_t) c->n_head * c->head_dim + (int64_t) c->n_head * rmax;
+        const uint64_t n = (uint64_t) c->n_layer * (uint64_t) e->cap_ld;
+        if (!e->cap_buf && !(e->cap_buf = (float*) scratch(e, n * 4))) return -1;
+        free(e->cap_sum);
+        free(e->cap_host);
+        e->cap_sum = (double*) calloc(n, sizeof(double));
+        e->cap_host = (float*) malloc(n * 4);
+        if (!e->cap_sum || !e->cap_host || !CK(cudaMemset(e->cap_buf, 0, n * 4))) return -1;
+        e->cap_rows = 0;
+    }
+    e->cap_on = on;
+    return 0;
+}
 int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {
-    (void) e; (void) l; (void) x; (void) v; (void) q; (void) o; (void) rows;
-    return -1;
+    const MovaCfg* c = &e->c;
+    if (!c->mla || !e->cap_sum || l < 0 || l >= c->n_layer) return -1;
+    const int d = c->d, kvd = c->n_kv * c->head_dim, qd = c->n_head * c->head_dim, od = c->n_head * e->L[l].mla_r;
+    const double* sm = e->cap_sum + (uint64_t) l * (uint64_t) e->cap_ld;
+    if (x) memcpy(x, sm, sizeof(double) * (size_t) d);
+    if (v) memcpy(v, sm + d, sizeof(double) * (size_t) kvd);
+    if (q) memcpy(q, sm + d + kvd, sizeof(double) * (size_t) qd);
+    if (o) memcpy(o, sm + d + kvd + qd, sizeof(double) * (size_t) od);
+    if (rows) *rows = e->cap_rows;
+    return 0;
 }
 int eng_mova_routes_read(Eng* e, int rows, int32_t* mlp, int32_t* val, float* mlp_sel, float* val_sel) {
     if (!e->route_on || rows > e->route_rows) return -1;

@@ -988,20 +988,29 @@ static __device__ __forceinline__ uint4 welem8(int fmt, const WSlice& w, size_t 
     return make_uint4(pack_bf2(a.x, a.y), pack_bf2(a.z, a.w), pack_bf2(b.x, b.y), pack_bf2(b.z, b.w));
 }
 
-// Per-head maps (q_rope_mix, q_lat, v_up): warp = (output row o, head h, token t); lanes take 4 inputs at a time
-// (I is a multiple of 32; Q8 / Q4: of 64); f32 sums.  y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] .
-// x) * bf16(softplus_ln2(g[t][h][o]))).  W BF16, Q8 or Q4 (welem4).  Block = 8 output rows; grid (ceil(O / 8), H, T).
+// Per-head maps (q_rope_mix, q_lat, v_up): warp = (output row o, head h, token t); f32 sums.  y[t][h][o] = bf16(W_h[o] .
+// x), or with the gate bf16(bf16(W_h[o] . x) * bf16(softplus_ln2(g[t][h][o]))).  W stacked [H][O][I]: BF16 (lanes take
+// 4 inputs at a time; I a multiple of 32), or Q8 / Q4 / SEED4P4 through the dense matvec's mv_lane on row h * O + o
+// (Q4 in MLX's qmv form, SEED4P4 with head h's exponent bias, W.p[2][h]; G its stream table).  Block = 8 output rows;
+// grid (ceil(O / 8), H, T).
 #define HMV_ROWS 8
-__global__ void __launch_bounds__(32 * HMV_ROWS) k_heads_mv(HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y) {
+__global__ void __launch_bounds__(32 * HMV_ROWS) k_heads_mv(HmvArgs a, int fmt, WSlice W, const uint32_t* G, const float* x,
+                                                           const float* g, float* y) {
     const int lane = threadIdx.x & 31, o = (int) blockIdx.x * HMV_ROWS + (threadIdx.x >> 5), h = (int) blockIdx.y, t = (int) blockIdx.z;
     if (o >= a.O) return;   // whole warps
-    const size_t w0 = ((size_t) h * a.O + o) * a.I;
     const float* xv = x + (size_t) t * a.xs + (size_t) h * a.hs;
     float s = 0;
-    for (int i = lane * 4; i < a.I; i += 128) {
-        const float4 wf = welem4(fmt, W, w0 + i);
-        const float4 xf = *(const float4*) (xv + i);
-        s += wf.x * xf.x + wf.y * xf.y + wf.z * xf.z + wf.w * xf.w;
+    if (fmt == MF_BF16) {
+        const size_t w0 = ((size_t) h * a.O + o) * a.I;
+        for (int i = lane * 4; i < a.I; i += 128) {
+            const float4 wf = welem4(fmt, W, w0 + i);
+            const float4 xf = *(const float4*) (xv + i);
+            s += wf.x * xf.x + wf.y * xf.y + wf.z * xf.z + wf.w * xf.w;
+        }
+    } else {
+        WSlice ws = W;
+        if (fmt == MF_SEED4P4) ws.eb = ((const int32_t*) W.p[2])[h];
+        s = mv_lane(fmt, &ws, G, h * a.O + o, a.I, xv, lane);
     }
     s = warp_sum(s);
     if (lane == 0) {
@@ -1151,6 +1160,27 @@ __global__ void __launch_bounds__(128) k_mla_reduce(MlaArgs a, const float* part
         }
         olat[((size_t) t * a.n_head + h) * r + d] = bfr(acc / l);
     }
+}
+
+// A SEED4P4 per-head map [H][O][I] (exponent bias per head in W.p[2]) decoded to BF16, out [H][O][I]: the prefill GEMM's
+// seed weights (tile_weights) rounded to BF16, once per prompt forward for the GEMMs and k_mla_decomp.  A thread a block.
+__global__ void k_heads_deq(WSlice W, const uint32_t* G, int O, int I, int nbt, uint16_t* out) {
+    const int b = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (b >= nbt) return;
+    const int nbk = I / 8, row = b / nbk, j = b - row * nbk;
+    WSlice ws = W;
+    ws.eb = ((const int32_t*) W.p[2])[row / O];
+    float f[8];
+    tile_weights(MF_SEED4P4, &ws, G, row, I, j, f);
+    *(uint4*) (out + (size_t) b * 8) = make_uint4(pack_bf2(f[0], f[1]), pack_bf2(f[2], f[3]), pack_bf2(f[4], f[5]), pack_bf2(f[6], f[7]));
+}
+// out[c] += sum over T rows of X[t][c]^2 (row stride xs): the MLA capture's column statistics
+__global__ void k_sumsq(const float* X, int n, int T, int xs, float* out) {
+    const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= n) return;
+    float s = 0;
+    for (int t = 0; t < T; ++t) { const float v = X[(size_t) t * xs + c]; s += v * v; }
+    out[c] += s;
 }
 
 // Per-head maps of prompt rows (T > MV_MAXT) on tensor cores: head blockIdx.z's [T x I] x [I x O] through the dense
@@ -1975,15 +2005,22 @@ void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, cons
     k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS * FA_RG - 1) / (FA_ROWS * FA_RG), (unsigned) a.n_kv), 32 * ATTF_G * FA_RG, 0, s>>>(a, q, kv, ri, g, o, T);
 }
 int kc_heads_mm(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T) {
-    if (a.I % MMT_BK || a.xs % 4 || a.hs % 4) return -1;
+    if (a.I % MMT_BK || a.xs % 4 || a.hs % 4 || fmt == MF_SEED4P4) return -1;   // seeds: kc_heads_deq first
     const MmArgs m = {a.I, a.O, T, a.xs, a.H * a.O, 1, a.gate ? 2 : 0, 0};
     k_heads_mm<<<dim3((unsigned) (a.O + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN, (unsigned) a.H), MMT_THREADS, 0, s>>>(
         a, m, fmt, W, x, g, y);
     return 0;
 }
-void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T) {
+void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const uint32_t* G, const float* x, const float* g, float* y, int T) {
     if (T > MV_MAXT && !kc_heads_mm(s, a, fmt, W, x, g, y, T)) return;   // more rows than a matvec takes: the GEMM
-    k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, fmt, W, x, g ? g : x, y);
+    k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, fmt, W, G, x, g ? g : x, y);
+}
+void kc_heads_deq(cudaStream_t s, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out) {
+    const int nbt = H * O * (I / 8);
+    k_heads_deq<<<(unsigned) ((nbt + 255) / 256), 256, 0, s>>>(W, G, O, I, nbt, out);
+}
+void kc_sumsq(cudaStream_t s, const float* X, int n, int T, int xs, float* out) {
+    k_sumsq<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(X, n, T, xs, out);
 }
 void kc_kv_f32(cudaStream_t s, int fmt, const uint8_t* codes, const uint8_t* scales, int n, int rows, float* y) {
     k_kv_f32<<<(unsigned) ((n * rows / 8 + 127) / 128), 128, 0, s>>>(fmt, codes, scales, n, rows, y);

@@ -122,9 +122,15 @@ void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, cons
 // per-head maps: y[t][h][o] = bf16(W_h[o] . x[t * a.xs + h * a.hs ..]) (W [H][O][I] in fmt MF_BF16, or MF_Q8 / MF_Q4 with
 // W.p codes, scales, biases per 64 as nslm/model_st.h; I a multiple of 32, of 64 for Q8 / Q4); with g
 // (y's layout): bf16(that * bf16(softplus_ln2(g)))
-void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T);
+// SEED4P4: W.p = seeds, coefficients, exponent biases [H] (int32, device), exponent codes; G the 32-bit stream table.
+void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const uint32_t* G, const float* x, const float* g, float* y, int T);
+// A SEED4P4 per-head map [H][O][I] (W as kc_heads_mv's) decoded to BF16 into out [H][O][I] (the prefill GEMM's seed
+// weights rounded to BF16)
+void kc_heads_deq(cudaStream_t s, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out);
+// out[c] += sum_t X[t * xs + c]^2 for c < n (the MLA capture)
+void kc_sumsq(cudaStream_t s, const float* X, int n, int T, int xs, float* out);
 // the same on tensor cores (any T; prompt rows): BF16 mma, f32 sums.  -1 (nothing launched) unless a.I is a multiple of
-// MMT_BK and the strides of 4 floats.  kc_heads_mv takes it for T > MV_MAXT.
+// MMT_BK and the strides of 4 floats, or for SEED4P4 (decode it with kc_heads_deq first).  kc_heads_mv takes it for T > MV_MAXT.
 int kc_heads_mm(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T);
 // RoPE of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into kv.k; the latent c [T][r] into kv.v
 void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const float* c, KvView kv, const RowInfo* ri,
