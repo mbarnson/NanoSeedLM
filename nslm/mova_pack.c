@@ -1,7 +1,7 @@
 // nslm/mova_pack.c - nslm-mova-pack: writes a NanoSeedLM model folder for K2-Horizon MoVA (nslm/model_st.h).
 //
 //   nslm-mova-pack --model DIR --config CONFIG --out DIR [--blk DIR] [--blk4 DIR] [--q4 PARTS|--rest4]
-//                  [--mla bf16|q8|q4|p4 [--mla-blk4 DIR]] [--threads 16]
+//                  [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] [--threads 16]
 //                  [--shard-gb 4.5] [--loader tools/nanoseedlm_k2.py]
 //
 //   CONFIG  routed experts                                                  needs
@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
     const char* loader = opt(argc, argv, "--loader", "tools/nanoseedlm_k2.py");
     if (!model || !config || !out) {
         fprintf(stderr, "usage: nslm-mova-pack --model DIR --config q8mx|q4mx|nslmmx|gu4d|gup4d|p4mx|p4mxbf [--blk DIR] [--blk4 DIR] "
-                        "[--q4 vamh|--rest4] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR]] --out DIR [--threads N] [--shard-gb 4.5] [--loader FILE]\n");
+                        "[--q4 vamh|--rest4] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] --out DIR [--threads N] [--shard-gb 4.5] [--loader FILE]\n");
         return 2;
     }
     const int q8mx = !strcmp(config, "q8mx"), q4mx = !strcmp(config, "q4mx"), mx = !strcmp(config, "nslmmx"),
@@ -337,6 +337,7 @@ int main(int argc, char** argv) {
                       : !strcmp(mla, "bf16") ? NS_BF16 : -1;
     if (mla_enc < 0) { fprintf(stderr, "--mla: bf16, q8, q4 or p4\n"); return 2; }
     if (mla_enc == NS_SEED4P4 && !opt(argc, argv, "--mla-blk4", NULL)) { fprintf(stderr, "--mla p4 needs --mla-blk4 DIR\n"); return 2; }
+    const char* mla_q8 = opt(argc, argv, "--mla-q8", "");   // MLA tensors kept in Q8 (comma-separated names, e.g. q_rope_mix)
     if ((gup4d || p4mx || p4mxbf) && !opt(argc, argv, "--blk4", NULL)) { fprintf(stderr, "--config %s needs --blk4\n", config); return 2; }
     if ((mx || gu4d || gup4d) && !blk) { fprintf(stderr, "--config %s needs --blk\n", config); return 2; }
     char err[512] = "";
@@ -363,9 +364,9 @@ int main(int argc, char** argv) {
             else if (mx || strcmp(t->proj, "down_proj")) enc = NS_SEED4;
             break;
         case MOVA_K_ROUTER: case MOVA_K_NORM: case MOVA_K_ROUTER_BIAS: enc = NS_BF16; break;
-        case MOVA_K_HEADS: enc = mla_enc; break;
+        case MOVA_K_HEADS: enc = strstr(mla_q8, strstr(t->name, ".mla.") + 5) ? NS_Q8 : mla_enc; break;
         case MOVA_K_VEXPERTS: case MOVA_K_LINEAR: case MOVA_K_EMBED: case MOVA_K_HEAD: {
-            if (strstr(t->name, ".mla.")) { enc = mla_enc; break; }   // MLA projections: --mla
+            if (strstr(t->name, ".mla.")) { enc = strstr(mla_q8, strstr(t->name, ".mla.") + 5) ? NS_Q8 : mla_enc; break; }   // --mla
             // --q4 PARTS: v value experts, a attention, m shared / dense MLPs, h LM head (--rest4 = vamh)
             const int part = t->kind == MOVA_K_VEXPERTS ? 'v' : t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 0
                            : strstr(t->name, "self_attn") ? 'a' : 'm';
