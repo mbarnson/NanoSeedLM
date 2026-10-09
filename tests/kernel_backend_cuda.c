@@ -6,6 +6,7 @@
 
 #include "kernel_backend.h"
 #include "kernels_cuda.h"
+#include "kvq.h"
 #include "lfsr.h"
 
 static uint32_t *g_stab24, *g_stab32;   // the seed tables: lfsr_stream24 (SEED4) and lfsr_stream32 (SEED4P4)
@@ -354,12 +355,58 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
 }
 int kt_bf16_f32(const uint16_t* x, float* y, int n) { return 1; }   // Metal only so far
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) { return 1; }
+// An FP8 / FP4 MLA cache (nslm/kvq.h: the RoPE key all FP8; the latent FP8, or FP4 past its first KVQ_FP4_LEAD values),
+// codes and scales on the device, split in two segments at npos / 2 as mla_kv
+static int mla_lead_(int fmt, int r) { return fmt == KV_FP4 && r > KVQ_FP4_LEAD ? KVQ_FP4_LEAD : r; }
+static KtKvMla mla_kvq_dev(int fmt, KtKvMla h, int npos, int r) {
+    const int ld = mla_lead_(fmt, r);
+    KtKvMla d = {(uint8_t*) dev(h.k, (size_t) npos * 128), (uint8_t*) dev(h.v, (size_t) npos * kvq_row_bytes(ld, r)),
+                 (uint8_t*) dev(h.ks, (size_t) npos * 4), (uint8_t*) dev(h.vs, (size_t) npos * kvq_row_scales(ld, r))};
+    return d;
+}
+static KvView mla_kvq(int fmt, KtKvMla d, int npos, int r) {
+    const int ld = mla_lead_(fmt, r), nv = npos / 2;
+    KvView kv;
+    memset(&kv, 0, sizeof kv);
+    kv.nv = nv;
+    kv.fmt = fmt;
+    kv.a.k = d.k; kv.a.v = d.v; kv.a.ks = (float*) d.ks; kv.a.vs = (float*) d.vs;
+    kv.b.k = d.k + (size_t) nv * 128;
+    kv.b.v = d.v + (size_t) nv * kvq_row_bytes(ld, r);
+    kv.b.ks = (float*) (d.ks + (size_t) nv * 4);
+    kv.b.vs = (float*) (d.vs + (size_t) nv * kvq_row_scales(ld, r));
+    return kv;
+}
 int kt_mla_rope_q(MlaArgs a, int fmt, float* qr, const float* kr, const float* c, KtKvMla kv, int npos, const RowInfo* ri,
-                  const float* inv, int T) { return 1; }   // FP8 / FP4 caches: Metal only so far
-int kt_mla_attn_q(MlaArgs a, int fmt, const float* ql, const float* qr, KtKvMla kv, int npos, const RowInfo* ri, float* olat, int T) { return 1; }
+                  const float* inv, int T) {
+    const int ld = mla_lead_(fmt, a.r);
+    const size_t qn = 4 * (size_t) T * a.n_head * 128, vb = (size_t) npos * kvq_row_bytes(ld, a.r), vsb = (size_t) npos * kvq_row_scales(ld, a.r);
+    float* dq = (float*) dev(qr, qn);
+    const KtKvMla d = mla_kvq_dev(fmt, kv, npos, a.r);
+    kc_mla_rope(0, a, dq, (const float*) dev(kr, 4 * (size_t) T * 128), (const float*) dev(c, 4 * (size_t) T * a.r),
+                mla_kvq(fmt, d, npos, a.r), (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T), (const float*) dev(inv, 4 * 64), T);
+    if (fetch("kc_mla_rope (quantized)", qr, dq, qn) || fetch("kc_mla_rope (quantized)", kv.k, d.k, (size_t) npos * 128) ||
+        fetch("kc_mla_rope (quantized)", kv.ks, d.ks, (size_t) npos * 4) || fetch("kc_mla_rope (quantized)", kv.v, d.v, vb))
+        return -1;
+    return done("kc_mla_rope (quantized)", kv.vs, d.vs, vsb);
+}
+int kt_mla_attn_q(MlaArgs a, int fmt, const float* ql, const float* qr, KtKvMla kv, int npos, const RowInfo* ri, float* olat, int T) {
+    const size_t on = 4 * (size_t) T * a.n_head * a.r;
+    float* dout = (float*) dev(NULL, on);
+    kc_mla_attn(0, a, (const float*) dev(ql, on), (const float*) dev(qr, 4 * (size_t) T * a.n_head * 128),
+                mla_kvq(fmt, mla_kvq_dev(fmt, kv, npos, a.r), npos, a.r), (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T),
+                (float*) dev(NULL, 4 * (size_t) T * a.n_head * a.n_splits * (a.r + 2)), dout, T);
+    return done("kc_mla_attn (quantized)", olat, dout, on);
+}
 int kt_mla_attn_xq(int fmt, int n_head, float scale, const int* kb, int nb, const float* qn, const float* qr, const float* kn,
                    const float* vn, const uint8_t* Kq, const uint8_t* Ks, int npos, const RowInfo* ri, const float* g, float* o, int T) { return 1; }
-int kt_kv_f32(int fmt, const uint8_t* codes, const uint8_t* scales, int len, int rows, float* y) { return 1; }
+int kt_kv_f32(int fmt, const uint8_t* codes, const uint8_t* scales, int len, int rows, float* y) {
+    const int ld = mla_lead_(fmt, len);
+    float* dy = (float*) dev(NULL, 4 * (size_t) len * rows);
+    kc_kv_f32(0, fmt, (const uint8_t*) dev(codes, (size_t) rows * kvq_row_bytes(ld, len)),
+              (const uint8_t*) dev(scales, (size_t) rows * kvq_row_scales(ld, len)), len, rows, dy);
+    return done("kc_kv_f32", y, dy, 4 * (size_t) len * rows);
+}
 int kt_argmax(const float* logits, int V, int n, int32_t* out) {
     int32_t* d = (int32_t*) dev(NULL, 4 * (size_t) n);
     kc_argmax(0, (const float*) dev(logits, 4 * (size_t) V * n), d, V, n);

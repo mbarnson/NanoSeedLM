@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "kernels_cuda.h"
+#include "kvq.h"
 
 #define FULL 0xFFFFFFFFu
 #undef INFINITY   // MSVC defines it as an overflowing constant expression
@@ -852,6 +853,117 @@ __global__ void k_attn_reduce(AttnArgs a, const float* part, const float* g, flo
     o[i] = bfr(att * softplus_gate(g[i]));
 }
 
+// ---- MLA caches in FP8 / FP4 (nslm/kvq.h is the spec: the same codes bit for bit, as kernels_moe.metal) -----------------
+static __device__ __forceinline__ float e4m3_dec(uint32_t c) {
+    const uint32_t e = (c >> 3) & 15u, m = c & 7u;
+    const float v = e ? __uint_as_float(((e + 120u) << 23) | (m << 20)) : (float) m * 0x1p-9f;
+    return c & 0x80u ? -v : v;
+}
+static __device__ __forceinline__ float e8m0_dec(uint32_t s) { return __uint_as_float(s << 23); }   // 2^(s - 127), s in 1 .. 254
+static __device__ __forceinline__ float e2m1_dec(uint32_t n) {
+    const uint32_t k = n & 7u;   // 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    const float v = k < 4u ? (float) k * 0.5f : (float) (1u << ((k >> 1) - 1u)) * ((k & 1u) ? 1.5f : 1.0f);
+    return n & 8u ? -v : v;
+}
+static __device__ __forceinline__ uint32_t e4m3_enc_abs(float a) {   // a >= 0: nearest even, saturated at 448
+    if (!(a < 448.0f)) return 0x7Eu;
+    if (a < 0x1p-6f) return (uint32_t) rintf(a * 512.0f);
+    int e;
+    const float f = frexpf(a, &e);
+    int E = e - 1, m = (int) rintf((2 * f - 1) * 8);
+    if (m == 8) { ++E; m = 0; }
+    return min((uint32_t) (((E + 7) << 3) | m), 0x7Eu);
+}
+static __device__ __forceinline__ uint32_t e2m1_enc(float x, float s) {   // x / s against the midpoints times s (exact); ties even
+    const float a = fabsf(x);
+    uint32_t k = (uint32_t) (a > 0.25f * s) + (uint32_t) (a > 0.75f * s) + (uint32_t) (a > 1.25f * s) + (uint32_t) (a > 1.75f * s) +
+                 (uint32_t) (a > 2.5f * s) + (uint32_t) (a > 3.5f * s) + (uint32_t) (a > 5.0f * s);
+    k += (uint32_t) (a == 0.75f * s || a == 1.75f * s || a == 3.5f * s);   // a tie above an odd code: the even one
+    return k && x < 0 ? k | 8u : k;
+}
+static __device__ __forceinline__ uint32_t fp8_scale(float amax) {
+    if (!(amax > 0)) return 127u;
+    int k;
+    frexpf(amax, &k);
+    const int e = min(max(amax <= ldexpf(448.0f, k - 9) ? k - 9 : k - 8, -126), 127);
+    return (uint32_t) (e + 127);
+}
+static __device__ __forceinline__ uint32_t fp4_scale(float amax) {
+    if (!(amax > 0)) return 0u;
+    const int c0 = (int) e4m3_enc_abs(amax / 6);
+    int best = -1;
+    float bd = 0;
+    for (int c = max(c0 - 1, 0); c <= min(c0 + 1, 0x7E); ++c) {
+        const float d = fabsf(6 * e4m3_dec((uint32_t) c) - amax);
+        if (best < 0 || d < bd || (d == bd && !(c & 1))) { best = c; bd = d; }
+    }
+    return (uint32_t) best;
+}
+// A row of n values: the first `lead` (a multiple of 32) FP8 with an E8M0 scale per 32, the rest FP4 (two a byte, the
+// even value low) with an E4M3 scale per 16: lead + (n - lead) / 2 code bytes, lead / 32 + (n - lead) / 16 scales.
+static __device__ __forceinline__ int kvq_rowb(int lead, int n) { return lead + (n - lead) / 2; }
+static __device__ __forceinline__ int kvq_srowb(int lead, int n) { return lead / 32 + (n - lead) / 16; }
+static __device__ __forceinline__ int mla_lead(int fmt, int r) { return fmt == KV_FP8 || r < KVQ_FP4_LEAD ? r : KVQ_FP4_LEAD; }
+// Values d .. d + 7 (d a multiple of 8) of row `row` as BF16 pairs (exact: a code times its scale)
+static __device__ __forceinline__ uint4 kvq_get8(const uint8_t* C, const uint8_t* S, int lead, int n, size_t row, int d) {
+    C += row * (size_t) kvq_rowb(lead, n);
+    S += row * (size_t) kvq_srowb(lead, n);
+    float v[8];
+    if (d < lead) {
+        const uint2 w = *(const uint2*) (C + d);
+        const float s = e8m0_dec(S[d / 32]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { v[i] = e4m3_dec((w.x >> (8 * i)) & 255u) * s; v[4 + i] = e4m3_dec((w.y >> (8 * i)) & 255u) * s; }
+    } else {
+        const int e = d - lead;
+        const uint32_t w = *(const uint32_t*) (C + lead + e / 2);
+        const float s = e4m3_dec(S[lead / 32 + e / 16]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = e2m1_dec(w >> (4 * i)) * s;
+    }
+    return make_uint4(pack_bf2(v[0], v[1]), pack_bf2(v[2], v[3]), pack_bf2(v[4], v[5]), pack_bf2(v[6], v[7]));
+}
+// Dims d .. d + 7 of an MLA cache row as BF16 bits: the RoPE key (isk; 128 dims) or the latent (r dims), any format
+static __device__ __forceinline__ uint4 mla_get8(int fmt, const KvSeg& sg, size_t row, int isk, int r, int d) {
+    if (fmt == KV_BF16) return *(const uint4*) ((const uint16_t*) (isk ? sg.k : sg.v) + row * (isk ? ATT_HD : r) + d);
+    if (isk) return kvq_get8((const uint8_t*) sg.k, (const uint8_t*) sg.ks, ATT_HD, ATT_HD, row, d);
+    return kvq_get8((const uint8_t*) sg.v, (const uint8_t*) sg.vs, mla_lead(fmt, r), r, row, d);
+}
+// Store value v at dim d of a quantized row (lead FP8 dims, then FP4) when `store`: d % 32 is the lane, and a block's
+// dims are consecutive lanes, which share its max |v| (FP4 pairs lanes into bytes).  Every lane of the warp calls it.
+static __device__ __forceinline__ void kvq_put(bool store, int lead, float v, uint8_t* C, uint8_t* S, size_t row, int n, int d) {
+    float a16 = fabsf(v);
+#pragma unroll
+    for (int o = 1; o < 16; o <<= 1) a16 = fmaxf(a16, __shfl_xor_sync(FULL, a16, o));
+    const float a32 = fmaxf(a16, __shfl_xor_sync(FULL, a16, 16));
+    const bool f8 = d < lead;
+    const uint32_t sc = f8 ? fp8_scale(a32) : fp4_scale(a16);
+    const float s4 = e4m3_dec(sc);
+    const uint32_t c = f8 ? e4m3_enc_abs(ldexpf(fabsf(v), 127 - (int) sc)) : (s4 > 0 ? e2m1_enc(v, s4) : 0u);
+    const uint32_t hi = __shfl_xor_sync(FULL, c, 1);
+    if (!store) return;
+    C += row * (size_t) kvq_rowb(lead, n);
+    S += row * (size_t) kvq_srowb(lead, n);
+    const int e = d - lead;
+    if (f8) {
+        C[d] = (uint8_t) (c && v < 0 ? c | 0x80u : c);
+        if (d % 32 == 0) S[d / 32] = (uint8_t) sc;
+    } else {
+        if (!(e & 1)) C[lead + e / 2] = (uint8_t) (c | hi << 4);
+        if (e % 16 == 0) S[lead / 32 + e / 16] = (uint8_t) sc;
+    }
+}
+
+// y = `rows` FP8 / FP4 cache rows of n values (a latent's layout, mla_lead), decoded (8 values a thread; tests)
+__global__ void k_kv_f32(int fmt, const uint8_t* C, const uint8_t* S, int n, int rows, float* y) {
+    const int i = ((int) blockIdx.x * (int) blockDim.x + threadIdx.x) * 8;
+    if (i >= n * rows) return;
+    const uint4 w = kvq_get8(C, S, mla_lead(fmt, n), n, (size_t) (i / n), i % n);
+    const uint32_t u[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { y[i + 2 * j] = __uint_as_float(u[j] << 16); y[i + 2 * j + 1] = __uint_as_float(u[j] & 0xFFFF0000u); }
+}
+
 // ---- MLA (TransMLA): per-head maps, RoPE + latent cache write, latent attention ---------------------------------------
 // The KvView of an MLA layer: k holds the RoPE key (ATT_HD BF16 per position), v the latent (r BF16 per position).
 
@@ -888,23 +1000,32 @@ __global__ void __launch_bounds__(64) k_mla_rope(MlaArgs a, float* qr, const flo
     const int i = (int) blockIdx.x * 64 + threadIdx.x, t = (int) blockIdx.y, pos = ri[t].pos;
     int row;
     const KvSeg sg = kv_seg(kv, ri[t].kv0 + pos, &row);   // the slot's cache row
-    if (i < a.r) ((uint16_t*) sg.v)[(size_t) row * a.r + i] = tobf(c[(size_t) t * a.r + i]);
     const int head = i / 64, p = i % 64;
-    if (head > a.n_head) return;
-    float sn, cs;
-    sincosf((float) pos * inv[p], &sn, &cs);
-    if (head < a.n_head) {
-        float* qh = qr + ((size_t) t * a.n_head + head) * ATT_HD;
-        const float x0 = qh[p], x1 = qh[p + 64];
-        qh[p] = bfr(x0 * cs - x1 * sn);
-        qh[p + 64] = bfr(x1 * cs + x0 * sn);
-    } else {
-        const float* kh = kr + (size_t) t * ATT_HD;
-        const float x0 = kh[p], x1 = kh[p + 64];
-        uint16_t* kc = (uint16_t*) sg.k + (size_t) row * ATT_HD;
-        kc[p] = tobf(x0 * cs - x1 * sn);
-        kc[p + 64] = tobf(x1 * cs + x0 * sn);
+    const bool lat = i < a.r, key = head == a.n_head;
+    float y0 = 0, y1 = 0;
+    if (head <= a.n_head) {
+        float sn, cs;
+        sincosf((float) pos * inv[p], &sn, &cs);
+        float* qh = qr + ((size_t) t * a.n_head + (key ? 0 : head)) * ATT_HD;
+        const float* xh = key ? kr + (size_t) t * ATT_HD : qh;
+        const float x0 = xh[p], x1 = xh[p + 64];
+        y0 = x0 * cs - x1 * sn;
+        y1 = x1 * cs + x0 * sn;
+        if (!key) { qh[p] = bfr(y0); qh[p + 64] = bfr(y1); }
     }
+    if (kv.fmt == KV_BF16) {
+        if (lat) ((uint16_t*) sg.v)[(size_t) row * a.r + i] = tobf(c[(size_t) t * a.r + i]);
+        if (key) {
+            uint16_t* kc = (uint16_t*) sg.k + (size_t) row * ATT_HD;
+            kc[p] = tobf(y0);
+            kc[p + 64] = tobf(y1);
+        }
+        return;
+    }
+    // FP8 / FP4 (uniform over the grid): every lane runs the shuffles; a warp's 32 dims are one FP8 block or two FP4 ones
+    kvq_put(lat, mla_lead(kv.fmt, a.r), lat ? bfr(c[(size_t) t * a.r + i]) : 0.0f, (uint8_t*) sg.v, (uint8_t*) sg.vs, row, a.r, i);
+    kvq_put(key, ATT_HD, bfr(y0), (uint8_t*) sg.k, (uint8_t*) sg.ks, row, ATT_HD, p);
+    kvq_put(key, ATT_HD, bfr(y1), (uint8_t*) sg.k, (uint8_t*) sg.ks, row, ATT_HD, p + 64);
 }
 
 // Latent attention (absorbed MLA: multi-query over the shared latent), as Metal's k_mla_attn.  Block (split, head group,
@@ -916,7 +1037,7 @@ __global__ void __launch_bounds__(64) k_mla_rope(MlaArgs a, float* qr, const flo
 #define MLA_HG 8   // query heads per block (MLA_HG x 32 threads: room for the 64 accumulators per lane)
 __global__ void __launch_bounds__(32 * MLA_HG) k_mla_attn(MlaArgs a, const float* ql, const float* qr, KvView kv, const RowInfo* ri,
                                                          float* out) {
-    __shared__ uint16_t sh[MLA_KU * (32 * MLA_MAXL + ATT_HD)];
+    __shared__ __align__(16) uint16_t sh[MLA_KU * (32 * MLA_MAXL + ATT_HD)];
     const int lane = threadIdx.x & 31, tid = threadIdx.x, ntg = (int) blockDim.x;
     const int split = (int) blockIdx.x, t = (int) blockIdx.z, r = a.r, nl = r / 32, kw = r + ATT_HD;
     const int h = (int) blockIdx.y * MLA_HG + (threadIdx.x >> 5);
@@ -939,11 +1060,11 @@ __global__ void __launch_bounds__(32 * MLA_HG) k_mla_attn(MlaArgs a, const float
     for (int p = p0; p < p1; p += MLA_KU) {
         const int nk = min(MLA_KU, p1 - p);
         __syncthreads();
-        for (int e = tid; e < nk * kw; e += ntg) {
-            const int u = e / kw, d = e - u * kw;
+        for (int e = tid; e < nk * kw / 8; e += ntg) {   // 8 dims at a time (r and 128: multiples of 8)
+            const int u = e / (kw / 8), d = (e - u * (kw / 8)) * 8;
             int row;
             const KvSeg sg = kv_seg(kv, ri[t].kv0 + p + u, &row);
-            sh[e] = d < r ? ((const uint16_t*) sg.v)[(size_t) row * r + d] : ((const uint16_t*) sg.k)[(size_t) row * ATT_HD + d - r];
+            *(uint4*) &sh[u * kw + d] = d < r ? mla_get8(kv.fmt, sg, row, 0, r, d) : mla_get8(kv.fmt, sg, row, 1, r, d - r);
         }
         __syncthreads();
         float s[MLA_KU];
@@ -1130,6 +1251,17 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
         for (int k = 0; k < (int) (sizeof cmap / sizeof cmap[0]); ++k) {
             if (cmap[k] < 0) continue;
             const int u = cmap[k] >> 16, j = cmap[k] & 0xFFFF, kp = p + u;
+            uint16_t* dst = Ks + ((size_t) buf * MLAT_KT + u) * kld + j * 8;
+            if (kv.fmt != KV_BF16) {   // FP8 / FP4: decoded to BF16 by plain stores (the next tile barrier publishes them)
+                uint4 w = make_uint4(0, 0, 0, 0);
+                if (kp < p1) {
+                    int row;
+                    const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
+                    w = j * 8 < r ? mla_get8(kv.fmt, sg, row, 0, r, j * 8) : mla_get8(kv.fmt, sg, row, 1, r, j * 8 - r);
+                }
+                *(uint4*) dst = w;
+                continue;
+            }
             const void* src = kv.a.k;
             int ok = 0;
             if (kp < p1) {
@@ -1139,7 +1271,7 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
                                 : (const void*) ((const uint16_t*) sg.k + (size_t) row * ATT_HD + j * 8 - r);
                 ok = 16;
             }
-            cp_async16(Ks + ((size_t) buf * MLAT_KT + u) * kld + j * 8, src, ok);   // keys past the split: zeros
+            cp_async16(dst, src, ok);   // keys past the split: zeros
         }
         cp_async_commit();
     };
@@ -1293,14 +1425,11 @@ __global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv
     for (int i = 0; i < 8; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0;
     // this thread's latent row (one 16-byte chunk per step)
     const int au = tid >> 2, aj = (tid & 3) * 8, akp = key0 + au;
-    const uint16_t* arow = NULL;
-    if (akp < k_hi) {
-        int row;
-        const KvSeg sg = kv_seg(kv, kv0 + akp, &row);
-        arow = (const uint16_t*) sg.v + (size_t) row * r;
-    }
+    int arow = -1;
+    KvSeg asg = kv.a;
+    if (akp < k_hi) asg = kv_seg(kv, kv0 + akp, &arow);
     for (int j0 = 0; j0 < r; j0 += MLD_BJ) {
-        *(uint4*) &As[au * MLD_ALD + aj] = arow ? *(const uint4*) (arow + j0 + aj) : make_uint4(0, 0, 0, 0);
+        *(uint4*) &As[au * MLD_ALD + aj] = arow >= 0 ? mla_get8(kv.fmt, asg, arow, 0, r, j0 + aj) : make_uint4(0, 0, 0, 0);
         if (!isv)
             for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[j][d] = q_lat[h][j0 + j][d]
                 const int j = c >> 4, d8 = (c & 15) * 8;
@@ -1393,7 +1522,7 @@ __global__ void __launch_bounds__(32 * MLP_RW) k_mla_prefill(MlaArgs a, const fl
                 else {
                     int row;
                     const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
-                    v = *(const uint4*) ((const uint16_t*) sg.k + (size_t) row * ATT_HD + (j - 16) * 8);
+                    v = mla_get8(kv.fmt, sg, row, 1, 0, (j - 16) * 8);
                 }
             }
             *(uint4*) &Ks[u * MLP_KLD + j * 8] = v;
@@ -1833,6 +1962,9 @@ int kc_heads_mm(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, co
 void kc_heads_mv(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T) {
     if (T > MV_MAXT && !kc_heads_mm(s, a, W, x, g, y, T)) return;   // more rows than a matvec takes: the GEMM
     k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, W, x, g ? g : x, y);
+}
+void kc_kv_f32(cudaStream_t s, int fmt, const uint8_t* codes, const uint8_t* scales, int n, int rows, float* y) {
+    k_kv_f32<<<(unsigned) ((n * rows / 8 + 127) / 128), 128, 0, s>>>(fmt, codes, scales, n, rows, y);
 }
 void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const float* c, KvView kv, const RowInfo* ri,
                  const float* inv, int T) {

@@ -19,6 +19,7 @@
 
 #include "engine_api.h"
 #include "kernels_cuda.h"
+#include "kvq.h"
 #include "lfsr.h"
 #include "model_st.h"
 #include "mova_cfg.h"
@@ -63,6 +64,7 @@ typedef struct {
     int32_t* hist;
     int len, cap;
     int done;   // positions whose KV is computed (hist[0 .. done-1])
+    int xend;   // MLA: prompt rows at positions below xend attend with the latent expanded per head (EngOpts.mla_expand_min)
 } Seq;
 
 
@@ -80,10 +82,11 @@ struct Eng {
     // prompt stages the host rows of the layer it computes in kv_stage
     int kv_fmt;
     int64_t kv_cap, kv_nv;
-    uint64_t kv_row, kv_srow;   // bytes per position and layer: K values (MLA: the RoPE key), scales (K or V; Q8)
+    uint64_t kv_row, kv_ksrow;   // bytes per position and layer: K values (MLA: the RoPE key), K scales (Q8, FP8, FP4)
     uint64_t *kv_vrow, *kv_voff, kv_vsum, kv_vmax;   // V (MLA: the latent) bytes per position: layer l's, before layer l, all, max
+    uint64_t *kv_vsrow, *kv_vsoff, kv_vssum, kv_vsmax;   // V scale bytes per position (Q8, FP8, FP4), likewise
     uint8_t *kv_vk, *kv_vv, *kv_hk, *kv_hv, *kv_sk, *kv_sv;   // VRAM, host (device addresses), staging: values
-    float *kv_vks, *kv_vvs, *kv_hks, *kv_hvs, *kv_sks, *kv_svs;   // ... scales (Q8)
+    float *kv_vks, *kv_vvs, *kv_hks, *kv_hvs, *kv_sks, *kv_svs;   // ... scales (Q8: f32; FP8 / FP4: bytes)
     int kv_staged;   // the layer whose host rows kv_stage holds for the running prompt pass, or -1
     // scratch (MAX_ROWS rows), device
     float *x, *xn, *q, *k, *v, *gq, *ao, *ga, *ua, *aa, *G, *U, *A, *D, *V, *sh, *logits, *inv, *part, *wts, *vwts, *rsel, *vsel, *rscore;
@@ -127,6 +130,7 @@ struct Eng {
     int pred_pending;   // the layer whose prediction the main stream must join first, or -1
     int seed_f32;       // NSLM_SEED_GEMM_F32: the prefill GEMM's seed weights exact (kc_seed_gemm_f32)
     int prompt;         // prompt rows (forward_lm): the prefill kernels for any row count, so caches do not depend on chunks
+    int expand, expand_min;   // MLA prompt rows: the latent expanded per head (kc_mla_decomp; Seq.xend), else absorbed
     int in_lm;          // forward_lm's layer-major pass: no prediction (it could replace a slot a pending prefetch copy fills)
     // layer-major prefill: the hidden states, tokens and rows of up to xmax prompt rows
     float* x_all;
@@ -380,8 +384,8 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
 }
 
 // KV bytes per position: of every layer (all), of one layer's staging (per: the widest layer).
-static uint64_t kv_all(const Eng* e) { return (e->kv_row + 2 * e->kv_srow) * (uint64_t) e->c.n_layer + e->kv_vsum; }
-static uint64_t kv_per(const Eng* e) { return e->kv_row + e->kv_vmax + 2 * e->kv_srow; }
+static uint64_t kv_all(const Eng* e) { return (e->kv_row + e->kv_ksrow) * (uint64_t) e->c.n_layer + e->kv_vsum + e->kv_vssum; }
+static uint64_t kv_per(const Eng* e) { return e->kv_row + e->kv_vmax + e->kv_ksrow + e->kv_vsmax; }
 // Whether place_kv will keep part of the KV cache in host memory (its budget, before the prefill buffers exist).
 static int kv_spills(Eng* e) {
     const uint64_t all = kv_all(e);
@@ -422,11 +426,11 @@ static int place_kv(Eng* e, char* err, int errlen) {
     if (nv) {
         e->kv_vk = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_row * L, &e->mem.kv);
         e->kv_vv = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_vsum, &e->mem.kv);
-        if (e->kv_srow) {
-            e->kv_vks = (float*) dalloc(e, (uint64_t) nv * e->kv_srow * L, &e->mem.kv);
-            e->kv_vvs = (float*) dalloc(e, (uint64_t) nv * e->kv_srow * L, &e->mem.kv);
+        if (e->kv_ksrow) {
+            e->kv_vks = (float*) dalloc(e, (uint64_t) nv * e->kv_ksrow * L, &e->mem.kv);
+            e->kv_vvs = (float*) dalloc(e, (uint64_t) nv * e->kv_vssum, &e->mem.kv);
         }
-        if (!e->kv_vk || !e->kv_vv || (e->kv_srow && (!e->kv_vks || !e->kv_vvs))) {
+        if (!e->kv_vk || !e->kv_vv || (e->kv_ksrow && (!e->kv_vks || !e->kv_vvs))) {
             snprintf(err, (size_t) errlen, "KV cache (%lld positions in VRAM): out of GPU memory", (long long) nv);
             return -1;
         }
@@ -434,7 +438,7 @@ static int place_kv(Eng* e, char* err, int errlen) {
     if (nh) {
         void* dp = NULL;
         uint8_t* h[4] = {NULL, NULL, NULL, NULL};
-        const uint64_t sz[4] = {nh * e->kv_row * L, nh * e->kv_vsum, nh * e->kv_srow * L, nh * e->kv_srow * L};
+        const uint64_t sz[4] = {nh * e->kv_row * L, nh * e->kv_vsum, nh * e->kv_ksrow * L, nh * e->kv_vssum};
         for (int i = 0; i < 4; ++i) {
             if (!sz[i]) continue;
             h[i] = (uint8_t*) halloc(e, sz[i]);
@@ -448,11 +452,11 @@ static int place_kv(Eng* e, char* err, int errlen) {
         e->kv_hk = h[0]; e->kv_hv = h[1]; e->kv_hks = (float*) h[2]; e->kv_hvs = (float*) h[3];
         e->kv_sk = (uint8_t*) dalloc(e, nh * e->kv_row, &e->mem.kv);
         e->kv_sv = (uint8_t*) dalloc(e, nh * e->kv_vmax, &e->mem.kv);
-        if (e->kv_srow) {
-            e->kv_sks = (float*) dalloc(e, nh * e->kv_srow, &e->mem.kv);
-            e->kv_svs = (float*) dalloc(e, nh * e->kv_srow, &e->mem.kv);
+        if (e->kv_ksrow) {
+            e->kv_sks = (float*) dalloc(e, nh * e->kv_ksrow, &e->mem.kv);
+            e->kv_svs = (float*) dalloc(e, nh * e->kv_vsmax, &e->mem.kv);
         }
-        if (!e->kv_sk || !e->kv_sv || (e->kv_srow && (!e->kv_sks || !e->kv_svs))) {
+        if (!e->kv_sk || !e->kv_sv || (e->kv_ksrow && (!e->kv_sks || !e->kv_svs))) {
             snprintf(err, (size_t) errlen, "KV staging: out of GPU memory");
             return -1;
         }
@@ -521,8 +525,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Eng* e = (Eng*) calloc(1, sizeof *e);
     if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
     const MovaCfg* c = &e->c;
-    if (o->kv_format < ENG_KV_BF16 || o->kv_format > ENG_KV_Q8 || (c->mla && o->kv_format != ENG_KV_BF16)) {   // engine_api.h
-        snprintf(err, (size_t) errlen, "KV format %d not supported by the CUDA engine (MLA: bf16; GQA: bf16, q8)", o->kv_format);
+    int kv_ok = o->kv_format >= ENG_KV_BF16 && o->kv_format <= ENG_KV_FP4 && (c->mla ? o->kv_format != ENG_KV_Q8 : o->kv_format <= ENG_KV_Q8);
+    for (int l = 0; l < c->n_layer && c->mla && o->kv_format >= ENG_KV_FP8; ++l) kv_ok &= c->mla_rank[l] % 32 == 0;
+    if (!kv_ok) {   // engine_api.h: never ignore a format
+        snprintf(err, (size_t) errlen, "KV format %d not supported by the CUDA engine (MLA: bf16, fp8, fp4 with latent ranks a "
+                 "multiple of 32; GQA: bf16, q8)", o->kv_format);
         free(e);
         return NULL;
     }
@@ -620,20 +627,31 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         eng_close(e);
         return NULL;
     }
-    e->kv_fmt = o->kv_format == ENG_KV_Q8 ? KV_Q8 : KV_BF16;
+    e->kv_fmt = o->kv_format;   // = KV_* (checked above)
     e->kv_row = (uint64_t) kvd * (e->kv_fmt == KV_Q8 ? 1 : 2);
-    e->kv_srow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
-    // V rows per layer: as K's, or MLA's latent of the layer's rank (K: the 128-dim RoPE key; BF16)
+    e->kv_ksrow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
+    // V rows per layer: as K's, or MLA's latent of the layer's rank (K: the 128-dim RoPE key): BF16, or FP8 / FP4 codes
+    // with their block scales apart (nslm/kvq.h: the RoPE key all FP8; the latent FP8, or FP4 past its first
+    // KVQ_FP4_LEAD dims)
+    const int kq = c->mla && e->kv_fmt >= KV_FP8;
     e->kv_vrow = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
     e->kv_voff = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
-    if (c->mla) e->kv_row = (uint64_t) c->mla_rope * 2;
+    e->kv_vsrow = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
+    e->kv_vsoff = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
+    if (c->mla) e->kv_row = kq ? (uint64_t) c->mla_rope : (uint64_t) c->mla_rope * 2;
+    if (kq) e->kv_ksrow = (uint64_t) kvq_row_scales(c->mla_rope, c->mla_rope);
     int rmax = 0;
     for (int l = 0; l < c->n_layer; ++l) {
-        if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
-        e->kv_vrow[l] = c->mla ? (uint64_t) e->L[l].mla_r * 2 : e->kv_row;
+        const int r = e->L[l].mla_r, lead = e->kv_fmt == KV_FP4 && r > KVQ_FP4_LEAD ? KVQ_FP4_LEAD : r;
+        if (r > rmax) rmax = r;
+        e->kv_vrow[l] = !c->mla ? e->kv_row : kq ? (uint64_t) kvq_row_bytes(lead, r) : (uint64_t) r * 2;
+        e->kv_vsrow[l] = !c->mla ? e->kv_ksrow : kq ? (uint64_t) kvq_row_scales(lead, r) : 0;
         e->kv_voff[l] = e->kv_vsum;
+        e->kv_vsoff[l] = e->kv_vssum;
         e->kv_vsum += e->kv_vrow[l];
+        e->kv_vssum += e->kv_vsrow[l];
         if (e->kv_vrow[l] > e->kv_vmax) e->kv_vmax = e->kv_vrow[l];
+        if (e->kv_vsrow[l] > e->kv_vsmax) e->kv_vsmax = e->kv_vsrow[l];
     }
     // scratch
     const int T = MAX_ROWS, d = c->d, qd = c->n_head * c->head_dim, ffmax = c->ff_dense > c->ff_exp ? c->ff_dense : c->ff_exp;
@@ -784,6 +802,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     }
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL || getenv("MOVA_DUMP") != NULL;
     e->seed_f32 = getenv("NSLM_SEED_GEMM_F32") != NULL;   // a rounding-point experiment; BF16 seed weights by default
+    e->expand = 1;
+    e->expand_min = o->mla_expand_min > 0 ? o->mla_expand_min : 256;
     e->seqs = (Seq*) calloc((size_t) e->nseqs, sizeof(Seq));
     for (int s = 0; s < e->nseqs; ++s) {
         e->seqs[s].cap = 1024;
@@ -799,7 +819,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
              "expert cache %d + %d of %d + %d experts in VRAM",
              prop.name, fm[e->L[c->first_sparse].eg.fmt], fm[e->L[c->first_sparse].eu.fmt], fm[e->L[c->first_sparse].ed.fmt],
              fm[e->L[0].q.fmt], fm[e->L[c->first_sparse].vx.fmt], fm[e->embed.fmt], fm[e->head.fmt],
-             e->kv_fmt == KV_Q8 ? ", KV q8" : "", mla, e->pm.slots, e->pv.slots, (c->n_layer - c->first_sparse) * c->n_exp,
+             e->kv_fmt == KV_Q8 ? ", KV q8" : e->kv_fmt == KV_FP8 ? ", KV fp8" : e->kv_fmt == KV_FP4 ? ", KV fp4" : "", mla, e->pm.slots, e->pv.slots, (c->n_layer - c->first_sparse) * c->n_exp,
              (c->n_layer - c->first_sparse) * c->n_vexp);
     return e;
 }
@@ -837,7 +857,7 @@ void eng_close(Eng* e) {
     if (e->ck) mova_ckpt_close(e->ck);
     if (e->seqs) for (int s = 0; s < e->nseqs; ++s) free(e->seqs[s].hist);
     free(e->seqs);
-    free(e->kv_vrow); free(e->kv_voff);
+    free(e->kv_vrow); free(e->kv_voff); free(e->kv_vsrow); free(e->kv_vsoff);
     free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
     free(e);
 }
@@ -908,9 +928,9 @@ static KvView kv_view(Eng* e, int l) {
     const uint64_t nv = (uint64_t) e->kv_nv, nh = (uint64_t) (e->kv_cap - e->kv_nv);
     v.a.k = e->kv_vk + nv * e->kv_row * (uint64_t) l;
     v.a.v = e->kv_vv + nv * e->kv_voff[l];
-    if (e->kv_fmt == KV_Q8) {
-        v.a.ks = (float*) ((uint8_t*) e->kv_vks + nv * e->kv_srow * (uint64_t) l);
-        v.a.vs = (float*) ((uint8_t*) e->kv_vvs + nv * e->kv_srow * (uint64_t) l);
+    if (e->kv_ksrow) {
+        v.a.ks = (float*) ((uint8_t*) e->kv_vks + nv * e->kv_ksrow * (uint64_t) l);
+        v.a.vs = (float*) ((uint8_t*) e->kv_vvs + nv * e->kv_vsoff[l]);
     }
     if (!nh) return v;
     if (e->kv_staged == l) {
@@ -919,9 +939,9 @@ static KvView kv_view(Eng* e, int l) {
     }
     v.b.k = e->kv_hk + nh * e->kv_row * (uint64_t) l;
     v.b.v = e->kv_hv + nh * e->kv_voff[l];
-    if (e->kv_fmt == KV_Q8) {
-        v.b.ks = (float*) ((uint8_t*) e->kv_hks + nh * e->kv_srow * (uint64_t) l);
-        v.b.vs = (float*) ((uint8_t*) e->kv_hvs + nh * e->kv_srow * (uint64_t) l);
+    if (e->kv_ksrow) {
+        v.b.ks = (float*) ((uint8_t*) e->kv_hks + nh * e->kv_ksrow * (uint64_t) l);
+        v.b.vs = (float*) ((uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l]);
     }
     return v;
 }
@@ -931,12 +951,12 @@ static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
     const uint64_t nh = (uint64_t) (e->kv_cap - e->kv_nv);
     const enum cudaMemcpyKind kd = cudaMemcpyDeviceToDevice;   // the host rows are mapped: device addresses
     uint8_t* hs[4] = {e->kv_hk + nh * e->kv_row * (uint64_t) l, e->kv_hv + nh * e->kv_voff[l],
-                      e->kv_srow ? (uint8_t*) e->kv_hks + nh * e->kv_srow * (uint64_t) l : NULL,
-                      e->kv_srow ? (uint8_t*) e->kv_hvs + nh * e->kv_srow * (uint64_t) l : NULL};
+                      e->kv_ksrow ? (uint8_t*) e->kv_hks + nh * e->kv_ksrow * (uint64_t) l : NULL,
+                      e->kv_ksrow ? (uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l] : NULL};
     uint8_t* ss[4] = {e->kv_sk, e->kv_sv, (uint8_t*) e->kv_sks, (uint8_t*) e->kv_svs};
     for (int i = 0; i < 4; ++i) {
         if (!hs[i]) continue;
-        const uint64_t rb = i == 0 ? e->kv_row : i == 1 ? e->kv_vrow[l] : e->kv_srow, off = (uint64_t) r0 * rb,
+        const uint64_t rb = i == 0 ? e->kv_row : i == 1 ? e->kv_vrow[l] : i == 2 ? e->kv_ksrow : e->kv_vsrow[l], off = (uint64_t) r0 * rb,
                        len = (uint64_t) (r1 - r0) * rb;
         if (!CK(cudaMemcpyAsync(in ? ss[i] + off : hs[i] + off, in ? hs[i] + off : ss[i] + off, len, kd, e->st))) return -1;
     }
@@ -962,7 +982,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     enc_dense(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0);
     enc_heads_mv(e, &L->qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
     const int big = T > MV_MAXT || e->prompt;
-    if (big && e->dec_keys) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
+    if (big && e->dec_keys && e->expand) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
         tgroup(e, MOVA_TG_ATTN);
         const MlaArgs ma = {H, r, 128, 1, 1.0f / sqrtf((float) g->head_dim), {0}};
         const KvView kv = kv_view(e, l);
@@ -1321,6 +1341,7 @@ int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     int c = 0;
     while (c < s->done && c < n - 1 && s->hist[c] == ids[c]) ++c;
     s->len = s->done = c;
+    s->xend = n - 1 - c >= e->expand_min ? (n - 1) / e->expand_min * e->expand_min : 0;
     for (int i = c; i < n; ++i) hist_push(s, ids[i]);
     if (reused) *reused = c;
     return 0;
@@ -1330,14 +1351,20 @@ int eng_prefill_next(Eng* e, int seq, int max_rows) {
     if (!s || s->len < 1 || max_rows < 1) return -1;
     const int left = s->len - 1 - s->done;
     if (left <= 0) return 0;
-    const int T = left < max_rows ? left : max_rows;
-    if (forward_lm(e, seq, s->hist + s->done, T, s->done, T, NULL)) { s->len = s->done = 0; return -1; }   // no half-written KV
+    int T = left < max_rows ? left : max_rows;
+    if (s->done < s->xend && s->done + T > s->xend) T = s->xend - s->done;   // a forward on one side of xend
+    e->expand = s->done < s->xend;
+    const int rc = forward_lm(e, seq, s->hist + s->done, T, s->done, T, NULL);
+    e->expand = 1;
+    if (rc) { s->len = s->done = 0; return -1; }   // no half-written KV
     s->done += T;
     return left - T;
 }
 int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     if (eng_prefill_begin(e, seq, ids, n, reused)) return -1;
-    return eng_prefill_next(e, seq, INT32_MAX);   // one layer-major pass
+    int left;   // one layer-major pass, or two when the prompt has rows on both sides of Seq.xend
+    while ((left = eng_prefill_next(e, seq, INT32_MAX)) > 0) {}
+    return left;
 }
 int eng_prefill(Eng* e, int seq, const int32_t* ids, int n) {
     Seq* s = seq_of(e, seq);
@@ -1356,17 +1383,18 @@ int eng_fork(Eng* e, int dst, int src) { (void) e; return dst == src ? 0 : -1; }
 void eng_free(Eng* e, int seq) { Seq* s = seq_of(e, seq); if (s) s->len = s->done = 0; }
 int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len : 0; }
 
-// A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (Q8) their scales; positions
+// A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (Q8, FP8, FP4) their scales
+// (Metal's order); positions
 // below kv_nv are in VRAM, the rest in mapped host memory.
 static int kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
     const int64_t r0 = seq * e->slot_cap + p0, r1 = r0 + (p1 - p0), nv = e->kv_nv;
-    const uint64_t nh = (uint64_t) (e->kv_cap - nv), sr = e->kv_srow;
+    const uint64_t nh = (uint64_t) (e->kv_cap - nv), sr = e->kv_ksrow;
     for (int l = 0; l < e->c.n_layer; ++l) {
         uint8_t* va[4] = {e->kv_vk ? e->kv_vk + (uint64_t) nv * e->kv_row * l : NULL, e->kv_vv ? e->kv_vv + (uint64_t) nv * e->kv_voff[l] : NULL,
-                          sr && e->kv_vks ? (uint8_t*) e->kv_vks + (uint64_t) nv * sr * l : NULL, sr && e->kv_vvs ? (uint8_t*) e->kv_vvs + (uint64_t) nv * sr * l : NULL};
+                          sr && e->kv_vks ? (uint8_t*) e->kv_vks + (uint64_t) nv * sr * l : NULL, sr && e->kv_vvs ? (uint8_t*) e->kv_vvs + (uint64_t) nv * e->kv_vsoff[l] : NULL};
         uint8_t* ha[4] = {e->kv_hk ? e->kv_hk + nh * e->kv_row * l : NULL, e->kv_hv ? e->kv_hv + nh * e->kv_voff[l] : NULL,
-                          sr && e->kv_hks ? (uint8_t*) e->kv_hks + nh * sr * l : NULL, sr && e->kv_hvs ? (uint8_t*) e->kv_hvs + nh * sr * l : NULL};
-        const uint64_t rb[4] = {e->kv_row, e->kv_vrow[l], sr, sr};
+                          sr && e->kv_hks ? (uint8_t*) e->kv_hks + nh * sr * l : NULL, sr && e->kv_hvs ? (uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l] : NULL};
+        const uint64_t rb[4] = {e->kv_row, e->kv_vrow[l], sr, sr ? e->kv_vsrow[l] : 0};
         for (int i = 0; i < 4; ++i) {
             if (!rb[i]) continue;
             const int64_t m = r1 < nv ? r1 : nv, a = r0 > nv ? r0 : nv;   // VRAM rows [r0, m), host rows [a, r1)
@@ -1384,7 +1412,7 @@ static int kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
     }
     return 0;
 }
-int64_t eng_kv_bytes(Eng* e) { return (int64_t) ((e->kv_row + 2 * e->kv_srow) * (uint64_t) e->c.n_layer + e->kv_vsum); }
+int64_t eng_kv_bytes(Eng* e) { return (int64_t) kv_all(e); }
 int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst) {
     const Seq* s = seq_of(e, seq);
     if (!s || p0 < 0 || p1 < p0 || p1 > s->done) return -1;

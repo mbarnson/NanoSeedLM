@@ -54,12 +54,14 @@ void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks);
 
 // ---- the KV cache: per layer, positions [0, nv) in segment a and [nv, ...) in segment b (row 0 of b = position nv) ----
 // Rows hold n_kv heads of 128 values: BF16, or Q8 (int8 with one f32 scale per row and head: x = q * scale, scale =
-// max|x| / 127).  Segments live in VRAM or mapped host memory; a prompt stages b in VRAM for the layer it computes.
-enum { KV_BF16 = 0, KV_Q8 = 1 };
+// max|x| / 127).  MLA (k: the RoPE key, v: the latent): BF16, or FP8 / FP4 (= ENG_KV_*; nslm/kvq.h): codes in k / v,
+// block scales (bytes) in ks / vs; the RoPE key all FP8, the latent FP8 or (FP4) FP8 for its first KVQ_FP4_LEAD dims.
+// Segments live in VRAM or mapped host memory; a prompt stages b in VRAM for the layer it computes.
+enum { KV_BF16 = 0, KV_Q8 = 1, KV_FP8 = 2, KV_FP4 = 3 };
 typedef struct {
     void* k;
     void* v;
-    float* ks;   // Q8: [rows][n_kv]
+    float* ks;   // Q8: [rows][n_kv]; FP8 / FP4: the block scale bytes [rows][scales a row]
     float* vs;
 } KvSeg;
 typedef struct {
@@ -115,8 +117,8 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
 // tile, so the tile size is a rounding point: tests/test_mova_kernels.c), the gate fused
 #define FA_BK 64
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T);
-// MLA (TransMLA; kernels_moe.metal MlaArgs, HmvArgs).  The KvView of an MLA layer (BF16): k the RoPE key (128 per
-// position), v the latent (a.r per position).
+// MLA (TransMLA; kernels_moe.metal MlaArgs, HmvArgs).  The KvView of an MLA layer: k the RoPE key (128 per position),
+// v the latent (a.r per position); BF16, or FP8 / FP4 codes with ks / vs their block scales (kv.fmt; a.r a multiple of 32).
 // per-head maps: y[t][h][o] = bf16(W_h[o] . x[t * a.xs + h * a.hs ..]) (W BF16 [H][O][I], I a multiple of 32); with g
 // (y's layout): bf16(that * bf16(softplus_ln2(g)))
 void kc_heads_mv(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T);
@@ -139,6 +141,9 @@ void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k
 // o = bf16(bf16(O / l) * softplus_ln2(g)) ([T][n_head][128]), else the state
 void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri, const uint16_t* Kn,
                     const uint16_t* Vd, int kb0, int kb1, int first, int last, float* st, const float* g, float* o, int T);
+// y[i] = value i of `rows` FP8 / FP4 cache rows of n values (the latent's layout; n a multiple of 32): the decode the
+// MLA kernels read, for tests
+void kc_kv_f32(cudaStream_t s, int fmt, const uint8_t* codes, const uint8_t* scales, int n, int rows, float* y);
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n);
 
 #ifdef __cplusplus
