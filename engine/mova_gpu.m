@@ -32,6 +32,7 @@
 #define KVP_PAGE 65536           // paged KV: sparse page bytes (MTLSparsePageSize64)
 #define KVP_HEAP 1024            // pages per heap (64 MB)
 #define KVP_GROW 512             // positions a slot's backing grows by
+#define MAX_ENC 2048             // timing mode: compute encoders per command buffer
 #define MLP_KB 512               // MLA prompt rows: cached keys expanded per pass
 #define MAX_TILES (MAXP / MM_BN + 128)
 
@@ -122,6 +123,7 @@ struct Eng {
     // timing
     id<MTLCounterSampleBuffer> csb;
     int timing_on;
+    uint64_t ts_last[2 * MAX_ENC];        // timing: each sample slot's last resolved value (unchanged = not written)
     double tg_sec[MOVA_TG_N];
 };
 
@@ -155,7 +157,6 @@ static id<MTLComputePipelineState> pipe_(Eng* e, const char* name, int fmt, int 
     return p;
 }
 
-#define MAX_ENC 2048
 typedef struct {
     Eng* e;
     id<MTLCommandBuffer> cb;
@@ -205,8 +206,15 @@ static int cmd_wait(Cmd* c) {
     Eng* e = c->e;
     if (e->timing_on && c->n_enc > 0 && e->csb) {
         NSData* d = [e->csb resolveCounterRange:NSMakeRange(0, (NSUInteger) (2 * c->n_enc))];
-        const MTLCounterResultTimestamp* ts = (const MTLCounterResultTimestamp*) d.bytes;
-        // Encoders without dispatches (or samples the GPU dropped) read 0 / MTLCounterErrorValue: skipped.
+        MTLCounterResultTimestamp ts[2 * MAX_ENC];
+        memcpy(ts, d.bytes, sizeof(MTLCounterResultTimestamp) * (size_t) (2 * c->n_enc));
+        // Encoders without dispatches (or samples the GPU dropped) read 0 / MTLCounterErrorValue, or leave the slot as an
+        // earlier command buffer wrote it (a stale value, as an empty encoder between two group switches): skipped.
+        for (int i = 0; i < 2 * c->n_enc; ++i) {
+            const uint64_t v = ts[i].timestamp;
+            if (v == e->ts_last[i]) ts[i].timestamp = 0;
+            e->ts_last[i] = v;
+        }
         uint64_t lo = UINT64_MAX, hi = 0;
         double ticks = 0;
         for (int i = 0; i < c->n_enc; ++i) {
@@ -946,7 +954,8 @@ static int sync_cmd(Cmd* c) {
 // with T - h0 <= MAX_LOGIT_ROWS the head runs here (the caller copies e->logits and e->am), else the caller runs it.
 // MLA per-head maps (k_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by g (same layout as y)
 static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
-    const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != nil, {0}};
+    const int R = W->cols / 8 <= 16 ? 2 : 1;   // rows per simdgroup (k_heads_mv)
+    const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != nil, {R, 0}};
     cpipe(c, pipe_(c->e, "k_heads_mv", W->fmt, 0));
     cbytes(c, 0, &a, sizeof a);
     cbuf(c, 1, W->b[0], W->o[0]);
@@ -957,7 +966,7 @@ static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
     cbuf(c, 6, W->b[2] ? W->b[2] : W->b[0], W->o[2]);
     cbuf(c, 7, stab_for(c->e, W), 0);
     bind_nibbles(c, W, 8);
-    [c->enc dispatchThreads:MTLSizeMake((NSUInteger) W->rows * 32, (NSUInteger) W->slices, (NSUInteger) T)
+    [c->enc dispatchThreads:MTLSizeMake((NSUInteger) (W->rows + R - 1) / R * 32, (NSUInteger) W->slices, (NSUInteger) T)
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 

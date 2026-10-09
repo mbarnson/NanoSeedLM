@@ -1014,14 +1014,34 @@ kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W 
                        device const float* g [[buffer(3)]], device float* y [[buffer(4)]], device const ushort* S [[buffer(5)]],
                        device const ushort* B [[buffer(6)]], device const uint* G [[buffer(7)]], device const uchar* EN [[buffer(8)]],
                        uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    const int o = (int) gid.x / 32, h = (int) gid.y, t = (int) gid.z;
-    if (o >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
+    // a.pad[0] = R rows per simdgroup (1, or 2 when a row has at most 16 blocks of 8: q_lat, q_rope_mix), 32 / R lanes a row
+    const int R = a.pad[0] > 1 ? a.pad[0] : 1, L = 32 / R, h = (int) gid.y, t = (int) gid.z;
+    const int o = (int) gid.x / 32 * R + (int) lane / L, ln = (int) lane % L;
+    if ((int) gid.x / 32 * R >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
     // FC_FMT: BF16, Q8, Q4 or SEED4P4 (stacked [H][O][I]: row h * O + o; SEED4P4's exponent bias per head in B)
     const int eb = FC_FMT == MF_SEED4P4 ? ((device const int*) B)[h] : 0;
     device const float* xv = x + (ulong) t * a.xs + (ulong) h * a.hs;
-    float s = mv_lane(FC_FMT, W, S, B, G, eb, (ulong) h * a.O + o, a.I, xv, lane, EN);
-    s = simd_sum(s);
-    if (lane == 0) {
+    const ulong row = (ulong) h * a.O + (ulong) min(o, a.O - 1);
+    float s;
+    if (R == 1) s = simd_sum(mv_lane(FC_FMT, W, S, B, G, eb, row, a.I, xv, lane, EN));
+    else {   // L lanes a row, a block of 8 each step (Q4 unrounded: the qmv form, as mv_lane)
+        float acc = 0;
+        for (int j = ln; j < a.I / 8; j += L) {
+            float w[8];
+            if (FC_FMT == MF_SEED4P4) seed4p4_block(W, S, G, row, a.I, j, eb, EN, w);
+            else if (FC_FMT == MF_Q4) {
+                const ulong gi = (row * (ulong) a.I + (ulong) j * 8) / 64;
+                const float sc = bf(S[gi]), bi = bf(B[gi]);
+                const uint q = ((device const uint*) W)[(row * (ulong) a.I) / 8 + (ulong) j];
+                for (int i = 0; i < 8; ++i) w[i] = sc * (float) ((q >> (4 * i)) & 15u) + bi;
+            } else wblock(FC_FMT, W, S, B, row, a.I, j, w);
+            device const float4* xr = (device const float4*) (xv + (ulong) j * 8);
+            acc += dot(float4(w[0], w[1], w[2], w[3]), xr[0]) + dot(float4(w[4], w[5], w[6], w[7]), xr[1]);
+        }
+        for (ushort d = 1; d < (ushort) L; d <<= 1) acc += simd_shuffle_xor(acc, d);
+        s = acc;
+    }
+    if (ln == 0 && o < a.O) {
         const ulong yi = ((ulong) t * a.H + h) * a.O + o;
         float v = bfr(s);
         if (a.gate) v = bfr(v * softplus_ln2_bf(g[yi]));

@@ -374,7 +374,8 @@ int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const Ro
 int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, const float* g, float* y, int T) {
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     id<MTLBuffer> wb = buf(W, 2 * (size_t) H * O * I), xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
-    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+    const int R = I / 8 <= 16 ? 2 : 1;   // rows per simdgroup, as the engine
+    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
     if (T > MV_MAXT) {   // prompt rows, as the engine runs them: a GEMM per head (k_mm), with the gate
         const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
         id<MTLComputePipelineState> pm = pipe_("k_mm", MF_BF16, 1);
@@ -399,7 +400,7 @@ int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, 
             [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
             [e setBuffer:wb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
             [e setBuffer:yb offset:0 atIndex:4];
-            [e dispatchThreads:MTLSizeMake((size_t) O * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [e dispatchThreads:MTLSizeMake((size_t) (O + R - 1) / R * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }))
         return -1;
     memcpy(y, yb.contents, yn);
@@ -543,13 +544,14 @@ int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const ui
     id<MTLBuffer> wb = buf(codes, cb * H), sbuf = buf(scales, fmt == MF_BF16 ? 0 : sb * H), bbuf = buf(biases, fmt == MF_BF16 ? 0 : sb * H),
                   xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
     if (T <= MV_MAXT && !tr) {   // the decode matvec
-        const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+        const int R = I / 8 <= 16 ? 2 : 1;   // rows per simdgroup, as the engine
+    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
         id<MTLComputePipelineState> pp = pipe_("k_heads_mv", fmt, 0);
         if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
                 [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
                 [e setBuffer:wb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
                 [e setBuffer:yb offset:0 atIndex:4]; [e setBuffer:sbuf offset:0 atIndex:5]; [e setBuffer:bbuf offset:0 atIndex:6];
-                [e dispatchThreads:MTLSizeMake((size_t) O * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [e dispatchThreads:MTLSizeMake((size_t) (O + R - 1) / R * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }))
             return -1;
     } else {   // prompt rows: a GEMM per head (tr: W_h read transposed)
@@ -586,14 +588,15 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
     id<MTLBuffer> sb = buf(seeds, 2 * nb * H), cb = buf(coefs, 2 * nb * H), eb = buf(ebias, 4 * (size_t) H), nb4 = buf(ecodes, nb * H / 2),
                   xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
     if (T <= MV_MAXT && !tr) {
-        const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+        const int R = I / 8 <= 16 ? 2 : 1;   // rows per simdgroup, as the engine
+    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
         id<MTLComputePipelineState> pp = pipe_("k_heads_mv", MF_SEED4P4, 0);
         if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
                 [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
                 [e setBuffer:sb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
                 [e setBuffer:yb offset:0 atIndex:4]; [e setBuffer:cb offset:0 atIndex:5]; [e setBuffer:eb offset:0 atIndex:6];
                 [e setBuffer:tab offset:0 atIndex:7]; [e setBuffer:nb4 offset:0 atIndex:8];
-                [e dispatchThreads:MTLSizeMake((size_t) O * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [e dispatchThreads:MTLSizeMake((size_t) (O + R - 1) / R * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }))
             return -1;
     } else {
