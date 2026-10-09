@@ -318,26 +318,6 @@ static int write_config(const char* model, const char* out, const NsSpec* t, int
     return fclose(f);
 }
 
-// --mla-q8 LIST: comma-separated MLA tensor names, each optionally for layers A-B only (v_up@0-23); 1 when the MLA tensor
-// `name` (model.layers.L.self_attn.mla.NAME[.weight]) is listed
-static int mla_keep_q8(const char* list, const char* name) {
-    const char* m = strstr(name, ".mla."), *ly = strstr(name, "layers.");
-    if (!m) return 0;
-    m += 5;
-    const size_t mn = strcspn(m, ".");
-    const int l = ly ? atoi(ly + 7) : -1;
-    for (const char* p = list; *p;) {
-        const size_t n = strcspn(p, ",@");
-        int a = -1, b = 1 << 30;
-        const char* q = p + n;
-        if (*q == '@' && sscanf(q + 1, "%d-%d", &a, &b) != 2) { a = atoi(q + 1); b = a; }
-        if (n == mn && !strncmp(p, m, n) && (a < 0 || (l >= a && l <= b))) return 1;
-        p = q + strcspn(q, ",");
-        if (*p == ',') ++p;
-    }
-    return 0;
-}
-
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // (_IOLBF with size 0 fails fast in MSVC's CRT)
     const char* model = opt(argc, argv, "--model", NULL), *config = opt(argc, argv, "--config", NULL);
@@ -358,7 +338,7 @@ int main(int argc, char** argv) {
                       : !strcmp(mla, "bf16") ? NS_BF16 : -1;
     if (mla_enc < 0) { fprintf(stderr, "--mla: bf16, q8, q4 or p4\n"); return 2; }
     if (mla_enc == NS_SEED4P4 && !opt(argc, argv, "--mla-blk4", NULL)) { fprintf(stderr, "--mla p4 needs --mla-blk4 DIR\n"); return 2; }
-    const char* mla_q8 = opt(argc, argv, "--mla-q8", "");   // MLA tensors kept in Q8 (mla_keep_q8)
+    const char* mla_q8 = opt(argc, argv, "--mla-q8", "");   // MLA tensors kept in Q8 (mova_mla_keep_q8)
     if ((gup4d || p4mx || p4mxbf) && !opt(argc, argv, "--blk4", NULL)) { fprintf(stderr, "--config %s needs --blk4\n", config); return 2; }
     if ((mx || gu4d || gup4d) && !blk) { fprintf(stderr, "--config %s needs --blk\n", config); return 2; }
     char err[512] = "";
@@ -385,9 +365,9 @@ int main(int argc, char** argv) {
             else if (mx || strcmp(t->proj, "down_proj")) enc = NS_SEED4;
             break;
         case MOVA_K_ROUTER: case MOVA_K_NORM: case MOVA_K_ROUTER_BIAS: enc = NS_BF16; break;
-        case MOVA_K_HEADS: enc = mla_keep_q8(mla_q8, t->name) ? NS_Q8 : mla_enc; break;
+        case MOVA_K_HEADS: enc = mova_mla_keep_q8(mla_q8, t->name) ? NS_Q8 : mla_enc; break;
         case MOVA_K_VEXPERTS: case MOVA_K_LINEAR: case MOVA_K_EMBED: case MOVA_K_HEAD: {
-            if (strstr(t->name, ".mla.")) { enc = mla_keep_q8(mla_q8, t->name) ? NS_Q8 : mla_enc; break; }   // --mla
+            if (strstr(t->name, ".mla.")) { enc = mova_mla_keep_q8(mla_q8, t->name) ? NS_Q8 : mla_enc; break; }   // --mla
             // --q4 PARTS: v value experts, a attention, m shared / dense MLPs, h LM head (--rest4 = vamh)
             const int part = t->kind == MOVA_K_VEXPERTS ? 'v' : t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 0
                            : strstr(t->name, "self_attn") ? 'a' : 'm';

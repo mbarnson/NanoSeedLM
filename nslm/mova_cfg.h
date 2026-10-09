@@ -46,3 +46,6 @@ int mova_tensors(const MovaCfg* c, MovaTensor** out);
 const MovaTensor* mova_find(const MovaTensor* t, int n, const char* name);
 // The checkpoint name of slice s (for stacked tensors), or the tensor's own name.
 const char* mova_slice_name(const MovaTensor* t, int s, char* buf, int len);
+// nslm-mova-pack --mla-q8 LIST: 1 when the MLA tensor `name` (model.layers.L.self_attn.mla.NAME[.weight]) is listed;
+// LIST is comma-separated names, each optionally for layers A-B or layer A only (v_up@0-23, v_up@5)
+int mova_mla_keep_q8(const char* list, const char* name);

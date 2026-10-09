@@ -194,3 +194,21 @@ const char* mova_slice_name(const MovaTensor* t, int s, char* buf, int len) {
     else snprintf(buf, (size_t) len, "%s", t->name);
     return buf;
 }
+
+int mova_mla_keep_q8(const char* list, const char* name) {
+    const char* m = strstr(name, ".mla."), *ly = strstr(name, "layers.");
+    if (!m) return 0;
+    m += 5;
+    const size_t mn = strcspn(m, ".");
+    const int l = ly ? atoi(ly + 7) : -1;
+    for (const char* p = list; *p;) {
+        const size_t n = strcspn(p, ",@");
+        int a = -1, b = 1 << 30;
+        const char* q = p + n;
+        if (*q == '@' && sscanf(q + 1, "%d-%d", &a, &b) != 2) { a = atoi(q + 1); b = a; }
+        if (n == mn && !strncmp(p, m, n) && (a < 0 || (l >= a && l <= b))) return 1;
+        p = q + strcspn(q, ",");
+        if (*p == ',') ++p;
+    }
+    return 0;
+}

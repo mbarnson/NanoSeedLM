@@ -13,6 +13,14 @@ int main(int argc, char** argv) {
     char def[512];
     snprintf(def, sizeof def, "%s/.cache/huggingface/hub/models--IFM--K2-Horizon-MoVA-36B-A4B/snapshots/"
              "cca48b6631d03c338a0e1d8beb0c392af8becbd3", getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE") ? getenv("USERPROFILE") : ".");
+    {   // mova_mla_keep_q8 (nslm-mova-pack --mla-q8): names, optionally for layers A-B (or one layer A)
+        const char* l3 = "model.layers.3.self_attn.mla.v_up", *l30 = "model.layers.30.self_attn.mla.v_up.weight";
+        CHECK(!mova_mla_keep_q8("", l3) && mova_mla_keep_q8("v_up", l3) && mova_mla_keep_q8("q_lat,v_up", l30), "names");
+        CHECK(mova_mla_keep_q8("v_up@0-23", l3) && !mova_mla_keep_q8("v_up@0-23", l30) && mova_mla_keep_q8("v_up@24-47", l30), "ranges");
+        CHECK(mova_mla_keep_q8("v_up@3", l3) && !mova_mla_keep_q8("v_up@30", l3) && mova_mla_keep_q8("kv_a_x,v_up@30", l30), "one layer");
+        CHECK(!mova_mla_keep_q8("v_u", l3) && !mova_mla_keep_q8("v_up", "model.layers.3.self_attn.q_proj.weight"), "exact names, MLA only");
+        CHECK(!mova_mla_keep_q8("kv_a_x", "model.layers.3.self_attn.mla.kv_a_x_extra"), "no prefix match");
+    }
     const char* dir = argc > 1 ? argv[1] : getenv("MOVA_DIR") ? getenv("MOVA_DIR") : def;
     char probe[1100];
     snprintf(probe, sizeof probe, "%s/config.json", dir);
