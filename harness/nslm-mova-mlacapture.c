@@ -1,10 +1,11 @@
 // harness/nslm-mova-mlacapture.c - calibration statistics of an MLA model's projection inputs, for the activation-
 // weighted seed search over the MLA projections (nslm-moe --scope mla --act FILE).
 //
-//   nslm-mova-mlacapture --model DIR --text CALIB.txt --out FILE [--ctx 2048] [--max-windows N] [--res out/res] [--xtx DIR]
+//   nslm-mova-mlacapture --model DIR (--text CALIB.txt | --ids FILE) --out FILE [--ctx 2048] [--max-windows N] [--res out/res]
+//                        [--xtx DIR]
 //
 // The text is tokenized whole and cut into windows of BOS + (ctx - 1) tokens (as tools/mova_capture.py); each window is
-// prefilled with the engine's MLA capture on (mova_ext.h: prompts attend in latent space), which sums, per layer and
+// prefilled with the engine's MLA capture on (--ids: int32 windows of ctx ids each, BOS included, as nslm-mova-score's) (mova_ext.h: prompts attend in latent space), which sums, per layer and
 // column, the squares of the attention input, the value experts' output (MoVA layers), the heads' queries and the
 // latent outputs over every computed row.
 //
@@ -28,9 +29,10 @@ int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     setvbuf(stdout, NULL, _IONBF, 0);
     const char* model = opt(argc, argv, "--model", NULL), *text = opt(argc, argv, "--text", NULL), *out = opt(argc, argv, "--out", NULL);
+    const char* idsf = opt(argc, argv, "--ids", NULL);
     const int ctx = atoi(opt(argc, argv, "--ctx", "2048")), maxw = atoi(opt(argc, argv, "--max-windows", "0"));
-    if (!model || !text || !out || ctx < 16) {
-        fprintf(stderr, "usage: nslm-mova-mlacapture --model DIR --text CALIB.txt --out FILE [--ctx 2048] [--max-windows N]\n");
+    if (!model || !text == !idsf || !out || ctx < 16) {
+        fprintf(stderr, "usage: nslm-mova-mlacapture --model DIR (--text CALIB.txt | --ids FILE) --out FILE [--ctx 2048] [--max-windows N] [--xtx DIR]\n");
         return 2;
     }
     char err[512], path[2048];
@@ -41,16 +43,18 @@ int main(int argc, char** argv) {
     Tok* t = tok_open(path, err, sizeof err);
     if (!t) { fprintf(stderr, "%s\n", err); return 1; }
     size_t len = 0;
-    char* s = plat_slurp(text, &len);
-    if (!s) { fprintf(stderr, "cannot read %s\n", text); return 1; }
+    char* s = plat_slurp(idsf ? idsf : text, &len);
+    if (!s) { fprintf(stderr, "cannot read %s\n", idsf ? idsf : text); return 1; }
     int32_t* ids = (int32_t*) malloc(sizeof(int32_t) * (len + 16));
-    const int n = tok_encode(t, s, 0, ids, (int) len + 16);
+    int n = 0;
+    if (idsf) { n = (int) (len / 4); memcpy(ids, s, (size_t) n * 4); }
+    else n = tok_encode(t, s, 0, ids, (int) len + 16);
     const int bos = tok_bos(t) >= 0 ? tok_bos(t) : 0;
     free(s);
     tok_close(t);
-    int nw = n < 0 ? 0 : n / (ctx - 1);
+    int nw = n < 0 ? 0 : idsf ? n / ctx : n / (ctx - 1);
     if (maxw > 0 && nw > maxw) nw = maxw;
-    printf("%s: %d tokens, %d windows of BOS + %d\n", text, n, nw, ctx - 1);
+    printf("%s: %d tokens, %d windows of %s\n", idsf ? idsf : text, n, nw, idsf ? "ctx ids" : "BOS + ctx - 1");
     if (nw < 1) return 1;
     EngOpts o;
     memset(&o, 0, sizeof o);
@@ -65,8 +69,11 @@ int main(int argc, char** argv) {
     int32_t* w = (int32_t*) malloc(sizeof(int32_t) * (size_t) ctx);
     const double t0 = now_s();
     for (int i = 0; i < nw; ++i) {
-        w[0] = bos;
-        memcpy(w + 1, ids + (size_t) i * (ctx - 1), sizeof(int32_t) * (size_t) (ctx - 1));
+        if (idsf) memcpy(w, ids + (size_t) i * ctx, sizeof(int32_t) * (size_t) ctx);
+        else {
+            w[0] = bos;
+            memcpy(w + 1, ids + (size_t) i * (ctx - 1), sizeof(int32_t) * (size_t) (ctx - 1));
+        }
         if (eng_prefill(e, 0, w, ctx)) { fprintf(stderr, "window %d: prefill failed\n", i); return 1; }
         if (i % 10 == 0 || i == nw - 1) printf("  window %d/%d  %.0f s\n", i + 1, nw, now_s() - t0);
     }
