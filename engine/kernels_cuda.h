@@ -127,6 +127,9 @@ void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const uint32_t* G
 // A SEED4P4 per-head map [H][O][I] (W as kc_heads_mv's) decoded to BF16 into out [H][O][I] (the prefill GEMM's seed
 // weights rounded to BF16)
 void kc_heads_deq(cudaStream_t s, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out);
+// H[b] += X_b^T X_b on the lower 32 x 32 tiles of nb blocks of D columns (X_b at column b * bs; T rows of stride xs;
+// D a multiple of 32; H[b] at b * D * D): the GPTQ capture
+void kc_xtx(cudaStream_t s, const float* X, int D, int nb, int xs, int bs, int T, float* H);
 // out[c] += sum_t X[t * xs + c]^2 for c < n (the MLA capture)
 void kc_sumsq(cudaStream_t s, const float* X, int n, int T, int xs, float* out);
 // the same on tensor cores (any T; prompt rows): BF16 mma, f32 sums.  -1 (nothing launched) unless a.I is a multiple of

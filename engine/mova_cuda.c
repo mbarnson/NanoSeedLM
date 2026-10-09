@@ -96,6 +96,11 @@ struct Eng {
     float *cap_buf, *cap_host;        // this forward's sums [layer][x d | v kvd | q qd | o n_head * rmax] (device), a host copy
     double* cap_sum;                  // all forwards'
     int64_t cap_rows, cap_ld;
+    // capture mode 2 (GPTQ): one layer's X^T X per attention call (f32, [x d^2 | v kvd^2 | q H hd^2 | o H r^2], lower 32 x 32
+    // tiles) folded into host totals of the lower triangles (double, per layer cap_xtl apart): VRAM holds one layer
+    float *cap_x, *cap_xh;
+    double* cap_xt;
+    int64_t cap_xld, cap_xtl;
     // MLA prompt rows (kc_mla_prefill): decompressed keys and values of up to dec_keys positions ([key][n_head][128]
     // BF16), the softmax state across key blocks, and which keys the buffers hold: [0, dec_n) of layer dec_l in the slot
     // at cache row dec_kv0 (dec_l -1: none).  Any forward that is not a prompt's, and any cache write, forgets them.
@@ -885,7 +890,7 @@ void eng_close(Eng* e) {
     if (e->ck) mova_ckpt_close(e->ck);
     if (e->seqs) for (int s = 0; s < e->nseqs; ++s) free(e->seqs[s].hist);
     free(e->seqs);
-    free(e->cap_sum); free(e->cap_host);
+    free(e->cap_sum); free(e->cap_host); free(e->cap_xh); free(e->cap_xt);
     free(e->kv_vrow); free(e->kv_voff); free(e->kv_vsrow); free(e->kv_vsoff);
     free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
     free(e);
@@ -997,6 +1002,27 @@ static void enc_heads_mv(Eng* e, const MW* W, const float* X, int xs, int hs, co
     const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != NULL, {0}};
     if (!e->prompt || kc_heads_mm(e->st, a, W->fmt, W->w0, X, G, Y, T)) kc_heads_mv(e->st, a, W->fmt, W->w0, stab_for(e, W), X, G, Y, T);
 }
+// Capture mode 2: layer l's X^T X of this attention call (cap_x, lower tiles) added to the host totals' lower triangles
+static void xtx_fold(Eng* e, int l) {
+    const MovaCfg* c = &e->c;
+    if (!CK(cudaStreamSynchronize(e->st)) || !CK(cudaMemcpy(e->cap_xh, e->cap_x, (size_t) e->cap_xld * 4, cudaMemcpyDeviceToHost))) return;
+    const int64_t d = c->d, kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head, r = e->L[l].mla_r;
+    const int64_t dims[4] = {d, kvd, hd, r}, nbs[4] = {1, 1, H, H};
+    const float* src = e->cap_xh;
+    double* dst = e->cap_xt + l * e->cap_xtl;
+    for (int site = 0; site < 4; ++site)
+        for (int64_t b = 0; b < nbs[site]; ++b) {
+            const int64_t n = dims[site];
+            for (int64_t i = 0; i < n; ++i) {
+                const float* row = src + i * n;
+                double* tri = dst + i * (i + 1) / 2;
+                for (int64_t j = 0; j <= i; ++j) tri[j] += row[j];
+            }
+            src += n * n;
+            dst += n * (n + 1) / 2;
+        }
+}
+
 // A SEED4P4 per-head map decoded to BF16 into Y (kc_heads_deq), as a BF16 MW over Y; any other map as it is
 static MW heads_bf16(Eng* e, const MW* W, uint16_t* Y) {
     if (W->fmt != MF_SEED4P4) return *W;
@@ -1021,6 +1047,12 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
         kc_sumsq(e->st, e->xn, d, T, d, cb);
         if (L->sparse) kc_sumsq(e->st, e->v, kvd, T, kvd, cb + d);
         kc_sumsq(e->st, e->q, qd, T, qd, cb + d + kvd);
+    }
+    if (e->cap_on == 2) {   // GPTQ: this call's X^T X of the inputs (the latent outputs after the attention)
+        CK(cudaMemsetAsync(e->cap_x, 0, (size_t) e->cap_xld * 4, e->st));
+        kc_xtx(e->st, e->xn, d, 1, d, 0, T, e->cap_x);
+        if (L->sparse) kc_xtx(e->st, e->v, kvd, 1, kvd, 0, T, e->cap_x + (size_t) d * d);
+        kc_xtx(e->st, e->q, g->head_dim, H, qd, g->head_dim, T, e->cap_x + (size_t) d * d + (size_t) kvd * kvd);
     }
     const int big = T > MV_MAXT || e->prompt;
     // prompt rows: seed per-head maps decoded to BF16 once here (not per row or key tile)
@@ -1062,6 +1094,10 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
     kc_mla_attn(e->st, ma, e->qlat, e->qrp, kv, RI, e->part, e->olat, T);
     if (cb) kc_sumsq(e->st, e->olat, H * r, T, H * r, cb + d + kvd + qd);
+    if (e->cap_on == 2) {
+        kc_xtx(e->st, e->olat, r, H, H * r, r, T, e->cap_x + (size_t) d * d + (size_t) kvd * kvd + (size_t) H * g->head_dim * g->head_dim);
+        xtx_fold(e, l);
+    }
     tgroup(e, MOVA_TG_ATTN_PROJ);
     enc_heads_mv(e, &vu, e->olat, H * r, r, e->gq, e->ao, T);
 }
@@ -1612,10 +1648,25 @@ static void route_collect(Eng* e, int T) {
 }
 int eng_mla_capture(Eng* e, int on) {   // mova_ext.h
     const MovaCfg* c = &e->c;
-    if (!c->mla || on == 2) return -1;   // 2: X^T X, Metal only so far
-    if (on && !e->cap_on) {
-        int rmax = 0;
-        for (int l = 0; l < c->n_layer; ++l) if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+    if (!c->mla || on < 0 || on > 2) return -1;
+    if (on && on != e->cap_on) {   // a new capture (fresh sums)
+        int rmax = 0, r32 = 1;
+        for (int l = 0; l < c->n_layer; ++l) { if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r; r32 &= e->L[l].mla_r % 32 == 0; }
+        if (on == 2) {   // X^T X: widths in whole 32 x 32 tiles; one layer in VRAM, the lower triangles on the host
+            const int64_t kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head;
+            if (!r32 || c->d % 32 || kvd % 32 || hd % 32) return -1;
+            const int64_t xld = (int64_t) c->d * c->d + kvd * kvd + H * (hd * hd + (int64_t) rmax * rmax);
+            const int64_t xtl = (int64_t) c->d * (c->d + 1) / 2 + kvd * (kvd + 1) / 2 + H * (hd * (hd + 1) / 2 + (int64_t) rmax * (rmax + 1) / 2);
+            if (e->cap_xld < xld) {
+                if (!(e->cap_x = (float*) scratch(e, (uint64_t) xld * 4))) return -1;
+                free(e->cap_xh);
+                if (!(e->cap_xh = (float*) malloc((size_t) xld * 4))) return -1;
+                e->cap_xld = xld;
+            }
+            free(e->cap_xt);
+            e->cap_xtl = xtl;
+            if (!(e->cap_xt = (double*) calloc((size_t) c->n_layer * (size_t) xtl, sizeof(double)))) return -1;
+        }
         e->cap_ld = (int64_t) c->d + (int64_t) c->n_kv * c->head_dim + (int64_t) c->n_head * c->head_dim + (int64_t) c->n_head * rmax;
         const uint64_t n = (uint64_t) c->n_layer * (uint64_t) e->cap_ld;
         if (!e->cap_buf && !(e->cap_buf = (float*) scratch(e, n * 4))) return -1;
@@ -1641,7 +1692,22 @@ int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double*
     if (rows) *rows = e->cap_rows;
     return 0;
 }
-int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) { return -1; }   // mova_ext.h: Metal only so far
+int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) {   // mova_ext.h: the lower triangles, mirrored
+    const MovaCfg* c = &e->c;
+    if (!c->mla || e->cap_on != 2 || !e->cap_xt || l < 0 || l >= c->n_layer || site < 0 || site > 3) return -1;
+    const int64_t d = c->d, kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head, r = e->L[l].mla_r;
+    const int64_t dims[4] = {d, kvd, hd, r}, nbs[4] = {1, 1, H, H};
+    const double* src = e->cap_xt + l * e->cap_xtl;
+    for (int s = 0; s < site; ++s) src += nbs[s] * dims[s] * (dims[s] + 1) / 2;
+    const int64_t n = dims[site];
+    for (int64_t b = 0; b < nbs[site]; ++b) {
+        float* hb = h + b * n * n;
+        for (int64_t i = 0; i < n; ++i)
+            for (int64_t j = 0; j <= i; ++j) hb[i * n + j] = hb[j * n + i] = (float) src[i * (i + 1) / 2 + j];
+        src += n * (n + 1) / 2;
+    }
+    return 0;
+}
 int eng_mova_routes_read(Eng* e, int rows, int32_t* mlp, int32_t* val, float* mlp_sel, float* val_sel) {
     if (!e->route_on || rows > e->route_rows) return -1;
     const MovaCfg* c = &e->c;

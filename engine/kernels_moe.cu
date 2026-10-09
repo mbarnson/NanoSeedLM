@@ -1174,6 +1174,34 @@ __global__ void k_heads_deq(WSlice W, const uint32_t* G, int O, int I, int nbt, 
     tile_weights(MF_SEED4P4, &ws, G, row, I, j, f);
     *(uint4*) (out + (size_t) b * 8) = make_uint4(pack_bf2(f[0], f[1]), pack_bf2(f[2], f[3]), pack_bf2(f[4], f[5]), pack_bf2(f[6], f[7]));
 }
+// X^T X for the GPTQ capture: H[b][i][j] += sum_t X[t * xs + b * bs + i] X[t * xs + b * bs + j] for the lower 32 x 32
+// tiles (blockIdx.x >= blockIdx.y) of block b = blockIdx.z (D x D, H at b * D * D).  128 threads, 8 sums each; rows
+// staged 32 at a time in shared memory.
+__global__ void __launch_bounds__(128) k_xtx(const float* X, int D, int T, int xs, int bs, float* H) {
+    const int ti = (int) blockIdx.x, tj = (int) blockIdx.y, b = (int) blockIdx.z, tid = threadIdx.x;
+    if (ti < tj) return;
+    __shared__ float xi[32][33], xj[32][33];
+    const int ii = tid & 31, j0 = (tid >> 5) * 8;   // this thread: row ii, columns j0 .. j0 + 7 of the tile
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const float* xb = X + (size_t) b * bs;
+    for (int t0 = 0; t0 < T; t0 += 32) {
+        __syncthreads();
+        for (int e = tid; e < 32 * 32; e += 128) {
+            const int tr = e >> 5, c = e & 31, t = t0 + tr;
+            xi[tr][c] = t < T ? xb[(size_t) t * xs + ti * 32 + c] : 0.0f;
+            xj[tr][c] = t < T ? xb[(size_t) t * xs + tj * 32 + c] : 0.0f;
+        }
+        __syncthreads();
+        for (int tr = 0; tr < 32; ++tr) {
+            const float a = xi[tr][ii];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) acc[k] += a * xj[tr][j0 + k];
+        }
+    }
+    float* hb = H + (size_t) b * D * D + (size_t) (ti * 32 + ii) * D + tj * 32 + j0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) hb[k] += acc[k];
+}
 // out[c] += sum over T rows of X[t][c]^2 (row stride xs): the MLA capture's column statistics
 __global__ void k_sumsq(const float* X, int n, int T, int xs, float* out) {
     const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x);
@@ -2018,6 +2046,9 @@ void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const uint32_t* G
 void kc_heads_deq(cudaStream_t s, WSlice W, const uint32_t* G, int H, int O, int I, uint16_t* out) {
     const int nbt = H * O * (I / 8);
     k_heads_deq<<<(unsigned) ((nbt + 255) / 256), 256, 0, s>>>(W, G, O, I, nbt, out);
+}
+void kc_xtx(cudaStream_t s, const float* X, int D, int nb, int xs, int bs, int T, float* H) {
+    k_xtx<<<dim3((unsigned) D / 32, (unsigned) D / 32, (unsigned) nb), 128, 0, s>>>(X, D, T, xs, bs, H);
 }
 void kc_sumsq(cudaStream_t s, const float* X, int n, int T, int xs, float* out) {
     k_sumsq<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(X, n, T, xs, out);

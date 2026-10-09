@@ -361,7 +361,12 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
     return done("kc_embed", x, dx, 4 * (size_t) n * d);
 }
 int kt_bf16_f32(const uint16_t* x, float* y, int n) { return 1; }   // Metal only so far
-int kt_xtx(const float* x, int T, int xs, int D, int nb, float* H) { return 1; }   // Metal only so far
+int kt_xtx(const float* x, int T, int xs, int D, int nb, float* H) {
+    const size_t hn = 4 * (size_t) nb * D * D;
+    float* dH = (float*) dev(H, hn);
+    kc_xtx(0, (const float*) dev(x, 4 * ((size_t) (T - 1) * xs + (size_t) nb * D)), D, nb, xs, D, T, dH);
+    return done("kc_xtx", H, dH, hn);
+}
 // The streams of an H x rows x cols tensor in fmt (BF16 values; Q8 / Q4 codes, then BF16 scales and biases per 64) on
 // the device
 static WSlice heads_dev(int fmt, int H, size_t n1, const void* codes, const uint16_t* scales, const uint16_t* biases) {
