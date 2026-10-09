@@ -10,7 +10,9 @@
 #     [WORKERS=8] [LOG=$OUT/log] [MOE_EXTRA="--layers 20-20"] [DENSE_EXTRA="--only layers.20."] bash tools/hf_seedbank.sh
 #
 # JOBS: moe3 / moe4 routed and value experts (nslm-moe --scope all, AW) at P = 3 / 4; dense3 / dense4 / dense8 the dense
-# tensors (nslm-dense --mode gptq) at P = 3 / 4 / 8.  MOE_EXTRA / DENSE_EXTRA: more options (e.g. one layer, for a benchmark).
+# tensors (nslm-dense --mode gptq) at P = 3 / 4 / 8; mla3 / mla4 / mla8 an MLA model's projections (nslm-moe --scope mla,
+# GPTQ) at P = 3 / 4 / 8, after one capture on GPU 0 (nslm-mova-mlacapture over CALIB, the model being an MLA folder; the
+# capture is kept in OUT/mla-capture and reused).  MOE_EXTRA / DENSE_EXTRA: more options (e.g. one layer, for a benchmark).
 set -euo pipefail
 GPUS=${GPUS:-$(nvidia-smi -L | wc -l)}
 JOBS=${JOBS:-"moe3 dense3 dense4"}
@@ -35,9 +37,19 @@ if [ -f "$ACT" ]; then cp "$ACT" /tmp/act.bin && ACT=/tmp/act.bin; fi   # local 
 if [ -d "$XTX" ]; then mkdir -p /tmp/xtx && cp -r "$XTX"/. /tmp/xtx/ && XTX=/tmp/xtx; fi   # mount can come back short
 rm -rf /work && cp -r "$SRC" /work
 cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
-cmake --build /work/build -j "$(nproc)" --target nslm-moe nslm-dense 2>&1 | grep -E "error" || true
+cmake --build /work/build -j "$(nproc)" --target nslm-moe nslm-dense nslm-mova-mlacapture 2>&1 | grep -E "error" || true
 BIN=/work/build/bin
 nvidia-smi --query-gpu=index,name,memory.total --format=csv | tee "$LOG/gpus.csv"
+
+if [[ " $JOBS " == *" mla"* ]] && [ ! -f "$OUT/mla-capture/done" ]; then   # the MLA capture, once (GPU 0)
+    mkdir -p "$OUT/mla-capture/xtx" /tmp/mlacap/xtx
+    t0=$(date +%s)
+    CUDA_VISIBLE_DEVICES=0 "$BIN/nslm-mova-mlacapture" --model "$MODEL" --text "$CALIB" --out /tmp/mlacap/actsq_mla.bin --xtx /tmp/mlacap/xtx \
+        >"$LOG/mlacapture.log" 2>&1
+    cp -r /tmp/mlacap/. "$OUT/mla-capture/" && touch "$OUT/mla-capture/done"
+    echo "== mla capture: $(( $(date +%s) - t0 )) s"
+fi
+[ -f "$OUT/mla-capture/done" ] && [ ! -d /tmp/mlacap ] && mkdir -p /tmp/mlacap && cp -r "$OUT/mla-capture/." /tmp/mlacap/
 
 run_gpu() {   # one GPU: its shard of every job, in order
     local g=$1 t0 j
@@ -49,6 +61,9 @@ run_gpu() {   # one GPU: its shard of every job, in order
             dense3|dense4|dense8)
                 "$BIN/nslm-dense" --model "$MODEL" --xtx "$XTX" --out "$OUT/dense-p${j#dense}" --mode gptq --codec "p${j#dense}" \
                     --shard "$g/$GPUS" --workers "$WORKERS" $DENSE_EXTRA ;;
+            mla3|mla4|mla8)
+                "$BIN/nslm-moe" --model "$MODEL" --act /tmp/mlacap/actsq_mla.bin --scope mla --xtx /tmp/mlacap/xtx \
+                    $([ "$j" = mla4 ] && echo --p4 || echo --codec "p${j#mla}") --out "$OUT/mla-p${j#mla}" --shard "$g/$GPUS" --workers "$WORKERS" ;;
             *) echo "unknown job $j"; return 1 ;;
         esac
         echo "== $j gpu $g: $(( $(date +%s) - t0 )) s"
