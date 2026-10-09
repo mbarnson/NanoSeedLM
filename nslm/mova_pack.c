@@ -1,7 +1,7 @@
 // nslm/mova_pack.c - nslm-mova-pack: writes a NanoSeedLM model folder for K2-Horizon MoVA (nslm/model_st.h).
 //
 //   nslm-mova-pack --model DIR --config CONFIG --out DIR [--blk DIR] [--blk4 DIR] [--q4 PARTS|--rest4] [--seeds PARTS]
-//                  [--seeds8 PARTS] [--seeds-only SUBSTR] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] [--threads 16]
+//                  [--seeds8 PARTS] [--seeds3 PARTS] [--seeds-only SUBSTR] [--mla bf16|q8|q4|p4 [--mla-blk4 DIR] [--mla-q8 NAMES]] [--threads 16]
 //   --mla-q8: MLA tensors kept in Q8 while the rest take --mla, comma-separated, each optionally for layers A-B (v_up@0-23);
 //             default with --mla p4: v_up (held-out KLD -0.0039 for 80 MB on J768), "none" for all seeds
 //                  [--shard-gb 4.5] [--loader tools/nanoseedlm_k2.py]
@@ -20,7 +20,8 @@
 // (v value experts, a attention, m shared / dense MLPs, h LM head; --rest4 = vamh; the embedding is always Q8), or
 // SEED4P4 for the parts named in --seeds, from --blk4 (v: L{l}_v_experts.blk4 of nslm-moe; a, m, h, e (embedding):
 // NAME.blk4 of nslm-dense, NAME without ".weight"), or SEED6P8 for the parts in --seeds8 (a, m, h, e: NAME.blk8 of
-// nslm-dense --codec p8, in --blk4); --seeds-only: only tensors whose name contains SUBSTR take --seeds8;
+// nslm-dense --codec p8, in --blk4), or SEED4 (P = 3) for the parts in --seeds3 (v, a, m, h: L{l}_v_experts.blk of nslm-moe,
+// NAME.blk of nslm-dense --codec p3, in --blk); --seeds-only: only tensors whose name contains SUBSTR take --seeds8;
 // routers are BF16 holding their Q8 round trip (the router needs BF16 operands); norms and router biases are BF16.
 // MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported, or Q8 / Q4
 // with --mla (per-head maps quantized per head along their input dim; a map or projection whose input dim is not a
@@ -267,9 +268,11 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
         free(q); free(sc); free(bi);
         return 0;
     }
-    // SEED4: from the nslm-moe .blk of (layer, projection)
+    // SEED4: from the nslm-moe .blk of (layer, projection), or nslm-dense's NAME.blk (--seeds3)
     if (s == 0) {
-        snprintf(path, sizeof path, "%s/L%d_%s.blk", c->blk, t->layer, t->proj);
+        if (t->kind == MOVA_K_EXPERTS || t->kind == MOVA_K_VEXPERTS)
+            snprintf(path, sizeof path, "%s/L%d_%s.blk", c->blk, t->layer, t->kind == MOVA_K_VEXPERTS ? "v_experts" : t->proj);
+        else snprintf(path, sizeof path, "%s/%.*s.blk", c->blk, (int) strlen(t->name) - 7, t->name);
         FILE* f = fopen(path, "rb");
         if (!f) { fprintf(stderr, "cannot read %s\n", path); return -1; }
         fseek(f, 0, SEEK_END);
@@ -380,6 +383,12 @@ int main(int argc, char** argv) {
     const char* mla_q8 = opt(argc, argv, "--mla-q8", mla_enc == NS_SEED4P4 ? "v_up" : "");
     if (!strcmp(mla_q8, "none")) mla_q8 = "";
     const char* seedparts = opt(argc, argv, "--seeds", ""), *seed8parts = opt(argc, argv, "--seeds8", ""), *seedonly = opt(argc, argv, "--seeds-only", "");
+    const char* seed3parts = opt(argc, argv, "--seeds3", "");
+    if (*seed3parts && (strspn(seed3parts, "vamh") != strlen(seed3parts) || strpbrk(seed3parts, seedparts) || strpbrk(seed3parts, seed8parts) ||
+                        !opt(argc, argv, "--blk", NULL))) {
+        fprintf(stderr, "--seeds3 takes v, a, m, h (not also in --seeds / --seeds8) and needs --blk\n");
+        return 2;
+    }
     if (*seed8parts && (strspn(seed8parts, "amhe") != strlen(seed8parts) || strpbrk(seed8parts, seedparts) || !opt(argc, argv, "--blk4", NULL))) {
         fprintf(stderr, "--seeds8 takes a, m, h, e (not also in --seeds) and needs --blk4\n");
         return 2;
@@ -422,7 +431,7 @@ int main(int argc, char** argv) {
                            : strstr(t->name, "self_attn") ? 'a' : 'm';
             const int sel_ok = !*seedonly || strstr(t->name, seedonly);
             enc = sel_ok && strchr(seed8parts, part) ? NS_SEED6P8 : strchr(seedparts, part) ? NS_SEED4P4
-                : part != 'e' && strchr(q4parts, part) ? NS_Q4 : NS_Q8;
+                : part != 'e' && strchr(seed3parts, part) ? NS_SEED4 : part != 'e' && strchr(q4parts, part) ? NS_Q4 : NS_Q8;
             break;
         }
         default: break;
