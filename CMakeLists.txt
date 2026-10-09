@@ -95,8 +95,13 @@ if(WIN32)
   target_link_libraries(nslm_harness PUBLIC nslm icu shell32 bcrypt ws2_32)
 elseif(APPLE)
   target_link_libraries(nslm_harness PUBLIC nslm icucore "-framework CoreFoundation" "-framework IOKit")
-else()
-  target_link_libraries(nslm_harness PUBLIC nslm icuuc icui18n)
+else()   # Linux: ICU's headers and libraries (Ubuntu / Debian: libicu-dev), found at configure time
+  find_package(ICU COMPONENTS uc i18n)
+  if(NOT ICU_FOUND)
+    message(FATAL_ERROR "ICU not found: the tokenizer (harness/tokenizer.c) needs ICU's headers and libraries "
+                        "(Ubuntu / Debian: apt install libicu-dev; Fedora: dnf install libicu-devel)")
+  endif()
+  target_link_libraries(nslm_harness PUBLIC nslm ICU::uc ICU::i18n)
 endif()
 
 foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke nslm-mova-kbench
