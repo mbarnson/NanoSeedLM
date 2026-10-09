@@ -1,4 +1,5 @@
-// nslm/lib_linalg.c - the dense linear algebra of GPTQ-style error feedback (S-01 S3), in double, C99 + Clang vectors.
+// nslm/lib_linalg.c - the dense linear algebra of GPTQ-style error feedback (S-01 S3), in double, C99.  Dot products sum
+// four interleaved lanes (x + y + z + w at the end), portably (MSVC, GCC, Clang): the same results everywhere.
 //
 // GPTQ needs U, the upper Cholesky factor of the inverse Hessian: H^-1 = U^T U.  With J the order reversal and
 // J H J = M M^T (lower Cholesky), H = (J M J)(J M J)^T, so H^-1 = (J M^-1 J)^T (J M^-1 J): U = J M^-1 J, upper
@@ -9,8 +10,15 @@
 
 #include "linalg.h"
 
-typedef double d4 __attribute__((ext_vector_type(4)));
-static inline d4 ld4(const double* p) { d4 v; memcpy(&v, p, sizeof v); return v; }   // unaligned
+// sum_k<n a[k] b[k] in four lanes (k mod 4) for the whole fours, the lanes added in order, then the rest one by one
+static inline double dot4(const double* a, const double* b, int n) {
+    double l0 = 0, l1 = 0, l2 = 0, l3 = 0;
+    int k = 0;
+    for (; k + 4 <= n; k += 4) { l0 += a[k] * b[k]; l1 += a[k + 1] * b[k + 1]; l2 += a[k + 2] * b[k + 2]; l3 += a[k + 3] * b[k + 3]; }
+    double s = l0 + l1 + l2 + l3;
+    for (; k < n; ++k) s += a[k] * b[k];
+    return s;
+}
 
 // In-place lower Cholesky of a (n x n, row-major, symmetric): a = L L^T, L in the lower triangle, upper set to 0.
 // Returns 0, or -1 (and the failing column + 1 in *bad) when a pivot is not positive.
@@ -18,26 +26,13 @@ static int chol_lower(double* a, int n, int* bad) {
     for (int j = 0; j < n; ++j) {
         double* rj = a + (size_t) j * n;
         double d = rj[j];
-        // d -= sum_k<j L[j][k]^2
-        d4 acc = 0;
-        int k = 0;
-        for (; k + 4 <= j; k += 4) { const d4 v = ld4(rj + k); acc += v * v; }
-        double s = acc.x + acc.y + acc.z + acc.w;
-        for (; k < j; ++k) s += rj[k] * rj[k];
-        d -= s;
+        d -= dot4(rj, rj, j);   // sum_k<j L[j][k]^2
         if (!(d > 0)) { if (bad) *bad = j + 1; return -1; }
         const double ljj = sqrt(d), inv = 1.0 / ljj;
         rj[j] = ljj;
         for (int i = j + 1; i < n; ++i) {
             double* ri = a + (size_t) i * n;
-            d4 ac = 0;
-            int q = 0;
-            for (; q + 4 <= j; q += 4) {
-                ac += ld4(ri + q) * ld4(rj + q);
-            }
-            double t = ac.x + ac.y + ac.z + ac.w;
-            for (; q < j; ++q) t += ri[q] * rj[q];
-            ri[j] = (ri[j] - t) * inv;
+            ri[j] = (ri[j] - dot4(ri, rj, j)) * inv;
         }
     }
     for (int i = 0; i < n; ++i) memset(a + (size_t) i * n + i + 1, 0, sizeof(double) * (size_t) (n - i - 1));
@@ -54,12 +49,7 @@ static void tri_lower_inverse(double* l, int n) {
         col[j] = 1.0 / l[(size_t) j * n + j];
         for (int i = j + 1; i < n; ++i) {
             const double* ri = l + (size_t) i * n;
-            d4 ac = 0;
-            int k = j;
-            for (; k + 4 <= i; k += 4) ac += ld4(ri + k) * ld4(col + k);
-            double s = ac.x + ac.y + ac.z + ac.w;
-            for (; k < i; ++k) s += ri[k] * col[k];
-            col[i] = -s / ri[i];
+            col[i] = -dot4(ri + j, col + j, i - j) / ri[i];
         }
         for (int i = j; i < n; ++i) inv[(size_t) i * n + j] = col[i];
     }
