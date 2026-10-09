@@ -115,7 +115,10 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   0 turns it off). A later request with the same prefix reads it back instead of computing it. Blocks are keyed by the
   tokens and the model's weights, so another model or quantization never reuses them.
 - `--ctx` sets each slot's context (prompt and output). On a 32 GB Mac, 4096 fits; on a larger Mac, use a larger value,
-  for example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held.
+  for example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held. On macOS
+  26.4 or later the Metal engine pages the KV cache: it reserves `--ctx` per slot but commits memory in 64 KB pages as
+  positions are written, and gives pages back when a slot is freed or reused for a shorter conversation, so only the
+  contexts in use take memory (`NSLM_KV_DENSE=1`: commit it all at start, as before).
 - `--kv q8` keeps the KV cache in 8 bits (int8 with a scale per token and head) on either engine: half the memory, so a
   200k-token cache takes about 20 GB instead of 39 GB. MLA models take `--kv fp8` or `--kv fp4` instead (Metal; see
   [MLA models](#mla-models-experimental)).  On an M4 Max it costs little quality (KLD against BF16,

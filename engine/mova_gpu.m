@@ -29,6 +29,9 @@
 #define MAX_SPLITS 32   // decode attention: at most this many key splits
 #endif
 #define MAX_LOGIT_ROWS 64        // LM head rows per pass (prompt scoring runs it in 64-row passes)
+#define KVP_PAGE 65536           // paged KV: sparse page bytes (MTLSparsePageSize64)
+#define KVP_HEAP 1024            // pages per heap (64 MB)
+#define KVP_GROW 512             // positions a slot's backing grows by
 #define MLP_KB 512               // MLA prompt rows: cached keys expanded per pass
 #define MAX_TILES (MAXP / MM_BN + 128)
 
@@ -51,6 +54,7 @@ typedef struct {
     int32_t* hist;
     int len, cap;
     int done;   // positions whose KV is computed (hist[0 .. done-1])
+    int backed; // paged KV: positions whose pages are mapped
     int xend;   // MLA: prompt rows at positions below xend attend with the latent expanded per head
 } Seq;
 
@@ -88,9 +92,20 @@ struct Eng {
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
     EngMem mem;
-    Seq* seqs;                            // slot s: KV cache rows s * slot_cap ..
+    Seq* seqs;                            // slot s: KV cache rows s * slot_stride .. (+ slot_cap)
     int nseqs;
     int64_t slot_cap;
+    int64_t slot_stride;                  // positions between slot bases (paged KV: each slot starts on a page)
+    NSMutableArray* kv_bufs;              // the KV buffers in kv_copy's order (per layer K, V, then their scales)
+    uint64_t* kv_rb;                      // their bytes per position
+    int kvp;                              // paged KV: placement sparse buffers, 64 KB pages mapped from heaps as needed
+    id kvp_q;                             // id<MTL4CommandQueue> (mapping updates)
+    id<MTLSharedEvent> kvp_ev;
+    uint64_t kvp_evv;
+    NSMutableArray* kvp_heaps;            // id<MTLHeap>, or NSNull once released
+    int* kvp_used;                        // pages in use per heap
+    uint64_t (*kvp_free)[KVP_HEAP / 64];  // free-page bitmaps per heap
+    int32_t** kvp_map;                    // per KV buffer: page -> heap * KVP_HEAP + heap page, or -1
     char desc[256];
     // route capture
     int route_on, route_max;
@@ -330,6 +345,147 @@ static uint64_t kv_srow(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? 
 static uint64_t kv_rowk(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) n : 2 * (uint64_t) n; }
 static uint64_t kv_srowk(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ? (uint64_t) n / 32 : 0; }
 
+// Layer l's KV buffers' bytes per position: K (MLA: the RoPE key), V (MLA: the latent), their scales (0: none)
+static void kv_rbs(const Eng* e, int l, uint64_t rb[4]) {
+    const MovaCfg* c = &e->c;
+    if (c->mla) {
+        rb[0] = kv_rowk(e, c->mla_rope); rb[1] = kv_row(e, e->L[l].mla_r);
+        rb[2] = kv_srowk(e, c->mla_rope); rb[3] = kv_srow(e, e->L[l].mla_r);
+    } else {
+        rb[0] = rb[1] = (uint64_t) c->n_kv * c->head_dim * (e->kv_q8 ? 1 : 2);
+        rb[2] = rb[3] = e->kv_q8 ? (uint64_t) c->n_kv * 4 : 0;
+    }
+}
+// One KV buffer of rb bytes per position for every slot.  Paged: a placement sparse buffer (pages mapped by kvp_back);
+// otherwise memory for all of it.  e->mem.kv counts kv_cap positions either way.
+static id<MTLBuffer> kv_alloc(Eng* e, uint64_t rb, const char* label) {
+    id<MTLBuffer> b = nil;
+    if (e->kvp) {
+        if (@available(macOS 26.0, *)) {
+            const uint64_t bytes = (uint64_t) e->slot_stride * (uint64_t) e->nseqs * rb;   // whole pages (slot_stride)
+            b = [e->dev newBufferWithLength:bytes options:MTLResourceStorageModePrivate placementSparsePageSize:MTLSparsePageSize64];
+            if (b) {
+                b.label = [NSString stringWithUTF8String:label];
+                [e->buffers addObject:b];
+                int32_t* m = (int32_t*) malloc(sizeof(int32_t) * (size_t) (bytes / KVP_PAGE));
+                for (uint64_t i = 0; i < bytes / KVP_PAGE; ++i) m[i] = -1;
+                e->kvp_map[e->kv_bufs.count] = m;
+                e->mem.kv += (int64_t) ((uint64_t) e->kv_cap * rb);
+            }
+        }
+    } else {
+        b = alloc_k(e, (uint64_t) e->kv_cap * rb, label, &e->mem.kv);
+    }
+    if (b) { e->kv_rb[e->kv_bufs.count] = rb; [e->kv_bufs addObject:b]; }
+    return b;
+}
+// A free heap page (heap * KVP_HEAP + page), from the lowest heap with one (so higher heaps empty and are released);
+// a new heap when all are full.  -1: out of memory.
+static int kvp_page(Eng* e) {
+    const int nh = (int) e->kvp_heaps.count;
+    for (int h = 0; h < nh; ++h) {
+        if (e->kvp_heaps[h] == [NSNull null] || e->kvp_used[h] == KVP_HEAP) continue;
+        for (int w = 0; w < KVP_HEAP / 64; ++w)
+            if (e->kvp_free[h][w]) {
+                const int b = __builtin_ctzll(e->kvp_free[h][w]);
+                e->kvp_free[h][w] &= ~(1ull << b);
+                ++e->kvp_used[h];
+                return h * KVP_HEAP + w * 64 + b;
+            }
+    }
+    id<MTLHeap> heap = nil;
+    if (@available(macOS 26.0, *)) {
+        MTLHeapDescriptor* d = [MTLHeapDescriptor new];
+        d.type = MTLHeapTypePlacement;
+        d.storageMode = MTLStorageModePrivate;
+        d.size = (NSUInteger) KVP_HEAP * KVP_PAGE;
+        d.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
+        heap = [e->dev newHeapWithDescriptor:d];
+    }
+    if (!heap) return -1;
+    int h = 0;
+    while (h < nh && e->kvp_heaps[h] != [NSNull null]) ++h;
+    if (h == nh) {
+        [e->kvp_heaps addObject:heap];
+        e->kvp_used = (int*) realloc(e->kvp_used, sizeof(int) * (size_t) (nh + 1));
+        e->kvp_free = (uint64_t (*)[KVP_HEAP / 64]) realloc(e->kvp_free, sizeof *e->kvp_free * (size_t) (nh + 1));
+    } else e->kvp_heaps[h] = heap;
+    for (int w = 0; w < KVP_HEAP / 64; ++w) e->kvp_free[h][w] = ~0ull;
+    e->kvp_free[h][0] &= ~1ull;
+    e->kvp_used[h] = 1;
+    if (e->residency) { [e->residency addAllocation:heap]; [e->residency commit]; }
+    return h * KVP_HEAP;
+}
+// Slot seq's KV pages for positions [0, n) mapped and the rest unmapped (n rounded up to KVP_GROW), in every KV buffer;
+// unmapped pages go back to their heaps, and a heap with none in use is released.  0, or -1 (out of memory).
+static int kvp_back(Eng* e, int seq, int n) {
+    if (!e->kvp) return 0;
+    Seq* s = &e->seqs[seq];
+    const int want = n <= 0 ? 0 : (int) ((n + KVP_GROW - 1) / KVP_GROW * KVP_GROW < e->slot_stride ? (n + KVP_GROW - 1) / KVP_GROW * KVP_GROW : e->slot_stride);
+    if (want == s->backed) return 0;
+    int rc = 0;
+    if (@available(macOS 26.0, *)) {
+        id<MTL4CommandQueue> q = (id<MTL4CommandQueue>) e->kvp_q;
+        MTL4UpdateSparseBufferMappingOperation ops[64];
+        for (NSUInteger i = 0; i < e->kv_bufs.count && !rc; ++i) {
+            id<MTLBuffer> b = e->kv_bufs[i];
+            const uint64_t rb = e->kv_rb[i], p0 = (uint64_t) seq * (uint64_t) e->slot_stride * rb / KVP_PAGE;
+            const uint64_t had = ((uint64_t) s->backed * rb + KVP_PAGE - 1) / KVP_PAGE, need = ((uint64_t) want * rb + KVP_PAGE - 1) / KVP_PAGE;
+            int32_t* m = e->kvp_map[i];
+            int no = 0, oh = -1;   // ops batched per heap (Metal: one heap per call)
+            for (uint64_t t = p0 + had; t < p0 + need; ++t) {
+                const int g = kvp_page(e);
+                if (g < 0) { rc = -1; break; }
+                m[t] = g;
+                const int h = g / KVP_HEAP;
+                if (no && (h != oh || no == 64)) {
+                    [q updateBufferMappings:b heap:e->kvp_heaps[oh] operations:ops count:(NSUInteger) no];
+                    no = 0;
+                }
+                if (no && ops[no - 1].bufferRange.location + ops[no - 1].bufferRange.length == t &&
+                    ops[no - 1].heapOffset + ops[no - 1].bufferRange.length == (NSUInteger) (g % KVP_HEAP))
+                    ++ops[no - 1].bufferRange.length;
+                else ops[no++] = (MTL4UpdateSparseBufferMappingOperation) {MTLSparseTextureMappingModeMap, NSMakeRange((NSUInteger) t, 1), (NSUInteger) (g % KVP_HEAP)};
+                oh = h;
+            }
+            if (no) [q updateBufferMappings:b heap:e->kvp_heaps[oh] operations:ops count:(NSUInteger) no];
+            if (need < had) {
+                const MTL4UpdateSparseBufferMappingOperation un = {MTLSparseTextureMappingModeUnmap, NSMakeRange((NSUInteger) (p0 + need), (NSUInteger) (had - need)), 0};
+                [q updateBufferMappings:b heap:nil operations:&un count:1];
+                for (uint64_t t = p0 + need; t < p0 + had; ++t) {
+                    const int g = m[t], h = g / KVP_HEAP, k = g % KVP_HEAP;
+                    m[t] = -1;
+                    e->kvp_free[h][k / 64] |= 1ull << (k % 64);
+                    --e->kvp_used[h];
+                }
+            }
+        }
+        for (NSUInteger i = 0; rc && i < e->kv_bufs.count; ++i) {   // out of memory: what this call mapped goes back
+            const uint64_t rb = e->kv_rb[i], p0 = (uint64_t) seq * (uint64_t) e->slot_stride * rb / KVP_PAGE;
+            const uint64_t had = ((uint64_t) s->backed * rb + KVP_PAGE - 1) / KVP_PAGE, need = ((uint64_t) want * rb + KVP_PAGE - 1) / KVP_PAGE;
+            int32_t* m = e->kvp_map[i];
+            for (uint64_t t = p0 + had; t < p0 + need; ++t) {
+                if (m[t] < 0) continue;
+                const MTL4UpdateSparseBufferMappingOperation un = {MTLSparseTextureMappingModeUnmap, NSMakeRange((NSUInteger) t, 1), 0};
+                [q updateBufferMappings:e->kv_bufs[i] heap:nil operations:&un count:1];
+                const int h = m[t] / KVP_HEAP, k = m[t] % KVP_HEAP;
+                e->kvp_free[h][k / 64] |= 1ull << (k % 64);
+                --e->kvp_used[h];
+                m[t] = -1;
+            }
+        }
+        [q signalEvent:e->kvp_ev value:++e->kvp_evv];
+        [e->kvp_ev waitUntilSignaledValue:e->kvp_evv timeoutMS:60000];
+        for (NSUInteger h = 0; h < e->kvp_heaps.count; ++h)   // heaps with no page in use go back to the OS
+            if (e->kvp_heaps[h] != [NSNull null] && !e->kvp_used[h]) {
+                if (e->residency) { [e->residency removeAllocation:e->kvp_heaps[h]]; [e->residency commit]; }
+                e->kvp_heaps[h] = [NSNull null];
+            }
+    }
+    if (!rc) s->backed = want;
+    return rc;
+}
+
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     @autoreleasepool {
         if (o->kv_format < ENG_KV_BF16 || o->kv_format > ENG_KV_FP4) {   // engine_api.h: never ignore a format
@@ -442,33 +598,45 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->Ks = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         e->Vs = (__strong id<MTLBuffer>*) calloc((size_t) c->n_layer, sizeof(id<MTLBuffer>));
         int rmax = 0;
-        for (int l = 0; l < c->n_layer; ++l) {
-            if (c->mla) {   // MLA: the RoPE key [cap][128] and the latent [cap][r] (BF16, or FP8 / FP4 codes + block scales)
-                if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
-                const int q = e->kv_fmt >= ENG_KV_FP8;
-                e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_rowk(e, c->mla_rope), "K rope", &e->mem.kv);
-                e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_row(e, e->L[l].mla_r), "latent", &e->mem.kv);
-                if (q) {
-                    e->Ks[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_srowk(e, c->mla_rope), "K rope scales", &e->mem.kv);
-                    e->Vs[l] = alloc_k(e, (uint64_t) e->kv_cap * kv_srow(e, e->L[l].mla_r), "latent scales", &e->mem.kv);
+        for (int l = 0; l < c->n_layer; ++l) if (c->mla && e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+        // Paged KV (placement sparse buffers): slots start on a page of every KV buffer
+        if (@available(macOS 26.4, *)) e->kvp = !getenv("NSLM_KV_DENSE") && e->dev.supportsPlacementSparse;
+        e->slot_stride = e->slot_cap;
+        if (e->kvp) {
+            int64_t al = 1;
+            for (int l = 0; l < c->n_layer; ++l) {
+                uint64_t rb[4];
+                kv_rbs(e, l, rb);
+                for (int i = 0; i < 4; ++i) {
+                    if (!rb[i]) continue;
+                    uint64_t g = KVP_PAGE, x = rb[i];
+                    while (x) { const uint64_t t = g % x; g = x; x = t; }
+                    if ((int64_t) (KVP_PAGE / g) > al) al = (int64_t) (KVP_PAGE / g);
                 }
-                if (!e->Kc[l] || !e->Vc[l] || (q && (!e->Ks[l] || !e->Vs[l]))) {
+            }
+            e->slot_stride = (e->slot_cap + al - 1) / al * al;
+            e->kvp_q = [e->dev newMTL4CommandQueue];
+            e->kvp_ev = [e->dev newSharedEvent];
+            e->kvp_heaps = [NSMutableArray new];
+            if (!e->kvp_q || !e->kvp_ev) e->kvp = 0;
+        }
+        e->kv_bufs = [NSMutableArray new];
+        e->kv_rb = (uint64_t*) calloc((size_t) c->n_layer * 4, sizeof(uint64_t));
+        e->kvp_map = (int32_t**) calloc((size_t) c->n_layer * 4, sizeof(int32_t*));
+        static const char* const kv_names[4] = {"K", "V", "K scales", "V scales"};
+        for (int l = 0; l < c->n_layer; ++l) {   // MLA: the RoPE key and the latent (BF16, or FP8 / FP4 codes + block scales)
+            uint64_t rb[4];
+            kv_rbs(e, l, rb);
+            id<MTLBuffer> __strong* dst[4] = {&e->Kc[l], &e->Vc[l], &e->Ks[l], &e->Vs[l]};
+            for (int i = 0; i < 4; ++i) {
+                if (!rb[i]) continue;
+                id<MTLBuffer> b = kv_alloc(e, rb[i], kv_names[i]);
+                if (!b) {
                     snprintf(err, (size_t) errlen, "KV cache: out of memory");
                     eng_close(e);
                     return NULL;
                 }
-                continue;
-            }
-            e->Kc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * (e->kv_q8 ? 1 : 2), "K", &e->mem.kv);
-            e->Vc[l] = alloc_k(e, (uint64_t) e->kv_cap * kvd * (e->kv_q8 ? 1 : 2), "V", &e->mem.kv);
-            if (e->kv_q8) {
-                e->Ks[l] = alloc_k(e, (uint64_t) e->kv_cap * c->n_kv * 4, "Ks", &e->mem.kv);
-                e->Vs[l] = alloc_k(e, (uint64_t) e->kv_cap * c->n_kv * 4, "Vs", &e->mem.kv);
-            }
-            if (!e->Kc[l] || !e->Vc[l] || (e->kv_q8 && (!e->Ks[l] || !e->Vs[l]))) {
-                snprintf(err, (size_t) errlen, "KV cache: out of memory");
-                eng_close(e);
-                return NULL;
+                *dst[i] = b;
             }
         }
         // scratch
@@ -561,6 +729,9 @@ void eng_close(Eng* e) {
         [e->buffers removeAllObjects];
         if (e->Kc) { for (int l = 0; l < e->c.n_layer; ++l) { e->Kc[l] = nil; e->Vc[l] = nil; } free(e->Kc); free(e->Vc); }
         if (e->Ks) { for (int l = 0; l < e->c.n_layer; ++l) { e->Ks[l] = nil; e->Vs[l] = nil; } free(e->Ks); free(e->Vs); }
+        if (e->kvp_map) for (NSUInteger i = 0; i < e->kv_bufs.count; ++i) free(e->kvp_map[i]);
+        free(e->kvp_map); free(e->kv_rb); free(e->kvp_used); free(e->kvp_free);
+        e->kv_bufs = nil; e->kvp_heaps = nil; e->kvp_q = nil; e->kvp_ev = nil;
         ns_close(&e->nm);
         if (e->ck) mova_ckpt_close(e->ck);
         free(e->L);
@@ -1078,6 +1249,11 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
         for (int t = 0; t < T; ++t) {
             if (rows[t].pos >= e->slot_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->slot_cap); return -1; }
             if (rows[t].pos + 1 > max_ctx) max_ctx = rows[t].pos + 1;
+            const int seq = (int) (rows[t].kv0 / e->slot_stride);
+            if (e->kvp && rows[t].pos >= e->seqs[seq].backed && kvp_back(e, seq, rows[t].pos + 1)) {
+                fprintf(stderr, "mova engine: KV pages: out of memory\n");
+                return -1;
+            }
         }
         memcpy(e->ids.contents, tok, (size_t) T * 4);
         memcpy(e->ri.contents, rows, (size_t) T * sizeof(RowInfo));
@@ -1100,7 +1276,7 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
 static int forward(Eng* e, int seq, const int32_t* tok, int T, int pos0, int h0, float* logits_out, int32_t* am) {
     RowInfo ri[MAX_ROWS];
     if (T < 1 || T > MAX_ROWS) return -1;
-    for (int t = 0; t < T; ++t) ri[t] = (RowInfo){pos0 + t, (int) (seq * e->slot_cap), {0}};
+    for (int t = 0; t < T; ++t) ri[t] = (RowInfo){pos0 + t, (int) (seq * e->slot_stride), {0}};
     return forward_rows(e, tok, ri, T, h0, logits_out, am);
 }
 
@@ -1127,6 +1303,7 @@ int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused) {
     if (!s || n < 1 || n > e->slot_cap) return -1;
     int c = 0;
     while (c < s->done && c < n - 1 && s->hist[c] == ids[c]) ++c;
+    if (s->backed > n) kvp_back(e, seq, n);   // paged KV: the old conversation's pages past the new prompt go back
     s->len = s->done = c;
     s->xend = n - 1 - c >= e->expand_min ? (n - 1) / e->expand_min * e->expand_min : 0;
     for (int i = c; i < n; ++i) hist_push(s, ids[i]);
@@ -1169,26 +1346,51 @@ int eng_rewind(Eng* e, int seq, int n) {
     return 0;
 }
 int eng_fork(Eng* e, int dst, int src) { (void) e; return dst == src ? 0 : -1; }
-void eng_free(Eng* e, int seq) { Seq* s = seq_of(e, seq); if (s) s->len = s->done = 0; }
+void eng_free(Eng* e, int seq) {
+    Seq* s = seq_of(e, seq);
+    if (!s) return;
+    s->len = s->done = 0;
+    kvp_back(e, seq, 0);
+}
 int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len : 0; }
 
 // A slot's positions [p0, p1) to (out) or from host bytes: per layer K rows, V rows, then (8-bit, FP8, FP4 caches) their
-// scales.
-static void kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
-    const MovaCfg* c = &e->c;
-    const uint64_t r0 = (uint64_t) (seq * e->slot_cap + p0), n = (uint64_t) (p1 - p0);
-    for (int l = 0; l < c->n_layer; ++l) {
-        const uint64_t kr = c->mla ? kv_rowk(e, c->mla_rope) : (uint64_t) c->n_kv * c->head_dim * (e->kv_q8 ? 1 : 2);
-        const uint64_t vr = c->mla ? kv_row(e, e->L[l].mla_r) : kr, sr = e->kv_q8 ? (uint64_t) c->n_kv * 4 : 0;
-        id<MTLBuffer> b[4] = {e->Kc[l], e->Vc[l], e->Ks[l], e->Vs[l]};
-        const uint64_t rb[4] = {kr, vr, c->mla ? kv_srowk(e, c->mla_rope) : sr, c->mla ? kv_srow(e, e->L[l].mla_r) : sr};
-        for (int i = 0; i < 4; ++i) {
-            if (!rb[i]) continue;
-            uint8_t* d = (uint8_t*) b[i].contents + r0 * rb[i];
-            if (out) memcpy(h, d, n * rb[i]); else memcpy(d, h, n * rb[i]);
-            h += n * rb[i];
+// scales.  Paged KV (private buffers): through a staging buffer and blits.  0, or -1.
+static int kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
+    const uint64_t r0 = (uint64_t) seq * (uint64_t) e->slot_stride + (uint64_t) p0, n = (uint64_t) (p1 - p0);
+    if (!e->kvp) {
+        for (NSUInteger i = 0; i < e->kv_bufs.count; ++i) {
+            id<MTLBuffer> b = e->kv_bufs[i];
+            const uint64_t rb = e->kv_rb[i];
+            uint8_t* d = (uint8_t*) b.contents + r0 * rb;
+            if (out) memcpy(h, d, n * rb); else memcpy(d, h, n * rb);
+            h += n * rb;
         }
+        return 0;
     }
+    @autoreleasepool {
+        uint64_t total = 0;
+        for (NSUInteger i = 0; i < e->kv_bufs.count; ++i) total += n * e->kv_rb[i];
+        if (!total) return 0;
+        id<MTLBuffer> st = [e->dev newBufferWithLength:total options:MTLResourceStorageModeShared];
+        if (!st) return -1;
+        if (!out) memcpy(st.contents, h, total);
+        id<MTLCommandBuffer> cb = [e->queue commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        uint64_t o = 0;
+        for (NSUInteger i = 0; i < e->kv_bufs.count; ++i) {
+            const uint64_t rb = e->kv_rb[i];
+            if (out) [bl copyFromBuffer:e->kv_bufs[i] sourceOffset:r0 * rb toBuffer:st destinationOffset:o size:n * rb];
+            else [bl copyFromBuffer:st sourceOffset:o toBuffer:e->kv_bufs[i] destinationOffset:r0 * rb size:n * rb];
+            o += n * rb;
+        }
+        [bl endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) return -1;
+        if (out) memcpy(h, st.contents, total);
+    }
+    return 0;
 }
 int64_t eng_kv_bytes(Eng* e) {
     const MovaCfg* c = &e->c;
@@ -1201,13 +1403,12 @@ int64_t eng_kv_bytes(Eng* e) {
 int eng_kv_read(Eng* e, int seq, int p0, int p1, void* dst) {
     const Seq* s = seq_of(e, seq);
     if (!s || p0 < 0 || p1 < p0 || p1 > s->done) return -1;
-    kv_copy(e, seq, p0, p1, (uint8_t*) dst, 1);
-    return 0;
+    return kv_copy(e, seq, p0, p1, (uint8_t*) dst, 1);
 }
 int eng_kv_write(Eng* e, int seq, const int32_t* ids, int p0, int p1, const void* src) {
     Seq* s = seq_of(e, seq);
     if (!s || p0 < 0 || p0 > s->done || p1 < p0 || p1 > e->slot_cap) return -1;
-    kv_copy(e, seq, p0, p1, (uint8_t*) src, 0);
+    if ((p1 > s->backed && kvp_back(e, seq, p1)) || kv_copy(e, seq, p0, p1, (uint8_t*) src, 0)) return -1;
     s->len = 0;
     for (int i = 0; i < p1; ++i) hist_push(s, ids[i]);
     s->done = p1;
@@ -1232,7 +1433,7 @@ static int step_rows(Eng* e, const int* seqs, int n, float* logits, int32_t* am)
         for (int t = 0; t < T; ++t) {
             const Seq* s = &e->seqs[seqs[i0 + t]];
             tok[t] = s->hist[s->len - 1];
-            ri[t] = (RowInfo){s->len - 1, (int) (seqs[i0 + t] * e->slot_cap), {0}};
+            ri[t] = (RowInfo){s->len - 1, (int) (seqs[i0 + t] * e->slot_stride), {0}};
         }
         e->decode_rows = T > MV_MAXT;
         const int rc = forward_rows(e, tok, ri, T, 0, logits ? logits + (size_t) i0 * e->c.vocab : NULL, am ? am + i0 : NULL);
