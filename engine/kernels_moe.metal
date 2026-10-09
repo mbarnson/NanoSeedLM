@@ -281,13 +281,6 @@ static inline void wblock(short fmt, device const uchar* W, device const ushort*
     }
 }
 
-// Element e (flat index) of a BF16 / Q8 / Q4 tensor (affine: bf16(scale x code + bias), a scale and bias per 64)
-static inline float welem(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, ulong e) {
-    if (fmt == MF_BF16) return bf(((device const ushort*) W)[e]);
-    const uint q = fmt == MF_Q8 ? (uint) W[e] : (uint) (W[e / 2] >> (4 * (e & 1))) & 15u;
-    return bfr(bf(S[e / 64]) * (float) q + bf(B[e / 64]));
-}
-
 // SEED4 block j of row r: returns 2^e times (sum_p q_p (x . V_p) + (sum_p q_p) xm), xm = -32768 sum(x); the caller
 // applies R32 per row.  States from the per-seed stream table G (lfsr_stream24).
 static inline void seed_states(uint s, uint g, thread float (&v)[24]) {
@@ -601,22 +594,26 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
 // into threadgroup memory: each thread dequantizes 8 consecutive weights (one block) per K step.
 // Dense: tile (row block, token block).  Grouped: tile (row block, entry of the tile table); the entry's pairs are
 // perm[start .. start + count), each reading input row pair / xdiv and writing output row pair.
+// SEED4P4 block j of row `row` (K columns): centred states, isum * fl(R32 2^e)
+static inline void seed4p4_block(device const uchar* W, device const ushort* S, device const uint* G, ulong row, int K, int j,
+                                 int ebias, device const uchar* EN, thread float (&w)[8]) {
+    const int nbk = K / 8;
+    const ulong k = row * (ulong) nbk + j;
+    const uint s = ((device const ushort*) W)[k], cw = S[k];
+    const uint g = G[s], lo = s | (g << 16);
+    float c[32];
+    for (short kk = 1; kk <= 16; ++kk) c[kk - 1] = as_type<float>(0x4B000000u | extract_bits(lo, (uint) kk, 16u)) - 8421376.0f;
+    for (short kk = 17; kk <= 32; ++kk) c[kk - 1] = as_type<float>(0x4B000000u | extract_bits(g, (uint) (kk - 16), 16u)) - 8421376.0f;
+    const int ci = (int) cw;
+    const float q0 = float((ci << 28) >> 28), q1 = float((ci << 24) >> 28), q2 = float((ci << 20) >> 28), q3 = float((ci << 16) >> 28);
+    const float sc = as_type<float>(uint(ebias + seed4_ecode(EN, k) + 127) << 23) * (1.0f / 32767.0f);
+    for (short i = 0; i < 8; ++i) w[i] = ((((c[4 * i] * q0) + (c[4 * i + 1] * q1)) + (c[4 * i + 2] * q2)) + (c[4 * i + 3] * q3)) * sc;
+}
 static inline void tile_weights(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, device const uint* G,
                                 int slice, ulong row, int K, int j, int ebias, threadgroup float* dst, device const uchar* EN) {
     float w[8];
-    if (fmt == MF_SEED4P4) {   // centred states, isum * fl(R32 2^e)
-        const int nbk = K / 8;
-        const ulong k = row * (ulong) nbk + j;
-        const uint s = ((device const ushort*) W)[k], cw = S[k];
-        const uint g = G[s], lo = s | (g << 16);
-        float c[32];
-        for (short kk = 1; kk <= 16; ++kk) c[kk - 1] = as_type<float>(0x4B000000u | extract_bits(lo, (uint) kk, 16u)) - 8421376.0f;
-        for (short kk = 17; kk <= 32; ++kk) c[kk - 1] = as_type<float>(0x4B000000u | extract_bits(g, (uint) (kk - 16), 16u)) - 8421376.0f;
-        const int ci = (int) cw;
-        const float q0 = float((ci << 28) >> 28), q1 = float((ci << 24) >> 28), q2 = float((ci << 20) >> 28), q3 = float((ci << 16) >> 28);
-        const float sc = as_type<float>(uint(ebias + seed4_ecode(EN, k) + 127) << 23) * (1.0f / 32767.0f);
-        for (short i = 0; i < 8; ++i) w[i] = ((((c[4 * i] * q0) + (c[4 * i + 1] * q1)) + (c[4 * i + 2] * q2)) + (c[4 * i + 3] * q3)) * sc;
-    } else if (fmt == MF_SEED4) {
+    if (fmt == MF_SEED4P4) seed4p4_block(W, S, G, row, K, j, ebias, EN, w);
+    else if (fmt == MF_SEED4) {
         const int nbk = K / 8;
         const ushort s = ((device const ushort*) W)[row * (ulong) nbk + j];
         const int nb = (int) S[row * (ulong) nbk + j];
@@ -655,7 +652,14 @@ kernel void k_mm(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffe
     const int sr = (int) (sgi / 2) * 16, sn = (int) (sgi % 2) * 16;   // this simdgroup's 16 x 16 sub-tile
     // the input row of each of the tile's 32 columns (token or pair)
     for (int k0 = 0; k0 < a.K; k0 += MM_BK) {
-        if (FC_T == 2 && FC_FMT != MF_BF16) {   // Q8 / Q4 weights stored transposed [K][R] (R a multiple of 64): a thread's
+        if (FC_T == 2 && FC_FMT == MF_SEED4P4) {   // SEED4P4 stored transposed [K][R]: a thread's 8 rows are one block
+            const int kk = (int) tid % 32, rb = ((int) tid / 32) * 8;
+            if (r0 + rb < a.R) {
+                float w[8];
+                seed4p4_block(W, S, G, (ulong) (k0 + kk), a.R, (r0 + rb) / 8, ebias, EN, w);
+                for (int i = 0; i < 8; ++i) Wt[(rb + i) * MM_BK + kk] = w[i];
+            } else for (int i = 0; i < 8; ++i) Wt[(rb + i) * MM_BK + kk] = 0;
+        } else if (FC_T == 2 && FC_FMT != MF_BF16) {   // Q8 / Q4 weights stored transposed [K][R] (R a multiple of 64): a thread's
             const int kk = (int) tid % 32, rb = ((int) tid / 32) * 8;   // 8 rows are consecutive codes of one group
             const ulong e0 = (ulong) (k0 + kk) * a.R + r0 + rb;
             if (r0 + rb < a.R) {
@@ -995,14 +999,14 @@ kernel void k_attn_reduce(constant AttnArgs& a [[buffer(0)]], device const float
 // Grid (O * 32, H, T), threadgroups of 256.
 kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const float* x [[buffer(2)]],
                        device const float* g [[buffer(3)]], device float* y [[buffer(4)]], device const ushort* S [[buffer(5)]],
-                       device const ushort* B [[buffer(6)]], uint3 gid [[thread_position_in_grid]],
-                       uint lane [[thread_index_in_simdgroup]]) {
+                       device const ushort* B [[buffer(6)]], device const uint* G [[buffer(7)]], device const uchar* EN [[buffer(8)]],
+                       uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     const int o = (int) gid.x / 32, h = (int) gid.y, t = (int) gid.z;
     if (o >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
-    const ulong w0 = ((ulong) h * a.O + o) * a.I;   // FC_FMT: BF16, Q8 or Q4 (welem)
+    // FC_FMT: BF16, Q8, Q4 or SEED4P4 (stacked [H][O][I]: row h * O + o; SEED4P4's exponent bias per head in B)
+    const int eb = FC_FMT == MF_SEED4P4 ? ((device const int*) B)[h] : 0;
     device const float* xv = x + (ulong) t * a.xs + (ulong) h * a.hs;
-    float s = 0;
-    for (int i = (int) lane; i < a.I; i += 32) s += welem(FC_FMT, W, S, B, w0 + (ulong) i) * xv[i];
+    float s = mv_lane(FC_FMT, W, S, B, G, eb, (ulong) h * a.O + o, a.I, xv, lane, EN);
     s = simd_sum(s);
     if (lane == 0) {
         const ulong yi = ((ulong) t * a.H + h) * a.O + o;

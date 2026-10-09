@@ -82,6 +82,10 @@ int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs
 // matvec, else the prompt GEMMs) or kt_heads_mm_t's (tr 1: W [H][I][O], T > 8; no gate).  1 where a backend lacks them.
 int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
                const float* x, int xs, int hs, const float* g, float* y, int T);
+// The same with W in SEED4P4 (nslm/search4.h): seeds and coefficients [H][rows][cols / 8], an exponent bias per head,
+// exponent codes [H][rows][cols / 8] as nibbles (low first).  1 where a backend lacks it.
+int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
+                  const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T);
 // rope of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into Kc [npos][128], and the latent
 // c [T][r] into Vc [npos][r], at the rows' positions (k_mla_rope); the caches are updated
 int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,

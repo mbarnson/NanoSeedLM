@@ -28,7 +28,8 @@ HARN_HDRS := $(wildcard harness/*.h)
 ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h
 
 METALLIBS := $(RES)/kernels_moe.metallib $(RES)/search.metallib $(RES)/search4.metallib
-ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes
+ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes \
+             nslm-mova-mlacapture
 TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-mova-pack nslm-bits-probe)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c \
                             tests/test_mova_kernels.c,$(wildcard tests/test_*.c))

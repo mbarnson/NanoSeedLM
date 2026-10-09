@@ -574,6 +574,51 @@ int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const ui
     memcpy(y, yb.contents, yn);
     return 0;
 }
+int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
+                  const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    const size_t nb = (size_t) O * I / 8;
+    const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
+    static id<MTLBuffer> tab;
+    if (!tab) {   // the 32-bit stream table (lfsr.h)
+        tab = buf(NULL, 4 * 65536);
+        for (uint32_t s = 0; s < 65536; ++s) ((uint32_t*) tab.contents)[s] = lfsr_stream32((uint16_t) s);
+    }
+    id<MTLBuffer> sb = buf(seeds, 2 * nb * H), cb = buf(coefs, 2 * nb * H), eb = buf(ebias, 4 * (size_t) H), nb4 = buf(ecodes, nb * H / 2),
+                  xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
+    if (T <= MV_MAXT && !tr) {
+        const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+        id<MTLComputePipelineState> pp = pipe_("k_heads_mv", MF_SEED4P4, 0);
+        if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
+                [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
+                [e setBuffer:sb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
+                [e setBuffer:yb offset:0 atIndex:4]; [e setBuffer:cb offset:0 atIndex:5]; [e setBuffer:eb offset:0 atIndex:6];
+                [e setBuffer:tab offset:0 atIndex:7]; [e setBuffer:nb4 offset:0 atIndex:8];
+                [e dispatchThreads:MTLSizeMake((size_t) O * 32, H, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }))
+            return -1;
+    } else {
+        const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
+        id<MTLComputePipelineState> pm = pipe_("k_mm", MF_SEED4P4, tr ? 2 : 1);
+        if (!pm || run(^(id<MTLComputeCommandEncoder> e) {
+                [e setComputePipelineState:pm]; [e setBytes:&m length:sizeof m atIndex:0];
+                [e setBuffer:xb offset:0 atIndex:6]; [e setBuffer:tab offset:0 atIndex:7]; [e setBuffer:xb offset:0 atIndex:8];
+                for (int h = 0; h < H; ++h) {
+                    [e setBuffer:sb offset:(NSUInteger) (h * nb * 2) atIndex:1];
+                    [e setBuffer:cb offset:(NSUInteger) (h * nb * 2) atIndex:2];
+                    [e setBuffer:eb offset:(NSUInteger) (h * 4) atIndex:3];
+                    [e setBuffer:nb4 offset:(NSUInteger) (h * nb / 2) atIndex:9];
+                    [e setBuffer:xb offset:(NSUInteger) h * hs * 4 atIndex:4];
+                    [e setBuffer:yb offset:(NSUInteger) h * O * 4 atIndex:5];
+                    [e setBuffer:(g ? gb : yb) offset:(NSUInteger) h * O * 4 atIndex:10];
+                    [e dispatchThreadgroups:MTLSizeMake((O + MM_BM - 1) / MM_BM, (T + MM_BN - 1) / MM_BN, 1)
+                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
+            }))
+            return -1;
+    }
+    memcpy(y, yb.contents, yn);
+    return 0;
+}
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) {
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     id<MTLBuffer> wb = buf(W, 2 * (size_t) H * O * I), xb = buf(x, xn), yb = buf(NULL, yn);

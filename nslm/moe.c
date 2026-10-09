@@ -1,7 +1,7 @@
 // nslm/moe.c - nslm-moe: activation-weighted SeedLM seed search over MoVA's routed and value expert matrices (one
 // block file per (layer, projection)), and their expansion to BF16 safetensors.
 //
-//   nslm-moe --model DIR --act FILE --out DIR [--scope gu|gud|d|v|dv|all] [--workers 4] [--n0 64] [--layers A-B]
+//   nslm-moe --model DIR --act FILE --out DIR [--scope gu|gud|d|v|dv|all|mla] [--workers 4] [--n0 64] [--layers A-B]
 //            [--res DIR] [--seeds 65535] [--weighting plain|w2] [--experts A-B] [--no-prune] [--p4]
 //       writes OUT/L{l}_{proj}.blk (.blk4 with --p4), proj = gate_proj|up_proj|down_proj|v_experts, so all scopes can
 //       share one directory; --res holds search.metallib / search4.metallib (default out/res); --weighting w2 weights
@@ -62,13 +62,24 @@ static double now_s(void) {
 
 // ---- the projections ------------------------------------------------------------------------------------------------
 
-enum { P_GATE, P_UP, P_DOWN, P_V, NPROJ };
-static const char* kProj[NPROJ] = {"gate_proj", "up_proj", "down_proj", "v_experts"};
-static int proj_rows(int p) { return p == P_DOWN ? 2560 : p == P_V ? 1024 : 768; }
-static int proj_cols(int p) { return p == P_DOWN ? 768 : 2560; }
-static int proj_experts(int p) { return p == P_V ? 64 : 100; }
+// MLA projections (--scope mla, a TransMLA conversion; shapes from the --act file): kv_a_x [r][d], kv_a_v [r][kvd]
+// (MoVA layers), k_rope_proj [128][d]; the per-head maps q_rope_mix [H][128][128], q_lat [H][r][128], v_up [H][128][r]
+// are searched head by head, as the experts of one file.
+enum { P_GATE, P_UP, P_DOWN, P_V, P_KAX, P_KAV, P_KR, P_QM, P_QL, P_VU, NPROJ };
+static const char* kProj[NPROJ] = {"gate_proj", "up_proj", "down_proj", "v_experts", "kv_a_x", "kv_a_v", "k_rope_proj",
+                                   "q_rope_mix", "q_lat", "v_up"};
+static struct { int on, n_layer, d, kvd, qd, H; int64_t rows; int r[64]; double *x[64], *v[64], *q[64], *o[64]; } g_mla;
+static int proj_rows(int l, int p) {
+    return p == P_DOWN ? 2560 : p == P_V ? 1024 : p < P_KAX ? 768 : p == P_KAX || p == P_KAV || p == P_QL ? g_mla.r[l] : 128;
+}
+static int proj_cols(int l, int p) {
+    return p == P_DOWN ? 768 : p < P_KAX ? 2560 : p == P_KAX || p == P_KR ? g_mla.d : p == P_KAV ? g_mla.kvd
+           : p == P_VU ? g_mla.r[l] : 128;
+}
+static int proj_experts(int p) { return p == P_V ? 64 : p < P_KAX ? 100 : p >= P_QM ? g_mla.H : 1; }
 static void tensor_name(char* s, int n, int l, int p, int e) {
-    if (p == P_V) snprintf(s, (size_t) n, "model.layers.%d.self_attn.v_experts.%d.weight", l, e);
+    if (p >= P_KAX) snprintf(s, (size_t) n, "model.layers.%d.self_attn.mla.%s", l, kProj[p]);
+    else if (p == P_V) snprintf(s, (size_t) n, "model.layers.%d.self_attn.v_experts.%d.weight", l, e);
     else snprintf(s, (size_t) n, "model.layers.%d.mlp.experts.%d.%s.weight", l, e, kProj[p]);
 }
 static int scope_mask(const char* s) {
@@ -78,6 +89,7 @@ static int scope_mask(const char* s) {
     if (!strcmp(s, "v")) return 1 << P_V;
     if (!strcmp(s, "dv")) return 1 << P_DOWN | 1 << P_V;
     if (!strcmp(s, "all")) return 1 << P_GATE | 1 << P_UP | 1 << P_DOWN | 1 << P_V;
+    if (!strcmp(s, "mla")) return 1 << P_KAX | 1 << P_KAV | 1 << P_KR | 1 << P_QM | 1 << P_QL | 1 << P_VU;
     return 0;
 }
 
@@ -102,8 +114,8 @@ static char* read_all(const char* path) {
     return b;
 }
 
-// BF16 tensor -> f32 (rows * cols).  NULL on error.
-static float* load_tensor(const char* name, int rows, int cols) {
+// BF16 tensor -> f32 (rows * cols; slice e of a 3-D tensor [slices][rows][cols] when slices > 1).  NULL on error.
+static float* load_tensor(const char* name, int rows, int cols, int slices, int ex) {
     char file[128], err[512], path[2048];
     if (nslm_moe_index_lookup(g_index, name, file, sizeof file)) { fprintf(stderr, "%s: not in the index\n", name); return NULL; }
     pthread_mutex_lock(&g_mu);
@@ -123,11 +135,13 @@ static float* load_tensor(const char* name, int rows, int cols) {
     const StFile* st = &g_shard[k].st;
     pthread_mutex_unlock(&g_mu);
     const StEntry* e = st_find(st, name);
-    if (!e || strcmp(e->dtype, "BF16") || e->ndim != 2 || e->shape[0] != rows || e->shape[1] != cols) {
+    const StEntry* t = e;
+    if (!t || strcmp(t->dtype, "BF16") || (slices > 1 ? t->ndim != 3 || t->shape[0] != slices || t->shape[1] != rows || t->shape[2] != cols
+                                                      : t->ndim != 2 || t->shape[0] != rows || t->shape[1] != cols)) {
         fprintf(stderr, "%s: missing or unexpected shape\n", name);
         return NULL;
     }
-    const uint16_t* b = (const uint16_t*) st_data(st, e);
+    const uint16_t* b = (const uint16_t*) st_data(st, t) + (size_t) (slices > 1 ? ex : 0) * rows * cols;
     float* w = (float*) malloc(sizeof(float) * (size_t) rows * cols);
     for (size_t i = 0; i < (size_t) rows * cols; ++i) w[i] = nslm_bf2f(b[i]);
     return w;
@@ -150,11 +164,31 @@ static LayerAct g_act[48];
 static int g_l0, g_nl;
 static int64_t g_tokens;
 
+// The MLA projections' statistics (harness/nslm-mova-mlacapture.c, "NSLMMLA1")
+static int read_act_mla(FILE* f) {
+    int32_t hd[5];
+    if (fread(hd, 4, 5, f) != 5 || fread(&g_mla.rows, 8, 1, f) != 1 || hd[0] > 64 || g_mla.rows < 1) return -1;
+    g_mla.n_layer = hd[0]; g_mla.d = hd[1]; g_mla.kvd = hd[2]; g_mla.qd = hd[3]; g_mla.H = hd[4];
+    for (int l = 0; l < g_mla.n_layer; ++l) {
+        int32_t r;
+        if (fread(&r, 4, 1, f) != 1 || r < 8 || r > 4096) return -1;
+        g_mla.r[l] = r;
+        const size_t n = (size_t) (g_mla.d + g_mla.kvd + g_mla.qd + g_mla.H * r);
+        double* b = (double*) malloc(sizeof(double) * n);
+        if (fread(b, sizeof(double), n, f) != n) return -1;
+        g_mla.x[l] = b; g_mla.v[l] = b + g_mla.d; g_mla.q[l] = b + g_mla.d + g_mla.kvd; g_mla.o[l] = b + g_mla.d + g_mla.kvd + g_mla.qd;
+    }
+    g_mla.on = 1;
+    g_l0 = 0; g_nl = g_mla.n_layer; g_tokens = g_mla.rows;
+    return 0;
+}
 static int read_act(const char* path) {
     FILE* f = fopen(path, "rb");
     char mg[8];
     int32_t hd[7];
-    if (!f || fread(mg, 1, 8, f) != 8 || memcmp(mg, "NSLMMOE1", 8) || fread(hd, 4, 7, f) != 7 || fread(&g_tokens, 8, 1, f) != 1)
+    if (!f || fread(mg, 1, 8, f) != 8) return -1;
+    if (!memcmp(mg, "NSLMMLA1", 8)) { const int rc = read_act_mla(f); fclose(f); return rc; }
+    if (memcmp(mg, "NSLMMOE1", 8) || fread(hd, 4, 7, f) != 7 || fread(&g_tokens, 8, 1, f) != 1)
         return -1;
     g_l0 = hd[0]; g_nl = hd[1];
     const int E = hd[2], D = hd[3], F = hd[4], EV = hd[5];
@@ -176,6 +210,13 @@ static int read_act(const char* path) {
 // h (cols floats) of expert e of projection p in layer l, with the shrinkage prior.
 static int g_w2;   // --weighting w2: weight each routed token by its routing weight squared
 static void act_h(int l, int p, int e, double n0, float* h) {
+    if (p >= P_KAX) {   // MLA: each input column's mean square over the calibration rows (every row reaches every layer)
+        const int n = proj_cols(l, p);
+        const double* sum = p == P_KAX || p == P_KR ? g_mla.x[l] : p == P_KAV ? g_mla.v[l]
+                          : p == P_VU ? g_mla.o[l] + (size_t) e * g_mla.r[l] : g_mla.q[l] + (size_t) e * 128;
+        for (int c = 0; c < n; ++c) h[c] = (float) (sum[c] / (double) g_mla.rows);
+        return;
+    }
     const LayerAct* a = &g_act[l];
     double prior[2560];
     if ((p == P_GATE || p == P_UP) && g_w2) {
@@ -242,7 +283,7 @@ static void* job_worker(void* arg) {
         const int k = atomic_fetch_add(&j->next, 1);
         if (k >= j->n || atomic_load(&j->failed)) break;
         const int l = j->items[k].l, p = j->items[k].p;
-        const int rows = proj_rows(p), cols = proj_cols(p), E = proj_experts(p);
+        const int rows = proj_rows(l, p), cols = proj_cols(l, p), E = proj_experts(p);
         const size_t nb = (size_t) rows * cols / NSLM_C;
         snprintf(path, sizeof path, "%s/L%d_%s.%s", j->out, l, kProj[p], g_p4 ? "blk4" : "blk");
         MoeBlkHeader h;
@@ -263,7 +304,7 @@ static void* job_worker(void* arg) {
         for (int e = 0; e < E; ++e) {
             if (j->e1 >= 0 && (e < j->e0 || e > j->e1)) continue;
             tensor_name(name, sizeof name, l, p, e);
-            float* w = load_tensor(name, rows, cols);
+            float* w = load_tensor(name, rows, cols, E > 1 && p >= P_KAX ? E : 1, e);
             if (!w) { atomic_store(&j->failed, 1); break; }
             int64_t clamped = 0;
             bias[e] = nslm_choose_bias(w, (int64_t) nb, &clamped);
@@ -351,10 +392,10 @@ static int check(const char* spec, const SearchOpts* o, double n0, const char* m
     int p = 0;
     while (p < NPROJ && strcmp(kProj[p], pn)) ++p;
     if (p == NPROJ) { fprintf(stderr, "unknown projection %s\n", pn); return 2; }
-    const int rows = proj_rows(p), cols = proj_cols(p), ng = cols / NSLM_C;
+    const int rows = proj_rows(l, p), cols = proj_cols(l, p), ng = cols / NSLM_C;
     char name[128], err[512];
     tensor_name(name, sizeof name, l, p, e);
-    float* w = load_tensor(name, rows, cols);
+    float* w = load_tensor(name, rows, cols, 1, 0);
     if (!w) return 2;
     int64_t clamped = 0;
     const int bias = nslm_choose_bias(w, (int64_t) rows * cols / NSLM_C, &clamped);
@@ -436,7 +477,7 @@ static int expand(const char* blk, const char* out, int mask) {
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // every line out at once (MSVC rejects _IOLBF with size 0: a fail-fast at start)
     const int mask = scope_mask(opt(argc, argv, "--scope", "gu"));
-    if (!mask) { fprintf(stderr, "--scope gu|gud|d|v|dv|all\n"); return 2; }
+    if (!mask) { fprintf(stderr, "--scope gu|gud|d|v|dv|all|mla\n"); return 2; }
     g_p4 = has_flag(argc, argv, "--p4");
     if (has_flag(argc, argv, "--expand")) {
         const char* blk = opt(argc, argv, "--blk", NULL), *out = opt(argc, argv, "--out", NULL);
@@ -469,10 +510,17 @@ int main(int argc, char** argv) {
     mkdir(out, 0755);
     int la = g_l0, lb = g_l0 + g_nl - 1;
     if (opt(argc, argv, "--layers", NULL)) sscanf(opt(argc, argv, "--layers", NULL), "%d-%d", &la, &lb);
-    static JobItem items[48 * NPROJ];
+    if ((mask >> P_KAX & 1) != g_mla.on) { fprintf(stderr, "--scope mla goes with an MLA capture (nslm-mova-mlacapture), and only it\n"); return 2; }
+    static JobItem items[64 * NPROJ];
     int n = 0;
     for (int l = la; l <= lb; ++l)
-        for (int p = 0; p < NPROJ; ++p) if (mask >> p & 1) items[n++] = (JobItem){l, p};
+        for (int p = 0; p < NPROJ; ++p) {
+            if (!(mask >> p & 1)) continue;
+            char nm[128], file[128];
+            tensor_name(nm, sizeof nm, l, p, 0);
+            if (p >= P_KAX && nslm_moe_index_lookup(g_index, nm, file, sizeof file)) continue;   // kv_a_v: MoVA layers only
+            items[n++] = (JobItem){l, p};
+        }
     const int workers = atoi(opt(argc, argv, "--workers", "4"));
     Jobs j = {items, n, 0, out, lib, &o, n0, !has_flag(argc, argv, "--no-prune"), 0, 0, -1};
     if (opt(argc, argv, "--experts", NULL)) sscanf(opt(argc, argv, "--experts", NULL), "%d-%d", &j.e0, &j.e1);

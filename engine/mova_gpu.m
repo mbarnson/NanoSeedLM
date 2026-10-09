@@ -250,6 +250,11 @@ static void crun(Cmd* c, uint64_t x, uint64_t y, uint64_t z, uint64_t tx) {
 // A tensor of the model folder: page-aligned streams map without a copy, the others are copied.
 static int from_model(Eng* e, const char* name, MW* w, char* err, int errlen) {
     const NsTensor* t = ns_find(&e->nm, name);
+    if (!t && strstr(name, ".mla.")) {   // MLA projections: NAME, or NAME.weight when seed-encoded (nslm-mova-pack --mla p4)
+        char wn[256];
+        snprintf(wn, sizeof wn, "%s.weight", name);
+        t = ns_find(&e->nm, wn);
+    }
     if (!t) return 1;
     *w = (MW){0};
     w->fmt = t->enc; w->slices = t->slices; w->rows = t->rows; w->cols = t->cols;
@@ -307,7 +312,7 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         }
         const int ok = t->kind == MOVA_K_EXPERTS ? 1
                        : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
-                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4))
+                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4 || w->fmt == MF_SEED4P4))
                        : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8)
                        : w->fmt != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
         if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, w->fmt); return -1; }
@@ -550,6 +555,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
                 LOAD(&L->qm, "model.layers.%d.self_attn.mla.q_rope_mix", l);
                 LOAD(&L->ql, "model.layers.%d.self_attn.mla.q_lat", l);
                 LOAD(&L->vu, "model.layers.%d.self_attn.mla.v_up", l);
+                const MW* mw[6] = {&L->ka_x, &L->ka_v, &L->kr, &L->qm, &L->ql, &L->vu};
+                for (int i = 0; i < 6; ++i) seeds4 += mw[i]->fmt == MF_SEED4P4;   // the 32-bit stream table
             }
             if (!L->sparse) {
                 if (!c->mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
@@ -935,8 +942,10 @@ static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, i
     cbuf(c, 2, X, 0);
     cbuf(c, 3, G ? G : X, 0);
     cbuf(c, 4, Y, 0);
-    cbuf(c, 5, W->b[1] ? W->b[1] : W->b[0], W->o[1]);   // Q8 / Q4: scales, biases
+    cbuf(c, 5, W->b[1] ? W->b[1] : W->b[0], W->o[1]);   // Q8 / Q4: scales, biases; SEED4P4: coefficients, exponent biases
     cbuf(c, 6, W->b[2] ? W->b[2] : W->b[0], W->o[2]);
+    cbuf(c, 7, stab_for(c->e, W), 0);
+    bind_nibbles(c, W, 8);
     [c->enc dispatchThreads:MTLSizeMake((NSUInteger) W->rows * 32, (NSUInteger) W->slices, (NSUInteger) T)
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
@@ -947,18 +956,22 @@ static void enc_heads_gemm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs,
     Eng* e = c->e;
     const int H = W->slices, O = tr ? W->cols : W->rows, I = tr ? W->rows : W->cols;
     const MmArgs a = {I, O, T, xs, H * O, 1, G ? 2 : 0, 0};
-    // one head's streams: BF16 values, or Q8 / Q4 codes with a BF16 scale and bias per 64
-    const uint64_t n = (uint64_t) O * I, cb = W->fmt == MF_BF16 ? 2 * n : W->fmt == MF_Q8 ? n : n / 2, sb = n / 64 * 2;
+    // one head's streams: BF16 values; Q8 / Q4 codes with a BF16 scale and bias per 64; SEED4P4 seeds, coefficients
+    // (2 bytes a block of 8), an int32 exponent bias, exponent codes (a nibble a block)
+    const uint64_t n = (uint64_t) O * I, sd = W->fmt == MF_SEED4P4;
+    const uint64_t cb = W->fmt == MF_BF16 ? 2 * n : W->fmt == MF_Q8 ? n : sd ? n / 4 : n / 2, sb = sd ? n / 4 : n / 64 * 2;
+    const uint64_t bb = sd ? 4 : sb;
     cpipe(c, pipe_(e, "k_mm", W->fmt, tr ? 2 : 1));
     cbytes(c, 0, &a, sizeof a);
     cbuf(c, 6, e->ids, 0);
-    cbuf(c, 7, e->stab, 0);
+    cbuf(c, 7, stab_for(e, W), 0);
     cbuf(c, 8, e->ids, 0);
     cbuf(c, 9, e->stab, 0);
     for (int h = 0; h < H; ++h) {
         cbuf(c, 1, W->b[0], W->o[0] + (uint64_t) h * cb);
         cbuf(c, 2, W->b[1] ? W->b[1] : W->b[0], W->b[1] ? W->o[1] + (uint64_t) h * sb : 0);
-        cbuf(c, 3, W->b[2] ? W->b[2] : W->b[0], W->b[2] ? W->o[2] + (uint64_t) h * sb : 0);
+        cbuf(c, 3, W->b[2] ? W->b[2] : W->b[0], W->b[2] ? W->o[2] + (uint64_t) h * bb : 0);
+        if (sd) cbuf(c, 9, W->b[3], W->o[3] + (uint64_t) h * n / 16);
         cbuf(c, 4, X, (uint64_t) h * hs * 4);
         cbuf(c, 5, Y, (uint64_t) h * O * 4);
         cbuf(c, 10, G ? G : Y, (uint64_t) h * O * 4);

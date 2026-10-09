@@ -493,3 +493,5 @@ int kt_argmax(const float* logits, int V, int n, int32_t* out) {
     kc_argmax(0, (const float*) dev(logits, 4 * (size_t) V * n), d, V, n);
     return done("kc_argmax", out, d, 4 * (size_t) n);
 }
+int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
+                  const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) { return 1; }   // Metal only so far
