@@ -1,7 +1,7 @@
 // harness/nslm-mova-mlacapture.c - calibration statistics of an MLA model's projection inputs, for the activation-
 // weighted seed search over the MLA projections (nslm-moe --scope mla --act FILE).
 //
-//   nslm-mova-mlacapture --model DIR --text CALIB.txt --out FILE [--ctx 2048] [--max-windows N] [--res out/res]
+//   nslm-mova-mlacapture --model DIR --text CALIB.txt --out FILE [--ctx 2048] [--max-windows N] [--res out/res] [--xtx DIR]
 //
 // The text is tokenized whole and cut into windows of BOS + (ctx - 1) tokens (as tools/mova_capture.py); each window is
 // prefilled with the engine's MLA capture on (mova_ext.h: prompts attend in latent space), which sums, per layer and
@@ -10,9 +10,13 @@
 //
 // FILE ("NSLMMLA1"): int32 n_layer, d, kvd, qd, n_head; int64 rows; then per layer: int32 r, double x[d], v[kvd],
 // q[qd], o[n_head * r].
+// --xtx DIR: also each input's X^T X (capture mode 2, for nslm-moe --scope mla --xtx), DIR/L<l>_<site>.xtx for site x
+// (kv_a_x, k_rope_proj), v (kv_a_v; MoVA layers), q (q_rope_mix, q_lat; per head), o (v_up; per head): "NSLMXTX2",
+// int32 dim, int32 blocks, int64 rows, float sums[blocks][dim][dim].
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "engine_api.h"
 #include "mova_cfg.h"
@@ -56,7 +60,8 @@ int main(int argc, char** argv) {
     o.kv_tokens = ctx + 64;
     Eng* e = eng_open(&o, err, sizeof err);
     if (!e) { fprintf(stderr, "eng_open: %s\n", err); return 1; }
-    if (eng_mla_capture(e, 1)) { fprintf(stderr, "this engine has no MLA capture\n"); return 1; }
+    const char* xdir = opt(argc, argv, "--xtx", NULL);
+    if (eng_mla_capture(e, xdir ? 2 : 1)) { fprintf(stderr, "this engine has no MLA capture%s\n", xdir ? " with X^T X" : ""); return 1; }
     int32_t* w = (int32_t*) malloc(sizeof(int32_t) * (size_t) ctx);
     const double t0 = now_s();
     for (int i = 0; i < nw; ++i) {
@@ -82,6 +87,25 @@ int main(int argc, char** argv) {
     }
     if (f && fclose(f)) ok = 0;
     if (!ok || rename(tmp, out)) { fprintf(stderr, "cannot write %s\n", out); remove(tmp); return 1; }
+    if (xdir) {
+        mkdir(xdir, 0755);
+        float* h = (float*) malloc(sizeof(float) * (size_t) c.n_head * 1024 * 1024);
+        for (int l = 0; l < c.n_layer && h; ++l)
+            for (int site = 0; site < 4; ++site) {
+                if (site == 1 && l < c.first_sparse) continue;   // no value experts
+                const int32_t dm[2] = {site == 0 ? c.d : site == 1 ? kvd : site == 2 ? c.head_dim : c.mla_rank[l], site < 2 ? 1 : c.n_head};
+                const size_t nn = (size_t) dm[0] * dm[0] * dm[1];
+                snprintf(path, sizeof path, "%s/L%d_%c.xtx", xdir, l, "xvqo"[site]);
+                snprintf(tmp, sizeof tmp, "%s.tmp", path);
+                FILE* g = fopen(tmp, "wb");
+                int gk = g && !eng_mla_capture_xtx(e, l, site, h) && fwrite("NSLMXTX2", 1, 8, g) == 8 && fwrite(dm, 4, 2, g) == 2 &&
+                         fwrite(&rows, 8, 1, g) == 1 && fwrite(h, sizeof(float), nn, g) == nn;
+                if (g && fclose(g)) gk = 0;
+                if (!gk || rename(tmp, path)) { fprintf(stderr, "cannot write %s\n", path); remove(tmp); return 1; }
+            }
+        free(h);
+        printf("wrote %s/L*_{x,v,q,o}.xtx\n", xdir);
+    }
     printf("wrote %s: %lld rows, %d layers (%.0f s)\n", out, (long long) rows, c.n_layer, now_s() - t0);
     eng_close(e);
     free(x); free(w); free(ids);
