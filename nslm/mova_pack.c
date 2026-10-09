@@ -23,7 +23,8 @@
 // NAME.blk4 of nslm-dense, NAME without ".weight"), or SEED6P8 for the parts in --seeds8 (a, m, h, e: NAME.blk8 of
 // nslm-dense --codec p8, in --blk4), or SEED4 (P = 3) for the parts in --seeds3 (v, a, m, h: L{l}_v_experts.blk of nslm-moe,
 // NAME.blk of nslm-dense --codec p3, in --blk); --seeds-only: only tensors whose name contains SUBSTR take --seeds8;
-// routers are BF16 holding their Q8 round trip (the router needs BF16 operands); norms and router biases are BF16.
+// routers are BF16 holding their Q8 round trip (the router needs BF16 operands), or with --router p8 their P = 8 seeds
+// decoded (NAME.blk8 of nslm-dense --parts r, in --blk4; a measurement of seeded routers); norms and router biases are BF16.
 // MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported, or Q8 / Q4
 // with --mla (per-head maps quantized per head along their input dim; a map or projection whose input dim is not a
 // multiple of 64, e.g. v_up at rank 96, stays BF16), or P = 4 seeds (--mla p4: SEED4P4 from --mla-blk4's nslm-moe
@@ -43,6 +44,7 @@
 #include "affine.h"
 #include "json.h"
 #include "model_st.h"
+#include "searchp.h"
 #include "search4.h"
 #include "mova_cfg.h"
 #include "mova_ckpt.h"
@@ -71,6 +73,7 @@ typedef struct {
     const char* blk;
     const char* blk4;            // --blk4: the P = 4 blocks (nslm-moe --p4)
     const char* blk4mla;         // --mla-blk4: the MLA projections' P = 4 blocks (nslm-moe --scope mla --p4)
+    int router8;                 // --router p8: routers as BF16 decoded from NAME.blk8 in --blk4 (else their Q8 round trip)
     int threads;
     // cache for the current quantized tensor (streams 0, 1, 2 come in order)
     int cur;
@@ -257,6 +260,25 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
         const uint16_t* w = mova_ckpt_bf16_3d(c->ck, t->name, t->slices, t->rows, t->cols, err, sizeof err);
         if (!w) { fprintf(stderr, "%s\n", err); return -1; }
         memcpy(dst, w, len);
+        return 0;
+    }
+    if (enc == NS_BF16 && t->kind == MOVA_K_ROUTER && c->router8) {   // --router p8: its P = 8 seeds decoded to BF16
+        snprintf(path, sizeof path, "%s/%.*s.blk8", c->blk4, (int) strlen(t->name) - 7, t->name);
+        FILE* f = fopen(path, "rb");
+        const size_t nb = (size_t) t->rows * t->cols / 8;
+        uint8_t* b = (uint8_t*) malloc(sizeof(MoeBlkHeader) + 12 + 7 * nb);
+        const int ok = f && fread(b, 1, sizeof(MoeBlkHeader) + 12 + 7 * nb, f) == sizeof(MoeBlkHeader) + 12 + 7 * nb &&
+                       !memcmp(((MoeBlkHeader*) b)->magic, "NSLMBLK8", 8);
+        if (f) fclose(f);
+        if (!ok) { fprintf(stderr, "%s: not the expected P = 8 seed file\n", path); free(b); return -1; }
+        const uint8_t* base = b + sizeof(MoeBlkHeader);
+        int32_t bias;
+        memcpy(&bias, base, 4);
+        const uint16_t* sd = (const uint16_t*) (base + 12);
+        const uint32_t* cw = (const uint32_t*) (base + 12 + 2 * nb);
+        const uint8_t* ec = base + 12 + 6 * nb;
+        for (size_t k = 0; k < nb; ++k) nslmp_decode_block(8, sd[k], cw[k], bias + ec[k], (uint16_t*) dst + k * 8);
+        free(b);
         return 0;
     }
     if (enc == NS_BF16) {   // a router: its Q8 round trip as BF16; norms, router biases and MLA projections verbatim
@@ -465,7 +487,8 @@ int main(int argc, char** argv) {
     if (mkdir(out, 0755) && errno != EEXIST) { perror(out); return 1; }
     Ctx c;
     memset(&c, 0, sizeof c);
-    c.ck = ck; c.src = sel; c.blk = blk; c.blk4 = opt(argc, argv, "--blk4", NULL); c.blk4mla = opt(argc, argv, "--mla-blk4", NULL); c.threads = atoi(opt(argc, argv, "--threads", "16"));
+    c.ck = ck; c.src = sel; c.blk = blk; c.blk4 = opt(argc, argv, "--blk4", NULL); c.blk4mla = opt(argc, argv, "--mla-blk4", NULL);
+    c.router8 = !strcmp(opt(argc, argv, "--router", "q8"), "p8"); c.threads = atoi(opt(argc, argv, "--threads", "16"));
     if (c.threads < 1 || c.threads > 64) c.threads = 16;
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);

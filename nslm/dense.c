@@ -10,7 +10,8 @@
 // down_proj input; L<n_layers>_0 the LM head input).  aw: the search weighted by h = diag(H) / rows (as nslm-moe).
 // gptq: column groups in order, each searched with A = T^T (T the inverse of the group's 8 x 8 block of
 // U = chol(H^-1), nslm_gptq_factor), its error (W_B - Q_B) T fed forward: W[:, after] -= E U[B, after].  The
-// embedding has no input and is searched unweighted.  Parts: a attention, m shared / dense MLPs, h LM head, e embedding.
+// embedding has no input and is searched unweighted.  Parts: a attention, m shared / dense MLPs, h LM head, e embedding,
+// r routers (mlp.gate, v_router: for measuring seeded routers; not in the default parts).
 // A finished .blk4 is skipped (resumable).
 #include <math.h>
 #include <pthread.h>
@@ -239,7 +240,8 @@ int main(int argc, char** argv) {
     int n = 0;
     for (int i = 0; i < na; ++i) {
         const MovaTensor* t = &all[i];
-        const int part = t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 'e' : t->kind == MOVA_K_LINEAR ? (strstr(t->name, "self_attn") ? 'a' : 'm') : 0;
+        const int part = t->kind == MOVA_K_HEAD ? 'h' : t->kind == MOVA_K_EMBED ? 'e' : t->kind == MOVA_K_ROUTER ? 'r'
+                       : t->kind == MOVA_K_LINEAR ? (strstr(t->name, "self_attn") ? 'a' : 'm') : 0;
         if (part && strchr(parts, part) && (!only || strstr(t->name, only))) sel[n++] = *t;
     }
     for (int i = 0; i < n; ++i)   // largest first, so the LM head and embedding do not finish last
