@@ -905,23 +905,75 @@ static __device__ __forceinline__ int kvq_rowb(int lead, int n) { return lead + 
 static __device__ __forceinline__ int kvq_srowb(int lead, int n) { return lead / 32 + (n - lead) / 16; }
 static __device__ __forceinline__ int mla_lead(int fmt, int r) { return fmt == KV_FP8 || r < KVQ_FP4_LEAD ? r : KVQ_FP4_LEAD; }
 // Values d .. d + 7 (d a multiple of 8) of row `row` as BF16 pairs (exact: a code times its scale)
-static __device__ __forceinline__ uint4 kvq_get8(const uint8_t* C, const uint8_t* S, int lead, int n, size_t row, int d) {
+// kvq_get8 in two halves, so the loads can be issued long before the values are needed: kvq_fetch8 reads the codes of
+// dims d .. d + 7 (8 FP8 bytes, or 4 bytes of FP4 nibbles in c.x) and their block's scale byte (bit 8: FP4); kvq_dec8
+// turns them into the same BF16 bits as kvq_get8
+static __device__ __forceinline__ void kvq_fetch8(const uint8_t* C, const uint8_t* S, int lead, int n, size_t row, int d, uint2& c,
+                                                  uint32_t& sc) {
     C += row * (size_t) kvq_rowb(lead, n);
     S += row * (size_t) kvq_srowb(lead, n);
+    if (d < lead) { c = *(const uint2*) (C + d); sc = S[d / 32]; }
+    else { const int e = d - lead; c = make_uint2(*(const uint32_t*) (C + lead + e / 2), 0u); sc = 256u | S[lead / 32 + e / 16]; }
+}
+// The decoded values are exact BF16 numbers, so their bits are built with integer operations and packed by truncation:
+// FP8: the code's exponent and mantissa (bits 6..0, as BF16's bits 10..4) plus the E8M0 scale's exponent in the exponent
+// field; FP4: the BF16 bits of s and 1.5 s (s the block's E4M3 scale; exact) plus an exponent step per code (|v| =
+// 0.5, 1, 1.5, 2, 3, 4, 6: s or 1.5 s times 2^((k >> 1) - 1)).  Codes or scales at the ends of the ranges (FP8
+// subnormals, scales whose products could leave BF16's normal range) take the float decode.
+static __device__ __forceinline__ uint32_t bf2_trunc(float lo, float hi) { return __byte_perm(__float_as_uint(lo), __float_as_uint(hi), 0x7632); }
+static __device__ __forceinline__ uint4 kvq_dec8_slow(uint2 c, uint32_t sc) {
     float v[8];
-    if (d < lead) {
-        const uint2 w = *(const uint2*) (C + d);
-        const float s = e8m0_dec(S[d / 32]);
+    if (!(sc & 256u)) {
+        const float s = e8m0_dec(sc);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { v[i] = e4m3_dec((w.x >> (8 * i)) & 255u) * s; v[4 + i] = e4m3_dec((w.y >> (8 * i)) & 255u) * s; }
+        for (int i = 0; i < 4; ++i) { v[i] = e4m3_dec((c.x >> (8 * i)) & 255u) * s; v[4 + i] = e4m3_dec((c.y >> (8 * i)) & 255u) * s; }
     } else {
-        const int e = d - lead;
-        const uint32_t w = *(const uint32_t*) (C + lead + e / 2);
-        const float s = e4m3_dec(S[lead / 32 + e / 16]);
+        const float s = e4m3_dec(sc & 255u);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) v[i] = e2m1_dec(w >> (4 * i)) * s;
+        for (int i = 0; i < 8; ++i) v[i] = e2m1_dec(c.x >> (4 * i)) * s;
     }
-    return make_uint4(pack_bf2(v[0], v[1]), pack_bf2(v[2], v[3]), pack_bf2(v[4], v[5]), pack_bf2(v[6], v[7]));
+    return make_uint4(bf2_trunc(v[0], v[1]), bf2_trunc(v[2], v[3]), bf2_trunc(v[4], v[5]), bf2_trunc(v[6], v[7]));
+}
+static __device__ __forceinline__ uint32_t e4m3_bf(uint32_t b, uint32_t off) {   // one FP8 code (normal or zero) as BF16 bits
+    const uint32_t m = b & 0x7Fu;
+    return ((b & 0x80u) << 8) | (m ? (m << 4) + off : 0u);
+}
+static __device__ __forceinline__ uint32_t e2m1_bf(uint32_t n, uint32_t b1, uint32_t b15) {   // one FP4 code as BF16 bits
+    const uint32_t k = n & 7u;
+    const uint32_t base = (k & 1u) && k > 1u ? b15 : b1;
+    return ((n & 8u) << 12) | (k ? base + (((k >> 1) - 1u) << 7) : 0u);   // (k >> 1) - 1 = -1 for k = 1: wraps, as intended
+}
+static __device__ __forceinline__ uint4 kvq_dec8(uint2 c, uint32_t sc) {
+    if (!(sc & 256u)) {   // FP8: BF16 exponent = code exponent + scale exponent - 7
+        const uint32_t S = sc & 255u;
+        // every code normal or zero (no exponent-0 code with a mantissa), and the exponent sums in BF16's normal range
+        bool ok = S >= 8u && S <= 239u;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t bx = (c.x >> (8 * i)) & 255u, by = (c.y >> (8 * i)) & 255u;
+            ok = ok && ((bx & 0x78u) || !(bx & 7u)) && ((by & 0x78u) || !(by & 7u));
+        }
+        if (!ok) return kvq_dec8_slow(c, sc);
+        const uint32_t off = (S - 7u) << 7;
+        uint32_t o[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { o[i] = e4m3_bf((c.x >> (8 * i)) & 255u, off); o[4 + i] = e4m3_bf((c.y >> (8 * i)) & 255u, off); }
+        return make_uint4(o[0] | o[1] << 16, o[2] | o[3] << 16, o[4] | o[5] << 16, o[6] | o[7] << 16);
+    }
+    const float s = e4m3_dec(sc & 255u);   // FP4: s and 1.5 s, exact in BF16 (4 and 5 significant bits)
+    const uint32_t b1 = __float_as_uint(s) >> 16, b15 = __float_as_uint(1.5f * s) >> 16, E = (b1 >> 7) & 255u;
+    if (!(E >= 2u && E <= 251u)) return kvq_dec8_slow(c, sc);   // s = 0, subnormal, or a product near BF16's range ends (1.5 s 2^2)
+    uint32_t o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) o[i] = e2m1_bf(c.x >> (4 * i), b1, b15);
+    return make_uint4(o[0] | o[1] << 16, o[2] | o[3] << 16, o[4] | o[5] << 16, o[6] | o[7] << 16);
+}
+// Values d .. d + 7 (d a multiple of 8) of row `row` as BF16 pairs (exact: a code times its scale)
+static __device__ __forceinline__ uint4 kvq_get8(const uint8_t* C, const uint8_t* S, int lead, int n, size_t row, int d) {
+    uint2 c;
+    uint32_t sc;
+    kvq_fetch8(C, S, lead, n, row, d, c, sc);
+    return kvq_dec8(c, sc);
 }
 // Dims d .. d + 7 of an MLA cache row as BF16 bits: the RoPE key (isk; 128 dims) or the latent (r dims), any format
 static __device__ __forceinline__ uint4 mla_get8(int fmt, const KvSeg& sg, size_t row, int isk, int r, int d) {
@@ -1332,16 +1384,6 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
             if (cmap[k] < 0) continue;
             const int u = cmap[k] >> 16, j = cmap[k] & 0xFFFF, kp = p + u;
             uint16_t* dst = Ks + ((size_t) buf * MLAT_KT + u) * kld + j * 8;
-            if (kv.fmt != KV_BF16) {   // FP8 / FP4: decoded to BF16 by plain stores (the next tile barrier publishes them)
-                uint4 w = make_uint4(0, 0, 0, 0);
-                if (kp < p1) {
-                    int row;
-                    const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
-                    w = j * 8 < r ? mla_get8(kv.fmt, sg, row, 0, r, j * 8) : mla_get8(kv.fmt, sg, row, 1, r, j * 8 - r);
-                }
-                *(uint4*) dst = w;
-                continue;
-            }
             const void* src = kv.a.k;
             int ok = 0;
             if (kp < p1) {
@@ -1355,15 +1397,50 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
         }
         cp_async_commit();
     };
-    if (ntile) load_tile(0, p0);
+    // FP8 / FP4 caches: a tile's codes and scales are loaded into registers right after the tile barrier (fetch) and
+    // decoded into the other buffer at the end of the tile (commit; the next barrier publishes them), so the loads
+    // overlap a tile of arithmetic, as cp.async does for BF16
+    constexpr int NCM = (int) (sizeof cmap / sizeof cmap[0]);
+    const bool quant = kv.fmt != KV_BF16;
+    const int vlead = mla_lead(kv.fmt, r);
+    uint2 qc[NCM];
+    uint32_t qs[NCM];
+    auto fetch_tile = [&](int p) {
+#pragma unroll
+        for (int k = 0; k < NCM; ++k) {
+            qs[k] = 0xFFFFFFFFu;   // a key past the split (or no chunk): zeros
+            if (cmap[k] < 0) continue;
+            const int u = cmap[k] >> 16, j = cmap[k] & 0xFFFF, kp = p + u;
+            if (kp >= p1) continue;
+            int row;
+            const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
+            if (j * 8 < r) kvq_fetch8((const uint8_t*) sg.v, (const uint8_t*) sg.vs, vlead, r, row, j * 8, qc[k], qs[k]);
+            else kvq_fetch8((const uint8_t*) sg.k, (const uint8_t*) sg.ks, ATT_HD, ATT_HD, row, j * 8 - r, qc[k], qs[k]);
+        }
+    };
+    auto commit_tile = [&](int buf) {
+#pragma unroll
+        for (int k = 0; k < NCM; ++k) {
+            if (cmap[k] < 0) continue;
+            const int u = cmap[k] >> 16, j = cmap[k] & 0xFFFF;
+            *(uint4*) (Ks + ((size_t) buf * MLAT_KT + u) * kld + j * 8) = qs[k] == 0xFFFFFFFFu ? make_uint4(0, 0, 0, 0) : kvq_dec8(qc[k], qs[k]);
+        }
+    };
+    if (ntile) {
+        if (quant) { fetch_tile(p0); commit_tile(0); }
+        else load_tile(0, p0);
+    }
     // Three barriers per tile: (A) the tile has landed and every warp is done with the previous one, so the other buffer
     // takes the next tile while this one computes; (B) partial scores written; (C) P and the rescale written.  The next
     // tile's scores (after its A) overwrite Sp, P and scor only once this tile's P c has read them.
     for (int it = 0; it < ntile; ++it) {
         const int buf = it & 1, p = p0 + it * MLAT_KT;
-        cp_async_wait<0>();
+        if (!quant) cp_async_wait<0>();
         __syncthreads();
-        if (it + 1 < ntile) load_tile(buf ^ 1, p + MLAT_KT);
+        if (it + 1 < ntile) {
+            if (quant) fetch_tile(p + MLAT_KT);
+            else load_tile(buf ^ 1, p + MLAT_KT);
+        }
         const uint16_t* Kb = Ks + (size_t) buf * MLAT_KT * kld;
         {   // partial scores of this warp's k-slice
             float sc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
@@ -1425,6 +1502,7 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
                 }
             }
         }
+        if (quant && it + 1 < ntile) commit_tile(buf ^ 1);   // nobody reads buf ^ 1 during this tile
     }
 #pragma unroll
     for (int o = 8; o > 0; o >>= 1) l_run += __shfl_xor_sync(FULL, l_run, o);
