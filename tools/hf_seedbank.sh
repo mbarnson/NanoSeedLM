@@ -31,6 +31,8 @@ if [ ! -d "$MODEL" ]; then
     echo "model download: $(( $(date +%s) - t0 )) s, $(du -sh /model | cut -f1)"
     MODEL=/model
 fi
+if [ -f "$ACT" ]; then cp "$ACT" /tmp/act.bin && ACT=/tmp/act.bin; fi   # local copies: concurrent reads through a bucket
+if [ -d "$XTX" ]; then mkdir -p /tmp/xtx && cp -r "$XTX"/. /tmp/xtx/ && XTX=/tmp/xtx; fi   # mount can come back short
 rm -rf /work && cp -r "$SRC" /work
 cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
 cmake --build /work/build -j "$(nproc)" --target nslm-moe nslm-dense 2>&1 | grep -E "error" || true
