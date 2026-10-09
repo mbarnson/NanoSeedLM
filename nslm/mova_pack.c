@@ -313,7 +313,7 @@ static int write_config(const char* model, const char* out, const NsSpec* t, int
 }
 
 int main(int argc, char** argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);   // (_IOLBF with size 0 fails fast in MSVC's CRT)
     const char* model = opt(argc, argv, "--model", NULL), *config = opt(argc, argv, "--config", NULL);
     const char* out = opt(argc, argv, "--out", NULL), *blk = opt(argc, argv, "--blk", NULL);
     const char* loader = opt(argc, argv, "--loader", "tools/nanoseedlm_k2.py");
