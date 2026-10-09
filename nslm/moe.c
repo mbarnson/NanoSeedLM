@@ -434,7 +434,7 @@ static int expand(const char* blk, const char* out, int mask) {
 }
 
 int main(int argc, char** argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);   // every line out at once (MSVC rejects _IOLBF with size 0: a fail-fast at start)
     const int mask = scope_mask(opt(argc, argv, "--scope", "gu"));
     if (!mask) { fprintf(stderr, "--scope gu|gud|d|v|dv|all\n"); return 2; }
     g_p4 = has_flag(argc, argv, "--p4");
