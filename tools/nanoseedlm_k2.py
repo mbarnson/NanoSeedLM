@@ -533,7 +533,7 @@ def _heads(w, x):
 
 
 class MLA(nn.Module):
-    """One layer's MLA tensors (BF16 arrays, or seed modules after Model.sanitize)."""
+    """One layer's MLA tensors (BF16 arrays, including affine tensors decoded at load, or seed modules)."""
 
     def __init__(self, args: ModelArgs, rank: int, mova: bool):
         super().__init__()
@@ -615,6 +615,19 @@ class Model(_k2.Model):
                 weights.pop(f"model.layers.{i}.self_attn.k_proj.weight", None)
                 if not layer.self_attn.mova:
                     weights.pop(f"model.layers.{i}.self_attn.v_proj.weight", None)
+                # The packer stores affine MLA arrays as NAME, NAME.scales, NAME.biases (no .weight).
+                # They are arrays rather than quantizable Linear modules; restore their BF16 values here.
+                for name, value in layer.self_attn.mla.items():
+                    path = f"model.layers.{i}.self_attn.mla.{name}"
+                    if path + ".scales" not in weights:
+                        continue
+                    packed = weights[path]
+                    bits, rem = divmod(32 * packed.shape[-1], value.shape[-1])
+                    if rem or bits not in (4, 8):
+                        raise ValueError(f"{path}: expected affine Q4 or Q8 MLA weights")
+                    weights[path] = mx.dequantize(
+                        packed, weights.pop(path + ".scales"), weights.pop(path + ".biases"), group_size=64, bits=bits
+                    ).astype(mx.bfloat16)
         for p in seeded:
             weights.pop(p + ".weight")
             e, n, kb = weights[p + ".seeds"].shape

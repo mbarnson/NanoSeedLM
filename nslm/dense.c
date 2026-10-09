@@ -210,7 +210,7 @@ static void* worker(void* arg) {
 }
 
 int main(int argc, char** argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);   // _IOLBF with size 0 fails fast in MSVC's CRT
     const char* model = opt(argc, argv, "--model", NULL), *mode = opt(argc, argv, "--mode", NULL);
     g_xtx = opt(argc, argv, "--xtx", NULL); g_out = opt(argc, argv, "--out", NULL); g_res = opt(argc, argv, "--res", "out/res");
     const char* parts = opt(argc, argv, "--parts", "amhe"), *only = opt(argc, argv, "--only", NULL);

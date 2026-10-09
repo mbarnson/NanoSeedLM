@@ -377,27 +377,35 @@ def test_load_through_mlx_lm():
         assert err < 0.02, err
 
 
-def test_load_mla():
-    """A small MLA model (config mla_ranks): the MLA tensors as P = 3 / 4 / 8 seeds (per-head maps as SeedHeads), the rest
-    BF16, through mlx-lm's loader, against the same model with the decoded MLA tensors as BF16 arrays."""
+def _load_mla(affine=False):
+    """Seeded MLA, optionally mixed with the packer's Q8 / Q4 arrays, against the decoded BF16 model."""
     from mlx_lm.utils import load_model
 
-    config = dict(small_config(), mla_ranks=[16, 32], mla_rope_dim=16)
+    config = dict(small_config(), mla_ranks=[64, 128] if affine else [16, 32], mla_rope_dim=16)
     mx.random.seed(5)
     ref = ns.Model(ns.ModelArgs.from_dict(config))
     rng = np.random.default_rng(13)
     gens = {3: (random_seeds3, ref_decode3), 4: (random_seeds, ref_decode), 8: (random_seeds8, ref_decode8)}
-    weights, kinds = {}, {}
+    weights, kinds, quantized = {}, {}, {}
     for i, layer in enumerate(ref.model.layers):
         m = layer.self_attn.mla
         for j, (name, value) in enumerate(sorted(m.items())):
+            path = f"model.layers.{i}.self_attn.mla.{name}"
+            if affine and name in ("v_up", "kv_a_x", "k_rope_proj"):
+                bits = 4 if name == "kv_a_x" else 8
+                w = mx.array((rng.standard_normal(value.shape) * 0.03).astype(np.float32)).astype(mx.bfloat16)
+                packed, scales, biases = mx.quantize(w, 64, bits)
+                # Match ns_write's affine MLA names, including the Q8 v_up kept by default with --mla p4.
+                weights.update({path: packed, path + ".scales": scales, path + ".biases": biases})
+                setattr(m, name, mx.dequantize(packed, scales, biases, group_size=64, bits=bits).astype(mx.bfloat16))
+                quantized[path] = bits
+                continue
             p = (4, 8, 3)[(i + j) % 3]
             gen, dec = gens[p]
             shape = value.shape if value.ndim == 3 else (1,) + value.shape
             parts = gen(shape, rng, -14)
             w = mx.array(bf16_bits(dec(*parts))).view(mx.bfloat16)
             setattr(m, name, w if value.ndim == 3 else w[0])
-            path = f"model.layers.{i}.self_attn.mla.{name}"
             keys = ("seeds", "nibbles", "exp_bias") if p == 3 else ("seeds", "coefs", "codes", "exp_bias")
             weights.update({f"{path}.{k}": mx.array(v) for k, v in zip(keys, parts)})
             kinds[path] = (value.ndim, p)
@@ -407,10 +415,19 @@ def test_load_mla():
             weights[name.replace("mlp.expert_bias", "mlp.gate.bias").replace("self_attn.v_expert_bias", "self_attn.v_router.bias")] = value
     with tempfile.TemporaryDirectory() as d:
         mx.save_safetensors(f"{d}/model.safetensors", weights, metadata={"format": "mlx"})
+        if affine:
+            config["quantization"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+            config["quantization"].update({p: {"group_size": 64, "bits": b} for p, b in quantized.items() if b == 4})
         Path(d, "config.json").write_text(json.dumps(dict(config, model_file="nanoseedlm_k2.py")))
         shutil.copy(TOOLS / "nanoseedlm_k2.py", d)
         model, _ = load_model(Path(d), trust_remote_code=True)
-    assert len(kinds) == 11 and {p for _, p in kinds.values()} == {3, 4, 8}
+    assert len(kinds) + len(quantized) == 11 and {p for _, p in kinds.values()} == {3, 4, 8}
+    params = dict(tree_flatten(model.parameters()))
+    ref_params = dict(tree_flatten(ref.parameters()))
+    for path in quantized:
+        assert params[path].dtype == mx.bfloat16 and params[path].shape == ref_params[path].shape
+        assert np.array_equal(np.array(params[path].view(mx.uint16)), np.array(ref_params[path].view(mx.uint16)))
+        assert path + ".scales" not in params and path + ".biases" not in params
     for path, (ndim, p) in kinds.items():
         layer, name = path.split(".self_attn.mla.")
         mod = getattr(model.model.layers[int(layer.rsplit(".", 1)[1])].self_attn.mla, name)
@@ -419,6 +436,14 @@ def test_load_mla():
     for ids in (mx.array([[5]]), mx.array([list(range(1, 41))])):
         err = rel_err(ref(ids), model(ids))
         assert err < 0.02, err
+
+
+def test_load_mla():
+    _load_mla()
+
+
+def test_load_mla_affine():
+    _load_mla(affine=True)
 
 
 if __name__ == "__main__":
