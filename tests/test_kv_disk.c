@@ -1,11 +1,14 @@
 // tests/test_kv_disk.c - the cold KV cache (harness/kv_disk.c): chained block hashes, store / count / load, the model
-// fingerprint, invalid files, the byte budget (least recently used blocks go first) and a reopened cache's index.
+// fingerprint, invalid files, the byte budget (least recently used blocks go first, also across restarts), a reopened
+// cache's index and the maximum age.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include "kv_disk.h"
+#include "platform.h"
 #include "model_st.h"
 
 static int fails = 0;
@@ -88,6 +91,43 @@ int main(void) {
     block_data(src, 2);
     CHECK(kvd_load(d, h[2], ids + 3 * KVD_BLOCK, dst) != 0, "a block whose tokens differ is a miss");
     kvd_close(d);
+    {   // least recently used across restarts: a read refreshes a block (its file's time); blocks unused for longer
+        // than the maximum age expire
+        const char* dl = "out/test/kvdisk_lru";
+        const uint64_t bud = 3 * (BB + 2048);
+        KvDisk* e = kvd_open(dl, bud, fa, BB, err, sizeof err);
+        CHECK(e != NULL, "kvd_open: %s", err);
+        if (!e) return 1;
+        for (int b = 0; b < NB; ++b) kvd_drop(e, h[b]);
+        for (int b = 0; b < 3; ++b) { block_data(src, b); CHECK(kvd_store(e, h[b], ids + b * KVD_BLOCK, src) == 0, "store %d", b); }
+        const time_t now = time(NULL);
+        for (int b = 0; b < 3; ++b) {   // written 300, 200, 100 s ago: block 0 the oldest
+            kvd_path(e, h[b], path, sizeof path);
+            CHECK(plat_set_mtime(path, (double) (now - 300 + 100 * b)) == 0, "plat_set_mtime %s", path);
+        }
+        kvd_close(e);
+        e = kvd_open(dl, bud, fa, BB, err, sizeof err);   // reopened: ages from the files
+        block_data(src, 0);
+        CHECK(e && kvd_load(e, h[0], ids, dst) == 0 && !memcmp(src, dst, BB), "load block 0");   // now the newest
+        kvd_close(e);
+        e = kvd_open(dl, bud, fa, BB, err, sizeof err);   // reopened again: block 0's read survives the restart
+        block_data(src, 3);
+        CHECK(e && kvd_store(e, h[3], ids + 3 * KVD_BLOCK, src) == 0, "store 3");
+        CHECK(e && kvd_count(e, h, 1) == 1 && kvd_count(e, h + 1, 1) == 0 && kvd_count(e, h + 2, 2) == 2,
+              "LRU across restarts: block 1 evicted (block 0 was read after it was written)");
+        for (int b = 2; b < 4; ++b) {   // blocks 2 and 3 unused for 40 days
+            kvd_path(e, h[b], path, sizeof path);
+            CHECK(plat_set_mtime(path, (double) (now - 40 * 86400)) == 0, "plat_set_mtime %s", path);
+        }
+        kvd_close(e);
+        e = kvd_open(dl, bud, fa, BB, err, sizeof err);
+        if (e) kvd_set_max_age(e, 30 * 86400.0);
+        CHECK(e && kvd_count(e, h, 1) == 1 && kvd_count(e, h + 2, 2) == 0 && kvd_used(e) == BB + KVD_HEAD_BYTES,
+              "blocks unused for 40 days expire at a 30-day maximum age (%llu bytes left)", e ? (unsigned long long) kvd_used(e) : 0ull);
+        kvd_path(e, h[2], path, sizeof path);
+        CHECK(stat(path, &st) != 0, "an expired block's file is deleted");
+        kvd_close(e);
+    }
     printf("test_kv_disk: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

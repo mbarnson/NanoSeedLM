@@ -2,7 +2,7 @@
 //
 //   nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080]
 //              [--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]
-//              [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048]
+//              [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048] [--kv-disk-days 30]
 //   nslm-serve --render REQUEST.json     print the prompt a chat request renders to, and exit
 //
 // GET /v1/models, GET /health, POST /v1/chat/completions, POST /v1/completions (stream or not).
@@ -17,7 +17,8 @@
 // The cold cache (harness/kv_disk.h; --kv-disk-gb 0: off): a request that ends with at least --kv-disk-min cached
 // tokens has its slot's cache saved to disk in blocks of 256 tokens (by a writer thread, the slot held meanwhile); a
 // new request restores the longest saved prefix of its prompt that beats its slot's own, a few blocks per scheduler
-// step, and computes the rest.  Default directory: ~/.cache/nslm/kv (Windows: %LOCALAPPDATA%/nslm/kv).
+// step, and computes the rest.  Default directory: ~/.cache/nslm/kv (Windows: %LOCALAPPDATA%/nslm/kv).  Beyond
+// --kv-disk-gb the least recently used blocks go; blocks unused for --kv-disk-days go at startup and on each save.
 // --kv q8 (GQA), fp8 / fp4 (MLA): smaller KV caches for long contexts (engine_api.h).
 #include <limits.h>
 #include <math.h>
@@ -1106,7 +1107,7 @@ int main(int argc, char** argv) {
     if (!model || g_ctx < 64) {
         fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
                         "[--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]\n"
-                        "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048]\n       nslm-serve --render REQUEST.json\n");
+                        "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048] [--kv-disk-days 30]\n       nslm-serve --render REQUEST.json\n");
         return 2;
     }
     char base[256];
@@ -1170,8 +1171,11 @@ int main(int argc, char** argv) {
         else if (!(g_kvd = kvd_open(kdir, (uint64_t) (kv_gb * 1e9), fp, (uint64_t) eng_kv_bytes(g_eng) * KVD_BLOCK, kerr, sizeof kerr)))
             fprintf(stderr, "nslm-serve: cold cache off: %s\n", kerr);
         else {
-            fprintf(stderr, "nslm-serve: cold cache %s: %.2f of %.0f GB used, sequences of %d+ tokens, %.1f MB per %d-token block\n",
-                    kdir, kvd_used(g_kvd) / 1e9, kv_gb, g_kv_min, eng_kv_bytes(g_eng) * KVD_BLOCK / 1e6, KVD_BLOCK);
+            const double days = atof(opt(argc, argv, "--kv-disk-days", "30"));
+            kvd_set_max_age(g_kvd, days * 86400);
+            fprintf(stderr, "nslm-serve: cold cache %s: %.2f of %.0f GB used, sequences of %d+ tokens, %.1f MB per %d-token block, "
+                    "unused blocks kept %g days\n", kdir, kvd_used(g_kvd) / 1e9, kv_gb, g_kv_min, eng_kv_bytes(g_eng) * KVD_BLOCK / 1e6,
+                    KVD_BLOCK, days);
             pthread_t wr;
             if (pthread_create(&wr, NULL, writer, NULL)) { fprintf(stderr, "nslm-serve: cannot start the cold-cache writer\n"); return 1; }
         }

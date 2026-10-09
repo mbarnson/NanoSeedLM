@@ -112,7 +112,7 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   prompts, tools and earlier turns are not computed again.
 - Cold cache: a request that ends with at least `--kv-disk-min` (2048) cached tokens has its cache saved to disk in
   256-token blocks (`--kv-disk`, default `~/.cache/nslm/kv`; `--kv-disk-gb` 32, least recently used blocks go first;
-  0 turns it off). A later request with the same prefix reads it back instead of computing it. Blocks are keyed by the
+  0 turns it off; `--kv-disk-days` 30: blocks not read or written for that long are deleted). A later request with the same prefix reads it back instead of computing it. Blocks are keyed by the
   tokens and the model's weights, so another model or quantization never reuses them.
 - `--ctx` sets each slot's context (prompt and output). On a 32 GB Mac, 4096 fits; on a larger Mac, use a larger value,
   for example `--ctx 32768`. On a CUDA GPU, see [NVIDIA GPUs](#nvidia-gpus-cuda) for how the context is held.

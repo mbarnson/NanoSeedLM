@@ -5,7 +5,8 @@
 // the model fingerprint (the engine's description and KV size, the weights' names, formats, shapes and leading bytes):
 // another model or quantization never matches.  One file per block, DIR/<fingerprint>/<h_b>.kv, written to a temporary
 // file, synced and renamed (a crash leaves no partial block); a file that fails its checks reads as a miss and is
-// deleted.  Beyond the byte budget the least recently used blocks go (across restarts: the least recently written).
+// deleted.  Beyond the byte budget the least recently used blocks go; a block's file time is its last read or write, so
+// the order survives restarts.  Blocks unused for longer than a maximum age (kvd_set_max_age) are deleted too.
 // Reads are plain reads: the OS page cache keeps recent blocks in memory as it sees fit.  Thread-safe.
 #pragma once
 #include <stdint.h>
@@ -15,6 +16,7 @@ extern "C" {
 #endif
 
 #define KVD_BLOCK 256
+#define KVD_HEAD_BYTES (88 + 4 * KVD_BLOCK)   // a block file's bytes before its KV (header, token ids)
 
 typedef struct KvDisk KvDisk;
 
@@ -32,6 +34,8 @@ int kvd_load(KvDisk* d, const uint8_t h[32], const int32_t* ids, void* dst);
 // Saves block h (nothing to do if it is there), then deletes least recently used blocks beyond the budget.  0 or -1.
 int kvd_store(KvDisk* d, const uint8_t h[32], const int32_t* ids, const void* src);
 void kvd_drop(KvDisk* d, const uint8_t h[32]);   // deletes block h
+// Blocks of every model not read or written for longer than seconds are deleted, now and on each store (0: no limit).
+void kvd_set_max_age(KvDisk* d, double seconds);
 uint64_t kvd_used(KvDisk* d);                     // bytes of every model's blocks under the directory
 void kvd_path(const KvDisk* d, const uint8_t h[32], char* out, int cap);
 

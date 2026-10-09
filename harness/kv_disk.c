@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "model_st.h"
+#include "platform.h"
 #include "sha256.h"
 
 #define KVD_MAGIC "NSLMKV1\n"
@@ -26,6 +27,7 @@ struct KvDisk {
     char root[1024], fp_hex[17];
     uint8_t fp[32];
     uint64_t budget, block_bytes, used;
+    double max_age;   // seconds; 0: none
     Ent* e;
     int n, cap;
     unsigned long tick;   // orders uses within a second, and names temporary files
@@ -155,6 +157,24 @@ int kvd_count(KvDisk* d, const uint8_t (*h)[32], int nb) {
     return b;
 }
 
+// Under mu: deletes the blocks unused for longer than max_age
+static void expire_locked(KvDisk* d) {
+    if (!(d->max_age > 0)) return;
+    const double cut = (double) time(NULL) - d->max_age;
+    for (int i = 0; i < d->n;) {
+        if (d->e[i].t >= cut) { ++i; continue; }
+        char q[1300];
+        snprintf(q, sizeof q, "%s/%s/%s.kv", d->root, d->e[i].dir, d->e[i].name);
+        unlink(q);
+        ent_del(d, i);
+    }
+}
+void kvd_set_max_age(KvDisk* d, double seconds) {
+    pthread_mutex_lock(&d->mu);
+    d->max_age = seconds;
+    expire_locked(d);
+    pthread_mutex_unlock(&d->mu);
+}
 static void drop_locked(KvDisk* d, const char* dir, const char* name) {
     const int i = ent_find(d, dir, name);
     if (i >= 0) ent_del(d, i);
@@ -169,6 +189,15 @@ void kvd_drop(KvDisk* d, const uint8_t h[32]) {
     pthread_mutex_unlock(&d->mu);
 }
 
+// A block was used: its index time and its file's (the order across restarts)
+static void touch(KvDisk* d, const char* path, const char* x) {
+    pthread_mutex_lock(&d->mu);
+    const int i = ent_find(d, d->fp_hex, x);
+    const double t = stamp(d);
+    if (i >= 0) d->e[i].t = t;
+    pthread_mutex_unlock(&d->mu);
+    plat_set_mtime(path, t);
+}
 int kvd_load(KvDisk* d, const uint8_t h[32], const int32_t* ids, void* dst) {
     char p[1300];
     kvd_path(d, h, p, sizeof p);
@@ -198,10 +227,7 @@ int kvd_load(KvDisk* d, const uint8_t h[32], const int32_t* ids, void* dst) {
         pthread_mutex_unlock(&d->mu);
         return -1;
     }
-    pthread_mutex_lock(&d->mu);
-    const int i = ent_find(d, d->fp_hex, x);
-    if (i >= 0) d->e[i].t = stamp(d);
-    pthread_mutex_unlock(&d->mu);
+    touch(d, p, x);
     return 0;
 }
 
@@ -210,7 +236,7 @@ int kvd_store(KvDisk* d, const uint8_t h[32], const int32_t* ids, const void* sr
     kvd_path(d, h, p, sizeof p);
     hex(h, 32, x);
     struct stat st;
-    if (!stat(p, &st)) return 0;
+    if (!stat(p, &st)) { touch(d, p, x); return 0; }   // there already: used again
     pthread_mutex_lock(&d->mu);
     snprintf(tp, sizeof tp, "%s.%d.%lu.tmp", p, (int) getpid(), ++d->tick);
     pthread_mutex_unlock(&d->mu);
@@ -232,6 +258,7 @@ int kvd_store(KvDisk* d, const uint8_t h[32], const int32_t* ids, const void* sr
     pthread_mutex_lock(&d->mu);
     drop_locked(d, d->fp_hex, x);
     ent_add(d, d->fp_hex, x, size, stamp(d));
+    expire_locked(d);
     while (d->used > d->budget && d->n > 1) {   // the least recently used other block
         int lru = -1;
         for (int i = 0; i < d->n; ++i)

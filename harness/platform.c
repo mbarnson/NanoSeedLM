@@ -11,6 +11,7 @@
 #include <bcrypt.h>
 #include <psapi.h>
 #include <shellapi.h>
+#include <sys/utime.h>
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/ps/IOPSKeys.h>
@@ -24,6 +25,7 @@
 #include <unistd.h>
 #endif
 #ifndef _WIN32
+#include <utime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -41,6 +43,16 @@ char* plat_slurp(const char* path, size_t* len) {
     b[got] = 0;
     if (len) *len = got;
     return b;
+}
+
+int plat_set_mtime(const char* path, double t) {
+#if defined(_WIN32)
+    struct _utimbuf u = {(time_t) t, (time_t) t};
+    return _utime(path, &u) ? -1 : 0;
+#else
+    struct utimbuf u = {(time_t) t, (time_t) t};
+    return utime(path, &u) ? -1 : 0;
+#endif
 }
 
 #if defined(_WIN32)

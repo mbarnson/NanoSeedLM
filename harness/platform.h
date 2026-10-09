@@ -15,6 +15,7 @@ double now_s(void);   // monotonic seconds
 // The whole file, NUL-terminated (*len without the NUL); NULL if unreadable.  The caller frees.
 char* plat_slurp(const char* path, size_t* len);
 uint64_t plat_random_u64(void);   // from the OS's random source
+int plat_set_mtime(const char* path, double t);   // a file's modification time (seconds since 1970); 0 or -1
 // The whole file mapped read-only (*len bytes); NULL if unreadable.  Lives for the process.
 const void* plat_map(const char* path, size_t* len);
 
