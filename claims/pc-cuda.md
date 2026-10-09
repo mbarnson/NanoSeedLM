@@ -1,9 +1,7 @@
-# pc-cuda claims (updated 2026-10-09T00:52:56Z)
+# pc-cuda claims (updated 2026-10-09T00:56:48Z)
 
-- **Done:** CUDA fp8 / fp4 + mla_expand_min (on main at 6364ffb).
-- **Next (CUDA files only):**
-  1. fp4/fp8 decode speed on CUDA: k_mla_attn_tc decodes the cache with plain stores (16k: 38.3 vs BF16 46.0 tok/s);
-     stage the codes with cp.async and decode in shared memory.
-  2. CUDA KV pool: give the VRAM rows to the active slots, not all to slot 0.
-- Re-run windows for mac/kv-disk-age once it is rebased on batch.
-- Linux: no toolkit in WSL yet; Matt's call.
+- **Next: CUDA per-head Q8 / Q4 for MLA HEADS tensors** (q_rope_mix, q_lat, v_up) on `pc/mla-heads-q` from mla-memory,
+  after mac-metal's packer lands (mac/mla-pack). Files: engine/kernels_moe.cu, engine/kernels_cuda.h, engine/mova_cuda.c,
+  tests/kernel_backend_cuda.c. KLD on the healed folder.
+- Then: fp4 / fp8 decode speed (k_mla_attn_tc staging codes with cp.async); CUDA KV VRAM rows by active slot.
+- Re-run windows for mac/kv-disk-age once it is rebased.
