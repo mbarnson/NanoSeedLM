@@ -1,7 +1,7 @@
 // harness/nslm-mova-gen.c - greedy and/or sampled generations of a prompt suite through the MoVA engine.
 //
 //   nslm-mova-gen --model DIR [--res out/res] --prompts PRE --out DIR [--only id,id]
-//                 [--modes greedy,sampled]
+//                 [--modes greedy,sampled] [--ctx 20480] [--kv bf16|q8|fp8|fp4]
 //
 // PRE.ids (int32) / PRE.index from tools/mova_export.py prompts (harness/suite.h).
 // Greedy: arg max of the BF16-valued logits, ties to the lowest id (MLX's argmax).  Sampled: exactly the MLX reference
@@ -37,7 +37,12 @@ int main(int argc, char** argv) {
     o.model_dir = opt(argc, argv, "--model", NULL);
     o.resource_dir = opt(argc, argv, "--res", "out/res");
     o.max_seqs = 1;
-    o.kv_tokens = 20480;
+    o.kv_tokens = atoi(opt(argc, argv, "--ctx", "20480"));
+    o.kv_format = eng_kv_parse(opt(argc, argv, "--kv", "bf16"));
+    if (o.kv_tokens <= 0 || o.kv_format < 0) {
+        fprintf(stderr, "nslm-mova-gen: --ctx must be positive; --kv must be bf16, q8, fp8 or fp4\n");
+        return 2;
+    }
     if (!o.model_dir || !pre || !outd) { fprintf(stderr, "usage: nslm-mova-gen --model DIR --prompts PRE --out DIR\n"); return 2; }
     mkdir(outd, 0755);
     Suite su;
