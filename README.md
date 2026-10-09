@@ -235,16 +235,22 @@ slower than GQA's mostly because it streams the MLA projections (945 MB per toke
 `--mla p4` packs them as P = 4 seeds (4.5 bits a weight, as Q4), searched like the experts' with activation weighting:
 `nslm-mova-mlacapture` sums each projection input's squares over the calibration text (the engine's MLA capture,
 `mova_ext.h`), `nslm-moe --scope mla --p4` searches every projection (per-head maps head by head; 536 s for all 472M
-weights on an M4 Max), and `--mla-blk4` points the packer at the blocks (`--mla-q8 NAMES` keeps some in Q8). J768 with
-p4mx-q4v seeds, held-out KLD over 31 windows:
+weights on an M4 Max), and `--mla-blk4` points the packer at the blocks (`--mla-q8 NAMES` keeps some in Q8).
+`nslm-mova-mlacapture --xtx DIR` also writes each input's X^T X (the engine's capture mode 2), and `nslm-moe --scope mla
+--p4 --xtx DIR` then searches by GPTQ (`nslm/gptq4.h`: column groups in order, each group's error fed forward to the
+columns not yet searched; 23 min on an M4 Max). On held-out rows GPTQ cuts each projection's output error by 10-45%
+(`v_up` about 45%), but the model's KLD moves less. J768 with p4mx-q4v seeds, held-out KLD over 31 windows (paired
+differences over the same windows: GPTQ - AW -0.0014 +/- 0.0009, `v_up` in Q8 -0.0039 +/- 0.0006):
 
 | MLA projections | Folder | KLD | top-1 agreement |
 |---|---|---|---|
 | BF16 | 23.56 GB | 0.2199 | 80.35% |
 | Q8 | 23.12 GB | 0.2206 | 80.35% |
-| P = 4 seeds | 22.88 GB | 0.2296 | 79.91% |
+| P = 4 seeds, GPTQ | 22.88 GB | 0.2282 | 79.88% |
+| P = 4 seeds (AW) | 22.88 GB | 0.2296 | 79.91% |
 | Q4 | 22.88 GB | 0.2471 | 79.00% |
-| P = 4 seeds, `v_up` in Q8 | 22.96 GB | 0.2250 | |
+| P = 4 seeds, GPTQ, `v_up` in Q8 | 22.96 GB | 0.2243 | 80.14% |
+| P = 4 seeds (AW), `v_up` in Q8 | 22.96 GB | 0.2250 | |
 
 At Q4's size, the seeds keep about two thirds of what Q4 loses. With the `fp4` cache: Q8 0.2246, seeds 0.2335. On
 Metal, prefill and decode with Q8 or seed projections run as with BF16 (prompt forwards decode a seed layer's MLA
