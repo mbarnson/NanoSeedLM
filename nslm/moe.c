@@ -8,6 +8,9 @@
 //       routed tokens by routing weight^2; --experts A-B profiles those experts only and writes nothing
 //       (NSLM_MOE_VERBOSE=1: per-expert times)
 //   nslm-moe --model DIR --act FILE --check L,PROJ,EXPERT,K    GPU vs the CPU search on K column groups of one expert
+//   --scope mla --p4 --xtx DIR [--damp 0.01]: the MLA projections by GPTQ (nslm/gptq4.h) over their inputs' X^T X
+//       (nslm-mova-mlacapture --xtx DIR: L{l}_{x,v,q,o}.xtx), H dampened by damp * mean(diag H); the heads of a per-head
+//       map with one exponent bias search together
 //   nslm-moe --expand --blk DIR --out DIR [--scope gu] [--p4]   OUT/L{l}_{proj}.safetensors: 'w' [E][rows][cols] BF16
 //
 // Each expert matrix (768 x 2560 gate/up, 2560 x 768 down, 1024 x 2560 value experts) is searched as its own tensor by
@@ -31,6 +34,8 @@
 #include <time.h>
 
 #include "format.h"
+#include "gptq4.h"
+#include "linalg.h"
 #include "moe.h"
 #include "search.h"
 #include "search_gpu.h"
@@ -263,6 +268,69 @@ typedef struct {
 
 static int g_p4;   // --p4: 4.5-bit blocks (nslm/search4.h), written as .blk4
 static char g_lib4[1024];
+static const char* g_xtx;   // --xtx DIR: GPTQ for the MLA projections
+static double g_damp = 0.01;
+
+// H / rows (double) of slice e of the X^T X file of projection p's input (nslm-mova-mlacapture --xtx), dim x dim
+static double* read_xtx(int l, int p, int e, int dim, int slices) {
+    char path[2048], mg[8];
+    snprintf(path, sizeof path, "%s/L%d_%c.xtx", g_xtx, l, p == P_KAX || p == P_KR ? 'x' : p == P_KAV ? 'v' : p == P_VU ? 'o' : 'q');
+    FILE* f = fopen(path, "rb");
+    int32_t dm[2] = {0, 0};
+    int64_t rows = 0;
+    if (!f || fread(mg, 1, 8, f) != 8 || memcmp(mg, "NSLMXTX2", 8) || fread(dm, 4, 2, f) != 2 || fread(&rows, 8, 1, f) != 1 ||
+        dm[0] != dim || dm[1] != (slices > 1 ? slices : 1) || rows < 1 ||
+        fseek(f, (long) ((size_t) e * dim * dim * sizeof(float)), SEEK_CUR)) {
+        fprintf(stderr, "%s: missing, or not %d x %d x %d\n", path, slices, dim, dim);
+        if (f) fclose(f);
+        return NULL;
+    }
+    float* hf = (float*) malloc(sizeof(float) * (size_t) dim * dim);
+    double* h = (double*) malloc(sizeof(double) * (size_t) dim * dim);
+    const int ok = fread(hf, sizeof(float), (size_t) dim * dim, f) == (size_t) dim * dim;
+    fclose(f);
+    for (size_t k = 0; ok && k < (size_t) dim * dim; ++k) h[k] = (double) hf[k] / (double) rows;
+    free(hf);
+    if (!ok) { fprintf(stderr, "%s: short\n", path); free(h); return NULL; }
+    return h;
+}
+typedef struct { Nslm4Gpu* g; Search4Opts o; } GptqCtx;
+static int gptq_search(void* ctx, const float* w, int rows, int cols, const float* A, int bias, uint16_t* seed, uint16_t* coef,
+                       uint8_t* ecode, char* err, int errlen) {
+    GptqCtx* c = (GptqCtx*) ctx;
+    float* er = (float*) malloc(sizeof(float) * (size_t) rows * (cols / 8));
+    const int rc = nslm4_gpu_search_a(c->g, w, rows, cols, A, bias, &c->o, seed, coef, ecode, er, err, errlen);
+    free(er);
+    return rc;
+}
+// GPTQ over every slice of MLA projection p of layer l (--xtx): seeds, coefficients, exponent codes and biases per slice
+static int gptq_job(Nslm4Gpu* gpu4, const Search4Opts* o4, int l, int p, int rows, int cols, int E, size_t nb, int32_t* bias,
+                    uint16_t* seed, uint16_t* nib, uint8_t* ec, float** w0, char* err, int errlen) {
+    float** W = (float**) calloc((size_t) E, sizeof(float*));
+    double** U = (double**) calloc((size_t) E, sizeof(double*));
+    uint16_t** sp = (uint16_t**) malloc(sizeof(void*) * (size_t) E), **cp = (uint16_t**) malloc(sizeof(void*) * (size_t) E);
+    uint8_t** ep = (uint8_t**) malloc(sizeof(void*) * (size_t) E);
+    int* bs = (int*) malloc(sizeof(int) * (size_t) E);
+    const int shared = p == P_KAX || p == P_KAV || p == P_KR;   // one input for the whole matrix
+    int rc = 0;
+    for (int e = 0; e < E && !rc; ++e) {
+        W[e] = (float*) malloc(sizeof(float) * (size_t) rows * cols);
+        memcpy(W[e], w0[e], sizeof(float) * (size_t) rows * cols);
+        int64_t clamped = 0;
+        bias[e] = bs[e] = nslm_choose_bias(w0[e], (int64_t) nb, &clamped);
+        sp[e] = seed + (size_t) e * nb; cp[e] = nib + (size_t) e * nb; ep[e] = ec + (size_t) e * nb;
+        double* h = read_xtx(l, p, shared ? 0 : e, cols, shared ? 1 : E);
+        U[e] = (double*) malloc(sizeof(double) * (size_t) cols * cols);
+        if (!h) { snprintf(err, (size_t) errlen, "no X^T X"); rc = -1; break; }
+        if (nslm_gptq_factor(h, cols, g_damp, U[e], NULL)) { snprintf(err, (size_t) errlen, "H + damp not positive definite"); rc = -1; }
+        free(h);
+    }
+    GptqCtx ctx = {gpu4, *o4};
+    if (!rc) rc = nslm4_gptq(gptq_search, &ctx, E, rows, cols, W, (const double* const*) U, bs, sp, cp, ep, err, errlen);
+    for (int e = 0; e < E; ++e) { free(W[e]); free(U[e]); }
+    free(W); free(U); free(sp); free(cp); free(ep); free(bs);
+    return rc;
+}
 
 static int blk_done(const char* path, const SearchOpts* o, double n0, MoeBlkHeader* h) {
     FILE* f = fopen(path, "rb");
@@ -301,7 +369,38 @@ static void* job_worker(void* arg) {
         float* er = (float*) malloc(4 * nb), *hh = (float*) malloc(4 * (size_t) cols), *sh = (float*) malloc(4 * (size_t) cols);
         const double t0 = now_s();
         double gsearch = 0;
-        for (int e = 0; e < E; ++e) {
+        if (g_xtx && p >= P_KAX) {   // GPTQ: every slice at once, then the same error report as below
+            float** w0 = (float**) calloc((size_t) E, sizeof(float*));
+            for (int e = 0; e < E && !atomic_load(&j->failed); ++e) {
+                tensor_name(name, sizeof name, l, p, e);
+                if (!(w0[e] = load_tensor(name, rows, cols, E > 1 ? E : 1, e))) atomic_store(&j->failed, 1);
+            }
+            const Search4Opts o4 = {j->o->n_seeds, j->o->n_exp, {j->o->exp_delta[0], j->o->exp_delta[1], j->o->exp_delta[2]}, j->o->refit};
+            if (!atomic_load(&j->failed) && gptq_job(gpu4, &o4, l, p, rows, cols, E, nb, bias, seed, nib, ec, w0, err, sizeof err)) {
+                fprintf(stderr, "L%d %s: %s\n", l, kProj[p], err);
+                atomic_store(&j->failed, 1);
+            }
+            gsearch = now_s() - t0;
+            for (int e = 0; e < E && !atomic_load(&j->failed); ++e) {
+                act_h(l, p, e, j->n0, hh);
+                double se = 0, sw = 0, wse = 0, wsw = 0;
+                for (size_t b = 0; b < nb; ++b) {
+                    uint16_t bf[NSLM_C];
+                    nslm4_decode_block(seed[(size_t) e * nb + b], nib[(size_t) e * nb + b], bias[e] + ec[(size_t) e * nb + b], bf);
+                    const int c0 = (int) (b % (size_t) (cols / NSLM_C)) * NSLM_C;
+                    for (int c = 0; c < NSLM_C; ++c) {
+                        const double x = w0[e][b * NSLM_C + c], d = x - nslm_bf2f(bf[c]);
+                        se += d * d; sw += x * x;
+                        wse += hh[c0 + c] * d * d; wsw += hh[c0 + c] * x * x;
+                    }
+                }
+                rel[e] = (float) sqrt(se / sw);
+                wrel[e] = (float) sqrt(wse / wsw);
+            }
+            for (int e = 0; e < E; ++e) free(w0[e]);
+            free(w0);
+        }
+        for (int e = 0; e < E && !(g_xtx && p >= P_KAX); ++e) {
             if (j->e1 >= 0 && (e < j->e0 || e > j->e1)) continue;
             tensor_name(name, sizeof name, l, p, e);
             float* w = load_tensor(name, rows, cols, E > 1 && p >= P_KAX ? E : 1, e);
@@ -511,6 +610,10 @@ int main(int argc, char** argv) {
     int la = g_l0, lb = g_l0 + g_nl - 1;
     if (opt(argc, argv, "--layers", NULL)) sscanf(opt(argc, argv, "--layers", NULL), "%d-%d", &la, &lb);
     if ((mask >> P_KAX & 1) != g_mla.on) { fprintf(stderr, "--scope mla goes with an MLA capture (nslm-mova-mlacapture), and only it\n"); return 2; }
+    g_xtx = opt(argc, argv, "--xtx", NULL);
+    g_damp = atof(opt(argc, argv, "--damp", "0.01"));
+    if (g_xtx && (!g_mla.on || !g_p4)) { fprintf(stderr, "--xtx goes with --scope mla --p4\n"); return 2; }
+    if (g_xtx) printf("GPTQ over X^T X from %s, damp %.3g\n", g_xtx, g_damp);
     static JobItem items[64 * NPROJ];
     int n = 0;
     for (int l = la; l <= lb; ++l)
