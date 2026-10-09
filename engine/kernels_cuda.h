@@ -119,12 +119,13 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T);
 // MLA (TransMLA; kernels_moe.metal MlaArgs, HmvArgs).  The KvView of an MLA layer: k the RoPE key (128 per position),
 // v the latent (a.r per position); BF16, or FP8 / FP4 codes with ks / vs their block scales (kv.fmt; a.r a multiple of 32).
-// per-head maps: y[t][h][o] = bf16(W_h[o] . x[t * a.xs + h * a.hs ..]) (W BF16 [H][O][I], I a multiple of 32); with g
+// per-head maps: y[t][h][o] = bf16(W_h[o] . x[t * a.xs + h * a.hs ..]) (W [H][O][I] in fmt MF_BF16, or MF_Q8 / MF_Q4 with
+// W.p codes, scales, biases per 64 as nslm/model_st.h; I a multiple of 32, of 64 for Q8 / Q4); with g
 // (y's layout): bf16(that * bf16(softplus_ln2(g)))
-void kc_heads_mv(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T);
+void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T);
 // the same on tensor cores (any T; prompt rows): BF16 mma, f32 sums.  -1 (nothing launched) unless a.I is a multiple of
 // MMT_BK and the strides of 4 floats.  kc_heads_mv takes it for T > MV_MAXT.
-int kc_heads_mm(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T);
+int kc_heads_mm(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T);
 // RoPE of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into kv.k; the latent c [T][r] into kv.v
 void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const float* c, KvView kv, const RowInfo* ri,
                  const float* inv, int T);
@@ -132,10 +133,11 @@ void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const fl
 // (r + 2) floats) and reduces; 1 is one pass
 void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, KvView kv, const RowInfo* ri, float* part,
                  float* olat, int T);
-// MLA prompt rows without absorption.  Decompression: keys [k_lo, k_hi) of the slot at cache row kv0 into
+// MLA prompt rows without absorption.  Decompression (q_lat [H][r][128], v_up [H][128][r] in wfmt, as kc_heads_mv's W):
+// keys [k_lo, k_hi) of the slot at cache row kv0 into
 // Kn = bf16(q_lat_h^T c) and Vd = bf16(v_up_h c) ([key - kb0][n_head][128] BF16; a.r a multiple of 32)
-void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, const uint16_t* Wql,
-                   const uint16_t* Wvu, uint16_t* Kn, uint16_t* Vd);
+void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int wfmt, WSlice Wql,
+                   WSlice Wvu, uint16_t* Kn, uint16_t* Vd);
 // Attention of T consecutive prompt rows of one slot over keys [kb0, kb1) (in Kn / Vd): scores scale (q . Kn + qr . kr),
 // causal softmax, P Vd; first starts the state, else reads it from st ([T][n_head][130] f32: m, l, O); last writes
 // o = bf16(bf16(O / l) * softplus_ln2(g)) ([T][n_head][128]), else the state

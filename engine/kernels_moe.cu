@@ -967,21 +967,41 @@ __global__ void k_kv_f32(int fmt, const uint8_t* C, const uint8_t* S, int n, int
 // ---- MLA (TransMLA): per-head maps, RoPE + latent cache write, latent attention ---------------------------------------
 // The KvView of an MLA layer: k holds the RoPE key (ATT_HD BF16 per position), v the latent (r BF16 per position).
 
+// Values e .. e + 3 / e .. e + 7 (e a multiple of 4 / 8) of a BF16, Q8 or Q4 tensor (w.p: values, or codes, BF16 scales
+// and biases per 64; nslm/model_st.h), as wblock dequantizes them: bf16(scale x code + bias), exact BF16 values.
+static __device__ __forceinline__ float4 welem4(int fmt, const WSlice& w, size_t e) {
+    if (fmt == MF_BF16) {
+        const uint2 u = *(const uint2*) ((const uint16_t*) w.p[0] + e);
+        return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000u), __uint_as_float(u.y << 16),
+                           __uint_as_float(u.y & 0xFFFF0000u));
+    }
+    const float sc = bf(((const uint16_t*) w.p[1])[e / 64]), bi = bf(((const uint16_t*) w.p[2])[e / 64]);
+    const uint32_t q = fmt == MF_Q8 ? *(const uint32_t*) ((const uint8_t*) w.p[0] + e) : *(const uint16_t*) ((const uint8_t*) w.p[0] + e / 2);
+    const int b = fmt == MF_Q8 ? 8 : 4;
+    const uint32_t m = (1u << b) - 1u;
+    return make_float4(bfr(sc * (float) (q & m) + bi), bfr(sc * (float) ((q >> b) & m) + bi), bfr(sc * (float) ((q >> 2 * b) & m) + bi),
+                       bfr(sc * (float) ((q >> 3 * b) & m) + bi));
+}
+static __device__ __forceinline__ uint4 welem8(int fmt, const WSlice& w, size_t e) {
+    if (fmt == MF_BF16) return *(const uint4*) ((const uint16_t*) w.p[0] + e);
+    const float4 a = welem4(fmt, w, e), b = welem4(fmt, w, e + 4);
+    return make_uint4(pack_bf2(a.x, a.y), pack_bf2(a.z, a.w), pack_bf2(b.x, b.y), pack_bf2(b.z, b.w));
+}
+
 // Per-head maps (q_rope_mix, q_lat, v_up): warp = (output row o, head h, token t); lanes take 4 inputs at a time
-// (I is a multiple of 32); f32 sums.  y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] . x) *
-// bf16(softplus_ln2(g[t][h][o]))).  Block = 8 output rows; grid (ceil(O / 8), H, T).
+// (I is a multiple of 32; Q8 / Q4: of 64); f32 sums.  y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] .
+// x) * bf16(softplus_ln2(g[t][h][o]))).  W BF16, Q8 or Q4 (welem4).  Block = 8 output rows; grid (ceil(O / 8), H, T).
 #define HMV_ROWS 8
-__global__ void __launch_bounds__(32 * HMV_ROWS) k_heads_mv(HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y) {
+__global__ void __launch_bounds__(32 * HMV_ROWS) k_heads_mv(HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y) {
     const int lane = threadIdx.x & 31, o = (int) blockIdx.x * HMV_ROWS + (threadIdx.x >> 5), h = (int) blockIdx.y, t = (int) blockIdx.z;
     if (o >= a.O) return;   // whole warps
-    const uint16_t* w = W + ((size_t) h * a.O + o) * a.I;
+    const size_t w0 = ((size_t) h * a.O + o) * a.I;
     const float* xv = x + (size_t) t * a.xs + (size_t) h * a.hs;
     float s = 0;
     for (int i = lane * 4; i < a.I; i += 128) {
-        const uint2 u = *(const uint2*) (w + i);
+        const float4 wf = welem4(fmt, W, w0 + i);
         const float4 xf = *(const float4*) (xv + i);
-        s += __uint_as_float(u.x << 16) * xf.x + __uint_as_float(u.x & 0xFFFF0000u) * xf.y + __uint_as_float(u.y << 16) * xf.z +
-             __uint_as_float(u.y & 0xFFFF0000u) * xf.w;
+        s += wf.x * xf.x + wf.y * xf.y + wf.z * xf.z + wf.w * xf.w;
     }
     s = warp_sum(s);
     if (lane == 0) {
@@ -1134,15 +1154,17 @@ __global__ void __launch_bounds__(128) k_mla_reduce(MlaArgs a, const float* part
 }
 
 // Per-head maps of prompt rows (T > MV_MAXT) on tensor cores: head blockIdx.z's [T x I] x [I x O] through the dense
-// GEMM body (the inputs are BF16 values and the weights BF16: exact products, f32 sums, as k_heads_mv), the gate fused.
-__global__ void __launch_bounds__(MMT_THREADS) k_heads_mm(HmvArgs h, MmArgs a, const uint16_t* W, const float* X, const float* g,
+// GEMM body (the inputs are BF16 values and the weights BF16 values, Q8 / Q4 dequantized as wblock: exact products, f32
+// sums, as k_heads_mv), the gate fused.  A head's streams: its O x I values (codes), scales and biases.
+__global__ void __launch_bounds__(MMT_THREADS) k_heads_mm(HmvArgs h, MmArgs a, int fmt, WSlice W, const float* X, const float* g,
                                                           float* Y) {
-    const int hd = (int) blockIdx.z;
+    const size_t n = (size_t) h.O * h.I * (size_t) blockIdx.z;   // values before this head
     WSlice w;
     memset(&w, 0, sizeof w);
-    w.p[0] = W + (size_t) hd * h.O * h.I;
-    mm_body<1>(MF_BF16, a, w, NULL, X + (size_t) hd * h.hs, Y + (size_t) hd * h.O, NULL, NULL, NULL, NULL,
-               h.gate ? g + (size_t) hd * h.O : NULL);
+    w.p[0] = (const uint8_t*) W.p[0] + (fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : n / 2);
+    if (fmt != MF_BF16) { w.p[1] = (const uint16_t*) W.p[1] + n / 64; w.p[2] = (const uint16_t*) W.p[2] + n / 64; }
+    mm_body<1>(fmt, a, w, NULL, X + (size_t) blockIdx.z * h.hs, Y + (size_t) blockIdx.z * h.O, NULL, NULL, NULL, NULL,
+               h.gate ? g + (size_t) blockIdx.z * h.O : NULL);
 }
 
 // Latent attention on tensor cores (absorbed MLA is multi-query attention over the latent: every head reads the same
@@ -1413,8 +1435,8 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
 #define MLD_ALD (MLD_BJ + 8)
 #define MLD_KLD (ATT_HD + 8)   // K weights staged [j][d]
 #define MLD_VLD (MLD_BJ + 8)   // V weights staged [d][j]
-__global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, const uint16_t* Wql,
-                                                   const uint16_t* Wvu, uint16_t* Kn, uint16_t* Vd) {
+__global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int wfmt, WSlice Wql,
+                                                   WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
     __shared__ __align__(16) uint16_t As[MLD_BK * MLD_ALD];
     __shared__ __align__(16) uint16_t Bs[MLD_BJ * MLD_KLD > ATT_HD * MLD_VLD ? MLD_BJ * MLD_KLD : ATT_HD * MLD_VLD];
     const int h = (int) blockIdx.y, isv = (int) blockIdx.z, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -1433,12 +1455,12 @@ __global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv
         if (!isv)
             for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[j][d] = q_lat[h][j0 + j][d]
                 const int j = c >> 4, d8 = (c & 15) * 8;
-                *(uint4*) &Bs[j * MLD_KLD + d8] = *(const uint4*) (Wql + ((size_t) h * r + j0 + j) * ATT_HD + d8);
+                *(uint4*) &Bs[j * MLD_KLD + d8] = welem8(wfmt, Wql, ((size_t) h * r + j0 + j) * ATT_HD + d8);
             }
         else
             for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[d][j] = v_up[h][d][j0 + j]
                 const int d = c >> 2, j8 = (c & 3) * 8;
-                *(uint4*) &Bs[d * MLD_VLD + j8] = *(const uint4*) (Wvu + ((size_t) h * ATT_HD + d) * r + j0 + j8);
+                *(uint4*) &Bs[d * MLD_VLD + j8] = welem8(wfmt, Wvu, ((size_t) h * ATT_HD + d) * r + j0 + j8);
             }
         __syncthreads();
 #pragma unroll
@@ -1952,16 +1974,16 @@ void kc_attn(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInf
 void kc_attn_prefill(cudaStream_t s, AttnArgs a, const float* q, KvView kv, const RowInfo* ri, const float* g, float* o, int T) {
     k_attn_prefill_tc<<<dim3((unsigned) (T + FA_ROWS * FA_RG - 1) / (FA_ROWS * FA_RG), (unsigned) a.n_kv), 32 * ATTF_G * FA_RG, 0, s>>>(a, q, kv, ri, g, o, T);
 }
-int kc_heads_mm(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T) {
+int kc_heads_mm(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T) {
     if (a.I % MMT_BK || a.xs % 4 || a.hs % 4) return -1;
     const MmArgs m = {a.I, a.O, T, a.xs, a.H * a.O, 1, a.gate ? 2 : 0, 0};
     k_heads_mm<<<dim3((unsigned) (a.O + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN, (unsigned) a.H), MMT_THREADS, 0, s>>>(
-        a, m, W, x, g, y);
+        a, m, fmt, W, x, g, y);
     return 0;
 }
-void kc_heads_mv(cudaStream_t s, HmvArgs a, const uint16_t* W, const float* x, const float* g, float* y, int T) {
-    if (T > MV_MAXT && !kc_heads_mm(s, a, W, x, g, y, T)) return;   // more rows than a matvec takes: the GEMM
-    k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, W, x, g ? g : x, y);
+void kc_heads_mv(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, const float* g, float* y, int T) {
+    if (T > MV_MAXT && !kc_heads_mm(s, a, fmt, W, x, g, y, T)) return;   // more rows than a matvec takes: the GEMM
+    k_heads_mv<<<dim3((unsigned) (a.O + HMV_ROWS - 1) / HMV_ROWS, (unsigned) a.H, (unsigned) T), 32 * HMV_ROWS, 0, s>>>(a, fmt, W, x, g ? g : x, y);
 }
 void kc_kv_f32(cudaStream_t s, int fmt, const uint8_t* codes, const uint8_t* scales, int n, int rows, float* y) {
     k_kv_f32<<<(unsigned) ((n * rows / 8 + 127) / 128), 128, 0, s>>>(fmt, codes, scales, n, rows, y);
@@ -1995,11 +2017,11 @@ void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, Kv
         a, ql, qr, kv, ri, a.n_splits > 1 ? part : olat);
     if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
 }
-void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, const uint16_t* Wql,
-                   const uint16_t* Wvu, uint16_t* Kn, uint16_t* Vd) {
+void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int wfmt, WSlice Wql,
+                   WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
     if (k_hi <= k_lo) return;
     k_mla_decomp<<<dim3((unsigned) (k_hi - k_lo + MLD_BK - 1) / MLD_BK, (unsigned) a.n_head, 2), 256, 0, s>>>(a, kv, kv0, kb0, k_lo, k_hi,
-                                                                                                         Wql, Wvu, Kn, Vd);
+                                                                                                         wfmt, Wql, Wvu, Kn, Vd);
 }
 void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri, const uint16_t* Kn,
                     const uint16_t* Vd, int kb0, int kb1, int first, int last, float* st, const float* g, float* o, int T) {

@@ -511,7 +511,7 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
     const int f = nt->enc;
     const int ok = t->kind == MOVA_K_EXPERTS ? 1
                    : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
-                      t->kind == MOVA_K_HEADS) ? f == MF_BF16
+                      t->kind == MOVA_K_HEADS) ? f == MF_BF16 || (t->kind == MOVA_K_HEADS && (f == MF_Q8 || f == MF_Q4) && nt->cols % 64 == 0)
                    : t->kind == MOVA_K_EMBED ? (f == MF_BF16 || f == MF_Q8)
                    : f != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
     if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, f); return -1; }
@@ -966,7 +966,7 @@ static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
 // MLA per-head maps (kc_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by G (y's layout)
 static void enc_heads_mv(Eng* e, const MW* W, const float* X, int xs, int hs, const float* G, float* Y, int T) {
     const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != NULL, {0}};
-    if (!e->prompt || kc_heads_mm(e->st, a, (const uint16_t*) W->w0.p[0], X, G, Y, T)) kc_heads_mv(e->st, a, (const uint16_t*) W->w0.p[0], X, G, Y, T);
+    if (!e->prompt || kc_heads_mm(e->st, a, W->fmt, W->w0, X, G, Y, T)) kc_heads_mv(e->st, a, W->fmt, W->w0, X, G, Y, T);
 }
 
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v), as Metal's
@@ -992,7 +992,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
             const int kb1 = max_ctx - kb0 < e->dec_keys ? max_ctx : kb0 + e->dec_keys;
             // the keys before this chunk stay decompressed while one layer's chunks follow each other (layer-major)
             const int lo = kb0 == 0 && e->dec_l == l && e->dec_kv0 == kv0 ? (e->dec_n < pos0 ? e->dec_n : pos0) : kb0;
-            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, (const uint16_t*) L->ql.w0.p[0], (const uint16_t*) L->vu.w0.p[0],
+            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, L->ql.fmt, L->ql.w0, L->vu.w0,
                           e->dec_k, e->dec_v);
             e->dec_l = kb0 == 0 ? l : -1;
             e->dec_kv0 = kv0;

@@ -275,8 +275,10 @@ int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, 
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
     float* dy = (float*) dev(NULL, yn);
-    kc_heads_mv(0, a, (const uint16_t*) dev(W, 2 * (size_t) H * O * I), (const float*) dev(x, xn), g ? (const float*) dev(g, yn) : NULL,
-                dy, T);
+    WSlice w;
+    memset(&w, 0, sizeof w);
+    w.p[0] = dev(W, 2 * (size_t) H * O * I);
+    kc_heads_mv(0, a, MF_BF16, w, (const float*) dev(x, xn), g ? (const float*) dev(g, yn) : NULL, dy, T);
     return done("kc_heads_mv", y, dy, yn);
 }
 // The MLA cache (RoPE keys [npos][128], latents [npos][r]) split in two segments at npos / 2, as the engine's VRAM and
@@ -332,7 +334,12 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
     float* dout = (float*) dev(NULL, qn);
     for (int kb0 = 0; kb0 < end; kb0 += dec_keys) {
         const int kb1 = end - kb0 < dec_keys ? end : kb0 + dec_keys;
-        kc_mla_decomp(0, a, kv, kv0, kb0, kb0, kb1, dql, dvu, Kn, Vd);
+        WSlice wq, wv;
+        memset(&wq, 0, sizeof wq);
+        memset(&wv, 0, sizeof wv);
+        wq.p[0] = dql;
+        wv.p[0] = dvu;
+        kc_mla_decomp(0, a, kv, kv0, kb0, kb0, kb1, MF_BF16, wq, wv, Kn, Vd);
         const size_t off = (size_t) kb0 * a.n_head * 128, n = 2 * (size_t) (kb1 - kb0) * a.n_head * 128;
         if (fetch("kc_mla_decomp", Kn_out + off, Kn, n) || fetch("kc_mla_decomp", Vd_out + off, Vd, n)) return -1;
         kc_mla_prefill(0, a, dq, dqr, kv, dri, Kn, Vd, kb0, kb1, kb0 == 0, kb1 == end, st, dg, dout, T);
@@ -354,9 +361,66 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
     return done("kc_embed", x, dx, 4 * (size_t) n * d);
 }
 int kt_bf16_f32(const uint16_t* x, float* y, int n) { return 1; }   // Metal only so far
-int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) { return 1; }
+// The streams of an H x rows x cols tensor in fmt (BF16 values; Q8 / Q4 codes, then BF16 scales and biases per 64) on
+// the device
+static WSlice heads_dev(int fmt, int H, size_t n1, const void* codes, const uint16_t* scales, const uint16_t* biases) {
+    const size_t n = (size_t) H * n1;
+    WSlice w;
+    memset(&w, 0, sizeof w);
+    w.p[0] = dev(codes, fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : n / 2);
+    if (fmt != MF_BF16) { w.p[1] = dev(scales, n / 32); w.p[2] = dev(biases, n / 32); }
+    return w;
+}
+// Per-head maps by W_h transposed (W [H][I][O], O = 128, I a multiple of 32): the CUDA engine reads weights so only
+// inside k_mla_decomp (keys expanded by q_lat^T), so head h's inputs go in as the latent rows of a BF16 cache, and its
+// row of the expanded keys Kn[t][h] is y[t][h].  1 for other shapes.
+static int heads_t(int fmt, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
+                   const float* x, int xs, int hs, float* y, int T) {
+    if (O != 128 || I % 32) return 1;
+    uint16_t* c = (uint16_t*) malloc(2 * (size_t) T * I);
+    uint16_t* kn = (uint16_t*) malloc(2 * (size_t) T * H * 128);
+    const MlaArgs a = {H, I, 128, 1, 1.0f, {0}};
+    int rc = 0;
+    for (int h = 0; h < H && !rc; ++h) {
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < I; ++i) {
+                uint32_t u;
+                memcpy(&u, &x[(size_t) t * xs + (size_t) h * hs + i], 4);
+                c[(size_t) t * I + i] = (uint16_t) (u >> 16);   // the inputs are BF16 values
+            }
+        const WSlice w = heads_dev(fmt, H, (size_t) I * O, codes, scales, biases);
+        KvView kv;
+        memset(&kv, 0, sizeof kv);
+        kv.nv = T;
+        kv.fmt = KV_BF16;
+        kv.a.k = dev(NULL, 2 * (size_t) T * 128);
+        kv.a.v = dev(c, 2 * (size_t) T * I);
+        uint16_t* dK = (uint16_t*) dev(NULL, 2 * (size_t) T * H * 128), *dV = (uint16_t*) dev(NULL, 2 * (size_t) T * H * 128);
+        kc_mla_decomp(0, a, kv, 0, 0, 0, T, fmt, w, w, dK, dV);   // the V half reads w as [H][128][I]: not used
+        rc = done("kc_mla_decomp (transposed per-head maps)", kn, dK, 2 * (size_t) T * H * 128);
+        for (int t = 0; t < T && !rc; ++t)
+            for (int o = 0; o < O; ++o) {
+                const uint32_t u = (uint32_t) kn[((size_t) t * H + h) * 128 + o] << 16;
+                memcpy(&y[((size_t) t * H + h) * O + o], &u, 4);
+            }
+    }
+    free(c);
+    free(kn);
+    return rc;
+}
+int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) {
+    return heads_t(MF_BF16, H, O, I, W, NULL, NULL, x, xs, hs, y, T);
+}
 int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
-               const float* x, int xs, int hs, const float* g, float* y, int T) { return 1; }   // Metal only so far
+               const float* x, int xs, int hs, const float* g, float* y, int T) {
+    if (tr) return heads_t(fmt, H, O, I, codes, scales, biases, x, xs, hs, y, T);
+    const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
+    const HmvArgs a = {H, O, I, xs, hs, g != NULL, {0}};
+    float* dy = (float*) dev(NULL, yn);
+    kc_heads_mv(0, a, fmt, heads_dev(fmt, H, (size_t) O * I, codes, scales, biases), (const float*) dev(x, xn),
+                g ? (const float*) dev(g, yn) : NULL, dy, T);   // T > 8: the prompt GEMM
+    return done("kc_heads_mv (Q8 / Q4)", y, dy, yn);
+}
 // An FP8 / FP4 MLA cache (nslm/kvq.h: the RoPE key all FP8; the latent FP8, or FP4 past its first KVQ_FP4_LEAD values),
 // codes and scales on the device, split in two segments at npos / 2 as mla_kv
 static int mla_lead_(int fmt, int r) { return fmt == KV_FP4 && r > KVQ_FP4_LEAD ? KVQ_FP4_LEAD : r; }
