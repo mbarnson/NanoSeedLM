@@ -2,6 +2,7 @@
 // block file per (layer, projection)), and their expansion to BF16 safetensors.
 //
 //   nslm-moe --model DIR --act FILE --out DIR [--scope gu|gud|d|v|dv|all|mla] [--workers 4] [--n0 64] [--layers A-B] [--shard I/N]
+//            [--proj NAMES]   (comma-separated projections of the scope, e.g. v_up)
 //            [--res DIR] [--seeds 65535] [--weighting plain|w2] [--experts A-B] [--no-prune] [--p4]
 //       writes OUT/L{l}_{proj}.blk (.blk4 with --p4), proj = gate_proj|up_proj|down_proj|v_experts, so all scopes can
 //       share one directory; --res holds search.metallib / search4.metallib (default out/res); --weighting w2 weights
@@ -671,10 +672,17 @@ int main(int argc, char** argv) {
     if (g_xtx && (!g_mla.on || !(g_p4 || g_pc))) { fprintf(stderr, "--xtx goes with --scope mla --p4 (or --codec p3|p8)\n"); return 2; }
     if (g_xtx) printf("GPTQ over X^T X from %s, damp %.3g\n", g_xtx, g_damp);
     static JobItem items[64 * NPROJ];
+    char projs_buf[256], *projs = NULL;
+    if (opt(argc, argv, "--proj", NULL)) { snprintf(projs_buf, sizeof projs_buf, ",%s,", opt(argc, argv, "--proj", NULL)); projs = projs_buf; }
     int n = 0;
     for (int l = la; l <= lb; ++l)
         for (int p = 0; p < NPROJ; ++p) {
             if (!(mask >> p & 1)) continue;
+            if (projs) {   // --proj NAMES: only these projections
+                char pat[64];
+                snprintf(pat, sizeof pat, ",%s,", kProj[p]);
+                if (!strstr(projs, pat)) continue;
+            }
             char nm[128], file[128];
             tensor_name(nm, sizeof nm, l, p, 0);
             if (p >= P_KAX && nslm_moe_index_lookup(g_index, nm, file, sizeof file)) continue;   // kv_a_v: MoVA layers only

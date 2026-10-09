@@ -19,6 +19,7 @@ JOBS=${JOBS:-"moe3 dense3 dense4"}
 WORKERS=${WORKERS:-8}
 MOE_EXTRA=${MOE_EXTRA:-}
 DENSE_EXTRA=${DENSE_EXTRA:-}
+MLA_EXTRA=${MLA_EXTRA:-}   # e.g. "--proj v_up"
 LOG=${LOG:-$OUT/log}   # per-GPU logs (one directory per job when jobs share OUT); written locally, copied at the end
 FINAL_LOG=$LOG
 LOG=/tmp/seedbank-log
@@ -65,7 +66,7 @@ run_gpu() {   # one GPU: its shard of every job, in order
                     --shard "$g/$GPUS" --workers "$WORKERS" $DENSE_EXTRA ;;
             mla3|mla4|mla8)
                 "$BIN/nslm-moe" --model "$MODEL" --act /tmp/mlacap/actsq_mla.bin --scope mla --xtx /tmp/mlacap/xtx \
-                    $([ "$j" = mla4 ] && echo --p4 || echo --codec "p${j#mla}") --out "$OUT/mla-p${j#mla}" --shard "$g/$GPUS" --workers "$WORKERS" ;;
+                    $([ "$j" = mla4 ] && echo --p4 || echo --codec "p${j#mla}") --out "$OUT/mla-p${j#mla}" --shard "$g/$GPUS" --workers "$WORKERS" $MLA_EXTRA ;;
             *) echo "unknown job $j"; return 1 ;;
         esac
         echo "== $j gpu $g: $(( $(date +%s) - t0 )) s"
