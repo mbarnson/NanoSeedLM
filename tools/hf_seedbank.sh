@@ -7,7 +7,7 @@
 # bounds the expert searches).
 #
 #   SRC=/src MODEL=IFM/K2-Horizon-MoVA-36B-A4B@cca48b6 ACT=/in/actsq_moe.bin XTX=/in/xtx OUT=/out [JOBS="moe3 dense3 dense4"] [GPUS=n] \
-#     [WORKERS=8] [MOE_EXTRA="--layers 20-20"] [DENSE_EXTRA="--only layers.20."] bash tools/hf_seedbank.sh
+#     [WORKERS=8] [LOG=$OUT/log] [MOE_EXTRA="--layers 20-20"] [DENSE_EXTRA="--only layers.20."] bash tools/hf_seedbank.sh
 #
 # JOBS: moe3 / moe4 routed and value experts (nslm-moe --scope all, AW) at P = 3 / 4; dense3 / dense4 / dense8 the dense
 # tensors (nslm-dense --mode gptq) at P = 3 / 4 / 8.  MOE_EXTRA / DENSE_EXTRA: more options (e.g. one layer, for a benchmark).
@@ -17,7 +17,8 @@ JOBS=${JOBS:-"moe3 dense3 dense4"}
 WORKERS=${WORKERS:-8}
 MOE_EXTRA=${MOE_EXTRA:-}
 DENSE_EXTRA=${DENSE_EXTRA:-}
-mkdir -p "$OUT/log"
+LOG=${LOG:-$OUT/log}   # per-GPU logs (one directory per job when jobs share OUT)
+mkdir -p "$LOG"
 if ! command -v cmake >/dev/null || [ ! -e /usr/include/unicode/unorm2.h ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cmake libicu-dev python3-pip >/dev/null 2>&1
@@ -34,7 +35,7 @@ rm -rf /work && cp -r "$SRC" /work
 cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
 cmake --build /work/build -j "$(nproc)" --target nslm-moe nslm-dense 2>&1 | grep -E "error" || true
 BIN=/work/build/bin
-nvidia-smi --query-gpu=index,name,memory.total --format=csv | tee "$OUT/log/gpus.csv"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv | tee "$LOG/gpus.csv"
 
 run_gpu() {   # one GPU: its shard of every job, in order
     local g=$1 t0 j
@@ -53,10 +54,10 @@ run_gpu() {   # one GPU: its shard of every job, in order
 }
 pids=()
 for g in $(seq 0 $((GPUS - 1))); do
-    CUDA_VISIBLE_DEVICES=$g run_gpu "$g" >"$OUT/log/gpu$g.log" 2>&1 &
+    CUDA_VISIBLE_DEVICES=$g run_gpu "$g" >"$LOG/gpu$g.log" 2>&1 &
     pids+=($!)
 done
 rc=0
 for p in "${pids[@]}"; do wait "$p" || rc=1; done
-grep -h "^== " "$OUT"/log/gpu*.log
+grep -h "^== " "$LOG"/gpu*.log
 exit $rc
