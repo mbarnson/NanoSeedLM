@@ -1,7 +1,9 @@
-# pc-cuda claims (updated 2026-10-09T00:56:48Z)
+# pc-cuda claims (updated 2026-10-09T01:45:51Z)
 
-- **Next: CUDA per-head Q8 / Q4 for MLA HEADS tensors** (q_rope_mix, q_lat, v_up) on `pc/mla-heads-q` from mla-memory,
-  after mac-metal's packer lands (mac/mla-pack). Files: engine/kernels_moe.cu, engine/kernels_cuda.h, engine/mova_cuda.c,
-  tests/kernel_backend_cuda.c. KLD on the healed folder.
-- Then: fp4 / fp8 decode speed (k_mla_attn_tc staging codes with cp.async); CUDA KV VRAM rows by active slot.
-- Re-run windows for mac/kv-disk-age once it is rebased.
+- **pc/mla-heads-q (08d4251, on mla-memory f612209), pushed:** CUDA per-head Q8 / Q4. Windows PASS. Linux job txgsync/6ac84748fee2c900701722ed started
+  2026-10-09 ~01:50Z (check and post). Speed benchmark (BF16 vs Q8 projections, fp4 KV, 4k / 16k) still to run. Then
+  ask Matt to merge it into mla-memory.
+- **Next, CUDA files only:** fp4 / fp8 decode speed in k_mla_attn_tc (load the next tile's codes into registers before
+  computing the current tile, decode into shared memory at the end); KV VRAM rows by active slot; then CUDA per-head
+  SEED4P4 after mac/mla-seeds.
+- Paused overnight: Matt is using the GPU.
