@@ -3,7 +3,10 @@
 # process per GPU through every search in JOBS, each GPU on its --shard of the tensors.  Finished files are skipped, so
 # a rerun resumes.  Logs and the search outputs go to OUT.
 #
-#   SRC=/src MODEL=/model ACT=/in/actsq_moe.bin XTX=/in/xtx OUT=/out [JOBS="moe3 dense3 dense4"] [GPUS=n] \
+# MODEL is a local folder, or REPO@REVISION (downloaded to local disk first: the Hub mount reads at a few MB/s, which
+# bounds the expert searches).
+#
+#   SRC=/src MODEL=IFM/K2-Horizon-MoVA-36B-A4B@cca48b6 ACT=/in/actsq_moe.bin XTX=/in/xtx OUT=/out [JOBS="moe3 dense3 dense4"] [GPUS=n] \
 #     [WORKERS=8] [MOE_EXTRA="--layers 20-20"] [DENSE_EXTRA="--only layers.20."] bash tools/hf_seedbank.sh
 #
 # JOBS: moe3 / moe4 routed and value experts (nslm-moe --scope all, AW) at P = 3 / 4; dense3 / dense4 / dense8 the dense
@@ -17,7 +20,15 @@ DENSE_EXTRA=${DENSE_EXTRA:-}
 mkdir -p "$OUT/log"
 if ! command -v cmake >/dev/null || [ ! -e /usr/include/unicode/unorm2.h ]; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cmake libicu-dev >/dev/null 2>&1
+    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cmake libicu-dev python3-pip >/dev/null 2>&1
+fi
+if [ ! -d "$MODEL" ]; then
+    command -v pip >/dev/null || { apt-get install -y -qq python3-pip >/dev/null 2>&1; }
+    pip install -q --break-system-packages "huggingface_hub[hf_xet]" >/dev/null 2>&1
+    t0=$(date +%s)
+    hf download "${MODEL%@*}" --revision "${MODEL#*@}" --local-dir /model --max-workers 16 >/dev/null
+    echo "model download: $(( $(date +%s) - t0 )) s, $(du -sh /model | cut -f1)"
+    MODEL=/model
 fi
 rm -rf /work && cp -r "$SRC" /work
 cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
