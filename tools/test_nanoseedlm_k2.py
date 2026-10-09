@@ -48,7 +48,7 @@ def ref_decode(seeds, coefs, codes, bias):
 
 
 def ref_decode8(seeds, coefs, codes, bias):
-    """P = 8 blocks (search8.h): 64 states, 8 int4 coefficients in a 32-bit word."""
+    """P = 8 blocks (searchp.h): 64 states, 8 int4 coefficients in a 32-bit word."""
     e, n, kb = seeds.shape
     s, c, k = seeds.reshape(-1), coefs.reshape(-1), codes.reshape(-1)
     out = np.empty((s.size, 8), np.float32)

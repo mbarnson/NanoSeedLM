@@ -353,7 +353,7 @@ static inline float seed4_dot(thread const float (&v)[32], uint cw, int e, float
     return e2 * ((((q0 * d0 + q1 * d1) + q2 * d2) + q3 * d3) + (((q0 + q1) + q2) + q3) * xm);
 }
 static inline int seed4_ecode(device const uchar* EN, ulong k) { return (EN[k >> 1] >> ((k & 1) * 4)) & 15; }
-// SEED6P8, 6.5-bit P = 8 blocks (nslm/search8.h): 64 states; states 33..64 are states 1..32 of the seed s2 = state 32
+// SEED6P8, 6.5-bit P = 8 blocks (nslm/searchp.h): 64 states; states 33..64 are states 1..32 of the seed s2 = state 32
 // = G[s] >> 16, so two stream-table words give them all.  seed8_dot as seed4_dot with 8 coefficients (32-bit word).
 static inline void seed8_states(uint s, device const uint* G, thread float (&v)[64]) {
     const uint g = G[s], s2 = g >> 16, g2 = G[s2], lo = s | (g << 16), lo2 = s2 | (g2 << 16);

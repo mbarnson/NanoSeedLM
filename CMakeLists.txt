@@ -60,7 +60,7 @@ target_link_libraries(nslm PUBLIC ${PLATFORM_LIBS})
 
 # ---- tests (pure C) -------------------------------------------------------------------------------------------------
 enable_testing()
-foreach(t affine kvq lfsr linalg model_st moe search search4 search8 sha256)
+foreach(t affine kvq lfsr linalg model_st moe search search4 searchp sha256)
   add_executable(test_${t} tests/test_${t}.c)
   target_link_libraries(test_${t} nslm)
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

@@ -14,7 +14,7 @@
 //            NAME.coefs    U16   [slices, rows, cols / 8]
 //            NAME.exp_bias I32   [slices]
 //            NAME.codes    U8    [slices, rows, cols / 16]   (4-bit exponent codes, low nibble first)
-//   SEED6P8  as SEED4P4 with NAME.coefs U32 [slices, rows, cols / 8]   (P = 8; search8.h)
+//   SEED6P8  as SEED4P4 with NAME.coefs U32 [slices, rows, cols / 8]   (P = 8; searchp.h)
 // The writer pads each header so the data starts on a 16 KiB page and puts entries whose size is a page multiple
 // first: those map into GPU buffers without a copy.
 #pragma once

@@ -43,7 +43,7 @@ typedef struct {
     uint8_t* p4nib;
     int32_t p4bias[3];
     double* p4w;                                   // SEED4P4: exact weights
-    uint16_t* p8seeds;                             // SEED6P8 (search8.h)
+    uint16_t* p8seeds;                             // SEED6P8 (searchp.h)
     uint32_t* p8coefs;
     uint8_t* p8nib;
     int32_t p8bias[3];
