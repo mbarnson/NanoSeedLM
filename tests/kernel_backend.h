@@ -77,6 +77,11 @@ int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, 
 // The same with W stored transposed, BF16 [H][I][O] (k_mm, prompt rows): y[t][h][o] = bf16(sum_i W_h[i][o] x_th[i]);
 // 1 where the backend lacks it
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T);
+// Per-head maps with W in fmt MF_BF16 / MF_Q8 / MF_Q4 (streams as nslm/model_st.h: codes, then a BF16 scale and bias
+// per 64 values; each head's O x I a whole number of groups): kt_heads_mv's maps (tr 0: W [H][O][I]; T <= 8 the decode
+// matvec, else the prompt GEMMs) or kt_heads_mm_t's (tr 1: W [H][I][O], T > 8; no gate).  1 where a backend lacks them.
+int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
+               const float* x, int xs, int hs, const float* g, float* y, int T);
 // rope of the query RoPE parts qr [T][n_head][128] (in place) and of kr [T][128] into Kc [npos][128], and the latent
 // c [T][r] into Vc [npos][r], at the rows' positions (k_mla_rope); the caches are updated
 int kt_mla_rope(MlaArgs a, float* qr, const float* kr, const float* c, uint16_t* Kc, uint16_t* Vc, int npos,

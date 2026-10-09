@@ -281,6 +281,13 @@ static inline void wblock(short fmt, device const uchar* W, device const ushort*
     }
 }
 
+// Element e (flat index) of a BF16 / Q8 / Q4 tensor (affine: bf16(scale x code + bias), a scale and bias per 64)
+static inline float welem(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, ulong e) {
+    if (fmt == MF_BF16) return bf(((device const ushort*) W)[e]);
+    const uint q = fmt == MF_Q8 ? (uint) W[e] : (uint) (W[e / 2] >> (4 * (e & 1))) & 15u;
+    return bfr(bf(S[e / 64]) * (float) q + bf(B[e / 64]));
+}
+
 // SEED4 block j of row r: returns 2^e times (sum_p q_p (x . V_p) + (sum_p q_p) xm), xm = -32768 sum(x); the caller
 // applies R32 per row.  States from the per-seed stream table G (lfsr_stream24).
 static inline void seed_states(uint s, uint g, thread float (&v)[24]) {
@@ -648,7 +655,18 @@ kernel void k_mm(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffe
     const int sr = (int) (sgi / 2) * 16, sn = (int) (sgi % 2) * 16;   // this simdgroup's 16 x 16 sub-tile
     // the input row of each of the tile's 32 columns (token or pair)
     for (int k0 = 0; k0 < a.K; k0 += MM_BK) {
-        if (FC_T == 2) {   // BF16 weights stored transposed [K][R] (R a multiple of 8): one k and 8 rows per thread
+        if (FC_T == 2 && FC_FMT != MF_BF16) {   // Q8 / Q4 weights stored transposed [K][R] (R a multiple of 64): a thread's
+            const int kk = (int) tid % 32, rb = ((int) tid / 32) * 8;   // 8 rows are consecutive codes of one group
+            const ulong e0 = (ulong) (k0 + kk) * a.R + r0 + rb;
+            if (r0 + rb < a.R) {
+                const float sc = bf(S[e0 / 64]), bi = bf(B[e0 / 64]);
+                const uint2 q = FC_FMT == MF_Q8 ? *(device const uint2*) (W + e0) : uint2(*(device const uint*) (W + e0 / 2), 0u);
+                for (int i = 0; i < 8; ++i) {
+                    const uint c = FC_FMT == MF_Q8 ? (i < 4 ? q.x >> (8 * i) : q.y >> (8 * (i - 4))) & 255u : (q.x >> (4 * i)) & 15u;
+                    Wt[(rb + i) * MM_BK + kk] = bfr(sc * (float) c + bi);
+                }
+            } else for (int i = 0; i < 8; ++i) Wt[(rb + i) * MM_BK + kk] = 0;
+        } else if (FC_T == 2) {   // BF16 weights stored transposed [K][R] (R a multiple of 8): one k and 8 rows per thread
             const int kk = (int) tid % 32, rb = ((int) tid / 32) * 8;
             if (r0 + rb < a.R) {
                 const uint4 w = *(device const uint4*) ((device const ushort*) W + (ulong) (k0 + kk) * a.R + r0 + rb);
@@ -975,15 +993,16 @@ kernel void k_attn_reduce(constant AttnArgs& a [[buffer(0)]], device const float
 // Per-head maps (q_rope_mix, q_lat, v_up): simdgroup = (output row o, head h, token t); lanes stride the input; f32 sums.
 // y[t][h][o] = bf16(W_h[o] . x), or with the gate bf16(bf16(W_h[o] . x) * bf16(softplus_ln2(g[t][h][o]))).
 // Grid (O * 32, H, T), threadgroups of 256.
-kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const ushort* W [[buffer(1)]], device const float* x [[buffer(2)]],
-                       device const float* g [[buffer(3)]], device float* y [[buffer(4)]], uint3 gid [[thread_position_in_grid]],
+kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const float* x [[buffer(2)]],
+                       device const float* g [[buffer(3)]], device float* y [[buffer(4)]], device const ushort* S [[buffer(5)]],
+                       device const ushort* B [[buffer(6)]], uint3 gid [[thread_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
     const int o = (int) gid.x / 32, h = (int) gid.y, t = (int) gid.z;
     if (o >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
-    device const ushort* w = W + ((ulong) h * a.O + o) * a.I;
+    const ulong w0 = ((ulong) h * a.O + o) * a.I;   // FC_FMT: BF16, Q8 or Q4 (welem)
     device const float* xv = x + (ulong) t * a.xs + (ulong) h * a.hs;
     float s = 0;
-    for (int i = (int) lane; i < a.I; i += 32) s += bf(w[i]) * xv[i];
+    for (int i = (int) lane; i < a.I; i += 32) s += welem(FC_FMT, W, S, B, w0 + (ulong) i) * xv[i];
     s = simd_sum(s);
     if (lane == 0) {
         const ulong yi = ((ulong) t * a.H + h) * a.O + o;

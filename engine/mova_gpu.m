@@ -288,7 +288,7 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         }
         const int ok = t->kind == MOVA_K_EXPERTS ? 1
                        : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
-                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16
+                          t->kind == MOVA_K_HEADS) ? w->fmt == MF_BF16 || (t->kind == MOVA_K_HEADS && (w->fmt == MF_Q8 || w->fmt == MF_Q4))
                        : t->kind == MOVA_K_EMBED ? (w->fmt == MF_BF16 || w->fmt == MF_Q8)
                        : w->fmt != MF_SEED4 || t->kind == MOVA_K_VEXPERTS || t->kind == MOVA_K_LINEAR || t->kind == MOVA_K_HEAD;
         if (!ok) { snprintf(err, (size_t) errlen, "%s: encoding %d not supported for this tensor", name, w->fmt); return -1; }
@@ -748,12 +748,14 @@ static int sync_cmd(Cmd* c) {
 // MLA per-head maps (k_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by g (same layout as y)
 static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
     const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != nil, {0}};
-    cpipe(c, pipe_(c->e, "k_heads_mv", 0, 0));
+    cpipe(c, pipe_(c->e, "k_heads_mv", W->fmt, 0));
     cbytes(c, 0, &a, sizeof a);
     cbuf(c, 1, W->b[0], W->o[0]);
     cbuf(c, 2, X, 0);
     cbuf(c, 3, G ? G : X, 0);
     cbuf(c, 4, Y, 0);
+    cbuf(c, 5, W->b[1] ? W->b[1] : W->b[0], W->o[1]);   // Q8 / Q4: scales, biases
+    cbuf(c, 6, W->b[2] ? W->b[2] : W->b[0], W->o[2]);
     [c->enc dispatchThreads:MTLSizeMake((NSUInteger) W->rows * 32, (NSUInteger) W->slices, (NSUInteger) T)
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
@@ -764,16 +766,18 @@ static void enc_heads_gemm(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs,
     Eng* e = c->e;
     const int H = W->slices, O = tr ? W->cols : W->rows, I = tr ? W->rows : W->cols;
     const MmArgs a = {I, O, T, xs, H * O, 1, G ? 2 : 0, 0};
-    cpipe(c, pipe_(e, "k_mm", MF_BF16, tr ? 2 : 1));
+    // one head's streams: BF16 values, or Q8 / Q4 codes with a BF16 scale and bias per 64
+    const uint64_t n = (uint64_t) O * I, cb = W->fmt == MF_BF16 ? 2 * n : W->fmt == MF_Q8 ? n : n / 2, sb = n / 64 * 2;
+    cpipe(c, pipe_(e, "k_mm", W->fmt, tr ? 2 : 1));
     cbytes(c, 0, &a, sizeof a);
-    cbuf(c, 2, W->b[0], 0);
-    cbuf(c, 3, W->b[0], 0);
     cbuf(c, 6, e->ids, 0);
     cbuf(c, 7, e->stab, 0);
     cbuf(c, 8, e->ids, 0);
     cbuf(c, 9, e->stab, 0);
     for (int h = 0; h < H; ++h) {
-        cbuf(c, 1, W->b[0], W->o[0] + (uint64_t) h * O * I * 2);
+        cbuf(c, 1, W->b[0], W->o[0] + (uint64_t) h * cb);
+        cbuf(c, 2, W->b[1] ? W->b[1] : W->b[0], W->b[1] ? W->o[1] + (uint64_t) h * sb : 0);
+        cbuf(c, 3, W->b[2] ? W->b[2] : W->b[0], W->b[2] ? W->o[2] + (uint64_t) h * sb : 0);
         cbuf(c, 4, X, (uint64_t) h * hs * 4);
         cbuf(c, 5, Y, (uint64_t) h * O * 4);
         cbuf(c, 10, G ? G : Y, (uint64_t) h * O * 4);

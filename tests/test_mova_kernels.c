@@ -757,6 +757,46 @@ static void test_mla(void) {
         CHECK(!bad, "per-head maps, transposed weights (T %d): %d mismatches", T, bad);
         free(W); free(x); free(y);
     }
+    {   // per-head maps in Q8 / Q4 (affine, a scale and bias per 64): against the scalar sum over the dequantized weights
+        enum { H = 3 };
+        static const struct { int O, I, T, tr, gate; } C[5] = {{96, 128, 3, 0, 0}, {128, 192, 5, 0, 1}, {96, 128, 20, 0, 0},
+                                                               {128, 192, 37, 0, 1}, {128, 192, 37, 1, 0}};
+        for (int f = 0; f < 2; ++f)
+            for (int cs = 0; cs < 5; ++cs) {
+                const int fmt = f ? MF_Q4 : MF_Q8, bits = f ? 4 : 8, O = C[cs].O, I = C[cs].I, T = C[cs].T, tr = C[cs].tr;
+                const int rows = tr ? I : O, cols = tr ? O : I;   // storage of one head: [rows][cols], groups along cols
+                const size_t n = (size_t) O * I;
+                uint16_t* W = malloc(2 * n * H), *Wd = malloc(2 * n * H), *sc = malloc(n / 32 * H), *bi = malloc(n / 32 * H);
+                uint32_t* q = malloc(n * H * (size_t) bits / 8);
+                for (size_t i = 0; i < n * H; ++i) W[i] = f2bf((float) (frand(&sd) * 0.1));
+                for (int h = 0; h < H; ++h) {
+                    nslm_affine_quantize(W + h * n, rows, cols, bits, q + h * n * bits / 32, sc + h * n / 64, bi + h * n / 64);
+                    nslm_affine_dequantize(q + h * n * bits / 32, sc + h * n / 64, bi + h * n / 64, rows, cols, bits, Wd + h * n);
+                }
+                float* x = malloc(4 * (size_t) T * H * I), *g = malloc(4 * (size_t) T * H * O), *y = malloc(4 * (size_t) T * H * O);
+                for (int i = 0; i < T * H * I; ++i) x[i] = bfr(frand(&sd) * 2);
+                for (int i = 0; i < T * H * O; ++i) g[i] = bfr(frand(&sd) * 3);
+                const int rc = kt_heads_q(fmt, tr, H, O, I, q, sc, bi, x, H * I, I, C[cs].gate ? g : NULL, y, T);
+                int bad = 0;
+                if (rc == 1) { printf("per-head maps in Q8 / Q4: not in this backend\n"); f = 2; }
+                else if (rc) ++fails;
+                else
+                    for (int t = 0; t < T; ++t)
+                        for (int h = 0; h < H; ++h)
+                            for (int o = 0; o < O; ++o) {
+                                double s = 0;
+                                for (int i = 0; i < I; ++i)
+                                    s += bf2f(Wd[h * n + (tr ? (size_t) i * O + o : (size_t) o * I + i)]) * (double) x[(size_t) t * H * I + h * I + i];
+                                const size_t yi = ((size_t) t * H + h) * O + o;
+                                bad += !close_bf(y[yi], C[cs].gate ? gated(s, g[yi]) : bfr(s), 2e-6);
+                            }
+                if (rc != 1) CHECK(!bad, "per-head maps %s (O %d, I %d, T %d%s%s): %d mismatches", f ? "Q4" : "Q8", O, I, T,
+                                   tr ? ", transposed" : "", C[cs].gate ? ", gate" : "", bad);
+                free(W); free(Wd); free(sc); free(bi); free(q); free(x); free(g); free(y);
+                if (f == 2) break;
+            }
+        printf("per-head maps in Q8 / Q4: decode, prompt GEMMs and transposed reads checked\n");
+    }
     {   // RoPE + latent cache write: 4 heads, r 96, rows at positions 3 and 4 of two sequence slots (cache bases 0 and 5)
         enum { nh = 4, r = 96, P = 10, T = 2 };
         float qr[T * nh * 128], kr[T * 128], c[T * r], q0[T * nh * 128];

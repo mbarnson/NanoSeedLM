@@ -5,6 +5,8 @@
 //   Q8, Q4   NAME.weight   U32   lead + [rows, cols * bits / 32]   (MLX affine, group 64)
 //            NAME.scales   BF16  lead + [rows, cols / 64]
 //            NAME.biases   BF16  lead + [rows, cols / 64]
+//            (a Q8 / Q4 tensor whose name does not end in .weight, as MLA's projections: codes as NAME, then
+//            NAME.scales and NAME.biases)
 //   SEED4    NAME.seeds    U16   [slices, rows, cols / 8]   (P = 3; lfsr.h)
 //            NAME.nibbles  U16   [slices, rows, cols / 8]
 //            NAME.exp_bias I32   [slices]
