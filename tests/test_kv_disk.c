@@ -128,6 +128,36 @@ int main(void) {
         CHECK(stat(path, &st) != 0, "an expired block's file is deleted");
         kvd_close(e);
     }
+    {   // file times keep fractions of a second (plat_set_mtime / plat_mtime), and so does the order of uses within one
+        // second across restarts: blocks written 0.1, 0.2, 0.3 s into one second, block 0 then read, reopened, a fourth
+        // block evicts block 1
+        const char* dl = "out/test/kvdisk_subsec";
+        const uint64_t bud = 3 * (BB + 2048);
+        KvDisk* e = kvd_open(dl, bud, fa, BB, err, sizeof err);
+        CHECK(e != NULL, "kvd_open: %s", err);
+        if (!e) return 1;
+        for (int b = 0; b < NB; ++b) kvd_drop(e, h[b]);
+        for (int b = 0; b < 3; ++b) { block_data(src, b); CHECK(kvd_store(e, h[b], ids + b * KVD_BLOCK, src) == 0, "store %d", b); }
+        const double base = (double) (time(NULL) - 100);
+        for (int b = 0; b < 3; ++b) {
+            kvd_path(e, h[b], path, sizeof path);
+            const double t = base + 0.1 * (b + 1);
+            CHECK(plat_set_mtime(path, t) == 0, "plat_set_mtime %s", path);
+            const double r = plat_mtime(path);
+            CHECK(r > t - 1e-6 && r < t + 1e-6, "file time %.7f read back as %.7f", t, r);
+        }
+        kvd_close(e);
+        e = kvd_open(dl, bud, fa, BB, err, sizeof err);
+        block_data(src, 0);
+        CHECK(e && kvd_load(e, h[0], ids, dst) == 0, "load block 0");
+        kvd_close(e);
+        e = kvd_open(dl, bud, fa, BB, err, sizeof err);
+        block_data(src, 3);
+        CHECK(e && kvd_store(e, h[3], ids + 3 * KVD_BLOCK, src) == 0, "store 3");
+        CHECK(e && kvd_count(e, h, 1) == 1 && kvd_count(e, h + 1, 1) == 0 && kvd_count(e, h + 2, 2) == 2,
+              "LRU within a second across restarts: block 1 evicted (it was 0.1 s older than block 2)");
+        kvd_close(e);
+    }
     printf("test_kv_disk: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

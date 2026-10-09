@@ -18,7 +18,8 @@
 // (v value experts, a attention, m shared / dense MLPs, h LM head; --rest4 = vamh; the embedding is always Q8);
 // routers are BF16 holding their Q8 round trip (the router needs BF16 operands); norms and router biases are BF16.
 // MLA models (a TransMLA conversion): the latent projections and per-head maps stay BF16, as exported, or Q8 / Q4
-// with --mla (per-head maps quantized per head along their input dim); such a folder is
+// with --mla (per-head maps quantized per head along their input dim; a map or projection whose input dim is not a
+// multiple of 64, e.g. v_up at rank 96, stays BF16); such a folder is
 // for the NanoSeedLM engine (no MLX loader reads MLA yet, so config.json gets no "model_file").
 // Q8/Q4 are MLX's affine g64 (affine.h).  The folder also gets config.json (with MLX's "quantization" and, for seeds,
 // "model_file": the MLX loader), the tokenizer and template files of DIR, and the loader.
@@ -368,6 +369,10 @@ int main(int argc, char** argv) {
         default: break;
         }
         if (enc < 0) { fprintf(stderr, "%s: no encoding for tensor kind %d\n", t->name, t->kind); return 2; }
+        if ((enc == NS_Q8 || enc == NS_Q4) && t->cols % 64 && (t->kind == MOVA_K_HEADS || strstr(t->name, ".mla."))) {
+            printf("%s: %d columns (not whole groups of 64), kept BF16\n", t->name, t->cols);   // e.g. v_up at rank 96
+            enc = NS_BF16;
+        }
         sel[n] = *t;
         g_enc[n] = enc;
         spec[n] = (NsSpec) {sel[n].name, enc, t->slices, t->rows, t->cols};

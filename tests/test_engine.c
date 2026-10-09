@@ -579,7 +579,31 @@ static void test_mla(void) {
             eng_close(ep);
         }
     }
-    test_batch(dir, "MLA", 0, ENG_KV_BF16);                // these prompts (< 256 rows): attention in latent space
+    {   // paged KV unavailable after its page alignment was worked out (no mapping queue: NSLM_KVP_NO_QUEUE fakes that):
+        // the dense cache's slots must use the dense layout.  A cache copied from slot 0 into slot 1 decodes the same.
+        EngOpts op = o;
+        op.kv_format = ENG_KV_BF16;
+        op.kv_tokens = 1024;
+        op.max_seqs = 2;
+        set_env("NSLM_KVP_NO_QUEUE", "1");
+        Eng* ep = eng_open(&op, err, sizeof err);
+        set_env("NSLM_KVP_NO_QUEUE", NULL);
+        CHECK(ep != NULL, "MLA eng_open (no paging queue): %s", err);
+        if (ep) {
+            const int P = N - 1;
+            const size_t kb = (size_t) eng_kv_bytes(ep) * P;
+            uint8_t* k0 = (uint8_t*) malloc(kb), *k1 = (uint8_t*) malloc(kb);
+            float* l0 = (float*) malloc(sizeof(float) * (size_t) V), *l1 = (float*) malloc(sizeof(float) * (size_t) V);
+            CHECK(eng_prefill(ep, 0, ids, N) == 0 && eng_kv_read(ep, 0, 0, P, k0) == 0, "MLA no paging queue: slot 0");
+            CHECK(eng_kv_write(ep, 1, ids, 0, P, k0) == 0, "MLA no paging queue: eng_kv_write to slot 1");
+            CHECK(eng_kv_read(ep, 1, 0, P, k1) == 0 && !memcmp(k0, k1, kb), "MLA no paging queue: slot 1's cache differs");
+            CHECK(eng_step(ep, 0, l0) == 0 && eng_push(ep, 1, ids[P]) == 0 && eng_step(ep, 1, l1) == 0 &&
+                  !memcmp(l0, l1, sizeof(float) * (size_t) V), "MLA no paging queue: slot 1 decodes differently");
+            free(k0); free(k1); free(l0); free(l1);
+            eng_close(ep);
+        }
+    }
+    test_batch(dir, "MLA", 0, ENG_KV_BF16);               // these prompts (< 256 rows): attention in latent space
     test_batch(dir, "MLA expanded", 1, ENG_KV_BF16);       // every prompt with the latent expanded per head
     test_batch(dir, "MLA blocks of 16", 16, ENG_KV_BF16);  // expanded up to the last multiple of 16 (the copied cache: 128)
     test_batch(dir, "MLA fp8", 16, ENG_KV_FP8);

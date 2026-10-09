@@ -266,6 +266,11 @@ int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, cons
     int ne = 0, nsh = 0;
     uint64_t cur = 0, total = 0;
     for (int i = 0; i < n; ++i) {
+        if ((t[i].enc == NS_Q8 || t[i].enc == NS_Q4) && t[i].cols % 64) {   // affine g64: whole groups per row
+            snprintf(err, (size_t) errlen, "%s: %d columns, not a multiple of the Q8 / Q4 group of 64", t[i].name, t[i].cols);
+            free(ents);
+            return -1;
+        }
         uint64_t tb = 0;
         for (int s = 0; s < 4; ++s) tb += ns_stream_len(t[i].enc, t[i].slices, t[i].rows, t[i].cols, s);
         if (nsh == 0 || (cur > 0 && cur + tb > shard_bytes)) { ++nsh; cur = 0; }

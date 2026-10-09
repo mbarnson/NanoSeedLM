@@ -992,7 +992,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
             const int kb1 = max_ctx - kb0 < e->dec_keys ? max_ctx : kb0 + e->dec_keys;
             // the keys before this chunk stay decompressed while one layer's chunks follow each other (layer-major)
             const int lo = kb0 == 0 && e->dec_l == l && e->dec_kv0 == kv0 ? (e->dec_n < pos0 ? e->dec_n : pos0) : kb0;
-            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, L->ql.fmt, L->ql.w0, L->vu.w0,
+            kc_mla_decomp(e->st, ma, kv, kv0, kb0, lo, kb1, L->ql.fmt, L->ql.w0, L->vu.fmt, L->vu.w0,
                           e->dec_k, e->dec_v);
             e->dec_l = kb0 == 0 ? l : -1;
             e->dec_kv0 = kv0;

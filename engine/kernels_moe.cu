@@ -1435,8 +1435,8 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
 #define MLD_ALD (MLD_BJ + 8)
 #define MLD_KLD (ATT_HD + 8)   // K weights staged [j][d]
 #define MLD_VLD (MLD_BJ + 8)   // V weights staged [d][j]
-__global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int wfmt, WSlice Wql,
-                                                   WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
+__global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int qfmt, WSlice Wql,
+                                                   int vfmt, WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
     __shared__ __align__(16) uint16_t As[MLD_BK * MLD_ALD];
     __shared__ __align__(16) uint16_t Bs[MLD_BJ * MLD_KLD > ATT_HD * MLD_VLD ? MLD_BJ * MLD_KLD : ATT_HD * MLD_VLD];
     const int h = (int) blockIdx.y, isv = (int) blockIdx.z, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
@@ -1455,12 +1455,12 @@ __global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv
         if (!isv)
             for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[j][d] = q_lat[h][j0 + j][d]
                 const int j = c >> 4, d8 = (c & 15) * 8;
-                *(uint4*) &Bs[j * MLD_KLD + d8] = welem8(wfmt, Wql, ((size_t) h * r + j0 + j) * ATT_HD + d8);
+                *(uint4*) &Bs[j * MLD_KLD + d8] = welem8(qfmt, Wql, ((size_t) h * r + j0 + j) * ATT_HD + d8);
             }
         else
             for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[d][j] = v_up[h][d][j0 + j]
                 const int d = c >> 2, j8 = (c & 3) * 8;
-                *(uint4*) &Bs[d * MLD_VLD + j8] = welem8(wfmt, Wvu, ((size_t) h * ATT_HD + d) * r + j0 + j8);
+                *(uint4*) &Bs[d * MLD_VLD + j8] = welem8(vfmt, Wvu, ((size_t) h * ATT_HD + d) * r + j0 + j8);
             }
         __syncthreads();
 #pragma unroll
@@ -2017,11 +2017,11 @@ void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, Kv
         a, ql, qr, kv, ri, a.n_splits > 1 ? part : olat);
     if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
 }
-void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int wfmt, WSlice Wql,
-                   WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
+void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int qfmt, WSlice Wql,
+                   int vfmt, WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
     if (k_hi <= k_lo) return;
     k_mla_decomp<<<dim3((unsigned) (k_hi - k_lo + MLD_BK - 1) / MLD_BK, (unsigned) a.n_head, 2), 256, 0, s>>>(a, kv, kv0, kb0, k_lo, k_hi,
-                                                                                                         wfmt, Wql, Wvu, Kn, Vd);
+                                                                                                         qfmt, Wql, vfmt, Wvu, Kn, Vd);
 }
 void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri, const uint16_t* Kn,
                     const uint16_t* Vd, int kb0, int kb1, int first, int last, float* st, const float* g, float* o, int T) {

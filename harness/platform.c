@@ -1,4 +1,5 @@
 // harness/platform.c - see platform.h.  Windows (Win32), macOS (Mach, libproc, IOKit) and Linux (/proc).
+#define _DEFAULT_SOURCE   // glibc under -std=c11: utimensat, st_mtim
 #include "platform.h"
 
 #include <stdio.h>
@@ -11,7 +12,6 @@
 #include <bcrypt.h>
 #include <psapi.h>
 #include <shellapi.h>
-#include <sys/utime.h>
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/ps/IOPSKeys.h>
@@ -25,7 +25,6 @@
 #include <unistd.h>
 #endif
 #ifndef _WIN32
-#include <utime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -45,15 +44,45 @@ char* plat_slurp(const char* path, size_t* len) {
     return b;
 }
 
-int plat_set_mtime(const char* path, double t) {
+// File times to the file system's precision (the cold KV cache orders uses within a second by them).  Windows: 100 ns
+// units since 1601, in integers (a double of them would round to microseconds).
 #if defined(_WIN32)
-    struct _utimbuf u = {(time_t) t, (time_t) t};
-    return _utime(path, &u) ? -1 : 0;
+#define FT_1970 11644473600ull   // seconds from 1601 to 1970
+int plat_set_mtime(const char* path, double t) {
+    HANDLE h = CreateFileA(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    const uint64_t s = (uint64_t) t, u = (s + FT_1970) * 10000000ull + (uint64_t) ((t - (double) s) * 1e7);
+    FILETIME ft = {(DWORD) u, (DWORD) (u >> 32)};
+    const BOOL ok = SetFileTime(h, NULL, &ft, &ft);
+    CloseHandle(h);
+    return ok ? 0 : -1;
+}
+double plat_mtime(const char* path) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return -1;
+    const uint64_t u = (uint64_t) a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+    return (double) (u / 10000000ull - FT_1970) + 1e-7 * (double) (u % 10000000ull);
+}
 #else
-    struct utimbuf u = {(time_t) t, (time_t) t};
-    return utime(path, &u) ? -1 : 0;
+int plat_set_mtime(const char* path, double t) {
+    const time_t s = (time_t) t;
+    struct timespec ts[2];
+    ts[0].tv_sec = s;
+    ts[0].tv_nsec = (long) ((t - (double) s) * 1e9);
+    ts[1] = ts[0];
+    return utimensat(AT_FDCWD, path, ts, 0) ? -1 : 0;
+}
+double plat_mtime(const char* path) {
+    struct stat st;
+    if (stat(path, &st)) return -1;
+#if defined(__APPLE__)
+    return (double) st.st_mtimespec.tv_sec + 1e-9 * (double) st.st_mtimespec.tv_nsec;
+#else
+    return (double) st.st_mtim.tv_sec + 1e-9 * (double) st.st_mtim.tv_nsec;
 #endif
 }
+#endif
 
 #if defined(_WIN32)
 

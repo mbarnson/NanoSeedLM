@@ -97,6 +97,11 @@ int kt_mla_attn(MlaArgs a, const float* ql, const float* qr, const uint16_t* Kc,
 // decompressed keys and values
 int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* Kc, const uint16_t* Vc, int npos, const RowInfo* ri,
                    const uint16_t* Wql, const uint16_t* Wvu, const float* g, float* o, int T, int dec_keys, uint16_t* Kn, uint16_t* Vd);
+// kt_mla_prefill's decompression alone, each map in its own format (MF_BF16 / MF_Q8 / MF_Q4, streams as kt_heads_q's;
+// q_lat [n_head][r][128] grouped along 128, v_up [n_head][128][r] along r): Kn, Vd [n][n_head][128] from the latent rows
+// c [n][r] (BF16).  1 where a backend has no such path.
+int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, const uint16_t* qb, int vfmt, const void* vc,
+                    const uint16_t* vs, const uint16_t* vb, const uint16_t* c, int n, uint16_t* Kn, uint16_t* Vd);
 // MLA prompt attention over keys and values already expanded per head (Metal's k_mla_prefill): o[t][h*128+d] = bf16(bf16(sum_p softmax_p(scale (qn_th . kn_ph
 // + qr_th . kr_p)) vn_ph[d]) * bf16(softplus_ln2(g))) over p <= pos_t, from qn [T][n_head*128] (the heads' queries),
 // qr [T][n_head][128] (rotated), kn / vn [npos][n_head][128] and the RoPE keys Kc [npos][128] (BF16, at the rows'

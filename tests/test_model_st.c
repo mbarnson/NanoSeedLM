@@ -151,6 +151,16 @@ int main(void) {
     CHECK(ns_open(&m, path, err, sizeof err) != 0, "wrong dtype accepted");
     CHECK(remove_dir(path) == 0, "cleanup");
 
+    // Q8 / Q4 need whole 64-element groups per row: an MLA rank of 96 (v_up [8][128][96]) is refused at write time
+    for (int enc = NS_Q8; enc <= NS_Q4; ++enc) {
+        const NsSpec odd = {"model.layers.0.self_attn.mla.v_up", enc, 8, 128, 96};
+        order = -1;
+        snprintf(path, sizeof path, "%s_odd", dir);
+        mkdir(path, 0755);
+        CHECK(ns_write(path, &odd, 1, 1u << 20, NULL, fill, &order, err, sizeof err) != 0, "enc %d: 96 columns written", enc);
+        remove_dir(path);
+    }
+
     printf("test_model_st: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

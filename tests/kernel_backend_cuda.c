@@ -339,7 +339,7 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
         memset(&wv, 0, sizeof wv);
         wq.p[0] = dql;
         wv.p[0] = dvu;
-        kc_mla_decomp(0, a, kv, kv0, kb0, kb0, kb1, MF_BF16, wq, wv, Kn, Vd);
+        kc_mla_decomp(0, a, kv, kv0, kb0, kb0, kb1, MF_BF16, wq, MF_BF16, wv, Kn, Vd);
         const size_t off = (size_t) kb0 * a.n_head * 128, n = 2 * (size_t) (kb1 - kb0) * a.n_head * 128;
         if (fetch("kc_mla_decomp", Kn_out + off, Kn, n) || fetch("kc_mla_decomp", Vd_out + off, Vd, n)) return -1;
         kc_mla_prefill(0, a, dq, dqr, kv, dri, Kn, Vd, kb0, kb1, kb0 == 0, kb1 == end, st, dg, dout, T);
@@ -396,7 +396,7 @@ static int heads_t(int fmt, int H, int O, int I, const void* codes, const uint16
         kv.a.k = dev(NULL, 2 * (size_t) T * 128);
         kv.a.v = dev(c, 2 * (size_t) T * I);
         uint16_t* dK = (uint16_t*) dev(NULL, 2 * (size_t) T * H * 128), *dV = (uint16_t*) dev(NULL, 2 * (size_t) T * H * 128);
-        kc_mla_decomp(0, a, kv, 0, 0, 0, T, fmt, w, w, dK, dV);   // the V half reads w as [H][128][I]: not used
+        kc_mla_decomp(0, a, kv, 0, 0, 0, T, fmt, w, fmt, w, dK, dV);   // the V half reads w as [H][128][I]: not used
         rc = done("kc_mla_decomp (transposed per-head maps)", kn, dK, 2 * (size_t) T * H * 128);
         for (int t = 0; t < T && !rc; ++t)
             for (int o = 0; o < O; ++o) {
@@ -407,6 +407,21 @@ static int heads_t(int fmt, int H, int O, int I, const void* codes, const uint16
     free(c);
     free(kn);
     return rc;
+}
+int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, const uint16_t* qb, int vfmt, const void* vc,
+                    const uint16_t* vs, const uint16_t* vb, const uint16_t* c, int n, uint16_t* Kn, uint16_t* Vd) {
+    const size_t on = 2 * (size_t) n * a.n_head * 128, hn = (size_t) a.r * 128;
+    KvView kv;
+    memset(&kv, 0, sizeof kv);
+    kv.nv = n;
+    kv.fmt = KV_BF16;
+    kv.a.k = dev(NULL, 2 * (size_t) n * 128);
+    kv.a.v = dev(c, 2 * (size_t) n * a.r);
+    const WSlice wq = heads_dev(qfmt, a.n_head, hn, qc, qs, qb), wv = heads_dev(vfmt, a.n_head, hn, vc, vs, vb);
+    uint16_t* dK = (uint16_t*) dev(NULL, on), *dV = (uint16_t*) dev(NULL, on);
+    kc_mla_decomp(0, a, kv, 0, 0, 0, n, qfmt, wq, vfmt, wv, dK, dV);
+    if (fetch("kc_mla_decomp (Q8 / Q4 maps)", Kn, dK, on)) return -1;
+    return done("kc_mla_decomp (Q8 / Q4 maps)", Vd, dV, on);
 }
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) {
     return heads_t(MF_BF16, H, O, I, W, NULL, NULL, x, xs, hs, y, T);

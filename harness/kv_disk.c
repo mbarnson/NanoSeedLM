@@ -30,11 +30,18 @@ struct KvDisk {
     double max_age;   // seconds; 0: none
     Ent* e;
     int n, cap;
-    unsigned long tick;   // orders uses within a second, and names temporary files
+    double last;          // the latest stamp
+    unsigned long tick;   // names temporary files
     pthread_mutex_t mu;
 };
 
-static double stamp(KvDisk* d) { return (double) time(NULL) + 1e-6 * (double) (++d->tick % 1000000); }   // under mu
+static double stamp(KvDisk* d) {   // the wall clock, increasing by at least 1 us a use (under mu)
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    const double t = (double) ts.tv_sec + 1e-9 * (double) ts.tv_nsec;
+    d->last = t > d->last + 1e-6 ? t : d->last + 1e-6;
+    return d->last;
+}
 static void hex(const uint8_t* p, int n, char* out) {
     static const char* x = "0123456789abcdef";
     for (int i = 0; i < n; ++i) { out[2 * i] = x[p[i] >> 4]; out[2 * i + 1] = x[p[i] & 15]; }
@@ -115,7 +122,7 @@ KvDisk* kvd_open(const char* dir, uint64_t budget, const uint8_t fingerprint[32]
             char name[65];
             memcpy(name, b->d_name, 64);
             name[64] = 0;
-            ent_add(d, a->d_name, name, (uint64_t) st.st_size, (double) st.st_mtime);
+            ent_add(d, a->d_name, name, (uint64_t) st.st_size, plat_mtime(f));   // (fractions of a second: the order of uses)
         }
         if (s) closedir(s);
     }

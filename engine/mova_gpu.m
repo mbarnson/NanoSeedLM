@@ -615,10 +615,14 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
                 }
             }
             e->slot_stride = (e->slot_cap + al - 1) / al * al;
-            e->kvp_q = [e->dev newMTL4CommandQueue];
+            e->kvp_q = getenv("NSLM_KVP_NO_QUEUE") ? nil : [e->dev newMTL4CommandQueue];   // (tests: no mapping queue)
             e->kvp_ev = [e->dev newSharedEvent];
             e->kvp_heaps = [NSMutableArray new];
-            if (!e->kvp_q || !e->kvp_ev) e->kvp = 0;
+            if (!e->kvp_q || !e->kvp_ev) {   // dense after all: the dense layout (kv_alloc sizes for slot_cap)
+                e->kvp = 0;
+                e->slot_stride = e->slot_cap;
+                e->kvp_q = nil; e->kvp_ev = nil; e->kvp_heaps = nil;
+            }
         }
         e->kv_bufs = [NSMutableArray new];
         e->kv_rb = (uint64_t*) calloc((size_t) c->n_layer * 4, sizeof(uint64_t));
@@ -1366,6 +1370,7 @@ static int kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
         for (NSUInteger i = 0; i < e->kv_bufs.count; ++i) {
             id<MTLBuffer> b = e->kv_bufs[i];
             const uint64_t rb = e->kv_rb[i];
+            if ((r0 + n) * rb > b.length) return -1;
             uint8_t* d = (uint8_t*) b.contents + r0 * rb;
             if (out) memcpy(h, d, n * rb); else memcpy(d, h, n * rb);
             h += n * rb;

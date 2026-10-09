@@ -639,3 +639,9 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
     (void) dec_keys; (void) Kn; (void) Vd;
     return 1;   // the Metal engine computes prompt rows absorbed (k_mla_attn)
 }
+int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, const uint16_t* qb, int vfmt, const void* vc,
+                    const uint16_t* vs, const uint16_t* vb, const uint16_t* c, int n, uint16_t* Kn, uint16_t* Vd) {
+    (void) a; (void) qfmt; (void) qc; (void) qs; (void) qb; (void) vfmt; (void) vc; (void) vs; (void) vb; (void) c; (void) n;
+    (void) Kn; (void) Vd;
+    return 1;   // (as kt_mla_prefill)
+}

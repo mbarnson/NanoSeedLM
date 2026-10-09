@@ -968,6 +968,56 @@ static void test_mla(void) {
         free(Kd); free(Vdd);
         free(q); free(qr); free(g); free(o); free(Kc); free(Vc); free(Wql); free(Wvu);
     }
+    // the decompression with q_lat and v_up in different formats (a packer keeps v_up BF16 at rank 96, whose rows are not
+    // whole groups of 64): each map read in its own format, against double sums over the dequantized weights
+    {
+        enum { nh = 8, n = 70 };
+        static const struct { int r, qf, vf; } C[4] = {{96, MF_Q8, MF_BF16}, {96, MF_Q4, MF_BF16}, {128, MF_Q8, MF_Q4}, {128, MF_BF16, MF_Q8}};
+        unsigned sd = 61;
+        for (int cs = 0; cs < 4; ++cs) {
+            const int r = C[cs].r, fm[2] = {C[cs].qf, C[cs].vf};
+            const size_t hn = (size_t) r * 128;
+            uint16_t* c = malloc(2 * (size_t) n * r), *W[2], *Wd[2], *sc[2], *bi[2];
+            uint32_t* q[2];
+            for (int i = 0; i < n * r; ++i) c[i] = f2bf((float) frand(&sd));
+            for (int m = 0; m < 2; ++m) {   // m 0: q_lat [h][r][128], 1: v_up [h][128][r]
+                const int rows = m ? 128 : r, cols = m ? r : 128, bits = fm[m] == MF_Q4 ? 4 : 8;
+                W[m] = malloc(2 * hn * nh); Wd[m] = malloc(2 * hn * nh);
+                sc[m] = malloc(hn / 32 * nh); bi[m] = malloc(hn / 32 * nh); q[m] = malloc(hn * nh);
+                for (size_t i = 0; i < hn * nh; ++i) W[m][i] = f2bf((float) (frand(&sd) * 0.15));
+                if (fm[m] == MF_BF16) { memcpy(Wd[m], W[m], 2 * hn * nh); continue; }
+                for (int h = 0; h < nh; ++h) {
+                    nslm_affine_quantize(W[m] + h * hn, rows, cols, bits, q[m] + h * hn * bits / 32, sc[m] + h * hn / 64, bi[m] + h * hn / 64);
+                    nslm_affine_dequantize(q[m] + h * hn * bits / 32, sc[m] + h * hn / 64, bi[m] + h * hn / 64, rows, cols, bits, Wd[m] + h * hn);
+                }
+            }
+            const void* codes[2] = {fm[0] == MF_BF16 ? (const void*) W[0] : q[0], fm[1] == MF_BF16 ? (const void*) W[1] : q[1]};
+            const MlaArgs a = {nh, r, 128, 1, 1.0f, {0}};
+            uint16_t* Kd = malloc(2 * (size_t) n * nh * 128), *Vdd = malloc(2 * (size_t) n * nh * 128);
+            const int rc = kt_mla_decomp_q(a, fm[0], codes[0], sc[0], bi[0], fm[1], codes[1], sc[1], bi[1], c, n, Kd, Vdd);
+            int bad = 0;
+            if (rc == 1) printf("MLA decompression with Q8 / Q4 maps: not on this backend\n");
+            else if (rc) ++fails;
+            else
+                for (int p = 0; p < n; ++p)
+                    for (int h = 0; h < nh; ++h)
+                        for (int d = 0; d < 128; ++d) {
+                            double k = 0, v = 0;
+                            for (int j = 0; j < r; ++j) {
+                                const double x = bf2f(c[(size_t) p * r + j]);
+                                k += bf2f(Wd[0][((size_t) h * r + j) * 128 + d]) * x;
+                                v += bf2f(Wd[1][((size_t) h * 128 + d) * r + j]) * x;
+                            }
+                            const size_t i = ((size_t) p * nh + h) * 128 + d;
+                            bad += !close_bf(bf2f(Kd[i]), bfr(k), 1e-6) + !close_bf(bf2f(Vdd[i]), bfr(v), 1e-6);
+                        }
+            if (rc != 1) CHECK(!bad, "MLA decompression (r %d, q_lat fmt %d, v_up fmt %d): %d mismatches of %d", r, fm[0], fm[1], bad,
+                               2 * n * nh * 128);
+            for (int m = 0; m < 2; ++m) { free(W[m]); free(Wd[m]); free(sc[m]); free(bi[m]); free(q[m]); }
+            free(c); free(Kd); free(Vdd);
+            if (rc == 1) break;
+        }
+    }
 }
 
 // ---- MLA prompt attention with the latent expanded per head (k_mla_prefill): rows of one slot at a nonzero cache base,
