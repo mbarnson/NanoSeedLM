@@ -545,6 +545,40 @@ static void test_mla(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
+    {   // paged KV (Metal on macOS 26.4+): positions are backed by memory as they are written, and freed with the slot;
+        // the device's allocated size shows it.  Engines that allocate the whole cache at open skip this.
+        EngOpts op = o;
+        op.kv_format = ENG_KV_BF16;
+        op.kv_tokens = 1 << 16;
+        op.max_seqs = 2;
+        Eng* ep = eng_open(&op, err, sizeof err);
+        CHECK(ep != NULL, "MLA eng_open (64k-token cache): %s", err);
+        if (ep) {
+            EngMem m0, m1, m2, m3;
+            int32_t* big = (int32_t*) malloc(sizeof(int32_t) * 3000);
+            for (int i = 0; i < 3000; ++i) big[i] = ids[i % N];
+            const int64_t per = eng_kv_bytes(ep);
+            eng_mem(ep, &m0);
+            CHECK(eng_prefill(ep, 1, big, 3000) == 0, "MLA prefill of 3000 tokens");
+            eng_mem(ep, &m1);
+            CHECK(eng_prefill(ep, 1, big, 100) == 0, "MLA prefill of 100 tokens in the same slot");
+            eng_mem(ep, &m2);
+            eng_free(ep, 1);
+            eng_mem(ep, &m3);
+            const double grew = (double) (m1.gpu_allocated - m0.gpu_allocated), kept = (double) (m2.gpu_allocated - m0.gpu_allocated);
+            if (grew < 0.5 * 3000 * per) printf("MLA KV pages: not paged in this engine\n");
+            else {
+                printf("MLA KV pages: 3000 positions back %.1f MB (%.1f MB of KV), 100 keep %.1f MB, freed slot %.1f MB\n",
+                       grew / 1e6, 3000.0 * per / 1e6, kept / 1e6, (double) (m3.gpu_allocated - m0.gpu_allocated) / 1e6);
+                CHECK(grew <= 3000.0 * per + 64e6 + 2e6 * 4 * 5, "MLA KV pages: %.0f bytes backed for 3000 positions", grew);
+                // (this model's 3000 positions fit one 64 MB heap, so the 100-token prompt keeps it: no partial hand-back here)
+                CHECK(kept <= grew && m3.gpu_allocated <= m0.gpu_allocated, "MLA KV pages: not given back (%.0f, %.0f)",
+                      kept, (double) (m3.gpu_allocated - m0.gpu_allocated));
+            }
+            free(big);
+            eng_close(ep);
+        }
+    }
     test_batch(dir, "MLA", 0, ENG_KV_BF16);                // these prompts (< 256 rows): attention in latent space
     test_batch(dir, "MLA expanded", 1, ENG_KV_BF16);       // every prompt with the latent expanded per head
     test_batch(dir, "MLA blocks of 16", 16, ENG_KV_BF16);  // expanded up to the last multiple of 16 (the copied cache: 128)
