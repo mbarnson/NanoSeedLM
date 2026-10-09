@@ -81,7 +81,7 @@ typedef struct { int pos, kv0; int pad[2]; } RowInfo;   // kv0: the KV cache row
 #define MLA_FP4_LEAD 256   // MLA FP4 caches: the latent's leading dims kept in FP8 (a multiple of 32)
 #define MLAF_Q 16          // Metal k_mla_attn: query heads per threadgroup
 #define MLAF_K 64          // keys per tile
-#define MLAF_SG 16         // simdgroups: one 8x8 score block each (MLAF_K / 8 x MLAF_Q / 8), one 8-dim output column
+#define MLAF_SG 16         // simdgroups: 2 x MLAF_K / 8 (a key block, both head blocks, half the dims), one 8-dim output column
 #define MLAF_DC 128        // dims per staged chunk
 #define MLAF_KLD (MLAF_DC + 2)               // staged keys [key][dim] row stride (BF16; padded against bank conflicts)
 #define MLAF_QLD (MLAF_Q + 2)                // staged queries [dim][head] row stride
@@ -1118,7 +1118,9 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
     const int chunk = (pos + nsr) / nsr;
     const int p0 = split * chunk, p1 = min(pos + 1, p0 + chunk);
     const int qid = (int) lane / 4, fm = (qid & 4) + ((int) lane / 2) % 4, fn = (qid & 2) * 2 + ((int) lane % 2) * 2;
-    const int kb = (int) sgi >> 1, qb = (int) sgi & 1;   // this simdgroup's score block: keys kb*8.., heads qb*8..
+    // scores: simdgroup sgi takes key block sgi % 8 against both head blocks (one key operand load for two products) over
+    // its half (sgi / 8) of each chunk's dims; the halves are summed in St
+    const int kb = (int) sgi % (MLAF_K / 8), hf = (int) sgi / (MLAF_K / 8);
     const int nc = FC_T > 0 ? FC_T : (r + MLAF_DC - 1) / MLAF_DC;   // latent chunks (pipelines specialize it: the
                                                                      // unused accumulators then take no registers)
     simdgroup_float8x8 O[MLAF_OC][2];                   // column sgi*8 of each latent chunk, both head blocks
@@ -1127,7 +1129,7 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
     if (tid < MLAF_Q) { ms[tid] = -INFINITY; ls[tid] = 0; }
     for (int e = (int) tid; e < MLAF_Q * 8; e += 32 * MLAF_SG) Dc[e / 64][e % 64] = 0;
     for (int k0 = p0; k0 < p1; k0 += MLAF_K) {
-        simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
+        simdgroup_float8x8 S0 = simdgroup_float8x8(0.0f), S1 = simdgroup_float8x8(0.0f);
         for (int dc = 0; dc < D; dc += MLAF_DC) {
             const int cw = min(MLAF_DC, D - dc);
             threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous chunk's (or phase's) readers are done
@@ -1139,14 +1141,28 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
                 mlaf_queries<0>(Qt, ql, qr, t, H, h0, dc, r, cw / 4, tid);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int i = 0; i < cw / 8; ++i) {
-                simdgroup_bfloat8x8 A, B;   // A: keys kb*8.., dims i*8..; B: dims i*8.., heads qb*8.. (exact products, f32 sums)
+            const int nb = cw / 8, ib0 = hf ? (nb + 1) / 2 : 0, ib1 = hf ? nb : (nb + 1) / 2;
+            for (int i = ib0; i < ib1; ++i) {
+                simdgroup_bfloat8x8 A, B0, B1;   // A: keys kb*8.., dims i*8..; B: dims i*8.., heads 0.. / 8.. (exact products, f32 sums)
                 simdgroup_load(A, (threadgroup const bfloat*) Kt + kb * 8 * MLAF_KLD + i * 8, MLAF_KLD);
-                simdgroup_load(B, (threadgroup const bfloat*) Qt + i * 8 * MLAF_QLD + qb * 8, MLAF_QLD);
-                simdgroup_multiply_accumulate(S, A, B, S);
+                simdgroup_load(B0, (threadgroup const bfloat*) Qt + i * 8 * MLAF_QLD, MLAF_QLD);
+                simdgroup_load(B1, (threadgroup const bfloat*) Qt + i * 8 * MLAF_QLD + 8, MLAF_QLD);
+                simdgroup_multiply_accumulate(S0, A, B0, S0);
+                simdgroup_multiply_accumulate(S1, A, B1, S1);
             }
         }
-        simdgroup_store(S, &St[kb * 8][qb * 8], MLAF_Q);
+        if (hf) { simdgroup_store(S0, &St[kb * 8][0], MLAF_Q); simdgroup_store(S1, &St[kb * 8][8], MLAF_Q); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!hf) {   // St = the second half's + this half's (the identity times St, accumulated)
+            const simdgroup_float8x8 I = simdgroup_float8x8(1.0f);
+            simdgroup_float8x8 T0, T1;
+            simdgroup_load(T0, &St[kb * 8][0], MLAF_Q);
+            simdgroup_load(T1, &St[kb * 8][8], MLAF_Q);
+            simdgroup_multiply_accumulate(S0, I, T0, S0);
+            simdgroup_multiply_accumulate(S1, I, T1, S1);
+            simdgroup_store(S0, &St[kb * 8][0], MLAF_Q);
+            simdgroup_store(S1, &St[kb * 8][8], MLAF_Q);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {   // online softmax: thread (head q, keys k + MLAF_TH u); a head's threads are adjacent lanes
             const int q = (int) tid / MLAF_TH, k = (int) tid % MLAF_TH;
