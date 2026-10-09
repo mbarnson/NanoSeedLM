@@ -1268,6 +1268,14 @@ kernel void k_mla_attn(constant MlaArgs& a [[buffer(0)]], device const float* ql
     }
 }
 
+// MLA capture: s[c] += sum over T rows of x[t * xs + c]^2, c < n (one thread per column)
+kernel void k_sumsq(device const float* x [[buffer(0)]], device float* s [[buffer(1)]], constant int4& a [[buffer(2)]],
+                    uint c [[thread_position_in_grid]]) {
+    if ((int) c >= a.x) return;
+    float acc = 0;
+    for (int t = 0; t < a.y; ++t) { const float v = x[(ulong) t * a.z + c]; acc += v * v; }
+    s[c] += acc;
+}
 // y[i] = value i of n / len consecutive cache rows of len values (format FC_FMT; codes C and scales S from the first row)
 kernel void k_kv_f32(device const uchar* C [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
                      device const uchar* S [[buffer(3)]], constant uint& len [[buffer(4)]], uint i [[thread_position_in_grid]]) {

@@ -19,6 +19,7 @@
 
 #include "engine_api.h"
 #include "kvq.h"
+#include "mova_ext.h"
 #include "lfsr.h"
 #include "model_st.h"
 #include "mova_cfg.h"
@@ -545,6 +546,48 @@ static void test_mla(void) {
     eng_close(e);
     mova_ref_close(ref);
     free(rl); free(el); free(rm); free(rv); free(em); free(ev); free(lg);
+    {   // MLA capture (mova_ext.h): per-layer sums of squares of the projections' inputs, the same whether the prompt is
+        // computed in one call or in chunks; value-expert inputs only on MoVA layers
+        EngOpts oc = o;
+        oc.kv_format = ENG_KV_BF16;
+        Eng* ec = eng_open(&oc, err, sizeof err);
+        int rc = ec ? eng_mla_capture(ec, 1) : -1;
+        if (ec && rc) printf("MLA capture: not in this engine\n");
+        else if (ec) {
+            enum { NL = 5, D = 512, KV = 256, Q = 1024, OMAX = 8 * 320 };
+            static double a[2][NL][D + KV + Q + OMAX];
+            int64_t rows[2] = {0, 0};
+            for (int pass = 0; pass < 2; ++pass) {
+                eng_mla_capture(ec, 0);
+                eng_mla_capture(ec, 1);   // fresh sums (a new capture)
+                if (pass == 0) CHECK(eng_prefill(ec, 0, ids, 40) == 0, "MLA capture prefill");
+                else {
+                    int left;
+                    eng_free(ec, 0);
+                    CHECK(eng_prefill_begin(ec, 0, ids, 40, NULL) == 0, "MLA capture prefill_begin");
+                    while ((left = eng_prefill_next(ec, 0, 7)) > 0) {}
+                }
+                for (int l = 0; l < NL; ++l)
+                    CHECK(eng_mla_capture_read(ec, l, a[pass][l], a[pass][l] + D, a[pass][l] + D + KV, a[pass][l] + D + KV + Q, &rows[pass]) == 0,
+                          "MLA capture read");
+            }
+            double worst = 0;
+            int zero = 0, vbad = 0;
+            for (int l = 0; l < NL; ++l) {
+                const int n = D + KV + Q + 8 * ranks[l];
+                for (int i = 0; i < n; ++i) {
+                    const double x = a[0][l][i], y = a[1][l][i];
+                    if (i >= D && i < D + KV) { vbad += l == 0 ? x != 0 : !(x > 0); continue; }   // layer 0: dense
+                    zero += !(x > 0);
+                    worst = fmax(worst, fabs(x - y) / fmax(fabs(x), 1e-30));
+                }
+            }
+            printf("MLA capture: %lld rows; sums in one call vs chunks of 7: worst relative difference %.2e\n", (long long) rows[0], worst);
+            CHECK(rows[0] == 39 && rows[1] == 39, "MLA capture rows %lld, %lld", (long long) rows[0], (long long) rows[1]);
+            CHECK(!zero && !vbad && worst < 1e-4, "MLA capture: %d empty sums, %d bad value-expert sums, difference %.3e", zero, vbad, worst);
+        }
+        if (ec) eng_close(ec);
+    }
     {   // paged KV (Metal on macOS 26.4+): positions are backed by memory as they are written, and freed with the slot;
         // the device's allocated size shows it.  Engines that allocate the whole cache at open skip this.
         EngOpts op = o;

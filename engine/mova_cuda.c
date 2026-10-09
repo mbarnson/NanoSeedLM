@@ -1553,6 +1553,11 @@ static void route_collect(Eng* e, int T) {
         }
     }
 }
+int eng_mla_capture(Eng* e, int on) { (void) e; (void) on; return -1; }   // mova_ext.h: not in this engine yet
+int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {
+    (void) e; (void) l; (void) x; (void) v; (void) q; (void) o; (void) rows;
+    return -1;
+}
 int eng_mova_routes_read(Eng* e, int rows, int32_t* mlp, int32_t* val, float* mlp_sel, float* val_sel) {
     if (!e->route_on || rows > e->route_rows) return -1;
     const MovaCfg* c = &e->c;

@@ -88,6 +88,10 @@ struct Eng {
     int prompt;                           // prompt rows: the prefill kernels for any row count (chunking-invariant caches)
     int expand, expand_min;               // MLA prompt rows: the latent expanded per head (Seq.xend)
     int gpu_cores;                        // the GPU's cores (IORegistry gpu-core-count; 0: unknown)
+    int cap_on;                           // MLA capture (mova_ext.h): per layer sums of squares of the projections' inputs
+    id<MTLBuffer> cap_buf;                // this forward's (f32), [layer][x d | v kvd | q qd | o n_head * rmax]
+    double* cap_sum;                      // all forwards'
+    int64_t cap_rows, cap_ld;
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
     int decode_rows;                      // this forward's rows are other slots' pending tokens: per-row attention
@@ -742,6 +746,8 @@ void eng_close(Eng* e) {
         if (e->seqs) for (int s = 0; s < e->nseqs; ++s) free(e->seqs[s].hist);
         free(e->seqs);
         free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
+        free(e->cap_sum);
+        e->cap_buf = nil;
         e->pipes = nil; e->buffers = nil; e->lib = nil; e->queue = nil; e->dev = nil; e->residency = nil;
         free(e);
     }
@@ -1009,11 +1015,26 @@ static void encode_mla_prefill(Eng* e, Cmd* c, int l, int T) {
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v): the latent
 // c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write, latent attention (split-key +
 // reduce for decode, one pass for prompt chunks), then v_up with the gate into ao.
+// MLA capture: the per-column sums of squares of X (T rows of n floats, row stride xs) into cap_buf at float offset off
+static void enc_cap(Eng* e, Cmd* c, id<MTLBuffer> X, int n, int xs, int T, uint64_t off) {
+    const int32_t a[4] = {n, T, xs, 0};
+    cpipe(c, pipe_(e, "k_sumsq", 0, 0));
+    cbuf(c, 0, X, 0);
+    cbuf(c, 1, e->cap_buf, off * 4);
+    cbytes(c, 2, a, sizeof a);
+    [c->enc dispatchThreads:MTLSizeMake((NSUInteger) n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
 static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
     const MovaCfg* g = &e->c;
     Layer* L = &e->L[l];
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim, r = L->mla_r, H = g->n_head;
     cmd_group(c, MOVA_TG_ATTN_PROJ);
+    const uint64_t cb = (uint64_t) l * (uint64_t) e->cap_ld;   // capture: this layer's sums
+    if (e->cap_on) {
+        enc_cap(e, c, e->xn, d, d, T, cb);
+        if (L->sparse) enc_cap(e, c, e->v, kvd, kvd, T, cb + (uint64_t) d);
+        enc_cap(e, c, e->q, qd, qd, T, cb + (uint64_t) (d + kvd));
+    }
     enc_dense(c, &L->ka_x, e->xn, d, e->lat, r, T, false);
     if (L->sparse) enc_dense(c, &L->ka_v, e->v, kvd, e->lat, r, T, true);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
     enc_dense(c, &L->kr, e->xn, d, e->k, g->mla_rope, T, false);
@@ -1056,6 +1077,7 @@ static void encode_mla_attn(Eng* e, Cmd* c, int l, int T, int ns) {
         crun(c, (uint64_t) H, (uint64_t) T, 1, 256);
     }
     cmd_group(c, MOVA_TG_ATTN_PROJ);
+    if (e->cap_on) enc_cap(e, c, e->olat, H * r, H * r, T, cb + (uint64_t) (d + kvd + qd));
     heads(c, &L->vu, e->olat, H * r, r, e->gq, e->ao, T);
     (void) kvd;
 }
@@ -1277,6 +1299,12 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
         }
         if (cmd_wait(&c)) return -1;
         if (e->route_on) route_collect(e, T);
+        if (e->cap_on) {   // this forward's sums into the totals
+            float* f = (float*) e->cap_buf.contents;
+            const uint64_t n = (uint64_t) e->c.n_layer * (uint64_t) e->cap_ld;
+            for (uint64_t i = 0; i < n; ++i) { e->cap_sum[i] += f[i]; f[i] = 0; }
+            e->cap_rows += T;
+        }
         return 0;
     }
 }
@@ -1326,7 +1354,7 @@ int eng_prefill_next(Eng* e, int seq, int max_rows) {
     int T = left < max_rows ? (left < MAX_ROWS ? left : MAX_ROWS) : (max_rows < MAX_ROWS ? max_rows : MAX_ROWS);
     if (s->done < s->xend && s->done + T > s->xend) T = s->xend - s->done;   // a forward on one side of xend
     e->prompt = 1;
-    e->expand = s->done < s->xend;
+    e->expand = s->done < s->xend && !e->cap_on;
     const int rc = forward(e, seq, s->hist + s->done, T, s->done, T, NULL, NULL);
     e->prompt = 0;
     e->expand = 1;
@@ -1533,6 +1561,37 @@ int eng_score(Eng* e, int seq, const int32_t* ids, int from, int count, float* l
     return 0;
 }
 
+int eng_mla_capture(Eng* e, int on) {
+    const MovaCfg* c = &e->c;
+    if (!c->mla) return -1;
+    if (on && !e->cap_on) {
+        int rmax = 0;
+        for (int l = 0; l < c->n_layer; ++l) if (e->L[l].mla_r > rmax) rmax = e->L[l].mla_r;
+        e->cap_ld = (int64_t) c->d + (int64_t) c->n_kv * c->head_dim + (int64_t) c->n_head * c->head_dim + (int64_t) c->n_head * rmax;
+        const uint64_t n = (uint64_t) c->n_layer * (uint64_t) e->cap_ld;
+        e->cap_buf = [e->dev newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+        free(e->cap_sum);
+        e->cap_sum = (double*) calloc(n, sizeof(double));
+        if (!e->cap_buf || !e->cap_sum) return -1;
+        memset(e->cap_buf.contents, 0, n * 4);
+        if (e->residency) { [e->residency addAllocation:e->cap_buf]; [e->residency commit]; }
+        e->cap_rows = 0;
+    }
+    e->cap_on = on;
+    return 0;
+}
+int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {
+    const MovaCfg* c = &e->c;
+    if (!c->mla || !e->cap_sum || l < 0 || l >= c->n_layer) return -1;
+    const int d = c->d, kvd = c->n_kv * c->head_dim, qd = c->n_head * c->head_dim, od = c->n_head * e->L[l].mla_r;
+    const double* s = e->cap_sum + (uint64_t) l * (uint64_t) e->cap_ld;
+    if (x) memcpy(x, s, sizeof(double) * (size_t) d);
+    if (v) memcpy(v, s + d, sizeof(double) * (size_t) kvd);
+    if (q) memcpy(q, s + d + kvd, sizeof(double) * (size_t) qd);
+    if (o) memcpy(o, s + d + kvd + qd, sizeof(double) * (size_t) od);
+    if (rows) *rows = e->cap_rows;
+    return 0;
+}
 int eng_mova_routes(Eng* e, int on, int max_rows) {
     free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
     e->route_mlp = NULL; e->route_val = NULL; e->route_mlp_sel = NULL; e->route_val_sel = NULL;
