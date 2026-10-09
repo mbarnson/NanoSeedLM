@@ -774,11 +774,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->h_tiles = (MmTile*) halloc(e, (uint64_t) MAX_TILES * sizeof(MmTile));
     e->h_am = (int32_t*) halloc(e, (uint64_t) T * 4);
     e->h_logits = (float*) halloc(e, (uint64_t) MAX_LOGIT_ROWS * c->vocab * 4);
-    // Rows per layer-major range.  When KV spills to host memory, every range stages each layer's earlier host rows
-    // into VRAM (PCIe traffic ~ prompt^2 / range): a larger range when the KV will not fit (NSLM_PREFILL_RANGE sets it).
+    // Rows per layer-major range: reuse each layer's experts across longer resident prompts too.  When KV spills,
+    // every range also stages that layer's earlier host rows (PCIe traffic ~ prompt^2 / range). NSLM_PREFILL_RANGE overrides.
     {
         const char* pr = getenv("NSLM_PREFILL_RANGE");
-        int64_t xm = pr ? atoll(pr) : kv_spills(e) ? 32768 : 8192;
+        int64_t xm = pr ? atoll(pr) : 32768;
         if (xm < MAX_ROWS) xm = MAX_ROWS;
         e->xmax = (int) (e->kv_cap < xm ? e->kv_cap : xm);
     }
