@@ -1014,7 +1014,7 @@ kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W 
                        device const float* g [[buffer(3)]], device float* y [[buffer(4)]], device const ushort* S [[buffer(5)]],
                        device const ushort* B [[buffer(6)]], device const uint* G [[buffer(7)]], device const uchar* EN [[buffer(8)]],
                        uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
-    // a.pad[0] = R rows per simdgroup (1, or 2 when a row has at most 16 blocks of 8: q_lat, q_rope_mix), 32 / R lanes a row
+    // a.pad[0] = R rows per simdgroup (1, 2 or 8: the host's choice by shape), 32 / R lanes a row
     const int R = a.pad[0] > 1 ? a.pad[0] : 1, L = 32 / R, h = (int) gid.y, t = (int) gid.z;
     const int o = (int) gid.x / 32 * R + (int) lane / L, ln = (int) lane % L;
     if ((int) gid.x / 32 * R >= a.O) return;   // whole simdgroups (the grid's x is a multiple of 32)
@@ -1024,12 +1024,20 @@ kernel void k_heads_mv(constant HmvArgs& a [[buffer(0)]], device const uchar* W 
     const ulong row = (ulong) h * a.O + (ulong) min(o, a.O - 1);
     float s;
     if (R == 1) s = simd_sum(mv_lane(FC_FMT, W, S, B, G, eb, row, a.I, xv, lane, EN));
-    else {   // L lanes a row, a block of 8 each step (Q4 unrounded: the qmv form, as mv_lane)
+    else {   // L lanes a row, a block of 8 each step (SEED4P4 and Q4 in mv_lane's forms)
         float acc = 0;
         for (int j = ln; j < a.I / 8; j += L) {
             float w[8];
-            if (FC_FMT == MF_SEED4P4) seed4p4_block(W, S, G, row, a.I, j, eb, EN, w);
-            else if (FC_FMT == MF_Q4) {
+            if (FC_FMT == MF_SEED4P4) {   // mv_lane's form: two-op states, the block's dot without its weights
+                const ulong k = row * (ulong) (a.I / 8) + j;
+                const uint sd = ((device const ushort*) W)[k];
+                float v[32];
+                seed4_states(sd, G[sd], v);
+                device const float4* xr = (device const float4*) (xv + (ulong) j * 8);
+                const float4 x0 = xr[0], x1 = xr[1];
+                acc += seed4_dot(v, (uint) S[k], eb + seed4_ecode(EN, k), x0, x1, -1.5f * dot(x0 + x1, float4(1.0f))) * (1.0f / 32767.0f);
+                continue;
+            } else if (FC_FMT == MF_Q4) {
                 const ulong gi = (row * (ulong) a.I + (ulong) j * 8) / 64;
                 const float sc = bf(S[gi]), bi = bf(B[gi]);
                 const uint q = ((device const uint*) W)[(row * (ulong) a.I) / 8 + (ulong) j];

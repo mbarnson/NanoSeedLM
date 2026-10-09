@@ -374,7 +374,7 @@ int kt_attn_prefill_q8(AttnArgs a, const float* q, KtKvQ8 kv, int npos, const Ro
 int kt_heads_mv(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, const float* g, float* y, int T) {
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     id<MTLBuffer> wb = buf(W, 2 * (size_t) H * O * I), xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
-    const int R = I / 8 <= 16 ? 2 : 1;   // rows per simdgroup, as the engine
+    const int R = I / 8 > 16 ? 1 : O * H / 8 >= 2048 ? 8 : 2;   // rows per simdgroup, as the engine
     const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
     if (T > MV_MAXT) {   // prompt rows, as the engine runs them: a GEMM per head (k_mm), with the gate
         const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
@@ -544,7 +544,7 @@ int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const ui
     id<MTLBuffer> wb = buf(codes, cb * H), sbuf = buf(scales, fmt == MF_BF16 ? 0 : sb * H), bbuf = buf(biases, fmt == MF_BF16 ? 0 : sb * H),
                   xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
     if (T <= MV_MAXT && !tr) {   // the decode matvec
-        const int R = I / 8 <= 16 ? 2 : 1;   // rows per simdgroup, as the engine
+        const int R = I / 8 > 16 ? 1 : O * H / 8 >= 2048 ? 8 : 2;   // rows per simdgroup, as the engine
     const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
         id<MTLComputePipelineState> pp = pipe_("k_heads_mv", fmt, 0);
         if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
@@ -588,7 +588,7 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
     id<MTLBuffer> sb = buf(seeds, 2 * nb * H), cb = buf(coefs, 2 * nb * H), eb = buf(ebias, 4 * (size_t) H), nb4 = buf(ecodes, nb * H / 2),
                   xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
     if (T <= MV_MAXT && !tr) {
-        const int R = I / 8 <= 16 ? 2 : 1;   // rows per simdgroup, as the engine
+        const int R = I / 8 > 16 ? 1 : O * H / 8 >= 2048 ? 8 : 2;   // rows per simdgroup, as the engine
     const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
         id<MTLComputePipelineState> pp = pipe_("k_heads_mv", MF_SEED4P4, 0);
         if (!pp || run(^(id<MTLComputeCommandEncoder> e) {

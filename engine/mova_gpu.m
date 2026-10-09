@@ -957,7 +957,9 @@ static int sync_cmd(Cmd* c) {
 // with T - h0 <= MAX_LOGIT_ROWS the head runs here (the caller copies e->logits and e->am), else the caller runs it.
 // MLA per-head maps (k_heads_mv): y[t][h][o] = W_h[o] . x[t * xs + h * hs ..], optionally gated by g (same layout as y)
 static void enc_heads_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, int hs, id<MTLBuffer> G, id<MTLBuffer> Y, int T) {
-    const int R = W->cols / 8 <= 16 ? 2 : 1;   // rows per simdgroup (k_heads_mv)
+    // rows per simdgroup (k_heads_mv): rows of at most 16 blocks take 8 (q_lat; M4 Max, decode per token: Q8 0.72 ->
+    // 0.45 ms, seeds 0.98 -> 0.71 ms) while that leaves 2048 simdgroups, else 2 (q_rope_mix); longer rows 1 (v_up)
+    const int R = W->cols / 8 > 16 ? 1 : W->rows * W->slices / 8 >= 2048 ? 8 : 2;
     const HmvArgs a = {W->slices, W->rows, W->cols, xs, hs, G != nil, {R, 0}};
     cpipe(c, pipe_(c->e, "k_heads_mv", W->fmt, 0));
     cbytes(c, 0, &a, sizeof a);

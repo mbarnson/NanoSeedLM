@@ -783,10 +783,11 @@ static void test_mla(void) {
     }
     {   // per-head maps in Q8 / Q4 (affine, a scale and bias per 64): against the scalar sum over the dequantized weights
         enum { H = 3 };
-        static const struct { int O, I, T, tr, gate; } C[5] = {{96, 128, 3, 0, 0}, {128, 192, 5, 0, 1}, {96, 128, 20, 0, 0},
-                                                               {128, 192, 37, 0, 1}, {128, 192, 37, 1, 0}};
+        // {6144, 128, 2}: q_lat-like decode with enough rows for Metal's 8 rows per simdgroup
+        static const struct { int O, I, T, tr, gate; } C[6] = {{96, 128, 3, 0, 0}, {128, 192, 5, 0, 1}, {96, 128, 20, 0, 0},
+                                                               {128, 192, 37, 0, 1}, {128, 192, 37, 1, 0}, {6144, 128, 2, 0, 1}};
         for (int f = 0; f < 2; ++f)
-            for (int cs = 0; cs < 5; ++cs) {
+            for (int cs = 0; cs < 6; ++cs) {
                 const int fmt = f ? MF_Q4 : MF_Q8, bits = f ? 4 : 8, O = C[cs].O, I = C[cs].I, T = C[cs].T, tr = C[cs].tr;
                 const int rows = tr ? I : O, cols = tr ? O : I;   // storage of one head: [rows][cols], groups along cols
                 const size_t n = (size_t) O * I;
@@ -828,9 +829,9 @@ static void test_mla(void) {
     }
     {   // per-head maps in SEED4P4 (nslm/search4.h): against the scalar sum over the exact weights
         enum { H = 3 };
-        static const struct { int O, I, T, tr, gate; } C[4] = {{96, 128, 3, 0, 0}, {128, 192, 5, 0, 1}, {128, 192, 37, 0, 1},
-                                                               {128, 192, 37, 1, 0}};
-        for (int cs = 0; cs < 4; ++cs) {
+        static const struct { int O, I, T, tr, gate; } C[5] = {{96, 128, 3, 0, 0}, {128, 192, 5, 0, 1}, {128, 192, 37, 0, 1},
+                                                               {128, 192, 37, 1, 0}, {6144, 128, 2, 0, 1}};
+        for (int cs = 0; cs < 5; ++cs) {
             const int O = C[cs].O, I = C[cs].I, T = C[cs].T, tr = C[cs].tr, rows = tr ? I : O, cols = tr ? O : I;
             const size_t n = (size_t) O * I, nb = n / 8;
             uint16_t* seed = malloc(2 * nb * H), *cf = malloc(2 * nb * H);
