@@ -94,7 +94,8 @@ struct Eng {
     id<MTLBuffer> cap_buf;                // this forward's (f32), [layer][x d | v kvd | q qd | o n_head * rmax]
     double* cap_sum;                      // all forwards'
     int64_t cap_rows, cap_ld;
-    id<MTLBuffer> cap_xtx;                // capture mode 2: X^T X sums (f32), [layer][x d^2 | v kvd^2 | q H hd^2 | o H rmax^2]
+    id<MTLBuffer> cap_xtx;                // capture mode 2: this forward's X^T X (f32), [layer][x d^2 | v kvd^2 | q H hd^2 | o H rmax^2]
+    double* cap_xsum;                     // all forwards' (f32 over 147k rows lost the PSD of layers with massive activations)
     int64_t cap_xld;
     int batch_gemm;                       // NSLM_BATCH_GEMM=N: decode steps of at least N (> MV_MAXT) slots run as forwards
                                           // of up to 64 rows through the GEMMs (faster at large N; not bit-equal to alone)
@@ -774,8 +775,8 @@ void eng_close(Eng* e) {
         if (e->seqs) for (int s = 0; s < e->nseqs; ++s) free(e->seqs[s].hist);
         free(e->seqs);
         free(e->route_mlp); free(e->route_val); free(e->route_mlp_sel); free(e->route_val_sel);
-        free(e->cap_sum);
-        e->cap_buf = nil;
+        free(e->cap_sum); free(e->cap_xsum);
+        e->cap_buf = nil; e->cap_xtx = nil;
         e->pipes = nil; e->buffers = nil; e->lib = nil; e->queue = nil; e->dev = nil; e->residency = nil;
         free(e);
     }
@@ -1386,6 +1387,11 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
             float* f = (float*) e->cap_buf.contents;
             const uint64_t n = (uint64_t) e->c.n_layer * (uint64_t) e->cap_ld;
             for (uint64_t i = 0; i < n; ++i) { e->cap_sum[i] += f[i]; f[i] = 0; }
+            if (e->cap_on == 2) {
+                float* x = (float*) e->cap_xtx.contents;
+                const uint64_t nx = (uint64_t) e->c.n_layer * (uint64_t) e->cap_xld;
+                for (uint64_t i = 0; i < nx; ++i) { e->cap_xsum[i] += x[i]; x[i] = 0; }
+            }
             e->cap_rows += T;
         }
         return 0;
@@ -1662,6 +1668,8 @@ int eng_mla_capture(Eng* e, int on) {
                 if (e->residency) { [e->residency addAllocation:e->cap_xtx]; [e->residency commit]; }
             }
             memset(e->cap_xtx.contents, 0, nx);
+            free(e->cap_xsum);
+            if (!(e->cap_xsum = (double*) calloc(nx / 4, sizeof(double)))) return -1;
         }
         e->cap_ld = (int64_t) c->d + (int64_t) c->n_kv * c->head_dim + (int64_t) c->n_head * c->head_dim + (int64_t) c->n_head * rmax;
         const uint64_t n = (uint64_t) c->n_layer * (uint64_t) e->cap_ld;
@@ -1678,16 +1686,16 @@ int eng_mla_capture(Eng* e, int on) {
 }
 int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) {
     const MovaCfg* c = &e->c;
-    if (!c->mla || e->cap_on != 2 || !e->cap_xtx || l < 0 || l >= c->n_layer || site < 0 || site > 3) return -1;
+    if (!c->mla || e->cap_on != 2 || !e->cap_xsum || l < 0 || l >= c->n_layer || site < 0 || site > 3) return -1;
     const int64_t d = c->d, kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head, r = e->L[l].mla_r;
     const int64_t dim = site == 0 ? d : site == 1 ? kvd : site == 2 ? hd : r, nb = site < 2 ? 1 : H;
     const int64_t off = site == 0 ? 0 : site == 1 ? d * d : site == 2 ? d * d + kvd * kvd : d * d + kvd * kvd + H * hd * hd;
-    const float* s = (const float*) e->cap_xtx.contents + l * e->cap_xld + off;
+    const double* s = e->cap_xsum + l * e->cap_xld + off;
     for (int64_t b = 0; b < nb; ++b) {   // the lower triangle, mirrored
-        const float* sb = s + b * dim * dim;
+        const double* sb = s + b * dim * dim;
         float* hb = h + b * dim * dim;
         for (int64_t i = 0; i < dim; ++i)
-            for (int64_t j = 0; j <= i; ++j) hb[i * dim + j] = hb[j * dim + i] = sb[i * dim + j];
+            for (int64_t j = 0; j <= i; ++j) hb[i * dim + j] = hb[j * dim + i] = (float) sb[i * dim + j];
     }
     return 0;
 }
