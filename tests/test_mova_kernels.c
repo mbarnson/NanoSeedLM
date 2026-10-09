@@ -28,7 +28,7 @@ static int close_bf(float a, double b, double extra) {
     const double ulp = fabs(b) * (1.0 / 128.0) + 1e-30;
     return fabs(a - b) <= ulp + extra;
 }
-static const char* kNames[5] = {"bf16", "seed4", "q8", "q4", "seed4p4"};
+static const char* kNames[6] = {"bf16", "seed4", "q8", "q4", "seed4p4", "seed6p8"};
 
 // ---- weights in every format: S slices of R x K, and the reference value of each element ---------------------------
 typedef struct {
@@ -43,6 +43,11 @@ typedef struct {
     uint8_t* p4nib;
     int32_t p4bias[3];
     double* p4w;                                   // SEED4P4: exact weights
+    uint16_t* p8seeds;                             // SEED6P8 (search8.h)
+    uint32_t* p8coefs;
+    uint8_t* p8nib;
+    int32_t p8bias[3];
+    double* p8w;                                   // SEED6P8: exact weights
 } Weights;
 
 static Weights make_weights(int S, int R, int K, unsigned* sd) {
@@ -94,11 +99,34 @@ static Weights make_weights(int S, int R, int K, unsigned* sd) {
             m.p4w[b * 8 + c] = sc * v;
         }
     }
+    // SEED6P8 (6.5-bit, P = 8): as SEED4P4 with 8 coefficients per block (32-bit words) and 64 states
+    m.p8seeds = malloc(2 * nb); m.p8coefs = malloc(4 * nb); m.p8nib = calloc(nb / 2 + 1, 1); m.p8w = malloc(sizeof(double) * n);
+    m.p8bias[0] = -20; m.p8bias[1] = -18; m.p8bias[2] = -22;
+    for (size_t b = 0; b < nb; ++b) {
+        *sd = *sd * 1103515245u + 12345u;
+        m.p8seeds[b] = (uint16_t) (1 + (*sd >> 8) % 65535);
+        *sd = *sd * 1103515245u + 12345u;
+        const uint32_t hi = *sd >> 16;
+        *sd = *sd * 1103515245u + 12345u;
+        m.p8coefs[b] = (hi << 16) | (*sd >> 16);
+        const int ec = (int) ((*sd >> 3) % 6);
+        m.p8nib[b / 2] |= (uint8_t) (ec << (4 * (b & 1)));
+        const int s = (int) (b / ((size_t) R * K / 8));
+        uint16_t st[64];
+        lfsr_states(m.p8seeds[b], 64, st);
+        const double sc = (double) NSLM_R32 * pow(2.0, m.p8bias[s] + ec);
+        for (int c = 0; c < 8; ++c) {
+            double v = 0;
+            for (int p = 0; p < 8; ++p) v += ((double) st[8 * c + p] - 32768) * (double) ((int32_t) (m.p8coefs[b] << (28 - 4 * p)) >> 28);
+            m.p8w[b * 8 + c] = sc * v;
+        }
+    }
     return m;
 }
 static void free_weights(Weights* m) {
     free(m->w); free(m->q8); free(m->q4); free(m->s8); free(m->b8); free(m->s4); free(m->b4); free(m->d8); free(m->d4);
     free(m->seeds); free(m->nibs); free(m->wseed); free(m->p4seeds); free(m->p4coefs); free(m->p4nib); free(m->p4w);
+    free(m->p8seeds); free(m->p8coefs); free(m->p8nib); free(m->p8w);
 }
 static KtWeight kt_weight(const Weights* m, int fmt) {
     const size_t n = (size_t) m->S * m->R * m->K, nb = n / 8;
@@ -110,6 +138,7 @@ static KtWeight kt_weight(const Weights* m, int fmt) {
     case MF_Q8: k.w = m->q8; k.wn = n; k.s = m->s8; k.b = m->b8; k.sn = k.bn = 2 * n / 64; break;
     case MF_Q4: k.w = m->q4; k.wn = n / 2; k.s = m->s4; k.b = m->b4; k.sn = k.bn = 2 * n / 64; break;
     case MF_SEED4: k.w = m->seeds; k.s = m->nibs; k.wn = k.sn = 2 * nb; k.b = m->ebias; k.bn = 4 * (size_t) m->S; break;
+    case MF_SEED6P8: k.w = m->p8seeds; k.s = m->p8coefs; k.wn = 2 * nb; k.sn = 4 * nb; k.b = m->p8bias; k.bn = 4 * (size_t) m->S; k.e = m->p8nib; k.en = nb / 2 + 1; break;
     default: k.w = m->p4seeds; k.s = m->p4coefs; k.wn = k.sn = 2 * nb; k.b = m->p4bias; k.bn = 4 * (size_t) m->S; k.e = m->p4nib; k.en = nb / 2 + 1;
     }
     return k;
@@ -123,6 +152,7 @@ static double wref(const Weights* m, int fmt, int mv, int s, int r, int c) {
     case MF_Q8: return bf2f(m->d8[i]);
     case MF_Q4: return mv ? (double) bf2f(m->s4[i / 64]) * (double) ((m->q4[i / 8] >> (4 * (i % 8))) & 15u) + bf2f(m->b4[i / 64]) : bf2f(m->d4[i]);
     case MF_SEED4: return m->wseed[i];
+    case MF_SEED6P8: return m->p8w[i];
     default: return m->p4w[i];
     }
 }
@@ -135,9 +165,10 @@ static void test_mv(int K) {   // K = 256 and 512: the matvec's one- and two-blo
     Weights m = make_weights(S, R, K, &sd);
     for (int i = 0; i < MV_MAXT * K; ++i) x[i] = bfr(frand(&sd));
     for (int i = 0; i < 16 * K; ++i) xg[i] = bfr(frand(&sd));
-    for (int fmt = 0; fmt < 5; ++fmt) {
+    for (int fmt = 0; fmt < 6; ++fmt) {
+        if (!kt_has_fmt(fmt)) { printf("mv %-7s: skipped (not in this backend)\n", kNames[fmt]); continue; }
         const KtWeight kw = kt_weight(&m, fmt);
-        const double f32b = (fmt == MF_SEED4 || fmt == MF_SEED4P4 ? 64 : 48) * 1.2e-7;   // f32 accumulation, per |w x|
+        const double f32b = (fmt == MF_SEED6P8 ? 128 : fmt == MF_SEED4 || fmt == MF_SEED4P4 ? 64 : 48) * 1.2e-7;   // f32 accumulation, per |w x|
         double worst = 0;
         for (int T = 1; T <= MV_MAXT; ++T) {   // dense on slice 0; also the residual add for T = 3
             const int add = T == 3;
@@ -174,7 +205,7 @@ static void test_mv(int K) {   // K = 256 and 512: the matvec's one- and two-blo
                         worst = fmax(worst, fabs(y[p * R + r] - ref) / (fabs(ref) / 128 + bound));
                     }
         }
-        {   // gate + up + SwiGLU: gate = slice sel[p], up = slice sel[p] + 1; a = bf16(silu(bf16 g) * bf16 u), within one
+        if (fmt != MF_SEED6P8) {   // gate + up + SwiGLU (routed experts; not P = 8): gate = slice sel[p], up = slice sel[p] + 1; a = bf16(silu(bf16 g) * bf16 u), within one
             // BF16 flip of g or u
             const int P = 6, xdiv = 2;
             const int32_t sel[6] = {1, 0, 1, 1, 0, 0};
@@ -210,7 +241,7 @@ static void test_mv(int K) {   // K = 256 and 512: the matvec's one- and two-blo
 static void test_mm_pass(const Weights* m, const float* x, int T, int P, int xdiv, int fmt, int exact, unsigned* sd) {
     const int R = m->R, K = m->K, S = m->S, BN = kt_mm_tile();
     const KtWeight kw = kt_weight(m, fmt);
-    const int seedf = fmt == MF_SEED4 || fmt == MF_SEED4P4;
+    const int seedf = fmt == MF_SEED4 || fmt == MF_SEED4P4 || fmt == MF_SEED6P8;
     int bad = 0;
     {   // dense, slice 0, residual add
         float* y0 = malloc(4 * (size_t) T * R), *y = malloc(4 * (size_t) T * R);
@@ -268,7 +299,8 @@ static void test_mm(void) {
     float* x = malloc(4 * (size_t) T * m.K);
     for (int i = 0; i < T * m.K; ++i) x[i] = bfr(frand(&sd));
     const int has_bf16 = kt_seed_gemm_exact(1);
-    for (int fmt = 0; fmt < 5; ++fmt) test_mm_pass(&m, x, T, P, xdiv, fmt, 1, &sd);
+    for (int fmt = 0; fmt < 6; ++fmt)
+        if (kt_has_fmt(fmt)) test_mm_pass(&m, x, T, P, xdiv, fmt, 1, &sd);
     if (has_bf16) {
         kt_seed_gemm_exact(0);
         test_mm_pass(&m, x, T, P, xdiv, MF_SEED4, 0, &sd);
@@ -510,6 +542,20 @@ static void test_misc(void) {
                 for (int c = 0; c < dd; ++c) bad += xe[t * dd + c] != bf2f(fmt == MF_Q8 ? deq[ids[t] * dd + c] : E[ids[t] * dd + c]);
         }
         CHECK(!bad, "embed: %d mismatches", bad);
+        {   // seed rows (SEED4P4, SEED6P8): equal to the BF16-rounded exact weights
+            Weights sw = make_weights(1, V, dd, &sd);
+            for (int fmt = MF_SEED4P4; fmt <= MF_SEED6P8; ++fmt) {
+                const KtWeight kw = kt_weight(&sw, fmt);
+                const int rc = kt_embed_seed(&kw, ids, 3, xe);
+                if (rc == 1) { printf("embed %s: skipped (not in this backend)\n", kNames[fmt]); continue; }
+                if (rc) { ++fails; continue; }
+                int bs = 0;
+                for (int t = 0; t < 3; ++t)
+                    for (int c = 0; c < dd; ++c) bs += xe[t * dd + c] != bfr((float) wref(&sw, fmt, 0, 0, ids[t], c));
+                CHECK(!bs, "embed %s: %d mismatches", kNames[fmt], bs);
+            }
+            free_weights(&sw);
+        }
         const int VV = 250624;
         float* lg = malloc(4 * (size_t) VV * 2);
         for (int i = 0; i < 2 * VV; ++i) lg[i] = bfr(frand(&sd) * 10);

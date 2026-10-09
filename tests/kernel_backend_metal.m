@@ -68,6 +68,7 @@ const char* kt_name(void) { return "Metal"; }
 int kt_mm_tile(void) { return MM_BN; }
 int kt_attn_key_tile(void) { return ATTF_BK; }
 int kt_seed_gemm_exact(int on) { (void) on; return 0; }   // the Metal GEMM always multiplies the f32 seed weights
+int kt_has_fmt(int fmt) { return fmt >= MF_BF16 && fmt <= MF_SEED6P8; }
 
 // The weight's buffers (the kernels address slices themselves) and its seed table.
 typedef struct { id<MTLBuffer> W, S, B, N, G; } MW;
@@ -77,7 +78,7 @@ static MW mw(const KtWeight* w) {
     m.S = buf(w->s, w->sn);
     m.B = buf(w->b, w->bn);
     m.N = buf(w->e, w->en);
-    m.G = w->fmt == MF_SEED4P4 ? g32 : g24;
+    m.G = w->fmt == MF_SEED4P4 || w->fmt == MF_SEED6P8 ? g32 : g24;
     return m;
 }
 static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuffer> xb, id<MTLBuffer> yb, id<MTLBuffer> sel) {
@@ -535,6 +536,22 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
         }))
         return -1;
     memcpy(x, xb.contents, 4 * (size_t) n * d);
+    return 0;
+}
+int kt_embed_seed(const KtWeight* w, const int32_t* ids, int n, float* x) {
+    const MW m = mw(w);
+    id<MTLBuffer> ib = buf(ids, 4 * (size_t) n), xb = buf(NULL, 4 * (size_t) n * w->K);
+    const int32_t d2 = w->K;
+    id<MTLComputePipelineState> p = pipe_("k_embed", w->fmt, 0);
+    if (!p || run(^(id<MTLComputeCommandEncoder> e) {   // 1 seeds, 3 coefficient words, 4 bias, 7 the 32-bit table, 8 codes
+            [e setComputePipelineState:p]; [e setBytes:&d2 length:4 atIndex:0]; [e setBuffer:m.W offset:0 atIndex:1];
+            [e setBuffer:m.W offset:0 atIndex:2]; [e setBuffer:m.S offset:0 atIndex:3]; [e setBuffer:m.B offset:0 atIndex:4];
+            [e setBuffer:ib offset:0 atIndex:5]; [e setBuffer:xb offset:0 atIndex:6]; [e setBuffer:m.G offset:0 atIndex:7];
+            [e setBuffer:m.N offset:0 atIndex:8];
+            [e dispatchThreads:MTLSizeMake(w->K, n, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }))
+        return -1;
+    memcpy(x, xb.contents, 4 * (size_t) n * w->K);
     return 0;
 }
 int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,

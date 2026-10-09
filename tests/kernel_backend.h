@@ -15,7 +15,8 @@ extern "C" {
 // A stacked weight: S slices of R x K in the model's streams, slice after slice in each stream (nslm/model_st.h):
 // BF16 w = values; Q8 / Q4 w = packed words, s = scales, b = biases (BF16, one per 64 values); SEED4 w = seeds,
 // s = nibble words, b = int32 exponent bias per slice; SEED4P4 w = seeds, s = coefficient words, b = int32 exponent bias
-// per slice, e = exponent codes (4 bits per block, two blocks per byte, low first).
+// per slice, e = exponent codes (4 bits per block, two blocks per byte, low first); SEED6P8 as SEED4P4 with s = 32-bit
+// coefficient words.
 typedef struct {
     int fmt, S, R, K;
     const void *w, *s, *b, *e;
@@ -30,6 +31,8 @@ int kt_mm_tile(void);   // pairs per tile of the grouped GEMM (MmTile.count <= t
 int kt_attn_key_tile(void);   // keys per tile of prefill attention (its online softmax rescales per tile)
 // The GEMM's seed weights: exact (f32) when on; returns whether the backend also has a BF16-rounded mode (off)
 int kt_seed_gemm_exact(int on);
+// 1 when the backend's kernels take weights in fmt (MF_*)
+int kt_has_fmt(int fmt);
 
 // y[t][r] (+)= W_0[r] . x[t] for t < T <= MV_MAXT (slice 0; add: y holds the residual)
 int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y);
@@ -130,6 +133,8 @@ int kt_kv_f32(int fmt, const uint8_t* codes, const uint8_t* scales, int len, int
 // fmt MF_BF16 (E) or MF_Q8 (q8, s8, b8): x[t] = row ids[t]
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x);
+// x[t] = row ids[t] of a SEED4P4 / SEED6P8 embedding (slice 0 of w); 1 where the backend lacks it
+int kt_embed_seed(const KtWeight* w, const int32_t* ids, int n, float* x);
 int kt_argmax(const float* logits, int V, int n, int32_t* out);
 // y[i] = x[i] (BF16 to f32, k_bf16_f32); 1 where the backend lacks it
 int kt_bf16_f32(const uint16_t* x, float* y, int n);
