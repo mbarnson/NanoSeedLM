@@ -27,14 +27,14 @@ HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harn
 HARN_HDRS := $(wildcard harness/*.h)
 ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h
 
-METALLIBS := $(RES)/kernels_moe.metallib $(RES)/search.metallib $(RES)/search4.metallib
+METALLIBS := $(RES)/kernels_moe.metallib $(RES)/search.metallib $(RES)/search4.metallib $(RES)/searchp.metallib
 ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes \
              nslm-mova-mlacapture
-TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-mova-pack nslm-bits-probe)
-C_TESTS   := $(filter-out tests/test_engine.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c \
+TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-bits-probe)
+C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c tests/test_searchp_gpu.c \
                             tests/test_mova_kernels.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
-             $(BIN)/test_search4_gpu $(BIN)/test_mova_kernels
+             $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels
 
 .PHONY: all build test test-mlx clean
 all: build
@@ -50,6 +50,9 @@ $(RES)/search.metallib: nslm/search.metal nslm/search_gpu.h nslm/lfsr.h
 $(RES)/search4.metallib: nslm/search4.metal nslm/search4_gpu.h nslm/lfsr.h
 	@mkdir -p $(@D)
 	$(METAL) -fno-fast-math -Inslm -c $< -o $(@D)/search4.air && xcrun -sdk macosx metallib $(@D)/search4.air -o $@
+$(RES)/searchp.metallib: nslm/searchp.metal nslm/searchp_gpu.h nslm/lfsr.h
+	@mkdir -p $(@D)
+	$(METAL) -fno-fast-math -Inslm -c $< -o $(@D)/searchp.air && xcrun -sdk macosx metallib $(@D)/searchp.air -o $@
 
 # ---- objects: the engine (Metal), the shared harness and the C library ---------------------------------------------
 ENG_O     := $(OBJ)/mova_gpu.o
@@ -81,13 +84,16 @@ $(BIN)/nslm-mova-kbench: harness/nslm-mova-kbench.m harness/common.h engine/kern
 	$(CC) $(OBJCFLAGS) harness/nslm-mova-kbench.m $(LIBS) -o $@
 
 # ---- compressor: seed search (C + the Metal search glue) and the packer -------------------------------------------
-SEARCH_O  := $(OBJ)/search_metal.o $(OBJ)/search4_metal.o
+SEARCH_O  := $(OBJ)/search_metal.o $(OBJ)/search4_metal.o $(OBJ)/searchp_metal.o
 $(OBJ)/%_metal.o: nslm/%_metal.m $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
 $(BIN)/nslm-moe: nslm/moe.c $(SEARCH_O) $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -O3 nslm/moe.c $(SEARCH_O) $(LIB_O) -o $@ -lm -lpthread $(LIBS)
+$(BIN)/nslm-dense: nslm/dense.c $(OBJ)/search4_metal.o $(OBJ)/searchp_metal.o $(LIB_O) $(NSLM_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -O3 nslm/dense.c $(OBJ)/search4_metal.o $(OBJ)/searchp_metal.o $(LIB_O) -o $@ -lm -lpthread $(LIBS)
 $(BIN)/nslm-mova-pack: nslm/mova_pack.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -O3 $< $(LIB_O) -o $@ -lm -lpthread
@@ -111,6 +117,9 @@ $(BIN)/test_serve_splitter: tests/test_serve_splitter.c harness/nslm-serve.c $(E
 $(BIN)/test_search_gpu: tests/test_search_gpu.c $(OBJ)/search_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/search.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(OBJ)/search_metal.o $(LIB_O) $(LIBS) -lpthread -o $@
+$(BIN)/test_searchp_gpu: tests/test_searchp_gpu.c $(OBJ)/searchp_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/searchp.metallib
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< $(OBJ)/searchp_metal.o $(LIB_O) $(LIBS) -lpthread -o $@
 $(BIN)/test_search4_gpu: tests/test_search4_gpu.c $(OBJ)/search4_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/search4.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(OBJ)/search4_metal.o $(LIB_O) $(LIBS) -lpthread -o $@

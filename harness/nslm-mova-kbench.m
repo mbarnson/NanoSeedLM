@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
             {"expert_gu x8 (768x2560)", 768, 2560, 100, 8, 1}, {"expert_d x8 (2560x768)", 2560, 768, 100, 8, 1},
             {"value x4 (1024x2560)", 1024, 2560, 64, 4, 1},
         };
-        const char* fnames[5] = {"bf16", "seed4", "q8", "q4", "seedp4"};
+        const char* fnames[6] = {"bf16", "seed4", "q8", "q4", "seedp4", "seedp8"};
         uint32_t* G = malloc(65536 * 4);
         for (uint32_t s = 0; s < 65536; ++s) G[s] = lfsr_stream24((uint16_t) s);
         id<MTLBuffer> gb = [dev newBufferWithBytes:G length:65536 * 4 options:MTLResourceStorageModeShared];
@@ -151,11 +151,12 @@ int main(int argc, char** argv) {
             Shape s = shapes[si];
             int copies = 1;   // dense: rotate through enough copies (>= 512 MB of BF16) that each call reads from DRAM
             if (!s.P) { while ((size_t) copies * s.R * s.K * 2 < (512u << 20) && copies < 64) ++copies; s.slices = copies; }
-            for (int fmt = 0; fmt < 5; ++fmt) {
+            for (int fmt = 0; fmt < 6; ++fmt) {
+                if (fmt == MF_SEED6P8 && s.P && s.slices != 64) continue;   // P = 8: dense tensors (and the value shape)
                 const size_t n = (size_t) s.slices * s.R * s.K, nb = n / 8;
-                const bool p4 = fmt == MF_SEED4P4;
+                const bool p4 = fmt == MF_SEED4P4 || fmt == MF_SEED6P8, p8 = fmt == MF_SEED6P8;
                 const size_t wbytes = fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : fmt == MF_Q4 ? n / 2 : 2 * nb;
-                const size_t sbytes = fmt == MF_SEED4 || p4 ? 2 * nb : (fmt == MF_Q8 || fmt == MF_Q4) ? 2 * (n / 64) : 16;
+                const size_t sbytes = p8 ? 4 * nb : fmt == MF_SEED4 || p4 ? 2 * nb : (fmt == MF_Q8 || fmt == MF_Q4) ? 2 * (n / 64) : 16;
                 const size_t bbytes = fmt == MF_SEED4 ? 4 * (size_t) s.slices : p4 ? 4 * (size_t) s.slices + nb / 2
                                     : (fmt == MF_Q8 || fmt == MF_Q4) ? 2 * (n / 64) : 16;
                 id<MTLBuffer> W = rnd(wbytes, 1), S = rnd(sbytes, 2), B = rnd(bbytes, 3);

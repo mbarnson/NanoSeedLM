@@ -14,6 +14,7 @@
 //            NAME.coefs    U16   [slices, rows, cols / 8]
 //            NAME.exp_bias I32   [slices]
 //            NAME.codes    U8    [slices, rows, cols / 16]   (4-bit exponent codes, low nibble first)
+//   SEED6P8  as SEED4P4 with NAME.coefs U32 [slices, rows, cols / 8]   (P = 8; searchp.h)
 // The writer pads each header so the data starts on a 16 KiB page and puts entries whose size is a page multiple
 // first: those map into GPU buffers without a copy.
 #pragma once
@@ -21,7 +22,7 @@
 
 #include "format.h"
 
-enum { NS_BF16 = 0, NS_SEED4 = 1, NS_Q8 = 2, NS_Q4 = 3, NS_SEED4P4 = 4 };   // = MF_* (engine/kernels_moe.metal)
+enum { NS_BF16 = 0, NS_SEED4 = 1, NS_Q8 = 2, NS_Q4 = 3, NS_SEED4P4 = 4, NS_SEED6P8 = 5 };   // = MF_* (engine/kernels_moe.metal)
 #define NS_PAGE 16384
 
 typedef struct {
@@ -32,7 +33,7 @@ typedef struct {
 } NsStream;
 
 // Streams: BF16 0 values; Q8/Q4 0 packed words, 1 scales, 2 biases; SEED4 0 seeds, 1 nibble words, 2 exponent biases;
-// SEED4P4 0 seeds, 1 coefficient words, 2 exponent biases, 3 exponent codes.
+// SEED4P4 / SEED6P8 0 seeds, 1 coefficient words, 2 exponent biases, 3 exponent codes.
 typedef struct {
     char name[96];
     int enc, slices, rows, cols;

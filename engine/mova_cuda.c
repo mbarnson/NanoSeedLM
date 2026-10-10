@@ -528,6 +528,11 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         return -1;
     }
     const int f = nt->enc;
+    if (f < MF_BF16 || f > MF_SEED4P4) {
+        snprintf(err, (size_t) errlen, "%s: encoding %d not supported by the CUDA engine (supported: BF16, SEED4, Q8, Q4, SEED4P4)",
+                 name, f);
+        return -1;
+    }
     const int ok = t->kind == MOVA_K_EXPERTS ? 1
                    : (t->kind == MOVA_K_ROUTER || t->kind == MOVA_K_NORM || t->kind == MOVA_K_ROUTER_BIAS ||
                       t->kind == MOVA_K_HEADS) ? f == MF_BF16 || (t->kind == MOVA_K_HEADS && (((f == MF_Q8 || f == MF_Q4) && nt->cols % 64 == 0) || f == MF_SEED4P4))

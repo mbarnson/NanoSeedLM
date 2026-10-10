@@ -68,6 +68,7 @@ const char* kt_name(void) { return "Metal"; }
 int kt_mm_tile(void) { return MM_BN; }
 int kt_attn_key_tile(void) { return ATTF_BK; }
 int kt_seed_gemm_exact(int on) { (void) on; return 0; }   // the Metal GEMM always multiplies the f32 seed weights
+int kt_has_fmt(int fmt) { return fmt >= MF_BF16 && fmt <= MF_SEED6P8; }
 
 // The weight's buffers (the kernels address slices themselves) and its seed table.
 typedef struct { id<MTLBuffer> W, S, B, N, G; } MW;
@@ -77,7 +78,7 @@ static MW mw(const KtWeight* w) {
     m.S = buf(w->s, w->sn);
     m.B = buf(w->b, w->bn);
     m.N = buf(w->e, w->en);
-    m.G = w->fmt == MF_SEED4P4 ? g32 : g24;
+    m.G = w->fmt == MF_SEED4P4 || w->fmt == MF_SEED6P8 ? g32 : g24;
     return m;
 }
 static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuffer> xb, id<MTLBuffer> yb, id<MTLBuffer> sel) {
@@ -537,6 +538,22 @@ int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8,
     memcpy(x, xb.contents, 4 * (size_t) n * d);
     return 0;
 }
+int kt_embed_seed(const KtWeight* w, const int32_t* ids, int n, float* x) {
+    const MW m = mw(w);
+    id<MTLBuffer> ib = buf(ids, 4 * (size_t) n), xb = buf(NULL, 4 * (size_t) n * w->K);
+    const int32_t d2 = w->K;
+    id<MTLComputePipelineState> p = pipe_("k_embed", w->fmt, 0);
+    if (!p || run(^(id<MTLComputeCommandEncoder> e) {   // 1 seeds, 3 coefficient words, 4 bias, 7 the 32-bit table, 8 codes
+            [e setComputePipelineState:p]; [e setBytes:&d2 length:4 atIndex:0]; [e setBuffer:m.W offset:0 atIndex:1];
+            [e setBuffer:m.W offset:0 atIndex:2]; [e setBuffer:m.S offset:0 atIndex:3]; [e setBuffer:m.B offset:0 atIndex:4];
+            [e setBuffer:ib offset:0 atIndex:5]; [e setBuffer:xb offset:0 atIndex:6]; [e setBuffer:m.G offset:0 atIndex:7];
+            [e setBuffer:m.N offset:0 atIndex:8];
+            [e dispatchThreads:MTLSizeMake(w->K, n, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }))
+        return -1;
+    memcpy(x, xb.contents, 4 * (size_t) n * w->K);
+    return 0;
+}
 int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const uint16_t* scales, const uint16_t* biases,
                const float* x, int xs, int hs, const float* g, float* y, int T) {
     const size_t n = (size_t) O * I, cb = fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : n / 2, sb = n / 64 * 2;
@@ -576,21 +593,21 @@ int kt_heads_q(int fmt, int tr, int H, int O, int I, const void* codes, const ui
     memcpy(y, yb.contents, yn);
     return 0;
 }
-int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
-                  const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
-    const size_t nb = (size_t) O * I / 8;
+static int heads_seed(int fmt, int tr, int H, int O, int I, const uint16_t* seeds, const void* coefs, const int32_t* ebias,
+                      const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    const size_t nb = (size_t) O * I / 8, cw = fmt == MF_SEED6P8 ? 4 : 2;
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;
     static id<MTLBuffer> tab;
     if (!tab) {   // the 32-bit stream table (lfsr.h)
         tab = buf(NULL, 4 * 65536);
         for (uint32_t s = 0; s < 65536; ++s) ((uint32_t*) tab.contents)[s] = lfsr_stream32((uint16_t) s);
     }
-    id<MTLBuffer> sb = buf(seeds, 2 * nb * H), cb = buf(coefs, 2 * nb * H), eb = buf(ebias, 4 * (size_t) H), nb4 = buf(ecodes, nb * H / 2),
+    id<MTLBuffer> sb = buf(seeds, 2 * nb * H), cb = buf(coefs, cw * nb * H), eb = buf(ebias, 4 * (size_t) H), nb4 = buf(ecodes, nb * H / 2),
                   xb = buf(x, xn), gb = buf(g, g ? yn : 16), yb = buf(NULL, yn);
     if (T <= MV_MAXT && !tr) {
         const int R = I / 8 > 16 ? 1 : O * H / 8 >= 2048 ? 8 : 2;   // rows per simdgroup, as the engine
     const HmvArgs a = {H, O, I, xs, hs, g != NULL, {R, 0}};
-        id<MTLComputePipelineState> pp = pipe_("k_heads_mv", MF_SEED4P4, 0);
+        id<MTLComputePipelineState> pp = pipe_("k_heads_mv", fmt, 0);
         if (!pp || run(^(id<MTLComputeCommandEncoder> e) {
                 [e setComputePipelineState:pp]; [e setBytes:&a length:sizeof a atIndex:0];
                 [e setBuffer:sb offset:0 atIndex:1]; [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:gb offset:0 atIndex:3];
@@ -600,7 +617,7 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
             }))
             return -1;
     } else {   // prompt rows, as the engine: the map decoded to BF16 once (k_heads_deq), then the BF16 GEMMs
-        const int32_t da2[4] = {tr ? I : O, tr ? O : I, H, 0}, *da = da2;   // the stored [H][rows][cols]; blocks cannot capture arrays
+        const int32_t da2[4] = {tr ? I : O, tr ? O : I, H, fmt == MF_SEED6P8}, *da = da2;   // the stored [H][rows][cols]; blocks cannot capture arrays
         id<MTLBuffer> wb = buf(NULL, 2 * nb * 8 * H);
         const MmArgs m = {I, O, T, xs, H * O, 1, g ? 2 : 0, 0};
         id<MTLComputePipelineState> pd = pipe_("k_heads_deq", 0, 0), pm = pipe_("k_mm", MF_BF16, tr ? 2 : 1);
@@ -626,6 +643,14 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
     }
     memcpy(y, yb.contents, yn);
     return 0;
+}
+int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
+                  const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    return heads_seed(MF_SEED4P4, tr, H, O, I, seeds, coefs, ebias, ecodes, x, xs, hs, g, y, T);
+}
+int kt_heads_seed8(int tr, int H, int O, int I, const uint16_t* seeds, const uint32_t* coefs, const int32_t* ebias,
+                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    return heads_seed(MF_SEED6P8, tr, H, O, I, seeds, coefs, ebias, ecodes, x, xs, hs, g, y, T);
 }
 int kt_heads_mm_t(int H, int O, int I, const uint16_t* W, const float* x, int xs, int hs, float* y, int T) {
     const size_t xn = 4 * ((size_t) (T - 1) * xs + (size_t) (H - 1) * hs + I), yn = 4 * (size_t) T * H * O;

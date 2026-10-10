@@ -60,7 +60,7 @@ target_link_libraries(nslm PUBLIC ${PLATFORM_LIBS})
 
 # ---- tests (pure C) -------------------------------------------------------------------------------------------------
 enable_testing()
-foreach(t affine kvq lfsr linalg model_st moe search search4 sha256)
+foreach(t affine kvq lfsr linalg model_st moe search search4 searchp sha256)
   add_executable(test_${t} tests/test_${t}.c)
   target_link_libraries(test_${t} nslm)
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
@@ -111,21 +111,28 @@ foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nsl
 endforeach()
 
 # ---- the compressor's GPU seed search (bit-identical to the C reference: no FMA contraction) -------------------------
-add_library(nslm_search_gpu STATIC nslm/search.cu nslm/search4.cu)
+add_library(nslm_search_gpu STATIC nslm/search.cu nslm/search4.cu nslm/searchp.cu)
 target_include_directories(nslm_search_gpu PUBLIC nslm)
 target_link_libraries(nslm_search_gpu PUBLIC nslm CUDA::cudart_static)
 target_compile_options(nslm_search_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 add_executable(test_search4_gpu tests/test_search4_gpu.c)
 target_link_libraries(test_search4_gpu nslm_search_gpu)
 add_test(NAME test_search4_gpu COMMAND test_search4_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_executable(test_searchp_gpu tests/test_searchp_gpu.c)
+target_link_libraries(test_searchp_gpu nslm_search_gpu)
+add_test(NAME test_searchp_gpu COMMAND test_searchp_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_search_gpu tests/test_search_gpu.c)
 target_link_libraries(test_search_gpu nslm_search_gpu)
 add_test(NAME test_search_gpu COMMAND test_search_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-set_tests_properties(test_search_gpu test_search4_gpu PROPERTIES SKIP_RETURN_CODE 77)   # 77: no GPU
+set_tests_properties(test_search_gpu test_search4_gpu test_searchp_gpu PROPERTIES SKIP_RETURN_CODE 77)   # 77: no GPU
 
-# the compressor: seed search (nslm-moe), the packer, the bits probe
+# the compressor: seed search (nslm-moe, nslm-dense), the packer, the bits probe
 add_executable(nslm-moe nslm/moe.c)
 target_link_libraries(nslm-moe nslm_search_gpu)
+add_executable(nslm-dense nslm/dense.c)
+target_link_libraries(nslm-dense nslm_search_gpu)
+add_test(NAME test_dense_help COMMAND nslm-dense -h)
+set_tests_properties(test_dense_help PROPERTIES WILL_FAIL TRUE)   # usage exits 2; a startup crash still fails
 add_executable(nslm-mova-pack nslm/mova_pack.c)
 target_link_libraries(nslm-mova-pack nslm)
 add_executable(nslm-bits-probe nslm/bits_probe.c)
@@ -136,6 +143,10 @@ add_executable(test_engine tests/test_engine.c)
 target_link_libraries(test_engine nslm_engine)
 add_test(NAME test_engine COMMAND test_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_engine PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_engine_formats tests/test_engine_formats.c)   # unsupported CUDA weight formats fail at load
+target_link_libraries(test_engine_formats nslm_engine)
+add_test(NAME test_engine_formats COMMAND test_engine_formats WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_engine_formats PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_mova_kernels tests/test_mova_kernels.c tests/kernel_backend_cuda.c)   # the kernels one by one
 target_link_libraries(test_mova_kernels nslm_engine)
 add_test(NAME test_mova_kernels COMMAND test_mova_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

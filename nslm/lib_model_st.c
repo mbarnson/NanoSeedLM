@@ -12,19 +12,21 @@
 
 #include "json.h"
 
-static const char* SUF[5][4] = {
+static const char* SUF[6][4] = {
     [NS_BF16] = {"", NULL, NULL, NULL},
     [NS_SEED4] = {".seeds", ".nibbles", ".exp_bias", NULL},
     [NS_Q8] = {".weight", ".scales", ".biases", NULL},
     [NS_Q4] = {".weight", ".scales", ".biases", NULL},
     [NS_SEED4P4] = {".seeds", ".coefs", ".exp_bias", ".codes"},
+    [NS_SEED6P8] = {".seeds", ".coefs", ".exp_bias", ".codes"},
 };
-static const char* DT[5][4] = {
+static const char* DT[6][4] = {
     [NS_BF16] = {"BF16", NULL, NULL, NULL},
     [NS_SEED4] = {"U16", "U16", "I32", NULL},
     [NS_Q8] = {"U32", "BF16", "BF16", NULL},
     [NS_Q4] = {"U32", "BF16", "BF16", NULL},
     [NS_SEED4P4] = {"U16", "U16", "I32", "U8"},
+    [NS_SEED6P8] = {"U16", "U32", "I32", "U8"},
 };
 
 uint64_t ns_stream_len(int enc, int slices, int rows, int cols, int s) {
@@ -35,6 +37,7 @@ uint64_t ns_stream_len(int enc, int slices, int rows, int cols, int s) {
     case NS_Q4: return s == 0 ? n / 2 : s < 3 ? 2 * (n / 64) : 0;
     case NS_SEED4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : 0;
     case NS_SEED4P4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
+    case NS_SEED6P8: return s == 0 ? 2 * (n / 8) : s == 1 ? 4 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
     default: return 0;
     }
 }
@@ -178,7 +181,10 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
             if (seeds) {
                 char k[176];
                 snprintf(k, sizeof k, "%s.codes", base);
-                enc = lookup(refs, nr, k) ? NS_SEED4P4 : NS_SEED4;
+                snprintf(k, sizeof k, "%s.coefs", base);
+                const Ref* cf = lookup(refs, nr, k);
+                snprintf(k, sizeof k, "%s.codes", base);
+                enc = !lookup(refs, nr, k) ? NS_SEED4 : cf && !strcmp(cf->e->dtype, "U32") ? NS_SEED6P8 : NS_SEED4P4;
                 C *= 8;
             } else {
                 char k[176];
@@ -238,12 +244,13 @@ typedef struct {
 } Ent;
 
 static void ent_shape(Ent* e, const NsSpec* t, int s) {
-    const int lead = t->slices > 1 || t->enc == NS_SEED4 || t->enc == NS_SEED4P4;
+    const int seed = t->enc == NS_SEED4 || t->enc == NS_SEED4P4 || t->enc == NS_SEED6P8;
+    const int lead = t->slices > 1 || seed;
     int64_t last = t->cols;
     if (t->enc == NS_Q8 || t->enc == NS_Q4) last = s == 0 ? (int64_t) t->cols * (t->enc == NS_Q8 ? 8 : 4) / 32 : t->cols / 64;
-    if (t->enc == NS_SEED4 || t->enc == NS_SEED4P4) last = s == 3 ? t->cols / 16 : t->cols / 8;
+    if (seed) last = s == 3 ? t->cols / 16 : t->cols / 8;
     e->ndim = 0;
-    if ((t->enc == NS_SEED4 || t->enc == NS_SEED4P4) && s == 2) { e->shape[0] = t->slices; e->ndim = 1; return; }
+    if (seed && s == 2) { e->shape[0] = t->slices; e->ndim = 1; return; }
     if (lead) e->shape[e->ndim++] = t->slices;
     if (t->enc != NS_BF16 || t->rows > 1 || t->slices > 1) e->shape[e->ndim++] = t->rows;
     e->shape[e->ndim++] = last;

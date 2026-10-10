@@ -347,6 +347,8 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
     return done("kc_mla_prefill", o, dout, qn);
 }
 
+int kt_has_fmt(int fmt) { return fmt >= MF_BF16 && fmt <= MF_SEED4P4; }   // no SEED6P8 kernels yet
+int kt_embed_seed(const KtWeight* w, const int32_t* ids, int n, float* x) { (void) w; (void) ids; (void) n; (void) x; return 1; }
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {
     WSlice w;
@@ -501,6 +503,12 @@ int kt_argmax(const float* logits, int V, int n, int32_t* out) {
 }
 // SEED4P4 per-head maps as the engine runs them: decode rows (T <= 8, tr 0) inline in k_heads_mv; prompt rows from the
 // map decoded to BF16 once (kc_heads_deq), then the BF16 GEMM (tr 0) or k_mla_decomp's transposed reads (tr 1)
+int kt_heads_seed8(int tr, int H, int O, int I, const uint16_t* seeds, const uint32_t* coefs, const int32_t* ebias,
+                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
+    (void) tr; (void) H; (void) O; (void) I; (void) seeds; (void) coefs; (void) ebias; (void) ecodes; (void) x; (void) xs; (void) hs;
+    (void) g; (void) y; (void) T;
+    return 1;   // no SEED6P8 kernels yet
+}
 int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint16_t* coefs, const int32_t* ebias,
                   const uint8_t* ecodes, const float* x, int xs, int hs, const float* g, float* y, int T) {
     const int rows = tr ? I : O, cols = tr ? O : I;
