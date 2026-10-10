@@ -22,6 +22,8 @@
 #include "kvq.h"
 #include "lfsr.h"
 #include "model_st.h"
+#include "mla_head_groups.h"
+#include "mla_resident_head_policy.h"
 #include "mova_cfg.h"
 #include "mova_ckpt.h"
 #include "mova_ext.h"
@@ -108,7 +110,7 @@ struct Eng {
     // at cache row dec_kv0 (dec_l -1: none).  Any forward that is not a prompt's, and any cache write, forgets them.
     uint16_t *dec_k, *dec_v;
     float* dec_st;
-    int dec_keys, dec_l, dec_kv0, dec_n;
+    int dec_keys, dec_l, dec_kv0, dec_n, dec_group;
     int cur_kv0;        // the slot (cache row of position 0) of the prompt rows being computed
     int32_t *ids, *inds, *vinds, *am, *perm, *vperm, *ntiles, *vntiles;
     RowInfo* ri;
@@ -550,6 +552,13 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Eng* e = (Eng*) calloc(1, sizeof *e);
     if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
     const MovaCfg* c = &e->c;
+    int expanded_full_forecast = 0;
+    e->dec_group = 1;
+    const char* share_text = getenv("NSLM_MLA_SHARE_HEADS");
+    if (share_text && strcmp(share_text, "0") && strcmp(share_text, "1")) {
+        snprintf(err, (size_t) errlen, "NSLM_MLA_SHARE_HEADS must be0(disabled) or1(auto)");
+        free(e); return NULL;
+    }
     int kv_ok = o->kv_format >= ENG_KV_BF16 && o->kv_format <= ENG_KV_FP4 && (c->mla ? o->kv_format != ENG_KV_Q8 : o->kv_format <= ENG_KV_Q8);
     for (int l = 0; l < c->n_layer && c->mla && o->kv_format >= ENG_KV_FP8; ++l) kv_ok &= c->mla_rank[l] % 32 == 0;
     if (!kv_ok) {   // engine_api.h: never ignore a format
@@ -823,10 +832,18 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             e->dec_st = (float*) scratch(e, (uint64_t) T * c->n_head * (ATT_HD + 2) * 4);
             if (e->dec_k && e->dec_v && e->dec_st) e->dec_keys = (int) nk;
         }
+        expanded_full_forecast = full_resident_forecast;
         fprintf(stderr, "MLA expanded keys: %d positions; policy %s; full-resident forecast %d\n",
                 e->dec_keys, dk ? "explicit" : "conditional-default", full_resident_forecast);
     }
     if (place_kv(e, err, errlen)) { eng_close(e); return NULL; }
+    // Keep the original allocation sizes. Only actual full residency can enable compact reads;
+    // spilled caches and explicit expanded-key overrides use the unchanged group1 kernels/layout.
+    if (c->mla && mla_resident_head_policy(!share_text || strcmp(share_text, "0"), expanded_full_forecast,
+                                         e->dec_keys, (uint64_t) e->kv_cap, (uint64_t) e->kv_nv))
+        e->dec_group = mla_head_groups(&e->nm, c->n_head, c->n_layer);
+    if (c->mla) fprintf(stderr, "MLA resident head sharing: group%d; full-cache resident %d; forecast %d; allocations unchanged\n",
+                        e->dec_group, e->kv_nv == e->kv_cap, expanded_full_forecast);
     // experts last: they take the VRAM that is left
     if (build_pools(e, err, errlen)) { eng_close(e); return NULL; }
     {
@@ -1105,7 +1122,7 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     enc_heads_mv(e, &qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
     if (big && e->dec_keys && e->expand && !cb) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
         tgroup(e, MOVA_TG_ATTN);
-        const MlaArgs ma = {H, r, 128, 1, 1.0f / sqrtf((float) g->head_dim), {0}};
+        const MlaArgs ma = {H, r, 128, 1, 1.0f / sqrtf((float) g->head_dim), {0, e->dec_group, 0}};
         const KvView kv = kv_view(e, l);
         kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
         const int pos0 = max_ctx - T, kv0 = e->cur_kv0;   // consecutive positions of one slot

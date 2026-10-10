@@ -322,16 +322,19 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
                    const uint16_t* Wql, const uint16_t* Wvu, const float* g, float* o, int T, int dec_keys, uint16_t* Kn_out,
                    uint16_t* Vd_out) {
     const size_t qn = 4 * (size_t) T * a.n_head * 128;
+    const int group = a.pad[1] == 4 ? 4 : 1, heads = a.n_head / group;
     const int kv0 = ri[0].kv0, end = ri[T - 1].pos + 1;
     const KvView kv = mla_kv(dev(Kc, 2 * (size_t) npos * 128), dev(Vc, 2 * (size_t) npos * a.r), npos, a.r);
     const float *dq = (const float*) dev(q, qn), *dqr = (const float*) dev(qr, qn), *dg = (const float*) dev(g, qn);
     const RowInfo* dri = (const RowInfo*) dev(ri, sizeof(RowInfo) * (size_t) T);
     const uint16_t* dql = (const uint16_t*) dev(Wql, 2 * (size_t) a.n_head * a.r * 128);
     const uint16_t* dvu = (const uint16_t*) dev(Wvu, 2 * (size_t) a.n_head * a.r * 128);
-    uint16_t* Kn = (uint16_t*) dev(NULL, 2 * (size_t) dec_keys * a.n_head * 128);
-    uint16_t* Vd = (uint16_t*) dev(NULL, 2 * (size_t) dec_keys * a.n_head * 128);
+    uint16_t* Kn = (uint16_t*) dev(NULL, 2 * (size_t) dec_keys * heads * 128);
+    uint16_t* Vd = (uint16_t*) dev(NULL, 2 * (size_t) dec_keys * heads * 128);
     float* st = (float*) dev(NULL, 4 * (size_t) T * a.n_head * 130);
     float* dout = (float*) dev(NULL, qn);
+    uint16_t* compact = group == 4 ? malloc(2 * (size_t) dec_keys * heads * 128) : NULL;
+    if (group == 4 && !compact) return -1;
     for (int kb0 = 0; kb0 < end; kb0 += dec_keys) {
         const int kb1 = end - kb0 < dec_keys ? end : kb0 + dec_keys;
         WSlice wq, wv;
@@ -340,10 +343,18 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
         wq.p[0] = dql;
         wv.p[0] = dvu;
         kc_mla_decomp(0, a, kv, kv0, kb0, kb0, kb1, MF_BF16, wq, MF_BF16, wv, Kn, Vd);
-        const size_t off = (size_t) kb0 * a.n_head * 128, n = 2 * (size_t) (kb1 - kb0) * a.n_head * 128;
-        if (fetch("kc_mla_decomp", Kn_out + off, Kn, n) || fetch("kc_mla_decomp", Vd_out + off, Vd, n)) return -1;
+        const size_t off = (size_t) kb0 * a.n_head * 128, n = 2 * (size_t) (kb1 - kb0) * heads * 128;
+        // The test API returns all logical heads; the CUDA buffers may store one map per group of4.
+        for (int which = 0; which < 2; ++which) {
+            uint16_t* dst = (which ? Vd_out : Kn_out) + off;
+            if (fetch("kc_mla_decomp", group == 4 ? compact : dst, which ? Vd : Kn, n)) { free(compact); return -1; }
+            if (group == 4) for (int p = 0; p < kb1 - kb0; ++p) for (int h = 0; h < a.n_head; ++h)
+                memcpy(dst + ((size_t) p * a.n_head + h) * 128,
+                       compact + ((size_t) p * heads + h / group) * 128, 2 * 128);
+        }
         kc_mla_prefill(0, a, dq, dqr, kv, dri, Kn, Vd, kb0, kb1, kb0 == 0, kb1 == end, st, dg, dout, T);
     }
+    free(compact);
     return done("kc_mla_prefill", o, dout, qn);
 }
 
