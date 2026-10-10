@@ -29,7 +29,7 @@ static int check(const char* raw, const char* reasoning, const char* content, bo
     return 0;
 }
 
-int main(void) {
+static int original_splitter_tests(void) {
     int failed = 0;
     const char* answer = "{\"say\":\"Hello\",\"commands\":[],\"stop\":true}";
     const char* tags[3] = {"ifm|think", "ifm|think_fast", "ifm|think_faster"};
@@ -121,3 +121,50 @@ int main(void) {
     failed += sf;
     return failed ? 1 : 0;
 }
+
+static int budget_tests(void) {
+    const char* good[] = {"{}", "{\"reasoning_budget_tokens\":0}", "{\"reasoning_budget_tokens\":32}", "{\"reasoning_budget_tokens\":32.0}", "{\"reasoning_budget_tokens\":2147483647}"};
+    const int expected[] = {0, 0, 32, 32, INT32_MAX};
+    const char* bad[] = {"null", "true", "false", "\"32\"", "-1", "1.5", "2147483648", "1e10", "1e309"};
+    int failed = 0;
+    char err[256], text[256];
+    for (int i = 0; i < 5; ++i) {
+        Json* req = json_parse(good[i], strlen(good[i]), err, sizeof err);
+        int n = -1;
+        failed += !req || !read_reasoning_budget(req, &n) || n != expected[i];
+        json_free(req);
+    }
+    for (int i = 0; i < 9; ++i) {
+        snprintf(text, sizeof text, "{\"reasoning_budget_tokens\":%s}", bad[i]);
+        Json* req = json_parse(text, strlen(text), err, sizeof err);
+        int n = -1;
+        failed += req && read_reasoning_budget(req, &n);
+        json_free(req);
+    }
+    const float lg[8] = {5, 4.5f, 3, 2, 1, 0, -1, -2};
+    Job j = {0}; j.temperature = 1.3; j.top_p = .95; j.top_k = 6; j.min_p = .02; j.rng = 77;
+    uint64_t ordinary = 77;
+    for (int i = 0; i < 100; ++i) {
+        const int a = sample_row(lg, 8, 1.3, .95, 6, .02, &ordinary);
+        const int b = sample_job(&j, lg, 8);
+        failed += a != b || ordinary != j.rng;
+    }
+    memset(&j, 0, sizeof j); j.thinking = true; j.reasoning_budget = 2; j.reasoning_close = 7;
+    j.reasoning_closes[0] = 7; j.reasoning_closes[1] = 6; j.reasoning_closes[2] = 5;
+    failed += sample_job(&j, lg, 8) != 0 || j.reasoning_tokens != 1;
+    failed += sample_job(&j, lg, 8) != 0 || j.reasoning_tokens != 2;
+    const uint64_t before = j.rng;
+    failed += sample_job(&j, lg, 8) != 7 || j.thinking || j.rng != before;
+    failed += sample_job(&j, lg, 8) != 0 || j.reasoning_tokens != 2;
+    for (int i = 0; i < 3; ++i) {
+        float early[8] = {0}; early[j.reasoning_closes[i]] = 1;
+        j.thinking = true; j.reasoning_tokens = 0;
+        failed += sample_job(&j, early, 8) != j.reasoning_closes[i] || j.thinking;
+        failed += sample_job(&j, lg, 8) != 0;
+    }
+    j.thinking = true; j.reasoning_budget = 0; j.reasoning_tokens = 0;
+    failed += sample_job(&j, lg, 8) != 7 || j.thinking;
+    printf("reasoning budget validation, forced close, natural closes, zero-budget RNG identity: %s\n", failed ? "FAILED" : "passed");
+    return failed;
+}
+int main(void) { return original_splitter_tests() + budget_tests() ? 1 : 0; }

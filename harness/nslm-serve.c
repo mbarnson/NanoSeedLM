@@ -284,7 +284,7 @@ static size_t utf8_complete(const char* buf, size_t n) {
 }
 
 typedef struct {
-    int max_tokens, top_k;
+    int max_tokens, top_k, reasoning_budget, reasoning_close, reasoning_closes[3];
     double temperature, top_p, min_p;
     uint64_t rng;
     bool chat, stream, include_usage;
@@ -478,7 +478,8 @@ static int sample_row(const float* l, int V, double temp, double top_p, int top_
 // under g_lock until the scheduler releases it.
 typedef struct Job {
     const int32_t* ids;
-    int n, max_tokens, top_k;
+    int n, max_tokens, top_k, reasoning_budget, reasoning_close, reasoning_closes[3], reasoning_tokens;
+    bool thinking;
     double temperature, top_p, min_p;
     uint64_t rng;
     int32_t* out;                     // generated tokens (the end token excluded), up to max_tokens
@@ -583,11 +584,29 @@ static void* writer(void* arg) {
     }
     return NULL;
 }
+// Missing or zero leaves sampling uncapped. Reject malformed values instead of silently ignoring them.
+static bool read_reasoning_budget(const Json* req, int* budget) {
+    const Json* v = json_get(req, "reasoning_budget_tokens");
+    *budget = 0;
+    if (!v) return true;
+    if (v->t != J_INT && v->t != J_NUM) return false;
+    const double n = jnumber(v);
+    if (!isfinite(n) || n < 0 || n > INT32_MAX || floor(n) != n) return false;
+    *budget = (int) n;
+    return true;
+}
 static int sample_job(Job* j, const float* l, int V) {
-    if (j->temperature > 0) return sample_row(l, V, j->temperature, j->top_p, j->top_k, j->min_p, &j->rng);
-    int b = 0;   // greedy: the first maximum, as the engine's arg max
-    for (int i = 1; i < V; ++i) if (l[i] > l[b]) b = i;
-    return b;
+    int t = 0;
+    if (j->thinking && j->reasoning_tokens >= j->reasoning_budget) t = j->reasoning_close;
+    else if (j->temperature > 0) t = sample_row(l, V, j->temperature, j->top_p, j->top_k, j->min_p, &j->rng);
+    else for (int i = 1; i < V; ++i) if (l[i] > l[t]) t = i;
+    if (j->thinking) {
+        bool close = false;
+        for (int i = 0; i < 3; ++i) close |= t == j->reasoning_closes[i];
+        if (close) j->thinking = false;
+        else ++j->reasoning_tokens;
+    }
+    return t;
 }
 
 static void* scheduler(void* arg) {
@@ -705,6 +724,11 @@ static bool run_generation(Conn* c, Gen* g, const int32_t* ids, int n) {
     j.ids = ids;
     j.n = n;
     j.max_tokens = g->max_tokens;
+    j.thinking = g->reasoning_budget > 0;
+    // Leave a slot for the closing token even when the requested budget exceeds max_tokens.
+    j.reasoning_budget = g->reasoning_budget < g->max_tokens ? g->reasoning_budget : g->max_tokens - 1;
+    j.reasoning_close = g->reasoning_close;
+    memcpy(j.reasoning_closes, g->reasoning_closes, sizeof j.reasoning_closes);
     j.top_k = g->top_k;
     j.temperature = g->temperature;
     j.top_p = g->top_p;
@@ -850,6 +874,12 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     v = jfield(req, "seed", J_NUM);
     g.rng = !v ? plat_random_u64() : v->t == J_INT ? (uint64_t) v->i : (uint64_t) jclamp(v, INT64_MIN, INT64_MAX);
     if (g.max_tokens < 1) { json_free(req); send_error(c, 400, "max_tokens must be >= 1"); return; }
+    if (!read_reasoning_budget(req, &g.reasoning_budget)) {
+        json_free(req); send_error(c, 400, "reasoning_budget_tokens must be an integer from 0 to 2147483647"); return;
+    }
+    if (!chat && g.reasoning_budget > 0) {
+        json_free(req); send_error(c, 400, "reasoning_budget_tokens is supported for chat completions only"); return;
+    }
     const Json* sv = json_get(req, "stream");
     g.stream = json_truthy(sv);   // true, or a nonzero number (as the Objective-C server read it)
     const Json* so = jfield(req, "stream_options", J_OBJ);
@@ -870,6 +900,22 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
         if (!prompt) { free(g.stops); json_free(req); send_error(c, 400, err); return; }
         g.close_tag = tag;
         g.tools = tools;
+        if (g.reasoning_budget > 0) {
+            g.reasoning_close = -1;
+            for (int i = 0; i < 3; ++i) {
+                int32_t id = -1;
+                if (tok_encode(g_tok, thinking_tags[i + 3], 0, &id, 1) != 1) {
+                    free(prompt); free(g.stops); json_free(req);
+                    send_error(c, 400, "reasoning budget requires native IFM thinking tokens"); return;
+                }
+                g.reasoning_closes[i] = id;
+                if (tag && !strcmp(tag, thinking_tags[i + 3])) g.reasoning_close = id;
+            }
+            if (g.reasoning_close < 0) {
+                free(prompt); free(g.stops); json_free(req);
+                send_error(c, 400, "reasoning budget requires a supported thinking effort"); return;
+            }
+        }
     } else {
         const Json* p = json_get(req, "prompt");
         if (p && p->t == J_ARR && p->n == 1) p = p->v[0];
@@ -888,6 +934,10 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
         return;
     }
     if (g.max_tokens > g_ctx - n - 1) g.max_tokens = g_ctx - n - 1;
+    if (g.max_tokens < 1) {
+        free(ids); free(g.stops); json_free(req);
+        send_error(c, 400, "context has no room for a completion token"); return;
+    }
     if (g.stream) {
         if (!sse_begin(c)) { free(ids); free(g.stops); json_free(req); return; }
         if (chat) {
