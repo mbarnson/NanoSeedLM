@@ -25,6 +25,7 @@
 #include "mova_cfg.h"
 #include "mova_ckpt.h"
 #include "mova_ext.h"
+#include "mla_full_resident_budget.h"
 
 #define MAX_ROWS 512             // rows per forward (prompt chunks); decode and T <= 8 use the matvecs
 #define MAXP (MAX_ROWS * 8)      // (row, expert) pairs per forward
@@ -735,19 +736,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             eng_close(e);
             return NULL;
         }
-        // NSLM_MLA_DEC_KEYS: keys decompressed at a time for prompt rows (default 8192: 128 MiB); 0: absorbed attention
-        // for prompts as for decode
-        const char* dk = getenv("NSLM_MLA_DEC_KEYS");
-        int64_t nk = dk ? atoll(dk) : 8192;
-        if (nk > e->slot_cap) nk = e->slot_cap;
-        nk = (nk + 63) / 64 * 64;
-        e->dec_l = -1;
-        if (nk > 0 && rmax % 32 == 0) {
-            e->dec_k = (uint16_t*) scratch(e, (uint64_t) nk * c->n_head * ATT_HD * 2);
-            e->dec_v = (uint16_t*) scratch(e, (uint64_t) nk * c->n_head * ATT_HD * 2);
-            e->dec_st = (float*) scratch(e, (uint64_t) T * c->n_head * (ATT_HD + 2) * 4);
-            if (e->dec_k && e->dec_v && e->dec_st) e->dec_keys = (int) nk;
-        }
+
     }
     e->inds = (int32_t*) scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4);
     e->wts = (float*) scratch(e, (uint64_t) c->n_layer * T * c->top_k * 4);
@@ -796,6 +785,46 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         snprintf(err, (size_t) errlen, "pinned host staging: out of memory");
         eng_close(e);
         return NULL;
+    }
+    // Forecast after all ordinary and range-prefill GPU buffers exist. Larger expanded keys
+    // are a default only when their complete scratch and the full KV fit with reserve/expert minimum.
+    // NSLM_MLA_DEC_KEYS remains authoritative (including0 for absorbed prompt attention).
+    if (c->mla) {
+        const char* dk = getenv("NSLM_MLA_DEC_KEYS");
+        int64_t nk = dk ? atoll(dk) : 8192;
+        int full_resident_forecast = 0;
+        if (!dk && rmax % 32 == 0) {
+            int64_t larger = e->slot_cap < 16384 ? e->slot_cap : 16384;
+            larger = (larger + 63) / 64 * 64;
+            size_t fr = 0, tot = 0;
+            const char* rs = getenv("NSLM_VRAM_RESERVE_MB");
+            const char* em = getenv("NSLM_EXPERT_MIN_MB");
+            const char* kvm = getenv("NSLM_KV_VRAM_MB");
+            const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 512) << 20;
+            const uint64_t emin = (uint64_t) (em ? atoll(em) : 6144) << 20;
+            const uint64_t cap = (uint64_t) e->kv_cap, L = (uint64_t) c->n_layer;
+            const uint64_t kv[4] = {cap * e->kv_row * L, cap * e->kv_vsum,
+                                    cap * e->kv_ksrow * L, cap * e->kv_vssum};
+            const uint64_t workspace[3] = {(uint64_t) larger * c->n_head * ATT_HD * 2,
+                (uint64_t) larger * c->n_head * ATT_HD * 2,
+                (uint64_t) T * c->n_head * (ATT_HD + 2) * 4};
+            const uint64_t allowed_rows = kvm ? (uint64_t) (atof(kvm) * 1048576.0) / kv_all(e) : cap;
+            if (cudaMemGetInfo(&fr, &tot) == cudaSuccess)
+                full_resident_forecast = mla_full_resident_budget((uint64_t) fr, reserve, emin,
+                    kv, workspace, cap, kvm != NULL, allowed_rows);
+            if (full_resident_forecast) nk = larger;
+        }
+        if (nk > e->slot_cap) nk = e->slot_cap;
+        nk = (nk + 63) / 64 * 64;
+        e->dec_l = -1;
+        if (nk > 0 && rmax % 32 == 0) {
+            e->dec_k = (uint16_t*) scratch(e, (uint64_t) nk * c->n_head * ATT_HD * 2);
+            e->dec_v = (uint16_t*) scratch(e, (uint64_t) nk * c->n_head * ATT_HD * 2);
+            e->dec_st = (float*) scratch(e, (uint64_t) T * c->n_head * (ATT_HD + 2) * 4);
+            if (e->dec_k && e->dec_v && e->dec_st) e->dec_keys = (int) nk;
+        }
+        fprintf(stderr, "MLA expanded keys: %d positions; policy %s; full-resident forecast %d\n",
+                e->dec_keys, dk ? "explicit" : "conditional-default", full_resident_forecast);
     }
     if (place_kv(e, err, errlen)) { eng_close(e); return NULL; }
     // experts last: they take the VRAM that is left

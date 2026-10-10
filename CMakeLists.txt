@@ -175,3 +175,7 @@ if(MSVC)
     endif()
   endforeach()
 endif()
+
+add_executable(test_mla_full_resident_budget tests/test_mla_full_resident_budget.c)
+target_include_directories(test_mla_full_resident_budget PRIVATE ${CMAKE_SOURCE_DIR}/engine)
+add_test(NAME test_mla_full_resident_budget COMMAND test_mla_full_resident_budget)
