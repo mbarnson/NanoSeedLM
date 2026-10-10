@@ -3,6 +3,7 @@
 
   mova_score.py --write-ref --text TEXT --ref REF                     (the BF16 reference)
   mova_score.py --cand q8-gu --text TEXT --ref REF [--name NAME] [--out FILE.kv] [--windows N] [--chunk 512]
+  mova_score.py --folder DIR --text TEXT --ref REF ...   (a model folder through mlx-lm, trust_remote_code, as oMLX loads it)
 
 Windows of BOS + 2047 text tokens (no overlap); in each, the logits at positions 1024..2046 predict the next token
 (1023 scored positions per window).  The reference pass stores every scored position's full log-softmax as f16
@@ -58,13 +59,20 @@ def main():
     ap.add_argument("--ref", required=True, help="reference prefix (REF.f16, REF.meta.npz)")
     ap.add_argument("--write-ref", action="store_true")
     ap.add_argument("--cand", default="bf16")
+    ap.add_argument("--folder", default=None, help="score this model folder (mlx_lm.load, trust_remote_code) instead of --cand")
     ap.add_argument("--name", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--windows", type=int, default=0)
     ap.add_argument("--chunk", type=int, default=0, help="candidate pass through the KV cache in chunks (diagnostics)")
     a = ap.parse_args()
     st0 = mc.machine_state()
-    model, tok = mc.load()
+    if a.folder:
+        mc.register()
+        from mlx_lm import load
+        model, _ = load(a.folder, trust_remote_code=True)
+        tok = mc.tokenizer()   # the reference's tokenization
+    else:
+        model, tok = mc.load()
     ids, wins = windows(tok, a.text, a.windows)
     npos = len(wins) * (CTX - 1 - FIRST)
     ref = Path(a.ref)
@@ -94,7 +102,8 @@ def main():
     meta = np.load(str(ref) + ".meta.npz")
     mm = np.load(str(ref) + ".f16.npy", mmap_mode="r")
     assert mm.shape[0] >= npos, (mm.shape, npos)
-    mc.apply_candidate(model, a.cand)
+    if not a.folder:
+        mc.apply_candidate(model, a.cand)
     kl = np.zeros(npos)
     nllc = np.zeros(npos)
     same = np.zeros(npos, bool)
@@ -115,7 +124,7 @@ def main():
             print(f"  window {w + 1}/{len(wins)}  {time.time() - t0:.0f}s  kld so far {kl[:s + lp.shape[0]].mean():.5f}", flush=True)
     nllr = meta["nll"][:npos]
     res = {
-        "name": a.name or a.cand, "cand": a.cand, "text": a.text, "windows": len(wins), "positions": npos,
+        "name": a.name or a.folder or a.cand, "cand": a.folder or a.cand, "text": a.text, "windows": len(wins), "positions": npos,
         "kld_mean": f"{kl.mean():.7f}", "kld_se": f"{kl.std(ddof=1) / np.sqrt(npos):.7f}",
         "kld_p99": f"{np.percentile(kl, 99):.5f}", "kld_max": f"{kl.max():.4f}",
         "nll_ref": f"{nllr.mean():.6f}", "nll_cand": f"{nllc.mean():.6f}",
