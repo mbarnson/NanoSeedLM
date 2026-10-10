@@ -1626,12 +1626,12 @@ __global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv
     }
 }
 
-// Attention of prompt rows over keys [kb0, kb1) (decompressed in Kn / Vd rows key - kb0): block (64 consecutive rows of
+// Attention of prompt rows over keys [kb0, kb1) (decompressed in Kn / Vd rows key - kb0): block (128 consecutive rows of
 // one slot, head), a warp per 16 rows; keys in tiles of MLP_BK through shared memory.  Scores scale (q . Kn + qr . kr)
 // from BF16 operands (exact products, f32 sums), causal online softmax in f32, P as BF16 hi + lo (as k_mla_attn_tc).
 // first: start the softmax state, else read it from st ([T][H][130]: m, l, O); last: o = bf16(bf16(O / l) *
 // softplus_ln2(g)) (k_attn_reduce's gate), else write the state.
-#define MLP_RW 4
+#define MLP_RW 8
 #define MLP_BK 32
 #define MLP_KLD (2 * ATT_HD + 8)
 #define MLP_VLD (ATT_HD + 8)
@@ -2164,14 +2164,223 @@ void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, Kv
         a, ql, qr, kv, ri, a.n_splits > 1 ? part : olat);
     if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
 }
+
+// Resident-only exact shared-map kernels; existing unshared kernel bodies are retained byte-for-byte.
+__global__ void __launch_bounds__(256) k_mla_decomp_shared4(MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int qfmt, WSlice Wql,
+                                                   int vfmt, WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
+    __shared__ __align__(16) uint16_t As[MLD_BK * MLD_ALD];
+    __shared__ __align__(16) uint16_t Bs[MLD_BJ * MLD_KLD > ATT_HD * MLD_VLD ? MLD_BJ * MLD_KLD : ATT_HD * MLD_VLD];
+    const int hout = (int) blockIdx.y, h = hout * 4, isv = (int) blockIdx.z, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int gq = lane >> 2, t4 = lane & 3, r = a.r, H = a.n_head / 4;
+    const int key0 = k_lo + (int) blockIdx.x * MLD_BK, wk = (w & 3) * 16, wd = (w >> 2) * 64;
+    float acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0;
+    // this thread's latent row (one 16-byte chunk per step)
+    const int au = tid >> 2, aj = (tid & 3) * 8, akp = key0 + au;
+    int arow = -1;
+    KvSeg asg = kv.a;
+    if (akp < k_hi) asg = kv_seg(kv, kv0 + akp, &arow);
+    for (int j0 = 0; j0 < r; j0 += MLD_BJ) {
+        *(uint4*) &As[au * MLD_ALD + aj] = arow >= 0 ? mla_get8(kv.fmt, asg, arow, 0, r, j0 + aj) : make_uint4(0, 0, 0, 0);
+        if (!isv)
+            for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[j][d] = q_lat[h][j0 + j][d]
+                const int j = c >> 4, d8 = (c & 15) * 8;
+                *(uint4*) &Bs[j * MLD_KLD + d8] = welem8(qfmt, Wql, ((size_t) h * r + j0 + j) * ATT_HD + d8);
+            }
+        else
+            for (int c = tid; c < MLD_BJ * ATT_HD / 8; c += 256) {   // Bs[d][j] = v_up[h][d][j0 + j]
+                const int d = c >> 2, j8 = (c & 3) * 8;
+                *(uint4*) &Bs[d * MLD_VLD + j8] = welem8(vfmt, Wvu, ((size_t) h * ATT_HD + d) * r + j0 + j8);
+            }
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < MLD_BJ; ks += 16) {
+            uint32_t af[4];
+            ldsm_x4(af, &As[(wk + (lane & 7) + ((lane >> 3) & 1) * 8) * MLD_ALD + ks + (lane >> 4) * 8]);
+#pragma unroll
+            for (int np = 0; np < 4; ++np) {
+                const int d0 = wd + np * 16;
+                uint32_t b[4];
+                if (!isv) ldsm_x4_t(b, &Bs[(ks + (lane & 7) + ((lane >> 3) & 1) * 8) * MLD_KLD + d0 + (lane >> 4) * 8]);
+                else ldsm_x4(b, &Bs[(d0 + (lane >> 4) * 8 + (lane & 7)) * MLD_VLD + ks + ((lane >> 3) & 1) * 8]);
+                mma_bf16(acc[2 * np], af, b);
+                mma_bf16(acc[2 * np + 1], af, b + 2);
+            }
+        }
+        __syncthreads();
+    }
+    uint16_t* out = isv ? Vd : Kn;
+    const int ka = key0 + wk + gq, kb = ka + 8;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        const int d = wd + nt * 8 + t4 * 2;
+        if (ka < k_hi) *(uint32_t*) &out[((size_t) (ka - kb0) * H + hout) * ATT_HD + d] = pack_bf2(acc[nt][0], acc[nt][1]);
+        if (kb < k_hi) *(uint32_t*) &out[((size_t) (kb - kb0) * H + hout) * ATT_HD + d] = pack_bf2(acc[nt][2], acc[nt][3]);
+    }
+}
+
+__global__ void __launch_bounds__(32 * MLP_RW) k_mla_prefill_shared4(MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri,
+                                                            const uint16_t* Kn, const uint16_t* Vd, int kb0, int kb1, int first,
+                                                            int last, float* st, const float* g, float* o, int T) {
+    __shared__ __align__(16) uint16_t Ks[MLP_BK * MLP_KLD];
+    __shared__ __align__(16) uint16_t Vs[MLP_BK * MLP_VLD];
+    const int H = a.n_head, h = (int) blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, gq = lane >> 2, t4 = lane & 3;
+    const int KH = H / 4, kh = h / 4;
+    const int b0 = (int) blockIdx.x * 16 * MLP_RW, tw = b0 + w * 16, live = tw < T;
+    const int t0 = live ? tw : T - 1, nrows = live ? min(16, T - tw) : 1;
+    const int ra = t0 + min(gq, nrows - 1), rb = t0 + min(gq + 8, nrows - 1);
+    const int pa = ri[ra].pos, pb = ri[rb].pos, plast = ri[t0 + nrows - 1].pos, kv0 = ri[b0].kv0;
+    const int kend = min(kb1, ri[min(b0 + 16 * MLP_RW, T) - 1].pos + 1);
+    uint32_t qf[16][4];   // 8 steps of q (128 dims), 8 of the roped query part
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+        const float* src = s < 8 ? q : qr;
+        const float* qa = src + ((size_t) ra * H + h) * ATT_HD;
+        const float* qb = src + ((size_t) rb * H + h) * ATT_HD;
+        const int c = (s & 7) * 16 + t4 * 2;
+        qf[s][0] = pack_bf2(qa[c], qa[c + 1]);
+        qf[s][1] = pack_bf2(qb[c], qb[c + 1]);
+        qf[s][2] = pack_bf2(qa[c + 8], qa[c + 9]);
+        qf[s][3] = pack_bf2(qb[c + 8], qb[c + 9]);
+    }
+    float O[16][4], ma = -INFINITY, mb = -INFINITY, la = 0, lb = 0;
+    const float* sa_ = st + ((size_t) ra * H + h) * (ATT_HD + 2);
+    const float* sb_ = st + ((size_t) rb * H + h) * (ATT_HD + 2);
+    if (first) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) O[j][0] = O[j][1] = O[j][2] = O[j][3] = 0;
+    } else {
+        ma = sa_[0]; la = sa_[1]; mb = sb_[0]; lb = sb_[1];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int d = 2 + j * 8 + t4 * 2;
+            O[j][0] = sa_[d]; O[j][1] = sa_[d + 1]; O[j][2] = sb_[d]; O[j][3] = sb_[d + 1];
+        }
+    }
+    for (int k0 = kb0; k0 < kend; k0 += MLP_BK) {
+        for (int c = threadIdx.x; c < MLP_BK * 2 * ATT_HD / 8; c += 32 * MLP_RW) {   // [Kn | kr] per key
+            const int u = c >> 5, j = c & 31, kp = k0 + u;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (kp < kend) {
+                if (j < 16) v = *(const uint4*) (Kn + ((size_t) (kp - kb0) * KH + kh) * ATT_HD + j * 8);
+                else {
+                    int row;
+                    const KvSeg sg = kv_seg(kv, kv0 + kp, &row);
+                    v = mla_get8(kv.fmt, sg, row, 1, 0, (j - 16) * 8);
+                }
+            }
+            *(uint4*) &Ks[u * MLP_KLD + j * 8] = v;
+        }
+        for (int c = threadIdx.x; c < MLP_BK * ATT_HD / 8; c += 32 * MLP_RW) {
+            const int u = c >> 4, j = c & 15, kp = k0 + u;
+            *(uint4*) &Vs[u * MLP_VLD + j * 8] =
+                kp < kend ? *(const uint4*) (Vd + ((size_t) (kp - kb0) * KH + kh) * ATT_HD + j * 8) : make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        if (live && k0 <= plast) {
+            float S[4][4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) S[j][0] = S[j][1] = S[j][2] = S[j][3] = 0;
+#pragma unroll
+            for (int s = 0; s < 16; ++s)
+#pragma unroll
+                for (int np = 0; np < 2; ++np) {
+                    uint32_t b[4];
+                    ldsm_x4(b, &Ks[(np * 16 + (lane >> 4) * 8 + (lane & 7)) * MLP_KLD + s * 16 + ((lane >> 3) & 1) * 8]);
+                    mma_bf16(S[2 * np], qf[s], b);
+                    mma_bf16(S[2 * np + 1], qf[s], b + 2);
+                }
+            float mxa = -INFINITY, mxb = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int key = k0 + j * 8 + t4 * 2;
+                S[j][0] = key > pa ? -INFINITY : S[j][0] * a.scale;
+                S[j][1] = key + 1 > pa ? -INFINITY : S[j][1] * a.scale;
+                S[j][2] = key > pb ? -INFINITY : S[j][2] * a.scale;
+                S[j][3] = key + 1 > pb ? -INFINITY : S[j][3] * a.scale;
+                mxa = fmaxf(mxa, fmaxf(S[j][0], S[j][1]));
+                mxb = fmaxf(mxb, fmaxf(S[j][2], S[j][3]));
+            }
+            mxa = fmaxf(mxa, __shfl_xor_sync(FULL, mxa, 1)); mxa = fmaxf(mxa, __shfl_xor_sync(FULL, mxa, 2));
+            mxb = fmaxf(mxb, __shfl_xor_sync(FULL, mxb, 1)); mxb = fmaxf(mxb, __shfl_xor_sync(FULL, mxb, 2));
+            const float na = fmaxf(ma, mxa), nb = fmaxf(mb, mxb);
+            const float ca = na == -INFINITY ? 1.0f : expf(ma - na), cb = nb == -INFINITY ? 1.0f : expf(mb - nb);
+            float sa = 0, sb = 0;
+            uint32_t ph[2][4], pl[2][4];   // P as A fragments (2 key steps of 16): BF16 hi and lo
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float p0 = S[j][0] == -INFINITY ? 0.0f : expf(S[j][0] - na);
+                const float p1 = S[j][1] == -INFINITY ? 0.0f : expf(S[j][1] - na);
+                const float p2 = S[j][2] == -INFINITY ? 0.0f : expf(S[j][2] - nb);
+                const float p3 = S[j][3] == -INFINITY ? 0.0f : expf(S[j][3] - nb);
+                sa += p0 + p1;
+                sb += p2 + p3;
+                const uint16_t h0 = tobf(p0), h1 = tobf(p1), h2 = tobf(p2), h3 = tobf(p3);
+                ph[j >> 1][(j & 1) * 2] = (uint32_t) h0 | (uint32_t) h1 << 16;
+                ph[j >> 1][(j & 1) * 2 + 1] = (uint32_t) h2 | (uint32_t) h3 << 16;
+                pl[j >> 1][(j & 1) * 2] = pack_bf2(p0 - bf(h0), p1 - bf(h1));
+                pl[j >> 1][(j & 1) * 2 + 1] = pack_bf2(p2 - bf(h2), p3 - bf(h3));
+            }
+            sa += __shfl_xor_sync(FULL, sa, 1); sa += __shfl_xor_sync(FULL, sa, 2);
+            sb += __shfl_xor_sync(FULL, sb, 1); sb += __shfl_xor_sync(FULL, sb, 2);
+            la = la * ca + sa;
+            lb = lb * cb + sb;
+            ma = na;
+            mb = nb;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) { O[j][0] *= ca; O[j][1] *= ca; O[j][2] *= cb; O[j][3] *= cb; }
+#pragma unroll
+            for (int s = 0; s < 2; ++s)
+#pragma unroll
+                for (int dp = 0; dp < 8; ++dp) {
+                    uint32_t b[4];
+                    ldsm_x4_t(b, &Vs[(s * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * MLP_VLD + dp * 16 + (lane >> 4) * 8]);
+                    mma_bf16(O[2 * dp], ph[s], b);
+                    mma_bf16(O[2 * dp], pl[s], b);
+                    mma_bf16(O[2 * dp + 1], ph[s], b + 2);
+                    mma_bf16(O[2 * dp + 1], pl[s], b + 2);
+                }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int q2 = 0; q2 < 4; ++q2) {
+            const int rr = (q2 >> 1) ? gq + 8 : gq;
+            if (rr >= nrows) continue;
+            const int t = t0 + rr, d = j * 8 + t4 * 2 + (q2 & 1);
+            if (last) {
+                const size_t i = ((size_t) t * H + h) * ATT_HD + d;
+                o[i] = bfr(bfr(O[j][q2] / ((q2 >> 1) ? lb : la)) * softplus_gate(g[i]));
+            } else {
+                float* sp = st + ((size_t) t * H + h) * (ATT_HD + 2);
+                sp[2 + d] = O[j][q2];
+                if (j == 0 && t4 == 0 && (q2 & 1) == 0) { sp[0] = (q2 >> 1) ? mb : ma; sp[1] = (q2 >> 1) ? lb : la; }
+            }
+        }
+}
+
 void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int qfmt, WSlice Wql,
                    int vfmt, WSlice Wvu, uint16_t* Kn, uint16_t* Vd) {
     if (k_hi <= k_lo) return;
+    if (a.pad[1] == 4) {
+        k_mla_decomp_shared4<<<dim3((unsigned) (k_hi - k_lo + MLD_BK - 1) / MLD_BK, (unsigned) a.n_head / 4, 2), 256, 0, s>>>(
+            a, kv, kv0, kb0, k_lo, k_hi, qfmt, Wql, vfmt, Wvu, Kn, Vd);
+        return;
+    }
     k_mla_decomp<<<dim3((unsigned) (k_hi - k_lo + MLD_BK - 1) / MLD_BK, (unsigned) a.n_head, 2), 256, 0, s>>>(a, kv, kv0, kb0, k_lo, k_hi,
                                                                                                          qfmt, Wql, vfmt, Wvu, Kn, Vd);
 }
 void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, KvView kv, const RowInfo* ri, const uint16_t* Kn,
                     const uint16_t* Vd, int kb0, int kb1, int first, int last, float* st, const float* g, float* o, int T) {
+    if (a.pad[1] == 4) {
+        k_mla_prefill_shared4<<<dim3((unsigned) (T + 16 * MLP_RW - 1) / (16 * MLP_RW), (unsigned) a.n_head), 32 * MLP_RW, 0, s>>>(
+            a, q, qr, kv, ri, Kn, Vd, kb0, kb1, first, last, st, g, o, T);
+        return;
+    }
     k_mla_prefill<<<dim3((unsigned) (T + 16 * MLP_RW - 1) / (16 * MLP_RW), (unsigned) a.n_head), 32 * MLP_RW, 0, s>>>(
         a, q, qr, kv, ri, Kn, Vd, kb0, kb1, first, last, st, g, o, T);
 }

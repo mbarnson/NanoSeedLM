@@ -1032,7 +1032,7 @@ static void test_mla(void) {
     // blocks) and 128 (one block).  The decompression against double sums (each value within its BF16 rounding), then the
     // attention against a reference that reads the kernel's own decompressed keys and values (a BF16 rounding the other
     // way in one value can move an output that cancels to near zero by far more than that output's ulp)
-    for (int dk = 64; dk <= 128; dk += 64) {
+    for (int group = 1; group <= 4; group += 3) for (int dk = 64; dk <= 128; dk += 64) {
         enum { nh = 8, r = 96, NP = 128, T = 40, P0 = 30, KV0 = 7 };
         unsigned sd = 57;   // the same data for both block sizes
         float* q = malloc(4 * (size_t) T * nh * 128), *qr = malloc(4 * (size_t) T * nh * 128), *g = malloc(4 * (size_t) T * nh * 128);
@@ -1043,10 +1043,15 @@ static void test_mla(void) {
         for (int i = 0; i < NP * 128; ++i) Kc[i] = f2bf((float) frand(&sd));
         for (int i = 0; i < NP * r; ++i) Vc[i] = f2bf((float) frand(&sd));
         for (int i = 0; i < nh * r * 128; ++i) { Wql[i] = f2bf((float) (frand(&sd) * 0.15)); Wvu[i] = f2bf((float) (frand(&sd) * 0.15)); }
+        // Preserve separate queries and gates while tying only the per-head decompression maps.
+        if (group == 4) for (int h = 0; h < nh; ++h) if (h % group) {
+            memcpy(Wql + (size_t) h * r * 128, Wql + (size_t) (h / group * group) * r * 128, 2 * r * 128);
+            memcpy(Wvu + (size_t) h * 128 * r, Wvu + (size_t) (h / group * group) * 128 * r, 2 * 128 * r);
+        }
         RowInfo ri[T];
         memset(ri, 0, sizeof ri);
         for (int t = 0; t < T; ++t) { ri[t].pos = P0 + t; ri[t].kv0 = KV0; }
-        const MlaArgs a = {nh, r, 128, 1, (float) (1 / sqrt(128.0)), {0}};
+        const MlaArgs a = {nh, r, 128, 1, (float) (1 / sqrt(128.0)), {0, group, 0}};
         const int NK = P0 + T;
         uint16_t* Kd = malloc(2 * (size_t) NK * nh * 128), *Vdd = malloc(2 * (size_t) NK * nh * 128);
         const int rc = kt_mla_prefill(a, q, qr, Kc, Vc, NP, ri, Wql, Wvu, g, o, T, dk, Kd, Vdd);
@@ -1104,7 +1109,7 @@ static void test_mla(void) {
         }
         CHECK(!dbad, "MLA decompressed keys and values (%d a block): %d mismatches of %d", dk, dbad, 2 * NK * nh * 128);
         CHECK(!bad, "MLA prompt rows (not absorbed, %d keys a block): %d mismatches of %d", dk, bad, T * nh * 128);
-        printf("MLA prompt rows (not absorbed): %d rows x %d heads, r %d, keys %d a block, %d + %d mismatches\n", T, nh, r, dk, dbad,
+        printf("MLA prompt rows (not absorbed, group %d): %d rows x %d heads, r %d, keys %d a block, %d + %d mismatches\n", group, T, nh, r, dk, dbad,
                bad);
         free(Kd); free(Vdd);
         free(q); free(qr); free(g); free(o); free(Kc); free(Vc); free(Wql); free(Wvu);

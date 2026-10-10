@@ -99,6 +99,9 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
   `tool_call_format` (`xml`, `json`, `xml_typed`).
 - `reasoning_effort` is `low`, `medium` or `high` (the default when a request names none). The model always thinks
   first; the reasoning text is in `reasoning_content`.
+- Optional `reasoning_budget_tokens` caps private reasoning in chat requests. A positive integer forces the native
+  thinking-close token at the cap, then continues the answer. Missing or `0` leaves reasoning uncapped. The closing
+  token counts toward `max_tokens`; the budget is clamped to leave a slot for it. Raw completions reject a positive budget.
 - Sampling defaults: `temperature` 1.0, `top_p` 0.95 (IFM). Use `temperature` 0 for greedy decode. `top_k`, `min_p`
   and `seed` are per request.
 - Continuous batching: concurrent requests share the GPU. Each gets one of `--max-seqs` sequence slots of `--ctx`

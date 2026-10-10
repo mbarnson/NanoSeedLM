@@ -146,6 +146,7 @@ void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, Kv
 // kc_heads_mv's W):
 // keys [k_lo, k_hi) of the slot at cache row kv0 into
 // Kn = bf16(q_lat_h^T c) and Vd = bf16(v_up_h c) ([key - kb0][n_head][128] BF16; a.r a multiple of 32)
+// a.pad[1]==4 uses exact shared q_lat/v_up maps in physical n_head/4 layout; caller verifies equality.
 void kc_mla_decomp(cudaStream_t s, MlaArgs a, KvView kv, int kv0, int kb0, int k_lo, int k_hi, int qfmt, WSlice Wql,
                    int vfmt, WSlice Wvu, uint16_t* Kn, uint16_t* Vd);
 // Attention of T consecutive prompt rows of one slot over keys [kb0, kb1) (in Kn / Vd): scores scale (q . Kn + qr . kr),
