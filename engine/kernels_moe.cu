@@ -1626,12 +1626,12 @@ __global__ void __launch_bounds__(256) k_mla_decomp(MlaArgs a, KvView kv, int kv
     }
 }
 
-// Attention of prompt rows over keys [kb0, kb1) (decompressed in Kn / Vd rows key - kb0): block (64 consecutive rows of
+// Attention of prompt rows over keys [kb0, kb1) (decompressed in Kn / Vd rows key - kb0): block (128 consecutive rows of
 // one slot, head), a warp per 16 rows; keys in tiles of MLP_BK through shared memory.  Scores scale (q . Kn + qr . kr)
 // from BF16 operands (exact products, f32 sums), causal online softmax in f32, P as BF16 hi + lo (as k_mla_attn_tc).
 // first: start the softmax state, else read it from st ([T][H][130]: m, l, O); last: o = bf16(bf16(O / l) *
 // softplus_ln2(g)) (k_attn_reduce's gate), else write the state.
-#define MLP_RW 4
+#define MLP_RW 8
 #define MLP_BK 32
 #define MLP_KLD (2 * ATT_HD + 8)
 #define MLP_VLD (ATT_HD + 8)
