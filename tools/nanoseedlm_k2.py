@@ -521,8 +521,9 @@ class SeedSparseMoeBlock(getattr(_k2, "SparseMoeBlock", nn.Module)):
 class ModelArgs(_k2.ModelArgs):
     mla_ranks: list = field(default_factory=list)   # MLA: the latent rank per layer (empty: GQA)
     mla_rope_dim: int = 128
-    mla_kv: dict = None                              # MLA: MLAQuantCache settings (bits, rope_bits, group_size, rotate),
-                                                     # or "auto" (mla_tune: AUTO_KV and a score budget for this Mac)
+    mla_kv: object = None                            # MLA cache: None / "auto" (q8, or rq4 for a long max_context),
+                                                     # "bf16", or MLAQuantCache settings (bits, rope_bits, group_size, rotate)
+    mla_max_context: int = 0                         # MLA: the longest context to plan the cache for (0: not set)
 
 
 def _lin(w, x):
@@ -927,21 +928,67 @@ class BatchMLAQuantCache(MLAQuantCache):
         return self._idx
 
 
-# K-02 step 4: settings sized to this Mac. AUTO_KV: the smallest cache format that kept quality (held-out KLD +0.004,
-# long-context NLL +0.2% vs BF16): the latent rotated and in 4 bits, the RoPE key in 8 (keys carry the loss).
-AUTO_KV = dict(bits=4, rope_bits=8, group_size=64, rotate=True)
+# The cache format and the score budget, sized to this Mac. q8 (8-bit latent and RoPE key: half the BF16 cache, no
+# measurable quality loss) unless the requested max_context needs more memory than is available; then rq4 (the latent
+# rotated and in 4 bits: a third of BF16, a small quality cost). docs/kv-cache.md in NanoSeedLM has the trade-offs.
+KV_FORMATS = {
+    "q8": dict(bits=8, rope_bits=8, group_size=64, rotate=False),
+    "rq4": dict(bits=4, rope_bits=8, group_size=64, rotate=True),
+}
+KV_DOC = "https://github.com/mbarnson/NanoSeedLM/blob/main/docs/kv-cache.md"
+_KV_LOGGED: set = set()
+
+
+def kv_bytes(args, fmt):
+    """Cache bytes per token over all layers: codes plus a BF16 scale and bias per group, latent and RoPE key."""
+    f = KV_FORMATS[fmt]
+    per = lambda d, bits: d * bits // 8 + d // f["group_size"] * 4
+    return sum(per(r, f["bits"]) + per(args.mla_rope_dim, f["rope_bits"]) for r in args.mla_ranks)
+
+
+def choose_kv(args, max_context, available):
+    """(format, message): q8 unless max_context tokens need more than `available` bytes as q8."""
+    if not max_context or max_context * kv_bytes(args, "q8") <= available:
+        return "q8", None
+    q8, rq4 = (max_context * kv_bytes(args, f) / 1e9 for f in ("q8", "rq4"))
+    msg = (f"NanoSeedLM: KV cache rq4 (4-bit latent) instead of q8: max_context {max_context:,} tokens needs "
+           f"{q8:.1f} GB as q8, more than the {available / 1e9:.1f} GB available after the weights; rq4 needs {rq4:.1f} GB "
+           f"at a small quality cost ({KV_DOC})")
+    if rq4 * 1e9 > available:
+        fit = int(max(available, 0) // kv_bytes(args, "rq4"))
+        msg += f". Even rq4 does not fit: about {fit:,} tokens fit"
+    return "rq4", msg
 
 
 def mla_tune(working_set=None):
     """The prompt-attention score budget (transient ~5.3x) within 5% of the GPU working set, 64 MB .. 512 MB in powers
-    of two, and the automatic cache format."""
+    of two."""
     if working_set is None:
-        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-        working_set = info["max_recommended_working_set_size"]
+        working_set = _device()["max_recommended_working_set_size"]
     budget = 64 << 20
     while budget < 512 << 20 and 6 * 2 * budget <= 0.05 * working_set:
         budget *= 2
-    return {"score_budget": budget, "kv": AUTO_KV}
+    return {"score_budget": budget}
+
+
+def _device():
+    return mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+
+
+def mla_kv_auto(args, max_context=None):
+    """The cache settings for this Mac: sets the score budget, then picks q8 / rq4 for the requested max_context
+    (make_cache(max_context=...), else config mla_max_context, else env NSLM_MAX_CONTEXT, else none: q8)."""
+    import os
+    global SCORE_BUDGET
+    working_set = _device()["max_recommended_working_set_size"]
+    SCORE_BUDGET = mla_tune(working_set)["score_budget"]
+    max_context = max_context or args.mla_max_context or int(os.environ.get("NSLM_MAX_CONTEXT", "0") or 0)
+    available = working_set - mx.get_active_memory() - 6 * SCORE_BUDGET - (2 << 30)   # weights, prompt transients
+    fmt, msg = choose_kv(args, max_context, available)
+    if msg and msg not in _KV_LOGGED:
+        _KV_LOGGED.add(msg)
+        print(msg, flush=True)
+    return KV_FORMATS[fmt]
 
 
 def mla_attention(q, qr, lat, kr, q_lat, v_up, scale, mask=None, cache=None, path=None):
@@ -1024,16 +1071,14 @@ class Model(_k2.Model):
             for i, layer in enumerate(self.model.layers):
                 layer.self_attn = MLAAttention(args, getattr(layer.self_attn, "mova", False), args.mla_ranks[i])
 
-    def make_cache(self):
-        """BF16 KVCaches, or MLAQuantCaches with config mla_kv (MLA only)."""
-        if self.args.mla_ranks and self.args.mla_kv:
-            kv = self.args.mla_kv
-            if kv == "auto":
-                global SCORE_BUDGET
-                tuned = mla_tune()
-                SCORE_BUDGET, kv = tuned["score_budget"], tuned["kv"]
-            return [MLAQuantCache(**kv) for _ in self.model.layers]
-        return [KVCache() for _ in self.model.layers]
+    def make_cache(self, max_context=None):
+        """MLA: MLAQuantCaches, q8 or rq4 for max_context (mla_kv_auto), or as config mla_kv gives ("bf16": KVCaches)."""
+        if not self.args.mla_ranks or self.args.mla_kv == "bf16":
+            return [KVCache() for _ in self.model.layers]
+        kv = self.args.mla_kv
+        if kv in (None, "auto"):
+            kv = mla_kv_auto(self.args, max_context)
+        return [MLAQuantCache(**kv) for _ in self.model.layers]
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})

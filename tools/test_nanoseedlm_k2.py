@@ -646,17 +646,21 @@ def test_mla_quant_cache_batch():
 
 
 def test_mla_make_cache():
-    """config mla_kv selects the quantized cache; a prompt then decode through it tracks the BF16 cache."""
+    """MLA models default to the q8 cache; mla_kv "bf16" keeps BF16 KVCaches; a dict is used as given; a prompt then
+    decode through the q8 cache tracks the BF16 cache."""
     from mlx_lm.models.cache import KVCache
     cfg = dict(small_config(), hidden_size=128, head_dim=32, mla_ranks=[64, 128], mla_rope_dim=64)
     mx.random.seed(9)
-    plain = ns.Model(ns.ModelArgs.from_dict(cfg))
-    quant = ns.Model(ns.ModelArgs.from_dict(dict(cfg, mla_kv={"bits": 8, "rope_bits": 8, "group_size": 64, "rotate": True})))
+    plain = ns.Model(ns.ModelArgs.from_dict(dict(cfg, mla_kv="bf16")))
+    quant = ns.Model(ns.ModelArgs.from_dict(cfg))
+    given = ns.Model(ns.ModelArgs.from_dict(dict(cfg, mla_kv={"bits": 4, "rope_bits": 8, "group_size": 64, "rotate": True})))
     plain.set_dtype(mx.bfloat16)
     quant.update(plain.parameters())
     assert all(type(c) is KVCache for c in plain.make_cache())
     caches = quant.make_cache()
-    assert len(caches) == 2 and all(type(c).__name__ == "MLAQuantCache" and c.bits == 8 for c in caches)
+    assert len(caches) == 2 and all(type(c).__name__ == "MLAQuantCache" for c in caches)
+    assert (caches[0].bits, caches[0].rope_bits, caches[0].rotate) == (8, 8, False)
+    assert given.make_cache()[0].bits == 4 and given.make_cache()[0].rotate
     ids = mx.array([list(range(3, 70))])
     cp, cq = plain.make_cache(), quant.make_cache()
     a = plain(ids[:, :66], cache=cp)
@@ -666,21 +670,47 @@ def test_mla_make_cache():
     assert rel_err(a, b) < 0.05 and cq[0].offset == 67
 
 
+def test_mla_kv_choice():
+    """q8 unless the requested max_context needs more memory than is available, then rq4, saying why on stdout (once);
+    the cache sizes per token are the measured ones (K2-Horizon MLA: 48 layers of rank 768, RoPE key 128)."""
+    import contextlib
+    import io
+    import os
+    real = ns.ModelArgs.from_dict(dict(small_config(), num_hidden_layers=48, mla_ranks=[768] * 48, mla_rope_dim=128))
+    assert ns.kv_bytes(real, "q8") == 45696 and ns.kv_bytes(real, "rq4") == 27264
+    gb = 1 << 30
+    assert ns.choose_kv(real, None, 4 * gb) == ("q8", None)                      # no request: q8
+    assert ns.choose_kv(real, 32768, 4 * gb) == ("q8", None)                     # 1.5 GB as q8: fits
+    fmt, msg = ns.choose_kv(real, 262144, 10 * gb)                              # q8 12.0 GB > 10, rq4 7.1 GB fits
+    assert fmt == "rq4" and "262,144" in msg and "q8" in msg and "kv-cache.md" in msg, msg
+    fmt, msg = ns.choose_kv(real, 524288, 10 * gb)                              # even rq4 (14.3 GB) does not fit
+    assert fmt == "rq4" and "about" in msg and "tokens fit" in msg, msg
+    cfg = dict(small_config(), hidden_size=128, head_dim=32, mla_ranks=[64, 128], mla_rope_dim=64)
+    model = ns.Model(ns.ModelArgs.from_dict(cfg))
+    saved = os.environ.get("NSLM_MAX_CONTEXT")
+    ns._KV_LOGGED.clear()
+    try:
+        os.environ["NSLM_MAX_CONTEXT"] = str(10 ** 12)                          # more than any Mac holds
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            caches = model.make_cache()
+            model.make_cache()
+        assert caches[0].bits == 4 and caches[0].rotate
+        assert out.getvalue().count("rq4") >= 1 and out.getvalue().count("NanoSeedLM: KV cache") == 1, out.getvalue()
+        del os.environ["NSLM_MAX_CONTEXT"]
+        assert model.make_cache(max_context=1024)[0].bits == 8
+    finally:
+        if saved is None:
+            os.environ.pop("NSLM_MAX_CONTEXT", None)
+        else:
+            os.environ["NSLM_MAX_CONTEXT"] = saved
+
+
 def test_mla_tune():
-    """The score budget sized to the GPU working set (6 x budget within 5% of it, 64 MB .. 512 MB); mla_kv "auto"."""
+    """The score budget sized to the GPU working set (6 x budget within 5% of it, 64 MB .. 512 MB)."""
     assert ns.mla_tune(118e9)["score_budget"] == 512 << 20     # M4 Max 128 GB
     assert ns.mla_tune(24e9)["score_budget"] == 128 << 20      # 32 GB Macs
     assert ns.mla_tune(10e9)["score_budget"] == 64 << 20       # 16 GB Macs
-    assert ns.mla_tune(10e9)["kv"] == ns.AUTO_KV
-    cfg = dict(small_config(), hidden_size=128, head_dim=32, mla_ranks=[64, 128], mla_rope_dim=64, mla_kv="auto")
-    model = ns.Model(ns.ModelArgs.from_dict(cfg))
-    saved = ns.SCORE_BUDGET
-    try:
-        caches = model.make_cache()
-        assert all(type(c).__name__ == "MLAQuantCache" and c.bits == ns.AUTO_KV["bits"] for c in caches)
-        assert ns.SCORE_BUDGET == ns.mla_tune()["score_budget"]
-    finally:
-        ns.SCORE_BUDGET = saved
 
 
 def test_load_mla():
