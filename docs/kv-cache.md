@@ -27,12 +27,17 @@ Measured with K2-Horizon-MoVA-36B-A4B-MLA-NanoSeedLM-P4 on an M4 Max (128 GB), M
 | quality vs BF16 (held-out KL divergence, lower is better) | | +0.0004 | +0.0039 |
 | quality at long context (log-likelihood of text 32K tokens in) | | +0.005% | +0.20% |
 | picks the same next token as BF16 | | 96.4% | 94.6% |
-| decode speed at 1K / 4K (tokens/s) | 20.6 / 19.6 | 20.0 / 19.1 | 19.2 / 17.6 |
-| decode speed at 32K / 128K / 512K (tokens/s) | 13.1 / 6.5 / 2.0 | 11.0 / 5.1 / 1.55 | 11.3 / 5.7 / 1.8 |
+| decode speed at 1K / 4K (tokens/s) | 19.5 / 18.8 | 19.3 / 18.1 | 17.7 / 16.9 |
+| decode speed at 32K / 128K / 512K (tokens/s) | 12.5 / 6.2 / 1.3-2.0 | 12.7 / 5.8 / 1.84 | 12.5 / 6.3 / 2.13 |
 
 For scale: rq4's quality cost is about half the difference between the P = 4 and P = 3 weights; q8's is about ten
-times smaller than rq4's. Both compressed caches decode a little slower than BF16 (the notes are unpacked as they are
-read); past 32K rq4 is slightly faster than q8 because it reads fewer bytes.
+times smaller than rq4's. Speed: q8 decodes within a few percent of BF16 at short contexts and as fast or faster from
+32K; rq4 pays a little at short contexts (it rotates each note) and is the fastest from 128K, because it reads the
+fewest bytes and a dedicated kernel reads its 4-bit notes without unpacking them first.
+
+In oMLX, prompt-prefix reuse (what keeps a long conversation responsive) needs oMLX to know how to store and restore a
+cache. It knows the BF16 cache; until the loader can register q8 / rq4 with oMLX, the loader keeps the BF16 cache under
+oMLX when the format is automatic, and prints why. Setting `mla_kv` explicitly overrides this.
 
 ## How the loader chooses
 

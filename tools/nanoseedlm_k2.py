@@ -16,6 +16,7 @@ MLA (config mla_ranks): per layer the cache holds the latent c (rank r_l) and on
 """
 
 from dataclasses import dataclass, field
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -614,6 +615,12 @@ def _mla_blocked(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache=None)
     return out if expanded else _heads(v_up, out)
 
 
+@partial(mx.compile, shapeless=True)
+def _score_sum(a, b, scale):
+    """(a + b) * scale in f32: one kernel per decode step instead of four."""
+    return (a.astype(mx.float32) + b.astype(mx.float32)) * scale
+
+
 def _mla_blocked_quant(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache, nb):
     """_mla_blocked on a quantized cache (lat, kr = (codes, scales, biases) from MLAQuantCache)."""
     g, rot = cache.group_size, cache.rotate
@@ -626,15 +633,19 @@ def _mla_blocked_quant(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache
         # heads as rows of one product against the shared cache (a head axis against its size-1 axis costs 2x)
         b, heads, L = q.shape[:3]
         rows = lambda x: x.reshape(b, 1, heads * L, x.shape[-1])
-        s = (mx.quantized_matmul(rows(qa), *lat, transpose=True, group_size=g, bits=cache.bits).astype(mx.float32)
-             + mx.quantized_matmul(rows(qr), *kr, transpose=True, group_size=g, bits=cache.rope_bits).astype(mx.float32))
-        s = s.reshape(b, heads, L, n) * scale
+        s = _score_sum(mx.quantized_matmul(rows(qa), *lat, transpose=True, group_size=g, bits=cache.bits),
+                       mx.quantized_matmul(rows(qr), *kr, transpose=True, group_size=g, bits=cache.rope_bits),
+                       mx.array(scale, mx.float32)).reshape(b, heads, L, n)
         if isinstance(mask, str):
             if L > 1:
                 s = mx.where(mx.arange(n)[None] <= mx.arange(n - L, n)[:, None], s, -mx.inf)
         elif mask is not None:
             s = mx.where(mask, s, -mx.inf) if mask.dtype == mx.bool_ else s + mask
-        if QUANT_PV == "dequant":   # one block of keys at a time to BF16, then the BF16 product
+        r = lat[0].shape[-1] * 32 // cache.bits
+        mma_ok = cache.bits in (4, 8) and g == 64 and r % 128 == 0 and (heads * L) % 8 == 0 and heads * L <= 64
+        if QUANT_PV == "mma" and mma_ok:
+            o = _quant_pv_mma(rows(mx.softmax(s, axis=-1)), lat, g, cache.bits).astype(q.dtype)
+        elif QUANT_PV in ("mma", "dequant"):   # one block of keys at a time to BF16, then the BF16 product
             pr = rows(mx.softmax(s, axis=-1).astype(q.dtype))
             o = None
             for k0 in range(0, n, DEQ_KEYS):
@@ -663,8 +674,85 @@ def _mla_blocked_quant(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache
                         expanded, cache)
 
 
-QUANT_PV = "dequant"  # decode P.V on a quantized cache: "dequant" (BF16 blocks, then the BF16 product: fastest, and
-                      # faster than a BF16 cache at 32K-512K) or "qmm" (MLX's quantized vector-matrix product, ~15% slower)
+_QUANT_PV_MMA = """
+// One threadgroup: output columns [cb * 128, +128) of all M rows, keys [k0, k1) of split sp. Per block of 32 keys the
+// codes are dequantized into threadgroup memory (f32) and multiplied there with 8 x 8 simdgroup matrices: the codes
+// are the only reads of the cache (no BF16 copy). Simdgroup sg: columns sg * 16 .. + 15, every row.
+uint tid = thread_position_in_threadgroup.x;
+uint sg = tid / 32;
+uint cb = threadgroup_position_in_grid.x, sp = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
+uint S = threadgroups_per_grid.y;
+int N = p_shape[3];
+int per = (N + S - 1) / S, k0 = sp * per, k1 = min(N, k0 + per);
+constexpr int VPW = 32 / BITS, WPB = 128 / VPW, VLD = 132;
+threadgroup float Vt[32 * VLD];
+threadgroup float Pt[M * 32];
+simdgroup_float8x8 acc[M / 8][2];
+for (int r = 0; r < M / 8; ++r) { acc[r][0] = simdgroup_float8x8(0.0f); acc[r][1] = simdgroup_float8x8(0.0f); }
+const device uint32_t* wb = w + b * w_strides[0];
+const device T* sb = scales + b * scales_strides[0];
+const device T* bb = biases + b * biases_strides[0];
+auto pb = p + b * p_strides[0];
+for (int base = k0; base < k1; base += 32) {
+    for (int e = tid; e < 32 * WPB; e += 256) {
+        int j = e / WPB, wi = e % WPB, d0 = wi * VPW, key = base + j;
+        if (key < k1) {
+            uint word = wb[key * w_strides[2] + (cb * WPB + wi) * w_strides[3]];
+            int g = (cb * 128 + d0) / 64;
+            float sc = float(sb[key * scales_strides[2] + g * scales_strides[3]]);
+            float bi = float(bb[key * biases_strides[2] + g * biases_strides[3]]);
+            for (int i = 0; i < VPW; ++i) Vt[j * VLD + d0 + i] = float((word >> (BITS * i)) & ((1u << BITS) - 1u)) * sc + bi;
+        } else {
+            for (int i = 0; i < VPW; ++i) Vt[j * VLD + d0 + i] = 0.0f;
+        }
+    }
+    for (int e = tid; e < M * 32; e += 256) {
+        int m = e / 32, j = e % 32;
+        Pt[e] = base + j < k1 ? float(pb[m * p_strides[2] + (base + j) * p_strides[3]]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < 4; ++kk) {
+        simdgroup_float8x8 B0, B1, A;
+        simdgroup_load(B0, Vt + kk * 8 * VLD + sg * 16, VLD);
+        simdgroup_load(B1, Vt + kk * 8 * VLD + sg * 16 + 8, VLD);
+        for (int r = 0; r < M / 8; ++r) {
+            simdgroup_load(A, Pt + r * 8 * 32 + kk * 8, 32);
+            simdgroup_multiply_accumulate(acc[r][0], A, B0, acc[r][0]);
+            simdgroup_multiply_accumulate(acc[r][1], A, B1, acc[r][1]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+device float* ob = part + ((size_t) b * S + sp) * M * R + cb * 128 + sg * 16;
+for (int r = 0; r < M / 8; ++r) {
+    simdgroup_store(acc[r][0], ob + r * 8 * R, R);
+    simdgroup_store(acc[r][1], ob + r * 8 * R + 8, R);
+}
+"""
+PV_SPLIT_KEYS = 256   # MMA P.V: keys per threadgroup (split-K), at most 256 splits (short contexts need the splits
+                      # to fill the GPU: 2,048 keys per split halved P.V speed at 4K)
+
+
+def _quant_pv_mma(p, lat, group_size, bits):
+    """p @ dequantize(lat) for decode rows: p [B, 1, M, N] (M a multiple of 8, <= 64), lat (codes [B, 1, N, words],
+    scales, biases); the latent dim a multiple of 128, group_size 64, 4 or 8 bits. Returns [B, 1, M, r] f32."""
+    w, sc, bi = lat
+    b, _, m, n = p.shape
+    r = w.shape[-1] * 32 // bits
+    splits = max(1, min(-(-n // PV_SPLIT_KEYS), 256))
+    if "quant_pv_mma" not in _kernels:
+        _kernels["quant_pv_mma"] = mx.fast.metal_kernel(
+            name="nanoseedlm_mla_quant_pv_mma", input_names=["p", "w", "scales", "biases"], output_names=["part"],
+            source=_QUANT_PV_MMA, ensure_row_contiguous=False)
+    part = _kernels["quant_pv_mma"](
+        inputs=[p, w, sc, bi], template=[("T", sc.dtype), ("M", m), ("R", r), ("BITS", bits)],
+        grid=(256 * (r // 128), splits, b), threadgroup=(256, 1, 1),
+        output_shapes=[(b, splits, m, r)], output_dtypes=[mx.float32])[0]
+    return part[:, :1] if splits == 1 else part.sum(axis=1)[:, None]
+
+
+QUANT_PV = "mma"      # decode P.V on a quantized cache: "mma" (_quant_pv_mma: reads only the codes; faster than the BF16
+                      # product), "dequant" (BF16 blocks, then the BF16 product) or "qmm" (MLX's quantized vector-matrix)
 DEQ_KEYS = 65536      # "dequant": keys per block (100 MB of BF16; 16K blocks: 3-8% slower decode at 128K-512K)
 
 
@@ -894,7 +982,7 @@ class BatchMLAQuantCache(MLAQuantCache):
         self._idx = max_idx
 
     def extract(self, idx):
-        cache = MLAQuantCache(**self._params())
+        cache = getattr(self, "_single", MLAQuantCache)(**self._params())
         pad = self.left_padding.tolist()[idx]
         cache.keys, cache.values = tree_map(lambda x: mx.contiguous(x[idx:idx + 1, :, pad:self._idx]),
                                             (self.keys, self.values))
@@ -908,7 +996,9 @@ class BatchMLAQuantCache(MLAQuantCache):
         params = next((c for c in caches), None)
         params = dict(bits=params.bits, rope_bits=params.rope_bits, group_size=params.group_size, rotate=params.rotate)
         if top == 0:
-            return cls([0] * len(caches), **params)
+            empty = cls([0] * len(caches), **params)
+            empty._single = type(caches[0])
+            return empty
         padding = [top - n for n in lengths]
         full = next(c for c in caches if c.keys is not None)
         blank = lambda x: mx.zeros((len(caches), x.shape[1], top, x.shape[3]), x.dtype)
@@ -922,6 +1012,7 @@ class BatchMLAQuantCache(MLAQuantCache):
         cache.keys, cache.values = keys, values
         cache.offset += top
         cache._idx = top
+        cache._single = type(caches[0])
         return cache
 
     def size(self):
@@ -989,6 +1080,177 @@ def mla_kv_auto(args, max_context=None):
         _KV_LOGGED.add(msg)
         print(msg, flush=True)
     return KV_FORMATS[fmt]
+
+
+class MLAQ8Cache(MLAQuantCache):
+    """The q8 cache (its own class name: oMLX restores prefix-cache blocks by class name, without metadata)."""
+
+    FORMAT = "q8"
+
+    def __init__(self, **kv):
+        super().__init__(**{**KV_FORMATS["q8"], **kv})
+
+
+class MLARQ4Cache(MLAQuantCache):
+    """The rq4 cache."""
+
+    FORMAT = "rq4"
+
+    def __init__(self, **kv):
+        super().__init__(**{**KV_FORMATS["rq4"], **kv})
+
+
+_OMLX_REUSE = False
+_FALLBACK_LOGGED = False
+
+
+def mla_caches(args, layers, max_context=None):
+    """make_cache for an MLA model: config mla_kv "bf16" -> KVCaches; a dict -> that MLAQuantCache; None / "auto" ->
+    q8 or rq4 (mla_kv_auto). Under oMLX without prefix reuse for the quantized caches (register_omlx_prefix_reuse
+    failed: an oMLX whose internals changed), "auto" falls back to KVCaches rather than lose prefix reuse."""
+    import sys
+    global _FALLBACK_LOGGED
+    kv = args.mla_kv
+    if kv in (None, "auto") and "omlx" in sys.modules and not _OMLX_REUSE:
+        if not _FALLBACK_LOGGED:
+            _FALLBACK_LOGGED = True
+            print("NanoSeedLM: KV cache BF16: this oMLX version cannot reuse prompt prefixes with the q8 / rq4 caches, "
+                  f"and prefix reuse matters more ({KV_DOC})", flush=True)
+        kv = "bf16"
+    if kv == "bf16":
+        return [KVCache() for _ in range(layers)]
+    if kv in (None, "auto"):
+        kv = mla_kv_auto(args, max_context)
+    cls = next((c for c in (MLAQ8Cache, MLARQ4Cache) if KV_FORMATS[c.FORMAT] == dict(kv)), MLAQuantCache)
+    return [cls(**kv) for _ in range(layers)]
+
+
+_STATE_NAMES = ("k_codes", "k_scales", "k_biases", "v_codes", "v_scales", "v_biases")
+
+
+def _omlx_handler(base, axis_info, cls):
+    """An oMLX cache-type handler for cls: its state is the six quantized arrays, each with the sequence on axis 2
+    (sliced, concatenated and restored like a KV cache's keys and values)."""
+
+    class CacheType:
+        value = cls.__name__
+
+    class Handler(base):
+        @property
+        def cache_type(self):
+            return CacheType
+
+        @property
+        def supports_block_slicing(self):
+            return True
+
+        def get_state_axis_info(self):
+            return tuple(axis_info(n, 2, True) for n in _STATE_NAMES)
+
+        def _get_state_keys(self):
+            return _STATE_NAMES
+
+        def serialize_state(self, cache_obj):
+            if cache_obj.keys is None:
+                return (None,) * 6
+            k, v = cache_obj.keys_and_values()
+            return tuple(k) + tuple(v)
+
+        def serialize_meta_state(self, cache_obj):
+            return tuple(cache_obj.meta_state)
+
+        def _elements(self, state):
+            e = state.get("states")
+            return tuple(e) if e is not None else tuple(state.get(n) for n in _STATE_NAMES)
+
+        def extract_state(self, cache_obj):
+            e = self.serialize_state(cache_obj)
+            return {**dict(zip(_STATE_NAMES, e)), "states": e, "offset": cache_obj.offset, "cache_type": CacheType.value}
+
+        def get_seq_len(self, state):
+            e = self._elements(state)
+            return int(e[0].shape[2]) if e[0] is not None else 0
+
+        def slice_state(self, state, start_idx, end_idx):
+            e = self._elements(state)
+            end = min(end_idx, self.get_seq_len(state))
+            if start_idx >= end:
+                return None
+            part = tuple(x[:, :, start_idx:end] for x in e)
+            return {**dict(zip(_STATE_NAMES, part)), "states": part, "cache_type": CacheType.value}
+
+        def concatenate_states(self, states):
+            parts = [self._elements(st) for st in states if st]
+            parts = [p for p in parts if p[0] is not None]
+            if not parts:
+                return {}
+            cat = tuple(mx.concatenate([p[i] for p in parts], axis=2) for i in range(6))
+            return {**dict(zip(_STATE_NAMES, cat)), "states": cat, "offset": int(cat[0].shape[2]),
+                    "cache_type": CacheType.value}
+
+        def deserialize_state(self, elements, meta_state=None):
+            elements = tuple(elements)
+            cache = cls()
+            if elements and elements[0] is not None:
+                cache.keys, cache.values = tuple(elements[:3]), tuple(elements[3:])
+                cache.offset = int(elements[0].shape[2])
+            return cache
+
+        def reconstruct_cache(self, state, meta_state=None):
+            return self.deserialize_state(self._elements(state), meta_state)
+
+    return Handler()
+
+
+def register_omlx_prefix_reuse():
+    """Prompt-prefix reuse in oMLX (its paged prefix cache and SSD cache) for the q8 / rq4 caches, from this model file:
+    a cache-type handler per class, the class names added to oMLX's sliceable sets, then a round trip through each
+    handler. All or nothing: on any failure oMLX is put back as it was (and mla_caches falls back to BF16).
+    Returns whether reuse is on."""
+    global _OMLX_REUSE
+    try:
+        import omlx.scheduler as sched
+        from omlx.cache.type_handlers import CacheStateAxisInfo, CacheTypeHandler
+        from omlx.cache.type_registry import CacheTypeRegistry as reg
+    except Exception:
+        return False
+    try:
+        import omlx.specprefill.draft as draft
+    except Exception:
+        draft = None
+    classes = (MLAQ8Cache, MLARQ4Cache)
+    added = frozenset(c.__name__ for c in classes)
+    saved = (dict(reg._handlers), dict(reg._class_name_map), sched._KNOWN_SLICEABLE_CACHE_TYPES,
+             draft._SLICEABLE_CACHE_TYPES if draft is not None else None)
+    try:
+        for cls in classes:
+            h = _omlx_handler(CacheTypeHandler, CacheStateAxisInfo, cls)
+            reg.register(h)
+            reg._class_name_map[cls.__name__] = h.cache_type
+        sched._KNOWN_SLICEABLE_CACHE_TYPES = frozenset(sched._KNOWN_SLICEABLE_CACHE_TYPES) | added
+        if draft is not None:
+            draft._SLICEABLE_CACHE_TYPES = frozenset(draft._SLICEABLE_CACHE_TYPES) | added
+        for cls in classes:   # serialize, two blocks, concatenate, reconstruct: the same arrays back
+            h = reg.get_handler_by_class_name(cls.__name__)
+            c = cls()
+            c.update_and_fetch(mx.ones((1, 1, 70, 128), mx.bfloat16), mx.ones((1, 1, 70, 256), mx.bfloat16))
+            e = h.serialize_state(c)
+            back = h.reconstruct_cache(h.concatenate_states([h.slice_state({"states": e}, 0, 64),
+                                                             h.slice_state({"states": e}, 64, 70)]))
+            if not (type(back) is cls and back.offset == 70 and cls.__name__ in reg.list_known_class_names()
+                    and all(bool(mx.array_equal(a, b)) for a, b in zip(h.serialize_state(back), e))):
+                raise RuntimeError(f"{cls.__name__}: prefix-cache round trip failed")
+        _OMLX_REUSE = True
+    except Exception:
+        reg._handlers.clear()
+        reg._handlers.update(saved[0])
+        reg._class_name_map.clear()
+        reg._class_name_map.update(saved[1])
+        sched._KNOWN_SLICEABLE_CACHE_TYPES = saved[2]
+        if draft is not None:
+            draft._SLICEABLE_CACHE_TYPES = saved[3]
+        _OMLX_REUSE = False
+    return _OMLX_REUSE
 
 
 def mla_attention(q, qr, lat, kr, q_lat, v_up, scale, mask=None, cache=None, path=None):
@@ -1072,13 +1334,10 @@ class Model(_k2.Model):
                 layer.self_attn = MLAAttention(args, getattr(layer.self_attn, "mova", False), args.mla_ranks[i])
 
     def make_cache(self, max_context=None):
-        """MLA: MLAQuantCaches, q8 or rq4 for max_context (mla_kv_auto), or as config mla_kv gives ("bf16": KVCaches)."""
-        if not self.args.mla_ranks or self.args.mla_kv == "bf16":
+        """MLA: q8 or rq4 caches for max_context, or as config mla_kv gives (mla_caches); GQA: KVCaches."""
+        if not self.args.mla_ranks:
             return [KVCache() for _ in self.model.layers]
-        kv = self.args.mla_kv
-        if kv in (None, "auto"):
-            kv = mla_kv_auto(self.args, max_context)
-        return [MLAQuantCache(**kv) for _ in self.model.layers]
+        return mla_caches(self.args, len(self.model.layers), max_context)
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})

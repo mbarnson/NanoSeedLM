@@ -597,13 +597,13 @@ def test_mla_quant_cache():
             q, qr, _, _ = _mla_inputs(rng, 1, heads, L, 1, r, hd, dr)
             kq, lq = cache.keys_and_values()
             ref = ref_mla(q, qr, clat, ckr, q_lat, v_up, hd ** -0.5)
-            for pv in ("qmm", "dequant"):
+            for pv in ("qmm", "dequant", "mma"):
                 ns.QUANT_PV, ns.DEQ_KEYS = pv, 256
                 try:
                     got = ns.mla_attention(q, qr, lq, kq, q_lat, v_up, hd ** -0.5, mask="causal" if L > 1 else None,
                                            cache=cache)
                 finally:
-                    ns.QUANT_PV, ns.DEQ_KEYS = "dequant", 65536
+                    ns.QUANT_PV, ns.DEQ_KEYS = "mma", 65536
                 assert got.shape == (1, heads, L, hd) and rel_err(mx.array(ref), got) < 0.02, (bits, rope_bits, L, pv)
         st = cache.state
         cache2 = ns.MLAQuantCache(bits=bits, rope_bits=rope_bits, group_size=64, rotate=rotate)
@@ -658,7 +658,7 @@ def test_mla_make_cache():
     quant.update(plain.parameters())
     assert all(type(c) is KVCache for c in plain.make_cache())
     caches = quant.make_cache()
-    assert len(caches) == 2 and all(type(c).__name__ == "MLAQuantCache" for c in caches)
+    assert len(caches) == 2 and all(type(c) is ns.MLAQ8Cache for c in caches)
     assert (caches[0].bits, caches[0].rope_bits, caches[0].rotate) == (8, 8, False)
     assert given.make_cache()[0].bits == 4 and given.make_cache()[0].rotate
     ids = mx.array([list(range(3, 70))])
@@ -711,6 +711,61 @@ def test_mla_tune():
     assert ns.mla_tune(118e9)["score_budget"] == 512 << 20     # M4 Max 128 GB
     assert ns.mla_tune(24e9)["score_budget"] == 128 << 20      # 32 GB Macs
     assert ns.mla_tune(10e9)["score_budget"] == 64 << 20       # 16 GB Macs
+
+
+def test_mla_quant_pv_mma():
+    """The MMA decode P.V kernel on quantized latents (4 and 8 bits, strided cache views, several splits, 32 and 64
+    rows) against dequantize (f32 scales) -> matmul."""
+    rng = np.random.default_rng(29)
+    for bits, n, rows in ((4, 1500, 32), (8, 777, 32), (4, 9000, 64), (8, 70, 32)):
+        lat = mx.array(rng.standard_normal((1, 1, n + 100, 768)).astype(np.float32)).astype(mx.bfloat16)
+        w, sc, bi = mx.quantize(lat, group_size=64, bits=bits)
+        w, sc, bi = w[:, :, :n], sc[:, :, :n], bi[:, :, :n]
+        p = mx.softmax(mx.array((rng.standard_normal((1, 1, rows, n)) * 3).astype(np.float32)), axis=-1).astype(mx.bfloat16)
+        deq = mx.dequantize(w, sc.astype(mx.float32), bi.astype(mx.float32), group_size=64, bits=bits)
+        ref = p.astype(mx.float32) @ deq
+        got = ns._quant_pv_mma(p, (w, sc, bi), group_size=64, bits=bits)
+        assert got.shape == ref.shape, (got.shape, ref.shape)
+        assert rel_err(ref, got) < 1e-3, (bits, n, rows, rel_err(ref, got))
+
+
+def test_mla_omlx_prefix_reuse():
+    """Under oMLX (importable here), the q8 / rq4 caches register prefix-reuse handlers: oMLX counts them as
+    reconstructible and sliceable, and serialize -> two blocks -> concatenate -> reconstruct (and oMLX's flat SSD
+    element round trip) gives back the same cache, which then keeps decoding."""
+    try:
+        import omlx.scheduler as sched
+        from omlx.cache import paged_ssd_cache as ssd
+        from omlx.cache.type_registry import CacheTypeRegistry
+    except ImportError:
+        print("  (oMLX not importable: skipped)")
+        return
+    assert ns.register_omlx_prefix_reuse(), "registration failed"
+    rng = np.random.default_rng(30)
+    for cls in (ns.MLAQ8Cache, ns.MLARQ4Cache):
+        name = cls.__name__
+        assert name in CacheTypeRegistry.list_known_class_names() and name in sched._KNOWN_SLICEABLE_CACHE_TYPES
+        h = CacheTypeRegistry.get_handler_by_class_name(name)
+        assert h.supports_block_slicing and h.cache_type.value == name
+        c = cls()
+        _, _, lat, kr = _mla_inputs(rng, 1, 4, 1, 300, 128, 32, 64)
+        c.update_and_fetch(kr, lat)
+        elements = h.serialize_state(c)
+        assert len(elements) == 6 and all(e.shape[2] == 300 for e in elements)
+        state = {"states": elements, "cache_type": name}
+        blocks = [h.slice_state(state, 0, 256), h.slice_state(state, 256, 300)]
+        back = h.reconstruct_cache(h.concatenate_states(blocks), None)
+        assert type(back) is cls and back.offset == 300
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(h.serialize_state(back), elements))
+        arrays, meta = {}, {}                                              # oMLX's SSD tensor layout, no disk
+        ssd._store_nstate_elements_flat(arrays, meta, "layer_0", elements)
+        loaded = ssd._load_nstate_flat(arrays, meta, "layer_0", name)
+        assert loaded is not None and all(bool(mx.array_equal(a, b)) for a, b in zip(loaded[2], elements))
+        _, _, lat2, kr2 = _mla_inputs(rng, 1, 4, 1, 3, 128, 32, 64)
+        back.update_and_fetch(kr2, lat2)                                   # keeps going after a restore
+        assert back.offset == 303
+        merged = cls.merge([back])
+        assert type(merged.extract(0)) is cls and merged.extract(0).offset == 303
 
 
 def test_load_mla():
