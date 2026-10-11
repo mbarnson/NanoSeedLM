@@ -96,6 +96,12 @@ void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* p
 void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                        int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, int max_tiles,
                        const uint32_t* G);
+// Inputs rounded to BF16 once, reused by dense or grouped prompt GEMMs. Formats MF_BF16..MF_SEED4P4; seed F32 stays on kc_mm.
+void kc_pack_input_bf16(cudaStream_t s, const float* x, uint16_t* y, size_t n);
+void kc_mm_packed(cudaStream_t s, int fmt, WSlice w, int K, int R, const uint16_t* x, int xs, float* y, int ys, int T, int add,
+                  const uint32_t* G);
+void kc_mm_grouped_packed(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const uint16_t* x, int xs, float* y, int ys,
+                         int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* nt, int max_tiles, const uint32_t* G);
 #define MMT_BM 64   // tensor-core GEMM: weight rows per block
 #define MMT_BN 128   // tokens (or pairs) per block
 #define MMT_THREADS (2 * MMT_BN)   // threads per block: (BM / 32) x (BN / 32) warps of 32 x 32

@@ -399,7 +399,7 @@ static __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, con
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
-template <int NT>   // weight terms (shared memory and MMAs scale with it: a template, so NT = 1 keeps its occupancy)
+template <int NT, bool PACKED_X = false>   // weight terms (shared memory and MMAs scale with it: a template, so NT = 1 keeps its occupancy)
 static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
                                                const int32_t* perm, const MmTile* tiles, const int32_t* ntiles,
                                                const uint32_t* G, const float* gate = NULL) {
@@ -446,15 +446,23 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
             const int n = tid >> 1, h = (tid & 1) * 16, src = srow[n];
             uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0;
             if (src >= 0) {
-                const float4* xr = (const float4*) (X + (size_t) src * a.xs + k0 + h);
-                const float4 x0 = xr[0], x1 = xr[1], x2 = xr[2], x3 = xr[3];
-                v0 = make_uint4(pack_bf2(x0.x, x0.y), pack_bf2(x0.z, x0.w), pack_bf2(x1.x, x1.y), pack_bf2(x1.z, x1.w));
-                v1 = make_uint4(pack_bf2(x2.x, x2.y), pack_bf2(x2.z, x2.w), pack_bf2(x3.x, x3.y), pack_bf2(x3.z, x3.w));
+                if constexpr (PACKED_X) {
+                    const uint4* xr = (const uint4*) ((const uint16_t*) X + (size_t) src * a.xs + k0 + h);
+                    v0 = xr[0]; v1 = xr[1];
+                } else {
+                    const float4* xr = (const float4*) (X + (size_t) src * a.xs + k0 + h);
+                    const float4 x0 = xr[0], x1 = xr[1], x2 = xr[2], x3 = xr[3];
+                    v0 = make_uint4(pack_bf2(x0.x, x0.y), pack_bf2(x0.z, x0.w), pack_bf2(x1.x, x1.y), pack_bf2(x1.z, x1.w));
+                    v1 = make_uint4(pack_bf2(x2.x, x2.y), pack_bf2(x2.z, x2.w), pack_bf2(x3.x, x3.y), pack_bf2(x3.z, x3.w));
+                }
             }
             *(uint4*) &Xs[n][h] = v0;
             *(uint4*) &Xs[n][h + 8] = v1;
         }
         __syncthreads();
+        // All lanes of a warp share wn/count. Empty output columns have no stores;
+        // retain every staging thread and both block barriers, elide only its MMAs.
+        if (wn < count) {
 #pragma unroll
         for (int kk = 0; kk < MMT_BK; kk += 16) {
             uint32_t af[2][4], bfr2[4][2];
@@ -478,6 +486,7 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
 #pragma unroll
                     for (int nt = 0; nt < 4; ++nt) mma_bf16(acc[mt][nt], af[mt], bfr2[nt]);
             }
+        }
         }
         __syncthreads();
     }
@@ -2027,6 +2036,26 @@ __global__ void __launch_bounds__(1024) k_argmax(const float* logits, int32_t* o
     }
 }
 
+// BF16 input views reuse the native weight reconstruction, tile geometry and accumulation order.
+__global__ void k_pack_input_bf16(const float* x, uint16_t* y, size_t n) {
+    const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n / 8) return;
+    *(uint4*) (y + b * 8) = make_uint4(pack_bf2(x[b*8], x[b*8+1]), pack_bf2(x[b*8+2], x[b*8+3]),
+                                     pack_bf2(x[b*8+4], x[b*8+5]), pack_bf2(x[b*8+6], x[b*8+7]));
+}
+#define PACKED_MM(F, SUF) \
+    __global__ void __launch_bounds__(MMT_THREADS) k_mm_packed_##SUF(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y, \
+                                  const int32_t* perm, const MmTile* tiles, const int32_t* nt, const uint32_t* G) { \
+        mm_body<1, true>(F, a, wd, ws, X, Y, perm, tiles, nt, G); \
+    }
+PACKED_MM(MF_BF16, bf16)
+PACKED_MM(MF_SEED4, seed4)
+PACKED_MM(MF_Q8, q8)
+PACKED_MM(MF_Q4, q4)
+PACKED_MM(MF_SEED4P4, seed4p4)
+#undef PACKED_MM
+static const MmKernel PACKED_MM_K[] = {k_mm_packed_bf16, k_mm_packed_seed4, k_mm_packed_q8, k_mm_packed_q4, k_mm_packed_seed4p4};
+
 // ---- launchers ---------------------------------------------------------------------------------------------------------
 extern "C" {
 
@@ -2076,6 +2105,21 @@ void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, 
     WSlice none;
     memset(&none, 0, sizeof none);
     mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), MMT_THREADS, 0, s>>>(a, none, ws, x, y, perm, tiles, ntiles, G);
+}
+void kc_pack_input_bf16(cudaStream_t s, const float* x, uint16_t* y, size_t n) {
+    k_pack_input_bf16<<<(unsigned) ((n / 8 + 255) / 256), 256, 0, s>>>(x, y, n);
+}
+void kc_mm_packed(cudaStream_t s, int fmt, WSlice w, int K, int R, const uint16_t* x, int xs, float* y, int ys, int T, int add,
+                  const uint32_t* G) {
+    MmArgs a = {K, R, T, xs, ys, 1, add, 0};
+    PACKED_MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), MMT_THREADS, 0, s>>>(
+        a, w, NULL, (const float*) x, y, NULL, NULL, NULL, G);
+}
+void kc_mm_grouped_packed(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const uint16_t* x, int xs, float* y, int ys,
+                         int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* nt, int max_tiles, const uint32_t* G) {
+    MmArgs a = {K, R, 0, xs, ys, xdiv, 0, 0}; WSlice none = {};
+    PACKED_MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), MMT_THREADS, 0, s>>>(
+        a, none, ws, (const float*) x, y, perm, tiles, nt, G);
 }
 void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* perm, MmTile* tiles, int32_t* ntiles) {
     k_bucket_count<<<1, 1024, 0, s>>>(inds, count, n, ntiles);

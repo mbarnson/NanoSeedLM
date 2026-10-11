@@ -54,6 +54,11 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
 
 # ---- the C99 library ------------------------------------------------------------------------------------------------
 file(GLOB NSLM_LIB_SRC ${CMAKE_SOURCE_DIR}/nslm/lib_*.c)
+# The CPU-ahead Metal backend needs Clang vectors and POSIX pthread_once.
+# CUDA does not call it; keep the MSVC/GCC library build on portable sources.
+if(MSVC OR NOT CMAKE_C_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
+  list(FILTER NSLM_LIB_SRC EXCLUDE REGEX "/lib_cpu_seed4\\.c$")
+endif()
 add_library(nslm STATIC ${NSLM_LIB_SRC})
 target_include_directories(nslm PUBLIC nslm harness)
 target_link_libraries(nslm PUBLIC ${PLATFORM_LIBS})
