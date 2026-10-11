@@ -1,0 +1,34 @@
+# NanoSeedLM
+
+> NanoSeedLM runs IFM/K2-Horizon-MoVA-36B-A4B in less memory. It replaces stored weights with SeedLM seeds that the GPU expands at run time. It also runs a TransMLA conversion of the model, with a KV cache less than half the size. It has a C99 engine with Metal and CUDA kernels, and an MLX loader in each Hugging Face model repository for oMLX (Trust Remote Code). Seed models are not faster or more accurate than affine quantization. They are often a little smaller at similar quality.
+
+Facts to keep in mind:
+
+- The MLA models give up some quality against the original GQA model. Most of the loss comes from a few texts, and the cause is not known.
+- The MLX loaders need `mlx_lm.models.k2_horizon`, which oMLX supplies. Stock mlx-lm does not include it.
+- Numbers on results pages are dated. The concept pages give the current state.
+
+## Docs
+
+- [Documentation index](docs/index.md): a catalog of all pages, with one line each
+- [SeedLM](docs/concepts/seedlm.md): seed format, search, kernels, speed cost
+- [Multi-head latent attention](docs/concepts/mla.md): GQA to MLA conversion, attention modes, quality cost
+- [The KV cache](docs/concepts/kv-cache.md): cache sizes and formats, longest context for each Mac
+- [Metal and CUDA parity](docs/concepts/parity.md): shared code, tests, feature matrix
+- [Models](docs/reference/models.md): published models and the runtimes that load them
+
+## Guides
+
+- [Build and test](docs/guides/build.md)
+- [Run and serve](docs/guides/run-and-serve.md): OpenAI-compatible server
+- [The MLX loader](docs/guides/mlx.md): oMLX and mlx-lm
+- [NVIDIA GPUs](docs/guides/cuda.md)
+- [Make a model folder](docs/guides/make-a-model.md)
+
+## Optional
+
+- [Log](docs/log.md): experiments and releases in date order
+- [Seeds against affine quantization](docs/results/2026-10-10-seeds-vs-affine.md): the main quality comparison
+- [Environment variables](docs/reference/env.md)
+- [Model folder format](docs/reference/model-folder.md)
+- [Related work](docs/reference/related-work.md)
