@@ -84,6 +84,7 @@ struct Eng {
     int64_t kv_cap;
     // scratch (MAX_ROWS rows)
     id<MTLBuffer> x, xn, q, k, v, gq, ao, ga, ua, aa, G, U, A, D, V, sh, logits, ids, ri, inv, part, inds, wts, vinds, vwts, am;
+    id<MTLBuffer> ids2, ri2, am2;          // gen_pipe: the next token's ids / rows / argmax (double buffered)
     id<MTLBuffer> perm, tiles, vperm, vtiles;   // grouped GEMM: pairs sorted by expert, tile tables (prompt chunks)
     id<MTLBuffer> lat, qrp, qlat, olat;   // MLA: latent c [T][r], query RoPE parts, absorbed queries, latent outputs
     id<MTLBuffer> latf, kn, vn, mst, lst, ost;   // MLA prompt rows: latent rows (f32), expanded keys / values, softmax state
@@ -739,6 +740,9 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         e->vsel = scratch(e, (uint64_t) c->n_layer * T * c->n_vexp * 4, "value router selection scores");
         e->rscore = scratch(e, (uint64_t) T * 128 * 4, "router scores");
         e->am = scratch(e, (uint64_t) T * 4, "argmax");
+        e->ids2 = scratch(e, (uint64_t) T * 4, "ids (next)");
+        e->ri2 = scratch(e, (uint64_t) T * sizeof(RowInfo), "rowinfo (next)");
+        e->am2 = scratch(e, (uint64_t) T * 4, "argmax (next)");
         float* inv = (float*) e->inv.contents;
         for (int p = 0; p < 64; ++p) inv[p] = (float) pow((double) c->rope_theta, -2.0 * p / (double) c->head_dim);
         if (@available(macOS 15.0, *)) {
@@ -1387,9 +1391,10 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
             if (cmd_wait(&c)) return -1;
             if (logits_out) memcpy(logits_out + (size_t) (r - h0) * e->c.vocab, e->logits.contents, (size_t) n * e->c.vocab * 4);
             if (am) memcpy(am + (r - h0), e->am.contents, (size_t) n * 4);
-            c = cmd_begin(e);
+            if (r + MAX_LOGIT_ROWS < T) c = cmd_begin(e);
+            else c.cb = nil;   // the last head chunk: nothing pending (was an empty command buffer and a round trip)
         }
-        if (cmd_wait(&c)) return -1;
+        if (c.cb && cmd_wait(&c)) return -1;
         if (e->route_on) route_collect(e, T);
         if (e->cap_on) {   // this forward's sums into the totals
             float* f = (float*) e->cap_buf.contents;
@@ -1624,9 +1629,93 @@ static int gen_pl(Eng* e, int seq, int n_new, int32_t* out, EngStats* st) {
     return 0;
 }
 
+// Greedy decode with the CPU one token ahead: token j + 1's command buffer is encoded and committed while the GPU runs
+// token j. Its input ids are token j's argmax, copied on the GPU (a blit at the head of its command buffer); its rows'
+// positions are known in advance; the ids / rows / argmax buffers alternate between the two steps in flight. The host
+// reads token j's argmax once it completes. Same kernels, same order: the tokens are forward_rows'. (Rows <= MV_MAXT;
+// timing, capture and route collection keep the synchronous path.)
+static int gen_pipe(Eng* e, const int* seqs, int nseq, int n_new, int32_t* out, EngStats* st) {
+    const int T = nseq;
+    id<MTLBuffer> idsb[2] = {e->ids, e->ids2}, rib[2] = {e->ri, e->ri2}, amb[2] = {e->am, e->am2};
+    id<MTLCommandBuffer> cbs[2] = {nil, nil};
+    RowInfo ri[MV_MAXT];
+    int32_t tok[MV_MAXT];
+    int base[MV_MAXT];
+    for (int t = 0; t < T; ++t) {
+        const Seq* s = &e->seqs[seqs[t]];
+        tok[t] = s->hist[s->len - 1];
+        base[t] = s->len - 1;
+        ri[t] = (RowInfo){s->len - 1, (int) (seqs[t] * e->slot_stride), {0}};
+    }
+    int rc = 0;
+    for (int j = 0; j <= n_new && !rc; ++j) {
+        @autoreleasepool {
+            if (j < n_new) {   // encode and commit step j
+                const int b = j & 1;
+                int max_ctx = 0;
+                for (int t = 0; t < T && !rc; ++t) {
+                    ri[t].pos = base[t] + j;
+                    if (ri[t].pos >= e->slot_cap) { fprintf(stderr, "mova engine: KV capacity %lld exceeded\n", (long long) e->slot_cap); rc = -1; }
+                    const int seq = (int) (ri[t].kv0 / e->slot_stride);
+                    if (!rc && e->kvp && ri[t].pos >= e->seqs[seq].backed && kvp_back(e, seq, ri[t].pos + 1)) {
+                        fprintf(stderr, "mova engine: KV pages: out of memory\n");
+                        rc = -1;
+                    }
+                    if (ri[t].pos + 1 > max_ctx) max_ctx = ri[t].pos + 1;
+                }
+                if (rc) break;
+                e->ids = idsb[b], e->ri = rib[b], e->am = amb[b];
+                memcpy(rib[b].contents, ri, (size_t) T * sizeof(RowInfo));
+                Cmd c;
+                c.e = e;
+                c.cb = [e->queue commandBufferWithUnretainedReferences];
+                c.enc = nil, c.n_enc = 0, c.group = -1;
+                if (j == 0) {
+                    memcpy(idsb[b].contents, tok, (size_t) T * 4);
+                } else {
+                    id<MTLBlitCommandEncoder> bl = [c.cb blitCommandEncoder];
+                    [bl copyFromBuffer:amb[b ^ 1] sourceOffset:0 toBuffer:idsb[b] destinationOffset:0 size:(NSUInteger) T * 4];
+                    [bl endEncoding];
+                }
+                open_encoder(&c, -1);
+                if (encode_forward(e, &c, T, max_ctx, 0)) { [c.enc endEncoding]; rc = -1; break; }
+                encode_head(e, &c, 0, T);
+                [c.enc endEncoding];
+                [c.cb commit];
+                cbs[b] = c.cb;
+            }
+            if (j > 0) {   // complete step j - 1
+                const int b = (j - 1) & 1;
+                [cbs[b] waitUntilCompleted];
+                if (cbs[b].status == MTLCommandBufferStatusError) {
+                    fprintf(stderr, "mova engine: GPU error: %s\n", cbs[b].error.localizedDescription.UTF8String);
+                    rc = -1;
+                    break;
+                }
+                cbs[b] = nil;
+                const int32_t* a = (const int32_t*) amb[b].contents;
+                for (int i = 0; i < T; ++i) {
+                    Seq* s = &e->seqs[seqs[i]];
+                    s->done = s->len;
+                    hist_push(s, a[i]);
+                    out[(size_t) i * n_new + j - 1] = a[i];
+                }
+                if (st) { st->tokens += T; st->forwards += 1; st->rows += T; }
+            }
+        }
+    }
+    for (int b = 0; b < 2; ++b)
+        if (cbs[b]) [cbs[b] waitUntilCompleted];
+    e->ids = idsb[0], e->ri = rib[0], e->am = amb[0];
+    return rc;
+}
+
 int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t* out, EngStats* st) {
     if (!ready(e, seqs, nseq)) return -1;
     if (mode == ENG_MODE_PL) return nseq == 1 ? gen_pl(e, seqs[0], n_new, out, st) : -1;
+    const char* pipe = getenv("NSLM_PIPE");
+    if (nseq <= MV_MAXT && !(pipe && pipe[0] == '0') && !e->timing_on && !e->cap_on && !e->route_on && !e->batch_gemm)
+        return gen_pipe(e, seqs, nseq, n_new, out, st);
     int32_t* am = (int32_t*) malloc(sizeof(int32_t) * (size_t) nseq);
     for (int j = 0; j < n_new; ++j) {
         if (step_rows(e, seqs, nseq, NULL, am)) { free(am); return -1; }
