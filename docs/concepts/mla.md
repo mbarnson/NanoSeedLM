@@ -103,6 +103,7 @@ reference do not run them yet, and they refuse a hybrid folder with an error.
 - [MLA projections in BF16, Q8, Q4 and seeds](../results/2026-10-08-mla-projections.md)
 - [Engine KV cache codes](../results/2026-10-08-engine-kv-codes.md)
 - [Seeds against affine quantization (R-02)](../results/2026-10-10-seeds-vs-affine.md)
+- [A fused MLA prompt kernel in the MLX loader](../results/2026-10-11-mla-fused-prefill.md)
 
 ## See also
 

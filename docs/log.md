@@ -111,3 +111,11 @@ The prompt GEMMs of a layer reuse one BF16 copy of their inputs. The kernels ski
 On an RTX 4080 (Q4 attention, FP8 KV cache), short prefill is 9.1% faster, and decode does not change. Token and
 logit checks and the 128K and 256K tests passed. The CPU seed mat-vec is now built only with Clang. Metal
 verification is pending. Commit [`ab6029d`](https://github.com/mbarnson/NanoSeedLM/commit/ab6029d).
+
+## [2026-10-11] loader | A fused MLA prompt kernel, and hybrid MLA models
+
+The MLX loader processes MLA prompts with one Metal kernel per block of keys: 27% to 38% faster at 32K to 256K, and
+1.3 GB to 1.5 GB less transient memory. `mla_ranks` 0 keeps a layer's GQA attention (a hybrid model). The MLX loader
+runs hybrid models; the config parser, the packer and the seed search accept them; the engines refuse them for now.
+Read [A fused MLA prompt kernel in the MLX loader](results/2026-10-11-mla-fused-prefill.md). Pull request
+[#14](https://github.com/mbarnson/NanoSeedLM/pull/14).

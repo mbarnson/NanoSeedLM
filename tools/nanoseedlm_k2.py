@@ -873,7 +873,7 @@ if (rv) {
 """
 FUSED_PREFILL = True  # prompt chunks with a causal mask or none: _mla_fused (False: the MLX-ops blocks above)
 FUSED_KEYS = None     # keys per expanded block (None: SCORE_BUDGET / expanded bytes per key, at least 256)
-FUSED_BQ = 32         # query rows per threadgroup (a multiple of 8)
+FUSED_BQ = 64         # query rows per threadgroup (a multiple of 8; 64: +21% over 32 at 128K, 128 ~ 64)
 
 
 def _mla_fused(q, qr, lat, kr, q_lat, v_up, scale, causal):
