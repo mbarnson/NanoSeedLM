@@ -998,6 +998,30 @@ static void enc_dense(Eng* e, const MW* W, const float* X, int xs, float* Y, int
     if (T <= MV_MAXT && !e->prompt) kc_mv(e->st, W->fmt, W->w0, W->cols, W->rows, X, xs, Y, ys, T, add, stab_for(e, W));
     else kc_mm(e->st, W->fmt, W->w0, W->cols, W->rows, X, xs, Y, ys, T, add, stab_for(e, W));
 }
+// Layer-local BF16 views occupy scratch whose previous readers have completed on the main stream.
+static int packed_layer(Eng* e, int T) {
+    const MovaCfg* c = &e->c;
+    const uint64_t pair_bytes = (uint64_t) MAXP * c->ff_exp * 4, qbytes = (uint64_t) T * c->n_head * c->head_dim * 4;
+    return (T > MV_MAXT || e->prompt) && !e->seed_f32 && c->d % 8 == 0 &&
+           (c->n_head * c->head_dim) % 8 == 0 && c->ff_exp % 8 == 0 && c->ff_dense % 8 == 0 &&
+           (uint64_t) T * c->top_k <= MAXP && (uint64_t) T * c->d * 2 <= qbytes &&
+           (uint64_t) T * c->d * 2 <= pair_bytes && (uint64_t) T * c->n_head * c->head_dim * 2 <= pair_bytes &&
+           (uint64_t) T * c->ff_dense * 2 <= pair_bytes;
+}
+static int can_pack_weight(const MW* W, int xs) {
+    return W->fmt >= MF_BF16 && W->fmt <= MF_SEED4P4 && W->cols % MMT_BK == 0 && xs % 8 == 0 && xs >= W->cols;
+}
+static void enc_dense_packed(Eng* e, const MW* W, const float* X, int xs, float* Y, int ys, int T, int add, const uint16_t* packed) {
+    if (packed && can_pack_weight(W, xs))
+        kc_mm_packed(e->st, W->fmt, W->w0, W->cols, W->rows, packed, xs, Y, ys, T, add, stab_for(e, W));
+    else enc_dense(e, W, X, xs, Y, ys, T, add);
+}
+static void enc_grouped_packed(Eng* e, const MW* W, const float* X, int xs, float* Y, int ys, int xdiv,
+                               const int32_t* perm, const MmTile* tiles, const int32_t* nt, int mt, const uint16_t* packed) {
+    if (packed && can_pack_weight(W, xs))
+        kc_mm_grouped_packed(e->st, W->fmt, W->d, W->cols, W->rows, packed, xs, Y, ys, xdiv, perm, tiles, nt, mt, stab_for(e, W));
+    else kc_mm_grouped_dev(e->st, W->fmt, W->d, W->cols, W->rows, X, xs, Y, ys, xdiv, perm, tiles, nt, mt, stab_for(e, W));
+}
 static void enc_router(Eng* e, const MW* W, const MW* bias, const float* X, int n, int k, int32_t* inds, float* wts, float* sel, int T) {
     RouterArgs a = {e->c.d, n, k, e->c.d / e->c.router_parts, e->c.route_scale};
     kc_router(e->st, a, (const uint16_t*) W->w0.p[0], (const uint16_t*) bias->w0.p[0], X, e->rscore, sel, inds, wts, T);
@@ -1095,7 +1119,7 @@ static MW heads_bf16(Eng* e, const MW* W, uint16_t* Y, int all) {
 // MLA attention of layer l (after q, the gate projection and, on MoVA layers, the value experts' v), as Metal's
 // encode_mla_attn: the latent c = kv_a_x xn (+ kv_a_v v), the RoPE key, the per-head query maps, RoPE + cache write,
 // latent attention (split-key + reduce for <= MV_MAXT rows, one pass for prompt chunks), then v_up with the gate into ao.
-static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int max_ctx) {
+static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int max_ctx, const uint16_t* packed_xn) {
     const MovaCfg* g = &e->c;
     const Layer* L = &e->L[l];
     const int d = g->d, qd = g->n_head * g->head_dim, kvd = g->n_kv * g->head_dim, r = L->mla_r, H = g->n_head;
@@ -1116,9 +1140,9 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     // prompt rows: seed per-head maps decoded to BF16 once here (not per row or key tile)
     const MW qm = big ? heads_bf16(e, &L->qm, e->qmf, 0) : L->qm, ql = big ? heads_bf16(e, &L->ql, e->qlf, 0) : L->ql;
     const MW vu = big ? heads_bf16(e, &L->vu, e->vuf, 0) : L->vu;
-    enc_dense(e, &L->ka_x, e->xn, d, e->lat, r, T, 0);
+    enc_dense_packed(e, &L->ka_x, e->xn, d, e->lat, r, T, 0, packed_xn);
     if (L->sparse) enc_dense(e, &L->ka_v, e->v, kvd, e->lat, r, T, 1);   // c = bf16(bf16(kv_a_x x) + bf16(kv_a_v v))
-    enc_dense(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0);
+    enc_dense_packed(e, &L->kr, e->xn, d, e->k, g->mla_rope, T, 0, packed_xn);
     enc_heads_mv(e, &qm, e->q, qd, g->head_dim, NULL, e->qrp, T);
     if (big && e->dec_keys && e->expand && !cb) {   // prompt rows: keys decompressed per head, then multi-head attention with the gate
         tgroup(e, MOVA_TG_ATTN);
@@ -1172,12 +1196,15 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
     tgroup(e, MOVA_TG_EMBED_NORM);
     kc_gnorm(e->st, d, g->eps, X, (const uint16_t*) L->ln1.w0.p[0], e->xn, T);
     tgroup(e, MOVA_TG_ATTN_PROJ);
-    enc_dense(e, &L->q, e->xn, d, e->q, qd, T, 0);
-    if (!g->mla) enc_dense(e, &L->k, e->xn, d, e->k, kvd, T, 0);
-    enc_dense(e, &L->g, e->xn, d, e->gq, qd, T, 0);
+    const int packed = packed_layer(e, T);
+    uint16_t* px = packed ? (uint16_t*) e->A : NULL;
+    if (packed) kc_pack_input_bf16(e->st, e->xn, px, (size_t) T * d);
+    enc_dense_packed(e, &L->q, e->xn, d, e->q, qd, T, 0, px);
+    if (!g->mla) enc_dense_packed(e, &L->k, e->xn, d, e->k, kvd, T, 0, px);
+    enc_dense_packed(e, &L->g, e->xn, d, e->gq, qd, T, 0, px);
     tgroup(e, MOVA_TG_VALUES);
     if (!L->sparse) {
-        if (!g->mla) enc_dense(e, &L->v, e->xn, d, e->v, kvd, T, 0);   // MLA: v_proj is folded into kv_a_x
+        if (!g->mla) enc_dense_packed(e, &L->v, e->xn, d, e->v, kvd, T, 0, px);   // MLA: v_proj is folded into kv_a_x
     } else {
         int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
         float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
@@ -1188,12 +1215,12 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         if (!big) kc_mv_sel(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, vi, T * g->top_kv, g->top_kv, stab_for(e, &L->vx));
         else {
             kc_bucket(e->st, vi, T * g->top_kv, g->n_vexp, e->vperm, e->vtiles, e->vntiles);
-            kc_mm_grouped_dev(e->st, L->vx.fmt, L->vx.d, L->vx.cols, L->vx.rows, e->xn, d, e->V, kvd, g->top_kv, e->vperm, e->vtiles,
-                              e->vntiles, T * g->top_kv / MMT_BN + g->n_vexp, stab_for(e, &L->vx));
+            enc_grouped_packed(e, &L->vx, e->xn, d, e->V, kvd, g->top_kv, e->vperm, e->vtiles,
+                               e->vntiles, T * g->top_kv / MMT_BN + g->n_vexp, px);
         }
         kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
     }
-    if (g->mla) encode_mla_attn(e, l, T, RI, aa.n_splits, max_ctx);
+    if (g->mla) encode_mla_attn(e, l, T, RI, aa.n_splits, max_ctx, px);
     else {
         tgroup(e, MOVA_TG_ATTN);
         const KvView kv = kv_view(e, l);
@@ -1202,15 +1229,20 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         else kc_attn(e->st, aa, e->q, kv, RI, e->part, e->gq, e->ao, T);
     }
     tgroup(e, MOVA_TG_ATTN_PROJ);
-    enc_dense(e, &L->o, e->ao, qd, X, d, T, 1);
+    if (packed) kc_pack_input_bf16(e->st, e->ao, px, (size_t) T * qd);
+    enc_dense_packed(e, &L->o, e->ao, qd, X, d, T, 1, px);
     tgroup(e, MOVA_TG_EMBED_NORM);
     kc_gnorm(e->st, d, g->eps, X, (const uint16_t*) L->ln2.w0.p[0], e->xn, T);
+    // Attention is finished; q can hold normalized MLP inputs through the routed and shared projections.
+    px = packed ? (uint16_t*) e->q : NULL;
+    if (packed) kc_pack_input_bf16(e->st, e->xn, px, (size_t) T * d);
     if (!L->sparse) {
         tgroup(e, MOVA_TG_SHARED);
-        enc_dense(e, &L->mg, e->xn, d, e->ga, g->ff_dense, T, 0);
-        enc_dense(e, &L->mu, e->xn, d, e->ua, g->ff_dense, T, 0);
+        enc_dense_packed(e, &L->mg, e->xn, d, e->ga, g->ff_dense, T, 0, px);
+        enc_dense_packed(e, &L->mu, e->xn, d, e->ua, g->ff_dense, T, 0, px);
         kc_swiglu(e->st, e->ga, e->ua, e->aa, T * g->ff_dense);
-        enc_dense(e, &L->md, e->aa, g->ff_dense, X, d, T, 1);
+        if (packed) kc_pack_input_bf16(e->st, e->aa, (uint16_t*) e->G, (size_t) T * g->ff_dense);
+        enc_dense_packed(e, &L->md, e->aa, g->ff_dense, X, d, T, 1, packed ? (uint16_t*) e->G : NULL);
         return 0;
     }
     tgroup(e, MOVA_TG_ROUTER);
@@ -1248,16 +1280,19 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
     } else {
         const int mt = P / MMT_BN + g->n_exp;
         kc_bucket(e->st, ri, P, g->n_exp, e->perm, e->tiles, e->ntiles);
-        kc_mm_grouped_dev(e->st, L->eg.fmt, L->eg.d, L->eg.cols, L->eg.rows, e->xn, d, e->G, g->ff_exp, g->top_k, e->perm, e->tiles, e->ntiles, mt, stab_for(e, &L->eg));
-        kc_mm_grouped_dev(e->st, L->eu.fmt, L->eu.d, L->eu.cols, L->eu.rows, e->xn, d, e->U, g->ff_exp, g->top_k, e->perm, e->tiles, e->ntiles, mt, stab_for(e, &L->eu));
+        enc_grouped_packed(e, &L->eg, e->xn, d, e->G, g->ff_exp, g->top_k, e->perm, e->tiles, e->ntiles, mt, px);
+        enc_grouped_packed(e, &L->eu, e->xn, d, e->U, g->ff_exp, g->top_k, e->perm, e->tiles, e->ntiles, mt, px);
         kc_swiglu(e->st, e->G, e->U, e->A, P * g->ff_exp);
-        kc_mm_grouped_dev(e->st, L->ed.fmt, L->ed.d, L->ed.cols, L->ed.rows, e->A, g->ff_exp, e->D, d, 1, e->perm, e->tiles, e->ntiles, mt, stab_for(e, &L->ed));
+        // SwiGLU consumed G; its storage can hold A's BF16 view until the down GEMM completes.
+        if (packed) kc_pack_input_bf16(e->st, e->A, (uint16_t*) e->G, (size_t) P * g->ff_exp);
+        enc_grouped_packed(e, &L->ed, e->A, g->ff_exp, e->D, d, 1, e->perm, e->tiles, e->ntiles, mt, packed ? (uint16_t*) e->G : NULL);
     }
     tgroup(e, MOVA_TG_SHARED);
-    enc_dense(e, &L->sg, e->xn, d, e->ga, g->ff_exp, T, 0);
-    enc_dense(e, &L->su, e->xn, d, e->ua, g->ff_exp, T, 0);
+    enc_dense_packed(e, &L->sg, e->xn, d, e->ga, g->ff_exp, T, 0, px);
+    enc_dense_packed(e, &L->su, e->xn, d, e->ua, g->ff_exp, T, 0, px);
     kc_swiglu(e->st, e->ga, e->ua, e->aa, T * g->ff_exp);
-    enc_dense(e, &L->sd, e->aa, g->ff_exp, e->sh, d, T, 0);
+    if (packed) kc_pack_input_bf16(e->st, e->aa, (uint16_t*) e->G, (size_t) T * g->ff_exp);
+    enc_dense_packed(e, &L->sd, e->aa, g->ff_exp, e->sh, d, T, 0, packed ? (uint16_t*) e->G : NULL);
     tgroup(e, MOVA_TG_EXPERTS);
     kc_moe_combine(e->st, e->D, rw, e->sh, X, d, g->top_k, T);
     return 0;
