@@ -104,3 +104,10 @@ stays bounded at long contexts. Commit [`0d5810d`](https://github.com/mbarnson/N
 
 The README now gives the purpose, the trade-offs and how to start. The technical content moved to `docs/`, with this
 log, an index and `llms.txt`.
+
+## [2026-10-11] kernel | Faster CUDA prefill: shared BF16 activations, no empty warp MMAs
+
+The prompt GEMMs of a layer reuse one BF16 copy of their inputs. The kernels skip MMAs for output warps with no work.
+On an RTX 4080 (Q4 attention, FP8 KV cache), short prefill is 9.1% faster, and decode does not change. Token and
+logit checks and the 128K and 256K tests passed. The CPU seed mat-vec is now built only with Clang. Metal
+verification is pending. Commit [`ab6029d`](https://github.com/mbarnson/NanoSeedLM/commit/ab6029d).
