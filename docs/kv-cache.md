@@ -35,9 +35,11 @@ times smaller than rq4's. Speed: q8 decodes within a few percent of BF16 at shor
 32K; rq4 pays a little at short contexts (it rotates each note) and is the fastest from 128K, because it reads the
 fewest bytes and a dedicated kernel reads its 4-bit notes without unpacking them first.
 
-In oMLX, prompt-prefix reuse (what keeps a long conversation responsive) needs oMLX to know how to store and restore a
-cache. It knows the BF16 cache; until the loader can register q8 / rq4 with oMLX, the loader keeps the BF16 cache under
-oMLX when the format is automatic, and prints why. Setting `mla_kv` explicitly overrides this.
+In oMLX, prompt-prefix reuse (what keeps a long conversation responsive) works with both: when oMLX loads the model,
+the loader registers q8 and rq4 with oMLX's prefix cache (in memory and on SSD). With a 13,000-token prompt on the M4 Max,
+the first request took 42 s to its first token; the same prefix again took 3.8 s (q8) / 3.6 s (rq4), and after an oMLX
+restart, restored from the SSD cache, 1.2 s / 1.1 s. If a future oMLX changes the internals this relies on, the loader
+notices, keeps the BF16 cache (prefix reuse matters more than its size) and says so.
 
 ## How the loader chooses
 

@@ -1393,3 +1393,7 @@ class Model(_k2.Model):
                 if type(block) is getattr(_k2, "SparseMoeBlock", None) and hasattr(_k2, "route"):
                     block.__class__ = SeedSparseMoeBlock
         return weights
+
+
+if "omlx" in __import__("sys").modules:   # loaded by oMLX (trust_remote_code): prompt-prefix reuse for q8 / rq4
+    register_omlx_prefix_reuse()
