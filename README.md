@@ -183,6 +183,8 @@ prompts absorbed as decode does), `NSLM_MLA_SCALAR=1` (the earlier one-pass late
 
 The model folder contains `nanoseedlm_k2.py`, an MLX loader with the seed kernels. `config.json` names it in
 `model_file`. In oMLX, enable **Trust Remote Code** for the model. oMLX supplies the K2-Horizon model code.
+MLA models keep their KV cache in 8 bits (q8), or in 4 bits (rq4) when you ask for a context q8 cannot hold: see
+[docs/kv-cache.md](docs/kv-cache.md).
 
 Other tools:
 

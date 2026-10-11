@@ -438,6 +438,336 @@ def _load_mla(affine=False):
         assert err < 0.02, err
 
 
+def ref_mla(q, qr, lat, kr, q_lat, v_up, scale, mask=None):
+    """Absorbed MLA attention in float32: o_a = v_up_a softmax(scale ((q_lat_a q_a) . c + qr_a . kr)) c, causal from the
+    bottom right (query l sees keys 0 .. N - L + l), or a boolean / additive mask [B, 1, L, N]."""
+    f = lambda a: np.array(a.astype(mx.float32))
+    q, qr, lat, kr, q_lat, v_up = map(f, (q, qr, lat, kr, q_lat, v_up))
+    ql = np.einsum("are,bale->balr", q_lat, q)
+    s = scale * (np.einsum("balr,bnr->baln", ql, lat[:, 0]) + np.einsum("bald,bnd->baln", qr, kr[:, 0]))
+    L, N = s.shape[2], s.shape[3]
+    if mask is None:
+        s = np.where(np.arange(N)[None, :] > np.arange(L)[:, None] + N - L, -np.inf, s)
+    else:
+        m = np.array(mask) if mask.dtype == mx.bool_ else f(mask)
+        s = np.where(m, s, -np.inf) if m.dtype == bool else s + m
+    p = np.exp(s - s.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    return np.einsum("aer,balr->bale", v_up, np.einsum("baln,bnr->balr", p, lat[:, 0]))
+
+
+def _mla_inputs(rng, b, heads, L, n, r, hd, dr):
+    g = lambda *s: mx.array(rng.standard_normal(s).astype(np.float32)).astype(mx.bfloat16)
+    return g(b, heads, L, hd), g(b, heads, L, dr), g(b, 1, n, r), g(b, 1, n, dr)
+
+
+def test_mla_attention_paths():
+    """Every attention path (absorbed MLX reference, blocked absorbed, blocked expanded) against the float32 reference,
+    on the real model's head shapes, with BF16 and with seeded q_lat / v_up."""
+    rng = np.random.default_rng(21)
+    heads, r, hd, dr = 32, 768, 128, 128
+    scale = hd ** -0.5
+    w = lambda *s: (rng.standard_normal(s) * 0.05).astype(np.float32)
+    bf = {"q_lat": mx.array(w(heads, r, hd)).astype(mx.bfloat16), "v_up": mx.array(w(heads, hd, r)).astype(mx.bfloat16)}
+    seeded, decoded = {}, {}
+    for name, (o, i) in {"q_lat": (r, hd), "v_up": (hd, r)}.items():
+        parts = random_seeds((heads, o, i), rng, -21)   # weights ~0.035, as the BF16 case
+        mod = ns.SeedHeads(heads, i, o)
+        mod.seeds, mod.coefs, mod.codes, mod.exp_bias = map(mx.array, parts)
+        seeded[name] = mod
+        decoded[name] = mx.array(bf16_bits(ref_decode(*parts))).view(mx.bfloat16)
+    cases = [(1, 1), (1, 37), (1, 1500), (3, 300), (100, 100), (200, 700)]
+    for weights, ref_w in ((bf, bf), (seeded, decoded)):
+        for L, n in cases:
+            q, qr, lat, kr = _mla_inputs(rng, 1, heads, L, n, r, hd, dr)
+            ref = ref_mla(q, qr, lat, kr, ref_w["q_lat"], ref_w["v_up"], scale)
+            for path in ("absorbed", "blocked", "expanded"):
+                got = ns.mla_attention(q, qr, lat, kr, weights["q_lat"], weights["v_up"], scale,
+                                       mask="causal" if L > 1 else None, path=path)
+                assert got.shape == (1, heads, L, hd) and got.dtype == mx.bfloat16, (path, got.shape, got.dtype)
+                err = rel_err(mx.array(ref), got)
+                # BF16 intermediates (absorbed queries, expanded keys / values, BF16 score products) cost ~1%
+                assert err < 0.02, (path, L, n, type(weights["q_lat"]).__name__, err)
+
+
+def test_mla_attention_small_dims_and_masks():
+    """Dims that are not multiples of 32 (the loader tests' small models), batch 2, the automatic choice, and an array
+    mask (batched left padding: sequence 1's first keys masked)."""
+    rng = np.random.default_rng(22)
+    heads, r, hd, dr = 4, 48, 16, 16
+    q_lat = mx.array((rng.standard_normal((heads, r, hd)) * 0.2).astype(np.float32)).astype(mx.bfloat16)
+    v_up = mx.array((rng.standard_normal((heads, hd, r)) * 0.2).astype(np.float32)).astype(mx.bfloat16)
+    for L, n in [(1, 9), (5, 40), (90, 90), (130, 200)]:
+        q, qr, lat, kr = _mla_inputs(rng, 2, heads, L, n, r, hd, dr)
+        ref = ref_mla(q, qr, lat, kr, q_lat, v_up, 0.25)
+        for path in (None, "absorbed", "blocked", "expanded"):
+            got = ns.mla_attention(q, qr, lat, kr, q_lat, v_up, 0.25, mask="causal" if L > 1 else None, path=path)
+            err = rel_err(mx.array(ref), got)
+            assert err < 0.02, (path, L, n, err)
+    q, qr, lat, kr = _mla_inputs(rng, 2, heads, 6, 30, r, hd, dr)
+    mask = np.tril(np.ones((6, 30), bool), 24)[None, None].repeat(2, 0)
+    mask[1, :, :, :7] = False                                                         # sequence 1 left-padded by 7
+    mask = mx.array(mask)
+    ref = ref_mla(q, qr, lat, kr, q_lat, v_up, 0.25, mask)
+    for path in (None, "absorbed", "blocked", "expanded"):
+        got = ns.mla_attention(q, qr, lat, kr, q_lat, v_up, 0.25, mask=mask, path=path)
+        assert rel_err(mx.array(ref), got) < 0.02, path
+
+
+def test_mla_attention_many_blocks():
+    """A tiny score budget: many key blocks, the causal diagonal inside a block, a strided cache view, and a padded row
+    whose first key blocks are all masked."""
+    rng = np.random.default_rng(24)
+    heads, r, hd, dr = 8, 64, 32, 32
+    q_lat = mx.array((rng.standard_normal((heads, r, hd)) * 0.15).astype(np.float32)).astype(mx.bfloat16)
+    v_up = mx.array((rng.standard_normal((heads, hd, r)) * 0.15).astype(np.float32)).astype(mx.bfloat16)
+    saved = ns.SCORE_BUDGET
+    ns.SCORE_BUDGET = 4 * 2 * heads * 70 * 128                                       # 128-key blocks at L = 70
+    try:
+        q, qr, lat_buf, kr_buf = _mla_inputs(rng, 2, heads, 70, 1100, r, hd, dr)
+        lat, kr = lat_buf[:, :, :1000], kr_buf[:, :, :1000]
+        ref = ref_mla(q, qr, lat, kr, q_lat, v_up, 0.2)
+        for path in ("blocked", "expanded"):
+            got = ns.mla_attention(q, qr, lat, kr, q_lat, v_up, 0.2, mask="causal", path=path)
+            assert rel_err(mx.array(ref), got) < 0.02, path
+        # a prompt chunk longer than a block: the diagonal crosses blocks, early rows see none of the later blocks
+        q2, qr2, lat2, kr2 = _mla_inputs(rng, 1, heads, 300, 300, r, hd, dr)
+        ref = ref_mla(q2, qr2, lat2, kr2, q_lat, v_up, 0.2)
+        for path in ("blocked", "expanded"):
+            got = ns.mla_attention(q2, qr2, lat2, kr2, q_lat, v_up, 0.2, mask="causal", path=path)
+            assert not bool(mx.any(mx.isnan(got))) and rel_err(mx.array(ref), got) < 0.02, path
+        mask = np.tril(np.ones((70, 1000), bool), 930)[None, None].repeat(2, 0)
+        mask[1, :, :, :300] = False
+        mask = mx.array(mask)
+        ref = ref_mla(q, qr, lat, kr, q_lat, v_up, 0.2, mask)
+        for path in ("blocked", "expanded"):
+            got = ns.mla_attention(q, qr, lat, kr, q_lat, v_up, 0.2, mask=mask, path=path)
+            assert not bool(mx.any(mx.isnan(got))) and rel_err(mx.array(ref), got) < 0.02, path
+    finally:
+        ns.SCORE_BUDGET = saved
+
+
+def test_mla_attention_memory_bounded():
+    """K-1's guard: a 2,048-token prompt chunk against 16K cached tokens keeps its transient near the score budget."""
+    rng = np.random.default_rng(25)
+    heads, r, hd, dr, L, n = 32, 768, 128, 128, 2048, 16384
+    q_lat = mx.array((rng.standard_normal((heads, r, hd)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    v_up = mx.array((rng.standard_normal((heads, hd, r)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    q, qr, lat, kr = _mla_inputs(rng, 1, heads, L, n, r, hd, dr)
+    mx.eval(q, qr, lat, kr, q_lat, v_up)
+    mx.reset_peak_memory()
+    base = mx.get_active_memory()
+    mx.eval(ns.mla_attention(q, qr, lat, kr, q_lat, v_up, hd ** -0.5, mask="causal"))
+    extra = mx.get_peak_memory() - base
+    assert extra < 6 * ns.SCORE_BUDGET, extra / 1e6                                  # unbounded: 4.3 GB of scores
+
+
+def _mla_cache_contents(cache):
+    """The latent and RoPE key a quantized MLA cache holds, dequantized and rotated back."""
+    kq, lq = cache.keys_and_values()
+    deq = lambda t, bits: mx.dequantize(*t, group_size=cache.group_size, bits=bits)
+    kr, lat = deq(kq, cache.rope_bits), deq(lq, cache.bits)
+    if cache.rotate:
+        lat = ns._rotate(lat, inverse=True)
+        kr = ns._rotate(kr, inverse=True)
+    return kr, lat
+
+
+def test_mla_quant_cache():
+    """MLAQuantCache: chunked appends match quantizing everything at once; attention through it matches the reference
+    on its dequantized contents (rotation transparent), decode and prompt chunks; trim and state round trip."""
+    rng = np.random.default_rng(26)
+    heads, r, hd, dr = 32, 768, 128, 128
+    q_lat = mx.array((rng.standard_normal((heads, r, hd)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    v_up = mx.array((rng.standard_normal((heads, hd, r)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    for bits, rope_bits, rotate in ((8, 8, False), (4, 8, True), (4, 4, True)):
+        cache = ns.MLAQuantCache(bits=bits, rope_bits=rope_bits, group_size=64, rotate=rotate)
+        _, _, lat, kr = _mla_inputs(rng, 1, heads, 1, 700, r, hd, dr)
+        for a, b in ((0, 300), (300, 301), (301, 700)):
+            got_k, got_l = cache.update_and_fetch(kr[:, :, a:b], lat[:, :, a:b])
+        assert cache.offset == 700 and got_l[0].shape[2] == 700
+        ckr, clat = _mla_cache_contents(cache)
+        whole = ns.MLAQuantCache(bits=bits, rope_bits=rope_bits, group_size=64, rotate=rotate)
+        whole.update_and_fetch(kr, lat)
+        wkr, wlat = _mla_cache_contents(whole)
+        assert np.array_equal(np.array(clat.astype(mx.float32)), np.array(wlat.astype(mx.float32)))
+        tol = 0.02 if bits == 8 else 0.12
+        assert rel_err(lat, clat) < tol and rel_err(kr, ckr) < (0.02 if rope_bits == 8 else 0.12), (bits, rope_bits)
+        for L in (1, 5, 120):
+            q, qr, _, _ = _mla_inputs(rng, 1, heads, L, 1, r, hd, dr)
+            kq, lq = cache.keys_and_values()
+            ref = ref_mla(q, qr, clat, ckr, q_lat, v_up, hd ** -0.5)
+            for pv in ("qmm", "dequant", "mma"):
+                ns.QUANT_PV, ns.DEQ_KEYS = pv, 256
+                try:
+                    got = ns.mla_attention(q, qr, lq, kq, q_lat, v_up, hd ** -0.5, mask="causal" if L > 1 else None,
+                                           cache=cache)
+                finally:
+                    ns.QUANT_PV, ns.DEQ_KEYS = "mma", 65536
+                assert got.shape == (1, heads, L, hd) and rel_err(mx.array(ref), got) < 0.02, (bits, rope_bits, L, pv)
+        st = cache.state
+        cache2 = ns.MLAQuantCache(bits=bits, rope_bits=rope_bits, group_size=64, rotate=rotate)
+        cache2.state = st
+        cache2.meta_state = cache.meta_state
+        assert cache2.offset == 700 and cache2.trim(100) == 100 and cache2.offset == 600
+        assert cache2.keys_and_values()[1][0].shape[2] == 600
+
+
+def test_mla_quant_cache_batch():
+    """BatchMLAQuantCache.merge of two caches of different lengths: masked batched attention equals each cache alone;
+    extract gives the caches back; filter keeps one."""
+    rng = np.random.default_rng(27)
+    heads, r, hd, dr = 8, 128, 32, 64
+    q_lat = mx.array((rng.standard_normal((heads, r, hd)) * 0.1).astype(np.float32)).astype(mx.bfloat16)
+    v_up = mx.array((rng.standard_normal((heads, hd, r)) * 0.1).astype(np.float32)).astype(mx.bfloat16)
+    singles = []
+    for n in (50, 90):
+        c = ns.MLAQuantCache(bits=4, rope_bits=8, group_size=64, rotate=True)
+        _, _, lat, kr = _mla_inputs(rng, 1, heads, 1, n, r, hd, dr)
+        c.update_and_fetch(kr, lat)
+        singles.append(c)
+    batch = ns.MLAQuantCache.merge(singles)
+    assert type(batch).__name__ == "BatchMLAQuantCache" and batch.size() == 90
+    q, qr, lat1, kr1 = _mla_inputs(rng, 2, heads, 1, 1, r, hd, dr)
+    mask = batch.make_mask(1, return_array=True)                                      # before the update, as the model
+    kq, lq = batch.update_and_fetch(kr1, lat1)                                         # one decode step each
+    got = ns.mla_attention(q, qr, lq, kq, q_lat, v_up, hd ** -0.5, mask=mask, cache=batch)
+    for i, c in enumerate(singles):
+        kq1, lq1 = c.update_and_fetch(kr1[i:i + 1], lat1[i:i + 1])
+        alone = ns.mla_attention(q[i:i + 1], qr[i:i + 1], lq1, kq1, q_lat, v_up, hd ** -0.5, cache=c)
+        assert rel_err(alone, got[i:i + 1]) < 0.01, i
+        back = batch.extract(i)
+        assert type(back).__name__ == "MLAQuantCache" and back.offset == c.offset
+        bk, bl = _mla_cache_contents(back)
+        ck, cl = _mla_cache_contents(c)
+        assert np.array_equal(np.array(bl.astype(mx.float32)), np.array(cl.astype(mx.float32)))
+    batch.filter([1])
+    assert batch.size() == 91 and batch.keys_and_values()[1][0].shape[0] == 1
+
+
+def test_mla_make_cache():
+    """MLA models default to the q8 cache; mla_kv "bf16" keeps BF16 KVCaches; a dict is used as given; a prompt then
+    decode through the q8 cache tracks the BF16 cache."""
+    from mlx_lm.models.cache import KVCache
+    cfg = dict(small_config(), hidden_size=128, head_dim=32, mla_ranks=[64, 128], mla_rope_dim=64)
+    mx.random.seed(9)
+    plain = ns.Model(ns.ModelArgs.from_dict(dict(cfg, mla_kv="bf16")))
+    quant = ns.Model(ns.ModelArgs.from_dict(cfg))
+    given = ns.Model(ns.ModelArgs.from_dict(dict(cfg, mla_kv={"bits": 4, "rope_bits": 8, "group_size": 64, "rotate": True})))
+    plain.set_dtype(mx.bfloat16)
+    quant.update(plain.parameters())
+    assert all(type(c) is KVCache for c in plain.make_cache())
+    caches = quant.make_cache()
+    assert len(caches) == 2 and all(type(c) is ns.MLAQ8Cache for c in caches)
+    assert (caches[0].bits, caches[0].rope_bits, caches[0].rotate) == (8, 8, False)
+    assert given.make_cache()[0].bits == 4 and given.make_cache()[0].rotate
+    ids = mx.array([list(range(3, 70))])
+    cp, cq = plain.make_cache(), quant.make_cache()
+    a = plain(ids[:, :66], cache=cp)
+    b = quant(ids[:, :66], cache=cq)
+    assert rel_err(a, b) < 0.05
+    a, b = plain(ids[:, 66:], cache=cp), quant(ids[:, 66:], cache=cq)
+    assert rel_err(a, b) < 0.05 and cq[0].offset == 67
+
+
+def test_mla_kv_choice():
+    """q8 unless the requested max_context needs more memory than is available, then rq4, saying why on stdout (once);
+    the cache sizes per token are the measured ones (K2-Horizon MLA: 48 layers of rank 768, RoPE key 128)."""
+    import contextlib
+    import io
+    import os
+    real = ns.ModelArgs.from_dict(dict(small_config(), num_hidden_layers=48, mla_ranks=[768] * 48, mla_rope_dim=128))
+    assert ns.kv_bytes(real, "q8") == 45696 and ns.kv_bytes(real, "rq4") == 27264
+    gb = 1 << 30
+    assert ns.choose_kv(real, None, 4 * gb) == ("q8", None)                      # no request: q8
+    assert ns.choose_kv(real, 32768, 4 * gb) == ("q8", None)                     # 1.5 GB as q8: fits
+    fmt, msg = ns.choose_kv(real, 262144, 10 * gb)                              # q8 12.0 GB > 10, rq4 7.1 GB fits
+    assert fmt == "rq4" and "262,144" in msg and "q8" in msg and "kv-cache.md" in msg, msg
+    fmt, msg = ns.choose_kv(real, 524288, 10 * gb)                              # even rq4 (14.3 GB) does not fit
+    assert fmt == "rq4" and "about" in msg and "tokens fit" in msg, msg
+    cfg = dict(small_config(), hidden_size=128, head_dim=32, mla_ranks=[64, 128], mla_rope_dim=64)
+    model = ns.Model(ns.ModelArgs.from_dict(cfg))
+    saved = os.environ.get("NSLM_MAX_CONTEXT")
+    ns._KV_LOGGED.clear()
+    try:
+        os.environ["NSLM_MAX_CONTEXT"] = str(10 ** 12)                          # more than any Mac holds
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            caches = model.make_cache()
+            model.make_cache()
+        assert caches[0].bits == 4 and caches[0].rotate
+        assert out.getvalue().count("rq4") >= 1 and out.getvalue().count("NanoSeedLM: KV cache") == 1, out.getvalue()
+        del os.environ["NSLM_MAX_CONTEXT"]
+        assert model.make_cache(max_context=1024)[0].bits == 8
+    finally:
+        if saved is None:
+            os.environ.pop("NSLM_MAX_CONTEXT", None)
+        else:
+            os.environ["NSLM_MAX_CONTEXT"] = saved
+
+
+def test_mla_tune():
+    """The score budget sized to the GPU working set (6 x budget within 5% of it, 64 MB .. 512 MB)."""
+    assert ns.mla_tune(118e9)["score_budget"] == 512 << 20     # M4 Max 128 GB
+    assert ns.mla_tune(24e9)["score_budget"] == 128 << 20      # 32 GB Macs
+    assert ns.mla_tune(10e9)["score_budget"] == 64 << 20       # 16 GB Macs
+
+
+def test_mla_quant_pv_mma():
+    """The MMA decode P.V kernel on quantized latents (4 and 8 bits, strided cache views, several splits, 32 and 64
+    rows) against dequantize (f32 scales) -> matmul."""
+    rng = np.random.default_rng(29)
+    for bits, n, rows in ((4, 1500, 32), (8, 777, 32), (4, 9000, 64), (8, 70, 32)):
+        lat = mx.array(rng.standard_normal((1, 1, n + 100, 768)).astype(np.float32)).astype(mx.bfloat16)
+        w, sc, bi = mx.quantize(lat, group_size=64, bits=bits)
+        w, sc, bi = w[:, :, :n], sc[:, :, :n], bi[:, :, :n]
+        p = mx.softmax(mx.array((rng.standard_normal((1, 1, rows, n)) * 3).astype(np.float32)), axis=-1).astype(mx.bfloat16)
+        deq = mx.dequantize(w, sc.astype(mx.float32), bi.astype(mx.float32), group_size=64, bits=bits)
+        ref = p.astype(mx.float32) @ deq
+        got = ns._quant_pv_mma(p, (w, sc, bi), group_size=64, bits=bits)
+        assert got.shape == ref.shape, (got.shape, ref.shape)
+        assert rel_err(ref, got) < 1e-3, (bits, n, rows, rel_err(ref, got))
+
+
+def test_mla_omlx_prefix_reuse():
+    """Under oMLX (importable here), the q8 / rq4 caches register prefix-reuse handlers: oMLX counts them as
+    reconstructible and sliceable, and serialize -> two blocks -> concatenate -> reconstruct (and oMLX's flat SSD
+    element round trip) gives back the same cache, which then keeps decoding."""
+    try:
+        import omlx.scheduler as sched
+        from omlx.cache import paged_ssd_cache as ssd
+        from omlx.cache.type_registry import CacheTypeRegistry
+    except ImportError:
+        print("  (oMLX not importable: skipped)")
+        return
+    assert ns.register_omlx_prefix_reuse(), "registration failed"
+    rng = np.random.default_rng(30)
+    for cls in (ns.MLAQ8Cache, ns.MLARQ4Cache):
+        name = cls.__name__
+        assert name in CacheTypeRegistry.list_known_class_names() and name in sched._KNOWN_SLICEABLE_CACHE_TYPES
+        h = CacheTypeRegistry.get_handler_by_class_name(name)
+        assert h.supports_block_slicing and h.cache_type.value == name
+        c = cls()
+        _, _, lat, kr = _mla_inputs(rng, 1, 4, 1, 300, 128, 32, 64)
+        c.update_and_fetch(kr, lat)
+        elements = h.serialize_state(c)
+        assert len(elements) == 6 and all(e.shape[2] == 300 for e in elements)
+        state = {"states": elements, "cache_type": name}
+        blocks = [h.slice_state(state, 0, 256), h.slice_state(state, 256, 300)]
+        back = h.reconstruct_cache(h.concatenate_states(blocks), None)
+        assert type(back) is cls and back.offset == 300
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(h.serialize_state(back), elements))
+        arrays, meta = {}, {}                                              # oMLX's SSD tensor layout, no disk
+        ssd._store_nstate_elements_flat(arrays, meta, "layer_0", elements)
+        loaded = ssd._load_nstate_flat(arrays, meta, "layer_0", name)
+        assert loaded is not None and all(bool(mx.array_equal(a, b)) for a, b in zip(loaded[2], elements))
+        _, _, lat2, kr2 = _mla_inputs(rng, 1, 4, 1, 3, 128, 32, 64)
+        back.update_and_fetch(kr2, lat2)                                   # keeps going after a restore
+        assert back.offset == 303
+        merged = cls.merge([back])
+        assert type(merged.extract(0)) is cls and merged.extract(0).offset == 303
+
+
 def test_load_mla():
     _load_mla()
 
