@@ -20,8 +20,9 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_unflatten
-from mlx_lm.models.base import scaled_dot_product_attention
+from mlx.utils import tree_map, tree_unflatten
+from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
+from mlx_lm.models.cache import KVCache, _BaseCache, create_attention_mask, dynamic_roll
 from mlx_lm.models.switch_layers import SwitchGLU
 
 try:
@@ -520,6 +521,8 @@ class SeedSparseMoeBlock(getattr(_k2, "SparseMoeBlock", nn.Module)):
 class ModelArgs(_k2.ModelArgs):
     mla_ranks: list = field(default_factory=list)   # MLA: the latent rank per layer (empty: GQA)
     mla_rope_dim: int = 128
+    mla_kv: dict = None                              # MLA: MLAQuantCache settings (bits, rope_bits, group_size, rotate),
+                                                     # or "auto" (mla_tune: AUTO_KV and a score budget for this Mac)
 
 
 def _lin(w, x):
@@ -530,6 +533,431 @@ def _lin(w, x):
 def _heads(w, x):
     """W_a x[b, a, l] for a per-head map: a BF16 array [heads, out, in] or SeedHeads."""
     return w(x) if isinstance(w, nn.Module) else mx.einsum("aoi,bali->balo", w, x)
+
+
+def _dense_heads(w):
+    """A per-head map as a BF16 array [heads, out, in]; SeedHeads decoded (transient, once per prompt chunk)."""
+    return decode(w.seeds, w.coefs, w.codes, w.exp_bias) if isinstance(w, nn.Module) else w
+
+
+# MLA attention, in key blocks with an online softmax (running max, sum and output in f32), so the transient is one
+# block's scores (SCORE_BUDGET bytes), whatever the context. Decode and short chunks: the absorbed form, the queries
+# q_lat_a q_a against the cached latent c and RoPE key in place (two score products, no concatenated keys). Prompt chunks
+# of EXPAND_MIN_L tokens or more: the expanded form, per block k_a = q_lat_a^T c (128) beside the shared RoPE key and
+# v_a = v_up_a c: 256-dim instead of 896-dim dot products, ~4x fewer FLOPs.
+EXPAND_MIN_L = 64
+SCORE_BUDGET = 128 << 20        # bytes of f32 scores per key block (transient ~5.3x: scores, softmax, BF16 copy)
+
+
+def _block_keys(b, heads, L, n):
+    nb = SCORE_BUDGET // (4 * b * heads * L)
+    return n if nb >= n else max(128, nb // 128 * 128)
+
+
+def _mla_blocked(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache=None):
+    """softmax over key blocks merged by log-sum-exp; mask None (one query or none), "causal" (bottom right) or an array
+    broadcastable to [B, H, L, N] (bool or additive). Returns the per-head outputs [B, H, L, hd] (v_up applied)."""
+    b, heads, L, hd = q.shape
+    quant = isinstance(lat, (tuple, list))
+    n = lat[0].shape[2] if quant else lat.shape[2]
+    nb = _block_keys(b, heads, L, n)
+    if quant:
+        return _mla_blocked_quant(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache, nb)
+    if not expanded and nb >= n:
+        # one block (decode): as few kernels as MLX's own attention, scale and sum inside one fused mat-mul
+        qa = _heads(q_lat, q)
+        s = mx.addmm(qr.astype(q.dtype) @ kr.swapaxes(-1, -2), qa, lat.swapaxes(-1, -2), alpha=scale, beta=scale)
+        if isinstance(mask, str):
+            if L > 1:
+                s = mx.where(mx.arange(n)[None] <= mx.arange(n - L, n)[:, None], s, -mx.inf)
+        elif mask is not None:
+            s = mx.where(mask, s, -mx.inf) if mask.dtype == mx.bool_ else s + mask.astype(s.dtype)
+        return _heads(v_up, mx.softmax(s, axis=-1, precise=True) @ lat)
+    qr = qr.astype(q.dtype) * scale
+    if expanded:
+        wq, wv = _dense_heads(q_lat), _dense_heads(v_up).swapaxes(1, 2)                # [H, r, hd] each
+        qa = q * scale
+    else:
+        qa = _heads(q_lat, q) * scale                                                   # [B, H, L, r]
+    causal = isinstance(mask, str)
+    o = lse = None
+    for k0 in range(0, n, nb):
+        k1 = min(n, k0 + nb)
+        lb, kb = lat[:, :, k0:k1], kr[:, :, k0:k1]
+        keys = lb @ wq if expanded else lb                                              # [B, H or 1, nb, hd or r]
+        # the two BF16 score products summed in f32 (a BF16 sum costs ~2x the error)
+        s = (qa @ keys.swapaxes(-1, -2)).astype(mx.float32) + (qr @ kb.swapaxes(-1, -2)).astype(mx.float32)
+        if causal and k1 > n - L:                                                       # the block meets the diagonal
+            s = mx.where(mx.arange(k0, k1)[None] <= mx.arange(n - L, n)[:, None], s, -mx.inf)
+        elif mask is not None and not causal:
+            mb = mask[..., k0:k1]
+            s = mx.where(mb, s, -mx.inf) if mb.dtype == mx.bool_ else s + mb
+        vals = lb @ wv if expanded else lb
+        ob = mx.softmax(s, axis=-1).astype(q.dtype) @ vals                              # normalized within the block
+        if (mask is not None and not causal) or (causal and k0 > n - L):
+            ob = mx.where(mx.isnan(ob), 0.0, ob)                                        # rows that see none of the block
+        if nb >= n:
+            o = ob
+            break
+        lb_ = mx.logsumexp(s, axis=-1, keepdims=True)
+        if o is None:
+            o, lse = ob.astype(mx.float32), lb_
+        else:
+            new = mx.logaddexp(lse, lb_)
+            wa = mx.exp(lse - new)
+            wb = mx.exp(lb_ - new)
+            o = o * mx.where(mx.isnan(wa), 0.0, wa) + ob.astype(mx.float32) * mx.where(mx.isnan(wb), 0.0, wb)
+            lse = new
+        mx.eval(o, lse)               # one block in flight: MLX frees buffers only when a command buffer completes
+    out = o.astype(q.dtype)
+    return out if expanded else _heads(v_up, out)
+
+
+def _mla_blocked_quant(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache, nb):
+    """_mla_blocked on a quantized cache (lat, kr = (codes, scales, biases) from MLAQuantCache)."""
+    g, rot = cache.group_size, cache.rotate
+    n = lat[0].shape[2]
+    if not expanded and nb >= n:
+        # decode: the codes straight through MLX's quantized mat-muls, queries rotated into the cache's basis
+        qa, qr = _heads(q_lat, q), qr.astype(q.dtype)
+        if rot:
+            qa, qr = _rotate(qa), _rotate(qr)
+        # heads as rows of one product against the shared cache (a head axis against its size-1 axis costs 2x)
+        b, heads, L = q.shape[:3]
+        rows = lambda x: x.reshape(b, 1, heads * L, x.shape[-1])
+        s = (mx.quantized_matmul(rows(qa), *lat, transpose=True, group_size=g, bits=cache.bits).astype(mx.float32)
+             + mx.quantized_matmul(rows(qr), *kr, transpose=True, group_size=g, bits=cache.rope_bits).astype(mx.float32))
+        s = s.reshape(b, heads, L, n) * scale
+        if isinstance(mask, str):
+            if L > 1:
+                s = mx.where(mx.arange(n)[None] <= mx.arange(n - L, n)[:, None], s, -mx.inf)
+        elif mask is not None:
+            s = mx.where(mask, s, -mx.inf) if mask.dtype == mx.bool_ else s + mask
+        if QUANT_PV == "dequant":   # one block of keys at a time to BF16, then the BF16 product
+            pr = rows(mx.softmax(s, axis=-1).astype(q.dtype))
+            o = None
+            for k0 in range(0, n, DEQ_KEYS):
+                blk = mx.dequantize(*(x[:, :, k0:k0 + DEQ_KEYS] for x in lat), group_size=g, bits=cache.bits)
+                part = pr[..., k0:k0 + DEQ_KEYS] @ blk.astype(q.dtype)
+                o = part.astype(mx.float32) if o is None else o + part.astype(mx.float32)
+            o = o.astype(q.dtype)
+        else:
+            p = rows(mx.softmax(s, axis=-1).astype(q.dtype))
+            o = mx.quantized_matmul(p, *lat, transpose=False, group_size=g, bits=cache.bits)
+        o = o.reshape(b, heads, L, -1)
+        return _heads(v_up, _rotate(o, inverse=True) if rot else o)
+    # prompt chunks: dequantize (and rotate back) one key block at a time
+    deq = lambda t, a, b_, bits: mx.dequantize(*(x[:, :, a:b_] for x in t), group_size=g, bits=bits).astype(q.dtype)
+
+    class _Blocks:
+        def __init__(self, t, bits):
+            self.t, self.bits, self.shape = t, bits, (*t[0].shape[:3], None)
+
+        def __getitem__(self, idx):
+            a, b_ = idx[2].start, idx[2].stop
+            x = deq(self.t, a, b_, self.bits)
+            return _rotate(x, inverse=True) if rot else x
+
+    return _mla_blocked(q, qr, _Blocks(lat, cache.bits), _Blocks(kr, cache.rope_bits), q_lat, v_up, scale, mask,
+                        expanded, cache)
+
+
+QUANT_PV = "dequant"  # decode P.V on a quantized cache: "dequant" (BF16 blocks, then the BF16 product: fastest, and
+                      # faster than a BF16 cache at 32K-512K) or "qmm" (MLX's quantized vector-matrix product, ~15% slower)
+DEQ_KEYS = 65536      # "dequant": keys per block (100 MB of BF16; 16K blocks: 3-8% slower decode at 128K-512K)
+
+
+# A quantized MLA cache: per token the RoPE key (rope_bits) and the latent (bits), MLX affine groups of group_size,
+# optionally rotated first by a Walsh-Hadamard transform with +-1 signs from the 16-bit LFSR (the rotation is a seed,
+# nothing stored). Attention reads the codes through MLX's fused quantized mat-muls (decode) or dequantizes one key
+# block at a time (prompt chunks), so no full-size copy of the cache is ever made.
+_ROT = {}
+
+
+def _rotation(n):
+    """R = H_n D / sqrt(n), D = diag(+-1) from the LFSR (seed 0xACE1, taps 0, 1, 3, 12)."""
+    if n not in _ROT:
+        h = np.array([[1.0]], np.float32)
+        while h.shape[0] < n:
+            h = np.block([[h, h], [h, -h]])
+        st, signs = 0xACE1, np.empty(n, np.float32)
+        for i in range(n):
+            st = (st >> 1) | (((st ^ (st >> 1) ^ (st >> 3) ^ (st >> 12)) & 1) << 15)
+            signs[i] = 1.0 if st & 1 else -1.0
+        _ROT[n] = mx.array(h * signs[None, :] / np.sqrt(n))
+    return _ROT[n]
+
+
+def _rotate(x, inverse=False):
+    """x R^T (or x R) in blocks of the largest power of two <= 256 dividing the last dim."""
+    d = x.shape[-1]
+    n = min(256, d & -d)
+    rot = _rotation(n).astype(x.dtype)
+    return (x.reshape(*x.shape[:-1], d // n, n) @ (rot if inverse else rot.T)).reshape(x.shape)
+
+
+class MLAQuantCache(_BaseCache):
+    """update_and_fetch(kr, lat) stores both quantized and returns their (codes, scales, biases) up to the offset."""
+
+    step = 256
+
+    def __init__(self, bits=4, rope_bits=8, group_size=64, rotate=True):
+        self.keys = self.values = None
+        self.offset = 0
+        self.bits, self.rope_bits, self.group_size, self.rotate = bits, rope_bits, group_size, rotate
+
+    def _quant(self, kr, lat):
+        if self.rotate:
+            kr, lat = _rotate(kr), _rotate(lat)
+        return (mx.quantize(kr, group_size=self.group_size, bits=self.rope_bits),
+                mx.quantize(lat, group_size=self.group_size, bits=self.bits))
+
+    def _grow(self, new, used, n):
+        steps = (self.step + n - 1) // self.step * self.step
+        blank = lambda x: mx.zeros((*x.shape[:2], steps, x.shape[3]), x.dtype)
+        if self.keys is None:
+            self.keys, self.values = tree_map(blank, new)
+            return
+        if used % self.step:
+            self.keys, self.values = tree_map(lambda x: x[..., :used, :], (self.keys, self.values))
+        self.keys, self.values = tree_map(lambda x: mx.concatenate([x, blank(x)], axis=2), (self.keys, self.values))
+
+    def _write(self, new, a, b):
+        for buf, part in zip((self.keys, self.values), new):
+            for i in range(3):
+                buf[i][..., a:b, :] = part[i]
+
+    def update_and_fetch(self, kr, lat):
+        new, n, prev = self._quant(kr, lat), kr.shape[2], self.offset
+        if self.keys is None or prev + n > self.keys[0].shape[2]:
+            self._grow(new, prev, n)
+        self.offset += n
+        self._write(new, prev, self.offset)
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
+
+    @property
+    def state(self):
+        return self.keys_and_values() if self.keys is not None else []
+
+    @state.setter
+    def state(self, v):
+        if v:
+            self.keys, self.values = v
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.offset, self.bits, self.rope_bits, self.group_size, int(self.rotate))))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self.bits, self.rope_bits, self.group_size, rot = map(int, v)
+        self.rotate = bool(rot)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def size(self):
+        return self.offset
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        return 0 if self.keys is None else sum(x.nbytes for t in (self.keys, self.values) for x in t)
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchMLAQuantCache.merge(caches)
+
+
+class BatchMLAQuantCache(MLAQuantCache):
+    """MLAQuantCache for continuous batching (mlx-lm's BatchKVCache protocol: left padding, filter, extend, extract)."""
+
+    def __init__(self, left_padding, bits=4, rope_bits=8, group_size=64, rotate=True):
+        super().__init__(bits, rope_bits, group_size, rotate)
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-p for p in left_padding])
+        self._idx = 0
+        self._right_padding = None
+
+    def _params(self):
+        return dict(bits=self.bits, rope_bits=self.rope_bits, group_size=self.group_size, rotate=self.rotate)
+
+    def update_and_fetch(self, kr, lat):
+        new, n, prev = self._quant(kr, lat), kr.shape[2], self._idx
+        if self.keys is None or prev + n > self.keys[0].shape[2]:
+            self._grow(new, prev, n)
+        self.offset = self.offset + n
+        self._idx += n
+        self._write(new, prev, self._idx)
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        return tree_map(lambda x: x[..., : self._idx, :], (self.keys, self.values))
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError("Left padding can only be added to an empty BatchMLAQuantCache")
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset = self.offset - left_padding
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            pad = self._right_padding
+            self.keys, self.values = tree_map(lambda x: dynamic_roll(x, pad[:, None], axis=2), (self.keys, self.values))
+            self.offset = self.offset - pad
+            self.left_padding += pad
+            self._right_padding = None
+
+    @property
+    def state(self):
+        return self.keys, self.values, self.offset, self.left_padding
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset, self.left_padding = v
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self._idx, self.bits, self.rope_bits, self.group_size, int(self.rotate))))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self._idx, self.bits, self.rope_bits, self.group_size, rot = map(int, v)
+        self.rotate = bool(rot)
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset = self.offset - n
+        return n
+
+    def make_mask(self, N, return_array=False, **kwargs):
+        return create_causal_mask(N, offset=self._idx, left_padding=self.left_padding, **kwargs)
+
+    def filter(self, batch_indices):
+        if self.keys is not None:
+            self.keys, self.values = tree_map(lambda x: x[batch_indices], (self.keys, self.values))
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        min_left = min(self.left_padding.tolist())
+        if min_left > 0:
+            if self.keys is not None:
+                self.keys, self.values = tree_map(lambda x: x[..., min_left:, :], (self.keys, self.values))
+            self._idx -= min_left
+            self.left_padding -= min_left
+
+    def extend(self, other):
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+        ref = self if self.keys is not None else other
+        max_idx = max(self._idx, other._idx)
+        max_size = max(c.keys[0].shape[2] for c in (self, other) if c.keys is not None)
+
+        def pad(c):
+            kv = (c.keys, c.values)
+            if c.keys is None:
+                b = c.offset.shape[0]
+                kv = tree_map(lambda x: mx.zeros((b, x.shape[1], 0, x.shape[3]), x.dtype), (ref.keys, ref.values))
+            left = max_idx - c._idx
+            right = max_size - kv[0][0].shape[2] - left
+            if right < 0:
+                kv = tree_map(lambda x: x[..., :right, :], kv)
+                right = 0
+            if left or right:
+                kv = tree_map(lambda x: mx.pad(x, [(0, 0), (0, 0), (left, right), (0, 0)]), kv)
+            return kv, c.offset, c.left_padding + left
+
+        (ka, oa, la), (kb, ob, lb) = pad(self), pad(other)
+        self.keys, self.values = tree_map(lambda x, y: mx.concatenate([x, y]), ka, kb)
+        self.offset = mx.concatenate([oa, ob])
+        self.left_padding = mx.concatenate([la, lb])
+        self._idx = max_idx
+
+    def extract(self, idx):
+        cache = MLAQuantCache(**self._params())
+        pad = self.left_padding.tolist()[idx]
+        cache.keys, cache.values = tree_map(lambda x: mx.contiguous(x[idx:idx + 1, :, pad:self._idx]),
+                                            (self.keys, self.values))
+        cache.offset = self._idx - pad
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        lengths = [c.size() for c in caches]
+        top = max(lengths)
+        params = next((c for c in caches), None)
+        params = dict(bits=params.bits, rope_bits=params.rope_bits, group_size=params.group_size, rotate=params.rotate)
+        if top == 0:
+            return cls([0] * len(caches), **params)
+        padding = [top - n for n in lengths]
+        full = next(c for c in caches if c.keys is not None)
+        blank = lambda x: mx.zeros((len(caches), x.shape[1], top, x.shape[3]), x.dtype)
+        keys, values = tree_map(blank, (full.keys, full.values))
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.keys is None:
+                continue
+            for dst, src in zip(keys + values, c.keys + c.values):
+                dst[i:i + 1, :, p:p + c.offset] = src[..., : c.offset, :]
+        cache = cls(padding, **params)
+        cache.keys, cache.values = keys, values
+        cache.offset += top
+        cache._idx = top
+        return cache
+
+    def size(self):
+        return self._idx
+
+
+# K-02 step 4: settings sized to this Mac. AUTO_KV: the smallest cache format that kept quality (held-out KLD +0.004,
+# long-context NLL +0.2% vs BF16): the latent rotated and in 4 bits, the RoPE key in 8 (keys carry the loss).
+AUTO_KV = dict(bits=4, rope_bits=8, group_size=64, rotate=True)
+
+
+def mla_tune(working_set=None):
+    """The prompt-attention score budget (transient ~5.3x) within 5% of the GPU working set, 64 MB .. 512 MB in powers
+    of two, and the automatic cache format."""
+    if working_set is None:
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        working_set = info["max_recommended_working_set_size"]
+    budget = 64 << 20
+    while budget < 512 << 20 and 6 * 2 * budget <= 0.05 * working_set:
+        budget *= 2
+    return {"score_budget": budget, "kv": AUTO_KV}
+
+
+def mla_attention(q, qr, lat, kr, q_lat, v_up, scale, mask=None, cache=None, path=None):
+    """MLA attention per head: v_up_a softmax(scale ((q_lat_a q_a) . c + qr_a . kr)) c, shape [B, H, L, hd].
+
+    q [B, H, L, hd] (q_proj heads), qr [B, H, L, dr] (RoPE applied), lat [B, 1, N, r] and kr [B, 1, N, dr] (cache
+    contents, or (codes, scales, biases) from MLAQuantCache), q_lat / v_up BF16 arrays or SeedHeads. path: None chooses; "blocked" (absorbed, key blocks), "expanded"
+    (expanded, key blocks), "absorbed" (MLX's attention on the concatenated keys: the reference, unbounded memory)."""
+    if path is None or (path == "absorbed" and isinstance(lat, (tuple, list))):
+        path = "expanded" if q.shape[2] >= EXPAND_MIN_L else "blocked"
+    if path == "absorbed":
+        keys = mx.concatenate([lat, kr], axis=-1)
+        queries = mx.concatenate([_heads(q_lat, q), qr], axis=-1)
+        out = scaled_dot_product_attention(queries, keys, lat, cache=cache, scale=scale, mask=mask)
+        return _heads(v_up, out)
+    return _mla_blocked(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded=path == "expanded", cache=cache)
 
 
 class MLA(nn.Module):
@@ -563,18 +991,14 @@ class MLAAttention(_k2.Attention):
         if self.mova:
             c = c + _lin(m.kv_a_v, self._values(x))
         kr = _lin(m.k_rope_proj, x)[:, None]                                            # [B, 1, L, 128]
-        qr = _heads(m.q_rope_mix, q)
-        ql = _heads(m.q_lat, q)
         offset = cache.offset if cache is not None else 0
-        qr = self.rope(qr, offset=offset)
+        qr = self.rope(_heads(m.q_rope_mix, q), offset=offset)
         kr = self.rope(kr, offset=offset)
         lat = c[:, None].astype(x.dtype)                                                # [B, 1, L, r]
         if cache is not None:
             kr, lat = cache.update_and_fetch(kr, lat)                                   # cache: 128 + r per token
-        keys = mx.concatenate([lat, kr], axis=-1)
-        queries = mx.concatenate([ql, qr], axis=-1)
-        out = scaled_dot_product_attention(queries, keys, lat, cache=cache, scale=self.scale, mask=mask)
-        out = _heads(m.v_up, out).transpose(0, 2, 1, 3)                                 # [B, L, heads, 128]
+        out = mla_attention(q, qr, lat, kr, m.q_lat, m.v_up, self.scale, mask, cache)
+        out = out.transpose(0, 2, 1, 3)                                                 # [B, L, heads, 128]
         if "gate_proj" in self:
             gate = _k2.softplus_beta_ln2(self.gate_proj(x)).reshape(b, L, self.n_heads, -1)
             out = out * gate
@@ -599,6 +1023,17 @@ class Model(_k2.Model):
                 raise ValueError(f"mla_ranks has {len(args.mla_ranks)} entries for {args.num_hidden_layers} layers")
             for i, layer in enumerate(self.model.layers):
                 layer.self_attn = MLAAttention(args, getattr(layer.self_attn, "mova", False), args.mla_ranks[i])
+
+    def make_cache(self):
+        """BF16 KVCaches, or MLAQuantCaches with config mla_kv (MLA only)."""
+        if self.args.mla_ranks and self.args.mla_kv:
+            kv = self.args.mla_kv
+            if kv == "auto":
+                global SCORE_BUDGET
+                tuned = mla_tune()
+                SCORE_BUDGET, kv = tuned["score_budget"], tuned["kv"]
+            return [MLAQuantCache(**kv) for _ in self.model.layers]
+        return [KVCache() for _ in self.model.layers]
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})
