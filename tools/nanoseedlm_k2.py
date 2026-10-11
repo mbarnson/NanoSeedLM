@@ -13,6 +13,8 @@ MLA (config mla_ranks): per layer the cache holds the latent c (rank r_l) and on
   k_rope   = RoPE(k_rope_proj x)
   scores_a = (q_lat_a q_a) . c + RoPE(q_rope_mix_a q_a) . k_rope,  scale 128^-0.5 as the original
   o_a      = v_up_a (sum_t p_t c_t), then the softplus gate and o_proj.
+A layer with mla_ranks[i] == 0 keeps its original (GQA) attention and a BF16 KVCache (a hybrid model: MLA where the
+latent holds the layer, GQA where it does not).
 """
 
 from dataclasses import dataclass, field
@@ -575,6 +577,9 @@ def _mla_blocked(q, qr, lat, kr, q_lat, v_up, scale, mask, expanded, cache=None)
         elif mask is not None:
             s = mx.where(mask, s, -mx.inf) if mask.dtype == mx.bool_ else s + mask.astype(s.dtype)
         return _heads(v_up, mx.softmax(s, axis=-1, precise=True) @ lat)
+    if (expanded and FUSED_PREFILL and (mask is None or isinstance(mask, str)) and q.dtype in (mx.bfloat16, mx.float16)
+            and hd % 8 == 0 and qr.shape[-1] % 8 == 0):
+        return _mla_fused(q, qr, lat, kr, q_lat, v_up, scale, isinstance(mask, str))
     qr = qr.astype(q.dtype) * scale
     if expanded:
         wq, wv = _dense_heads(q_lat), _dense_heads(v_up).swapaxes(1, 2)                # [H, r, hd] each
@@ -754,6 +759,148 @@ def _quant_pv_mma(p, lat, group_size, bits):
 QUANT_PV = "mma"      # decode P.V on a quantized cache: "mma" (_quant_pv_mma: reads only the codes; faster than the BF16
                       # product), "dequant" (BF16 blocks, then the BF16 product) or "qmm" (MLX's quantized vector-matrix)
 DEQ_KEYS = 65536      # "dequant": keys per block (100 MB of BF16; 16K blocks: 3-8% slower decode at 128K-512K)
+
+
+# Prompt chunks (expanded form), fused: per block of keys the latent is expanded by two MLX mat-muls (k_a = q_lat_a^T c,
+# v_a = v_up_a c, all heads) and one kernel does scores, causal mask, online softmax and P.V in simdgroup registers,
+# carrying the running output, max and sum to the next block: no score is written to memory, and the blocks are as
+# large as SCORE_BUDGET allows for the expanded keys and values (32K keys at 512 MB) instead of for f32 scores.
+_MLA_PREFILL = """
+// One threadgroup: BQ query rows of head h (BQ / 8 simdgroups of 8 rows). Per tile of BK keys the keys [k_a ; k_rope]
+// and the values v_a are staged in threadgroup memory; scores and P.V are 8 x 8 simdgroup products in f32. Fragment
+// layout as MLX's steel kernels: lane holds row fm, columns fn and fn + 1 of each 8 x 8 matrix.
+constexpr int BK = 32, DQ = HD + DR, KLD = DQ + 8, VLD = HD + 8, NT = BQ * 4;
+threadgroup T Ks[BK * KLD];
+threadgroup T Vs[BK * VLD];
+const uint tid = thread_position_in_threadgroup.x, lane = tid % 32, sg = tid / 32;
+const uint qt = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
+const int H = q_shape[1], L = q_shape[2], NB = kn_shape[2];
+const int k0g = prm[0], n = prm[1], causal = prm[2], first = prm[3];
+const short qid = lane / 4, fm = (qid & 4) + ((lane / 2) % 4), fn = (qid & 2) * 2 + (lane % 2) * 2;
+const int row = qt * BQ + sg * 8 + fm;
+const bool rv = row < L;
+const int qpos = n - L + row;
+const size_t qrow = (size_t) (b * H + h) * L + (rv ? row : 0);
+float2 Qf[DQ / 8];
+for (int d = 0; d < HD / 8; ++d)
+    Qf[d] = rv ? float2(float(q[qrow * HD + d * 8 + fn]), float(q[qrow * HD + d * 8 + fn + 1])) : float2(0.0f);
+for (int d = 0; d < DR / 8; ++d)
+    Qf[HD / 8 + d] = rv ? float2(float(qr[qrow * DR + d * 8 + fn]), float(qr[qrow * DR + d * 8 + fn + 1])) : float2(0.0f);
+float2 Of[HD / 8];
+float m_i = -INFINITY, l_i = 0.0f;
+for (int d = 0; d < HD / 8; ++d)
+    Of[d] = (first || !rv) ? float2(0.0f) : float2(o_in[qrow * HD + d * 8 + fn], o_in[qrow * HD + d * 8 + fn + 1]);
+if (!first && rv) {
+    m_i = ml_in[qrow * 2];
+    l_i = ml_in[qrow * 2 + 1];
+}
+// causal: keys past the tile's last query position are skipped
+const int qmax = n - L + min(L - 1, (int) (qt * BQ + BQ - 1));
+const int kend = causal ? min(NB, qmax - k0g + 1) : NB;
+const device T* knb = kn + (size_t) (b * H + h) * NB * HD;
+const device T* krb = kr + (size_t) b * NB * DR;
+const device T* vb = v + (size_t) (b * H + h) * NB * HD;
+for (int j0 = 0; j0 < kend; j0 += BK) {
+    for (int e = tid; e < BK * DQ / 4; e += NT) {
+        int j = e / (DQ / 4), c = (e % (DQ / 4)) * 4, key = j0 + j;
+        uint2 w = uint2(0);
+        if (key < NB)
+            w = c < HD ? *(const device uint2*) (knb + (size_t) key * HD + c)
+                       : *(const device uint2*) (krb + (size_t) key * DR + c - HD);
+        *(threadgroup uint2*) (Ks + j * KLD + c) = w;
+    }
+    for (int e = tid; e < BK * HD / 4; e += NT) {
+        int j = e / (HD / 4), c = (e % (HD / 4)) * 4, key = j0 + j;
+        *(threadgroup uint2*) (Vs + j * VLD + c) = key < NB ? *(const device uint2*) (vb + (size_t) key * HD + c) : uint2(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float2 S[BK / 8];
+    float rmax = -INFINITY;
+    for (int kb = 0; kb < BK / 8; ++kb) {
+        simdgroup_float8x8 acc = simdgroup_float8x8(0.0f), A, B;
+        for (int d = 0; d < DQ / 8; ++d) {
+            reinterpret_cast<thread float2&>(A.thread_elements()) = Qf[d];
+            reinterpret_cast<thread float2&>(B.thread_elements()) =
+                float2(float(Ks[(kb * 8 + fn) * KLD + d * 8 + fm]), float(Ks[(kb * 8 + fn + 1) * KLD + d * 8 + fm]));
+            simdgroup_multiply_accumulate(acc, A, B, acc);
+        }
+        float2 s = reinterpret_cast<thread float2&>(acc.thread_elements());
+        for (int e = 0; e < 2; ++e) {
+            int key = j0 + kb * 8 + fn + e;
+            if (!rv || key >= NB || (causal && k0g + key > qpos))
+                s[e] = -INFINITY;
+        }
+        rmax = max(rmax, max(s.x, s.y));
+        S[kb] = s;
+    }
+    rmax = max(rmax, simd_shuffle_xor(rmax, 1));
+    rmax = max(rmax, simd_shuffle_xor(rmax, 8));
+    const float mnew = max(m_i, rmax);
+    const float alpha = mnew == -INFINITY ? 1.0f : metal::precise::exp(m_i - mnew);
+    float rsum = 0.0f;
+    for (int kb = 0; kb < BK / 8; ++kb) {
+        for (int e = 0; e < 2; ++e)
+            S[kb][e] = S[kb][e] == -INFINITY ? 0.0f : metal::precise::exp(S[kb][e] - mnew);
+        rsum += S[kb].x + S[kb].y;
+    }
+    rsum += simd_shuffle_xor(rsum, 1);
+    rsum += simd_shuffle_xor(rsum, 8);
+    l_i = l_i * alpha + rsum;
+    m_i = mnew;
+    for (int db = 0; db < HD / 8; ++db) {
+        simdgroup_float8x8 acc, A, B;
+        reinterpret_cast<thread float2&>(acc.thread_elements()) = Of[db] * alpha;
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            reinterpret_cast<thread float2&>(A.thread_elements()) = S[kb];
+            reinterpret_cast<thread float2&>(B.thread_elements()) =
+                float2(float(Vs[(kb * 8 + fm) * VLD + db * 8 + fn]), float(Vs[(kb * 8 + fm) * VLD + db * 8 + fn + 1]));
+            simdgroup_multiply_accumulate(acc, A, B, acc);
+        }
+        Of[db] = reinterpret_cast<thread float2&>(acc.thread_elements());
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+if (rv) {
+    for (int d = 0; d < HD / 8; ++d) {
+        o_out[qrow * HD + d * 8 + fn] = Of[d].x;
+        o_out[qrow * HD + d * 8 + fn + 1] = Of[d].y;
+    }
+    if (fn == 0) {
+        ml_out[qrow * 2] = m_i;
+        ml_out[qrow * 2 + 1] = l_i;
+    }
+}
+"""
+FUSED_PREFILL = True  # prompt chunks with a causal mask or none: _mla_fused (False: the MLX-ops blocks above)
+FUSED_KEYS = None     # keys per expanded block (None: SCORE_BUDGET / expanded bytes per key, at least 256)
+FUSED_BQ = 32         # query rows per threadgroup (a multiple of 8)
+
+
+def _mla_fused(q, qr, lat, kr, q_lat, v_up, scale, causal):
+    """Expanded MLA attention for a prompt chunk through _MLA_PREFILL; lat / kr arrays or dequantizing views (_Blocks).
+    Returns [B, H, L, hd] in q's dtype."""
+    b, heads, L, hd = q.shape
+    dr, n = qr.shape[-1], lat.shape[2]
+    wq, wv = _dense_heads(q_lat), _dense_heads(v_up).swapaxes(1, 2)                    # [H, r, hd] each
+    qa, qr = q * scale, qr.astype(q.dtype) * scale
+    nk = FUSED_KEYS or max(256, SCORE_BUDGET // (4 * b * heads * hd) // 256 * 256)
+    if "mla_prefill" not in _kernels:
+        _kernels["mla_prefill"] = mx.fast.metal_kernel(
+            name="nanoseedlm_mla_prefill", input_names=["q", "qr", "kn", "kr", "v", "o_in", "ml_in", "prm"],
+            output_names=["o_out", "ml_out"], source=_MLA_PREFILL)
+    o, ml = mx.zeros((b, heads, L, hd), mx.float32), mx.zeros((b, heads, L, 2), mx.float32)
+    nt = FUSED_BQ * 4
+    for k0 in range(0, n, nk):
+        k1 = min(n, k0 + nk)
+        lb = lat[:, :, k0:k1]
+        o, ml = _kernels["mla_prefill"](
+            inputs=[qa, qr, lb @ wq, kr[:, :, k0:k1], lb @ wv, o, ml, mx.array([k0, n, int(causal), int(k0 == 0)], mx.int32)],
+            template=[("T", q.dtype), ("HD", hd), ("DR", dr), ("BQ", FUSED_BQ)],
+            grid=(-(-L // FUSED_BQ) * nt, heads, b), threadgroup=(nt, 1, 1),
+            output_shapes=[o.shape, ml.shape], output_dtypes=[mx.float32, mx.float32])
+        if k1 < n:
+            mx.eval(o, ml)            # one block of expanded keys in flight
+    return (o / ml[..., 1:]).astype(q.dtype)
 
 
 # A quantized MLA cache: per token the RoPE key (rope_bits) and the latent (bits), MLX affine groups of group_size,
@@ -1034,7 +1181,8 @@ def kv_bytes(args, fmt):
     """Cache bytes per token over all layers: codes plus a BF16 scale and bias per group, latent and RoPE key."""
     f = KV_FORMATS[fmt]
     per = lambda d, bits: d * bits // 8 + d // f["group_size"] * 4
-    return sum(per(r, f["bits"]) + per(args.mla_rope_dim, f["rope_bits"]) for r in args.mla_ranks)
+    gqa = 2 * args.num_key_value_heads * args.head_dim * 2                    # a GQA layer (rank 0): BF16 K and V
+    return sum(per(r, f["bits"]) + per(args.mla_rope_dim, f["rope_bits"]) if r else gqa for r in args.mla_ranks)
 
 
 def choose_kv(args, max_context, available):
@@ -1122,7 +1270,7 @@ def mla_caches(args, layers, max_context=None):
     if kv in (None, "auto"):
         kv = mla_kv_auto(args, max_context)
     cls = next((c for c in (MLAQ8Cache, MLARQ4Cache) if KV_FORMATS[c.FORMAT] == dict(kv)), MLAQuantCache)
-    return [cls(**kv) for _ in range(layers)]
+    return [cls(**kv) if args.mla_ranks[i] else KVCache() for i in range(layers)]
 
 
 _STATE_NAMES = ("k_codes", "k_scales", "k_biases", "v_codes", "v_scales", "v_biases")
@@ -1331,7 +1479,8 @@ class Model(_k2.Model):
             if len(args.mla_ranks) != args.num_hidden_layers:
                 raise ValueError(f"mla_ranks has {len(args.mla_ranks)} entries for {args.num_hidden_layers} layers")
             for i, layer in enumerate(self.model.layers):
-                layer.self_attn = MLAAttention(args, getattr(layer.self_attn, "mova", False), args.mla_ranks[i])
+                if args.mla_ranks[i]:                     # 0: the layer keeps its original (GQA) attention
+                    layer.self_attn = MLAAttention(args, getattr(layer.self_attn, "mova", False), args.mla_ranks[i])
 
     def make_cache(self, max_context=None):
         """MLA: q8 or rq4 caches for max_context, or as config mla_kv gives (mla_caches); GQA: KVCaches."""
