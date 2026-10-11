@@ -871,117 +871,8 @@ if (rv) {
     }
 }
 """
-_MLA_PREFILL_V2 = """
-// v2 of _MLA_PREFILL (BF16 only): tiles staged as raw 16-bit words, K transposed (Kt[dim][key]) and V row-major, padded
-// so the 32 lanes of a fragment load hit distinct banks; each lane loads its two fragment elements as one 32-bit word
-// and widens BF16 to f32 by shifts. Scores, online softmax and P.V as in v1.
-constexpr int DQ = HD + DR, KTLD = BK + 8, VLD = HD + 8, NT = BQ * 4;
-threadgroup ushort Kt[DQ * KTLD];
-threadgroup ushort Vs[BK * VLD];
-const uint tid = thread_position_in_threadgroup.x, lane = tid % 32, sg = tid / 32;
-const uint qt = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
-const int H = q_shape[1], L = q_shape[2], NB = kn_shape[2];
-const int k0g = prm[0], n = prm[1], causal = prm[2], first = prm[3];
-const short qid = lane / 4, fm = (qid & 4) + ((lane / 2) % 4), fn = (qid & 2) * 2 + (lane % 2) * 2;
-const int row = qt * BQ + sg * 8 + fm;
-const bool rv = row < L;
-const int qpos = n - L + row;
-const size_t qrow = (size_t) (b * H + h) * L + (rv ? row : 0);
-float2 Qf[DQ / 8];
-for (int d = 0; d < HD / 8; ++d)
-    Qf[d] = rv ? float2(float(q[qrow * HD + d * 8 + fn]), float(q[qrow * HD + d * 8 + fn + 1])) : float2(0.0f);
-for (int d = 0; d < DR / 8; ++d)
-    Qf[HD / 8 + d] = rv ? float2(float(qr[qrow * DR + d * 8 + fn]), float(qr[qrow * DR + d * 8 + fn + 1])) : float2(0.0f);
-float2 Of[HD / 8];
-float m_i = -INFINITY, l_i = 0.0f;
-for (int d = 0; d < HD / 8; ++d)
-    Of[d] = (first || !rv) ? float2(0.0f) : float2(o_in[qrow * HD + d * 8 + fn], o_in[qrow * HD + d * 8 + fn + 1]);
-if (!first && rv) {
-    m_i = ml_in[qrow * 2];
-    l_i = ml_in[qrow * 2 + 1];
-}
-const int qmax = n - L + min(L - 1, (int) (qt * BQ + BQ - 1));
-const int kend = causal ? min(NB, qmax - k0g + 1) : NB;
-const device ushort* knb = (const device ushort*) kn + (size_t) (b * H + h) * NB * HD;
-const device ushort* krb = (const device ushort*) kr + (size_t) b * NB * DR;
-const device ushort* vb = (const device ushort*) v + (size_t) (b * H + h) * NB * HD;
-for (int j0 = 0; j0 < kend; j0 += BK) {
-    for (int e = tid; e < BK * DQ / 4; e += NT) {               // K tile, transposed: 4 dims of one key per thread
-        int j = e % BK, c = (e / BK) * 4, key = j0 + j;
-        uint2 w = uint2(0);
-        if (key < NB)
-            w = c < HD ? *(const device uint2*) (knb + (size_t) key * HD + c) : *(const device uint2*) (krb + (size_t) key * DR + c - HD);
-        Kt[(c + 0) * KTLD + j] = ushort(w.x & 0xffffu);
-        Kt[(c + 1) * KTLD + j] = ushort(w.x >> 16);
-        Kt[(c + 2) * KTLD + j] = ushort(w.y & 0xffffu);
-        Kt[(c + 3) * KTLD + j] = ushort(w.y >> 16);
-    }
-    for (int e = tid; e < BK * HD / 4; e += NT) {
-        int j = e / (HD / 4), c = (e % (HD / 4)) * 4, key = j0 + j;
-        *(threadgroup uint2*) (Vs + j * VLD + c) = key < NB ? *(const device uint2*) (vb + (size_t) key * HD + c) : uint2(0);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float2 S[BK / 8];
-    float rmax = -INFINITY;
-    for (int kb = 0; kb < BK / 8; ++kb) {
-        simdgroup_float8x8 acc = simdgroup_float8x8(0.0f), A, B;
-        for (int d = 0; d < DQ / 8; ++d) {
-            const uint w = *(const threadgroup uint*) (Kt + (d * 8 + fm) * KTLD + kb * 8 + fn);
-            reinterpret_cast<thread float2&>(A.thread_elements()) = Qf[d];
-            reinterpret_cast<thread float2&>(B.thread_elements()) = float2(as_type<float>(w << 16), as_type<float>(w & 0xffff0000u));
-            simdgroup_multiply_accumulate(acc, A, B, acc);
-        }
-        float2 s = reinterpret_cast<thread float2&>(acc.thread_elements());
-        for (int e = 0; e < 2; ++e) {
-            int key = j0 + kb * 8 + fn + e;
-            if (!rv || key >= NB || (causal && k0g + key > qpos))
-                s[e] = -INFINITY;
-        }
-        rmax = max(rmax, max(s.x, s.y));
-        S[kb] = s;
-    }
-    rmax = max(rmax, simd_shuffle_xor(rmax, 1));
-    rmax = max(rmax, simd_shuffle_xor(rmax, 8));
-    const float mnew = max(m_i, rmax);
-    const float alpha = mnew == -INFINITY ? 1.0f : metal::precise::exp(m_i - mnew);
-    float rsum = 0.0f;
-    for (int kb = 0; kb < BK / 8; ++kb) {
-        for (int e = 0; e < 2; ++e)
-            S[kb][e] = S[kb][e] == -INFINITY ? 0.0f : metal::precise::exp(S[kb][e] - mnew);
-        rsum += S[kb].x + S[kb].y;
-    }
-    rsum += simd_shuffle_xor(rsum, 1);
-    rsum += simd_shuffle_xor(rsum, 8);
-    l_i = l_i * alpha + rsum;
-    m_i = mnew;
-    for (int db = 0; db < HD / 8; ++db) {
-        simdgroup_float8x8 acc, A, B;
-        reinterpret_cast<thread float2&>(acc.thread_elements()) = Of[db] * alpha;
-        for (int kb = 0; kb < BK / 8; ++kb) {
-            const uint w = *(const threadgroup uint*) (Vs + (kb * 8 + fm) * VLD + db * 8 + fn);
-            reinterpret_cast<thread float2&>(A.thread_elements()) = S[kb];
-            reinterpret_cast<thread float2&>(B.thread_elements()) = float2(as_type<float>(w << 16), as_type<float>(w & 0xffff0000u));
-            simdgroup_multiply_accumulate(acc, A, B, acc);
-        }
-        Of[db] = reinterpret_cast<thread float2&>(acc.thread_elements());
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-if (rv) {
-    for (int d = 0; d < HD / 8; ++d) {
-        o_out[qrow * HD + d * 8 + fn] = Of[d].x;
-        o_out[qrow * HD + d * 8 + fn + 1] = Of[d].y;
-    }
-    if (fn == 0) {
-        ml_out[qrow * 2] = m_i;
-        ml_out[qrow * 2 + 1] = l_i;
-    }
-}
-"""
 FUSED_PREFILL = True  # prompt chunks with a causal mask or none: _mla_fused (False: the MLX-ops blocks above)
 FUSED_KEYS = None     # keys per expanded block (None: SCORE_BUDGET / expanded bytes per key, at least 256)
-FUSED_KERNEL = "v2"   # "v2" (BF16: transposed K tile, 32-bit fragment loads) or "v1"
-FUSED_BK = 16         # v2: keys per tile (a multiple of 8; 16: ~13% faster than 32 at 32K)
 FUSED_BQ = 64         # query rows per threadgroup (a multiple of 8; 64: +21% over 32 at 128K, 128 ~ 64)
 
 
@@ -993,21 +884,18 @@ def _mla_fused(q, qr, lat, kr, q_lat, v_up, scale, causal):
     wq, wv = _dense_heads(q_lat), _dense_heads(v_up).swapaxes(1, 2)                    # [H, r, hd] each
     qa, qr = q * scale, qr.astype(q.dtype) * scale
     nk = FUSED_KEYS or max(256, SCORE_BUDGET // (4 * b * heads * hd) // 256 * 256)
-    v2 = FUSED_KERNEL == "v2" and q.dtype == mx.bfloat16
-    key = "mla_prefill_v2" if v2 else "mla_prefill"
-    if key not in _kernels:
-        _kernels[key] = mx.fast.metal_kernel(
-            name="nanoseedlm_" + key, input_names=["q", "qr", "kn", "kr", "v", "o_in", "ml_in", "prm"],
-            output_names=["o_out", "ml_out"], source=_MLA_PREFILL_V2 if v2 else _MLA_PREFILL)
-    _kernels["mla_prefill"] = _kernels[key]
+    if "mla_prefill" not in _kernels:
+        _kernels["mla_prefill"] = mx.fast.metal_kernel(
+            name="nanoseedlm_mla_prefill", input_names=["q", "qr", "kn", "kr", "v", "o_in", "ml_in", "prm"],
+            output_names=["o_out", "ml_out"], source=_MLA_PREFILL)
     o, ml = mx.zeros((b, heads, L, hd), mx.float32), mx.zeros((b, heads, L, 2), mx.float32)
     nt = FUSED_BQ * 4
     for k0 in range(0, n, nk):
         k1 = min(n, k0 + nk)
         lb = lat[:, :, k0:k1]
-        o, ml = _kernels[key](
+        o, ml = _kernels["mla_prefill"](
             inputs=[qa, qr, lb @ wq, kr[:, :, k0:k1], lb @ wv, o, ml, mx.array([k0, n, int(causal), int(k0 == 0)], mx.int32)],
-            template=[("T", q.dtype), ("HD", hd), ("DR", dr), ("BQ", FUSED_BQ)] + ([("BK", FUSED_BK)] if v2 else []),
+            template=[("T", q.dtype), ("HD", hd), ("DR", dr), ("BQ", FUSED_BQ)],
             grid=(-(-L // FUSED_BQ) * nt, heads, b), threadgroup=(nt, 1, 1),
             output_shapes=[o.shape, ml.shape], output_dtypes=[mx.float32, mx.float32])
         if k1 < n:
