@@ -167,6 +167,10 @@ static void lin1(const MovaRef* r, const NsTensor* t, int slice, const float* x,
 MovaRef* mova_ref_open(const char* dir, int threads, char* err, int errlen) {
     MovaRef* r = (MovaRef*) calloc(1, sizeof *r);
     if (mova_cfg_load(&r->c, dir, err, errlen) || ns_open(&r->nm, dir, err, errlen)) { free(r); return NULL; }
+    if (mova_cfg_hybrid(&r->c)) {
+        snprintf(err, (size_t) errlen, "%s: a hybrid MLA model (mla_ranks 0: GQA layers) runs in the MLX loader (oMLX), not yet in the C reference", dir);
+        ns_close(&r->nm); free(r); return NULL;
+    }
     {   // the forward reads every tensor without further checks: all present (stacked experts: a packed folder, not the
         // original checkpoint, which stores them one per expert), of their shapes; the MLA tensors BF16
         MovaTensor* mt = NULL;

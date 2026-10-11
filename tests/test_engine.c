@@ -340,6 +340,30 @@ static void test_mla(void) {
         CHECK(!rb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA reference without q_lat: %s", rb ? "opened" : err);
         if (rb) mova_ref_close(rb);
     }
+    // A hybrid folder (mla_ranks 0: layer 1 keeps GQA attention) loads in the MLX loader only: the reference and the
+    // engine refuse it by name instead of reading missing MLA tensors
+    {
+        const char* hyb = "out/test/engine_model_mla_hybrid";
+        char* hc = (char*) malloc(strlen(CONFIG) + 128);
+        sprintf(hc, "{\"mla_ranks\": [64, 0, 64, 320, 96], \"mla_rope_dim\": 128,%s", CONFIG + 1);
+        const int hok = write_model(hyb, hc, NULL, err, sizeof err) == 0;
+        CHECK(hok, "hybrid MLA folder: %s", err);
+        if (hok) {
+            MovaRef* rh = mova_ref_open(hyb, 1, err, sizeof err);
+            CHECK(!rh && strstr(err, "hybrid"), "hybrid MLA reference: %s", rh ? "opened" : err);
+            if (rh) mova_ref_close(rh);
+            EngOpts o;
+            memset(&o, 0, sizeof o);
+            o.model_dir = hyb;
+            o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
+            o.max_seqs = 1;
+            o.kv_tokens = 64;
+            Eng* eh = eng_open(&o, err, sizeof err);
+            CHECK(!eh && strstr(err, "hybrid"), "hybrid MLA engine: %s", eh ? "opened" : err);
+            if (eh) eng_close(eh);
+        }
+        free(hc);
+    }
     free(config);
     // The per-head maps are stacked 3-D BF16 tensors [n_head][rows][cols], as the conversion exports them: the engine
     // maps them from the folder (as from the real converted model's model-mla-delta.safetensors), and the checkpoint

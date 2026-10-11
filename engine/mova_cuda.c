@@ -551,6 +551,10 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Eng* e = (Eng*) calloc(1, sizeof *e);
     if (mova_cfg_load(&e->c, o->model_dir, err, errlen)) { free(e); return NULL; }
+    if (mova_cfg_hybrid(&e->c)) {
+        snprintf(err, (size_t) errlen, "%s: a hybrid MLA model (mla_ranks 0: GQA layers) runs in the MLX loader (oMLX), not yet in this engine", o->model_dir);
+        free(e); return NULL;
+    }
     const MovaCfg* c = &e->c;
     int expanded_full_forecast = 0;
     e->dec_group = 1;

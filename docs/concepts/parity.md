@@ -49,6 +49,8 @@ same results as the engine.
 | GQA KV cache q8 | Yes | Yes | oMLX options |
 | MLA KV cache fp8, fp4 | Yes | Yes | No |
 | MLA KV cache q8, rq4 | No | No | Yes |
+| Hybrid MLA (`mla_ranks` 0: GQA layers) | No (refused) | No (refused) | Yes |
+| Fused kernel for MLA prompts | `k_mla_prefill` | `k_mla_prefill` | `_MLA_PREFILL` |
 | Paged KV cache | Yes (macOS 26.4 or later) | No | No |
 | OpenAI-compatible server | `nslm-serve` | `nslm-serve` | oMLX |
 | Seed search | Yes | Yes | No |

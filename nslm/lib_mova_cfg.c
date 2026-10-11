@@ -85,18 +85,20 @@ int mova_cfg_parse(MovaCfg* c, const char* js, char* err, int errlen) {
     if (mr) {
         NEED(*mr == '[', "mla_ranks must be an array");
         NEED(c->n_layer <= MOVA_MAX_LAYERS, "too many layers for MLA");
-        int nr = 0;
+        int nr = 0, n_mla = 0;
         for (const char* p = mr + 1; *p && *p != ']'; ++p)
             if (*p >= '0' && *p <= '9') {
                 NEED(nr < c->n_layer, "mla_ranks has more entries than layers");
                 c->mla_rank[nr] = atoi(p);
-                NEED(c->mla_rank[nr] >= 32 && c->mla_rank[nr] <= 1024 && c->mla_rank[nr] % 32 == 0,
-                     "mla_ranks: %d is not a multiple of 32 in [32, 1024]", c->mla_rank[nr]);
+                NEED(c->mla_rank[nr] == 0 || (c->mla_rank[nr] >= 32 && c->mla_rank[nr] <= 1024 && c->mla_rank[nr] % 32 == 0),
+                     "mla_ranks: %d is not 0 (GQA layer) or a multiple of 32 in [32, 1024]", c->mla_rank[nr]);
+                n_mla += c->mla_rank[nr] > 0;
                 ++nr;
                 while (*p >= '0' && *p <= '9') ++p;
                 --p;
             }
         NEED(nr == c->n_layer, "mla_ranks has %d entries for %d layers", nr, c->n_layer);
+        NEED(n_mla > 0, "mla_ranks: no MLA layer (all 0)");
         c->mla_rope = c->head_dim;
         jint(js, "mla_rope_dim", &c->mla_rope);
         NEED(c->mla_rope == c->head_dim, "mla_rope_dim must equal head_dim (128)");
@@ -146,10 +148,11 @@ int mova_tensors(const MovaCfg* c, MovaTensor** out) {
         add(t, &n, MOVA_K_NORM, l, 1, 1, d, NULL, "model.layers.%d.input_layernorm.weight", l);
         add(t, &n, MOVA_K_NORM, l, 1, 1, d, NULL, "model.layers.%d.post_attention_layernorm.weight", l);
         add(t, &n, MOVA_K_LINEAR, l, 1, q, d, NULL, "model.layers.%d.self_attn.q_proj.weight", l);
-        if (!c->mla) add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.k_proj.weight", l);
+        const int mla = mova_mla_layer(c, l);
+        if (!mla) add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.k_proj.weight", l);
         add(t, &n, MOVA_K_LINEAR, l, 1, d, q, NULL, "model.layers.%d.self_attn.o_proj.weight", l);
         add(t, &n, MOVA_K_LINEAR, l, 1, q, d, NULL, "model.layers.%d.self_attn.gate_proj.weight", l);
-        if (c->mla) {
+        if (mla) {
             const int r = c->mla_rank[l], hd = c->head_dim, rd = c->mla_rope;
             add(t, &n, MOVA_K_LINEAR, l, 1, r, d, NULL, "model.layers.%d.self_attn.mla.kv_a_x", l);
             if (sparse) add(t, &n, MOVA_K_LINEAR, l, 1, r, kv, NULL, "model.layers.%d.self_attn.mla.kv_a_v", l);
@@ -159,7 +162,7 @@ int mova_tensors(const MovaCfg* c, MovaTensor** out) {
             add(t, &n, MOVA_K_HEADS, l, c->n_head, hd, r, NULL, "model.layers.%d.self_attn.mla.v_up", l);
         }
         if (!sparse) {
-            if (!c->mla) add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.v_proj.weight", l);
+            if (!mla) add(t, &n, MOVA_K_LINEAR, l, 1, kv, d, NULL, "model.layers.%d.self_attn.v_proj.weight", l);
             add(t, &n, MOVA_K_LINEAR, l, 1, c->ff_dense, d, NULL, "model.layers.%d.mlp.gate_proj.weight", l);
             add(t, &n, MOVA_K_LINEAR, l, 1, c->ff_dense, d, NULL, "model.layers.%d.mlp.up_proj.weight", l);
             add(t, &n, MOVA_K_LINEAR, l, 1, d, c->ff_dense, NULL, "model.layers.%d.mlp.down_proj.weight", l);

@@ -17,8 +17,16 @@ typedef struct {
     int norm_groups, router_parts;
     float rope_theta, eps, route_scale;
     int mla, mla_rope;                    // MLA: 1, the RoPE key width (128); 0 for the GQA original
-    int mla_rank[MOVA_MAX_LAYERS];        // the latent rank per layer (a multiple of 32, at most 1024)
+    int mla_rank[MOVA_MAX_LAYERS];        // the latent rank per layer (a multiple of 32, at most 1024; 0: the layer keeps GQA)
 } MovaCfg;
+
+// MLA in layer l (an MLA model's layer with a latent); 0 for the GQA original and for a hybrid model's GQA layers
+static inline int mova_mla_layer(const MovaCfg* c, int l) { return c->mla && c->mla_rank[l] > 0; }
+// a hybrid MLA model: some layers (mla_ranks 0) keep their GQA attention.  The MLX loader runs it; the engines do not yet.
+static inline int mova_cfg_hybrid(const MovaCfg* c) {
+    for (int l = 0; c->mla && l < c->n_layer; ++l) if (!c->mla_rank[l]) return 1;
+    return 0;
+}
 
 int mova_cfg_load(MovaCfg* c, const char* model_dir, char* err, int errlen);
 int mova_cfg_parse(MovaCfg* c, const char* json, char* err, int errlen);

@@ -91,6 +91,12 @@ budget.
 `config.json` has `mla_ranks` (the latent rank of each layer, a multiple of 32, at most 1024) and `mla_rope_dim`
 (128). Read [The model folder format](../reference/model-folder.md).
 
+A rank of 0 keeps the original GQA attention in that layer. The folder then keeps `k_proj` (and `v_proj` in the
+layers without value experts) for that layer, and the layer has no MLA tensors. This is a hybrid model. Use it when the
+latent cannot hold a layer: each GQA layer costs 4 KB of BF16 cache per token, against 1.75 KB for an MLA layer at
+rank 768. The MLX loader runs hybrid models. The packer and the seed search accept them. The engines and the C
+reference do not run them yet, and they refuse a hybrid folder with an error.
+
 ## Measurements
 
 - [MLA kernels on Metal and CUDA](../results/2026-10-08-mla-kernels.md)

@@ -27,7 +27,7 @@ An MLA model has two more keys in `config.json`:
 
 | Key | Value |
 |---|---|
-| `mla_ranks` | The latent rank of each layer. A multiple of 32, at most 1024 |
+| `mla_ranks` | The latent rank of each layer. A multiple of 32, at most 1024. 0 keeps the layer's GQA attention (a hybrid model; the MLX loader only) |
 | `mla_rope_dim` | 128 |
 
 The engine reads the MLA tensors from `model-mla-delta.safetensors`. For each layer, the file has the tensors
