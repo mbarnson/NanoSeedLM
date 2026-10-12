@@ -322,9 +322,17 @@ static void test_batch(const char* dir, const char* what, int expand_min, int kv
 
 // 8. MLA (a TransMLA conversion): the same random model with latent attention (ranks 64..320, one 128-dim RoPE key),
 // against the C reference: prompt scoring (one-pass latent attention) and decode (split-key + reduce), the cache size.
-static void test_mla(void) {
-    const char* dir = "out/test/engine_model_mla";
-    static const int ranks[5] = {64, 96, 64, 320, 96};   // 320: the fp4 cache's FP4 latent dims (past KVQ_FP4_LEAD)
+// A hybrid rank list (0: the layer keeps GQA attention and a BF16 K / V cache) runs the same checks.
+static int64_t layer_kv_bytes(int rank, int fmt) {   // bytes per position of one layer's cache (the test model: 2 KV heads)
+    if (!rank) return 2 * 2 * 128 * 2;                 // GQA layer: BF16 K and V, whatever the MLA format
+    if (fmt == ENG_KV_BF16) return (128 + rank) * 2;
+    const int lead = fmt == ENG_KV_FP8 || rank < KVQ_FP4_LEAD ? rank : KVQ_FP4_LEAD;
+    return 128 + 4 + kvq_row_bytes(lead, rank) + kvq_row_scales(lead, rank);
+}
+
+static void test_mla_ranks(const int ranks[5], const char* dir) {
+    int hybrid = 0;
+    for (int l = 0; l < 5; ++l) hybrid |= ranks[l] == 0;
     char* config = (char*) malloc(strlen(CONFIG) + 128);
     sprintf(config, "{\"mla_ranks\": [%d, %d, %d, %d, %d], \"mla_rope_dim\": 128,%s", ranks[0], ranks[1], ranks[2], ranks[3],
             ranks[4], CONFIG + 1);
@@ -333,36 +341,12 @@ static void test_mla(void) {
     // A folder without one layer's per-head query map: the reference (and below, the engine) must refuse it, naming
     // the tensor
     const char* bad = "out/test/engine_model_mla_missing";
-    const int bad_ok = write_model(bad, config, "layers.2.self_attn.mla.q_lat", err, sizeof err) == 0;
-    CHECK(bad_ok, "MLA folder without q_lat: %s", err);
+    const int bad_ok = !hybrid && write_model(bad, config, "layers.2.self_attn.mla.q_lat", err, sizeof err) == 0;
+    CHECK(bad_ok || hybrid, "MLA folder without q_lat: %s", err);
     if (bad_ok) {
         MovaRef* rb = mova_ref_open(bad, 1, err, sizeof err);
         CHECK(!rb && strstr(err, "layers.2.self_attn.mla.q_lat"), "MLA reference without q_lat: %s", rb ? "opened" : err);
         if (rb) mova_ref_close(rb);
-    }
-    // A hybrid folder (mla_ranks 0: layer 1 keeps GQA attention) loads in the MLX loader only: the reference and the
-    // engine refuse it by name instead of reading missing MLA tensors
-    {
-        const char* hyb = "out/test/engine_model_mla_hybrid";
-        char* hc = (char*) malloc(strlen(CONFIG) + 128);
-        sprintf(hc, "{\"mla_ranks\": [64, 0, 64, 320, 96], \"mla_rope_dim\": 128,%s", CONFIG + 1);
-        const int hok = write_model(hyb, hc, NULL, err, sizeof err) == 0;
-        CHECK(hok, "hybrid MLA folder: %s", err);
-        if (hok) {
-            MovaRef* rh = mova_ref_open(hyb, 1, err, sizeof err);
-            CHECK(!rh && strstr(err, "hybrid"), "hybrid MLA reference: %s", rh ? "opened" : err);
-            if (rh) mova_ref_close(rh);
-            EngOpts o;
-            memset(&o, 0, sizeof o);
-            o.model_dir = hyb;
-            o.resource_dir = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
-            o.max_seqs = 1;
-            o.kv_tokens = 64;
-            Eng* eh = eng_open(&o, err, sizeof err);
-            CHECK(!eh && strstr(err, "hybrid"), "hybrid MLA engine: %s", eh ? "opened" : err);
-            if (eh) eng_close(eh);
-        }
-        free(hc);
     }
     free(config);
     // The per-head maps are stacked 3-D BF16 tensors [n_head][rows][cols], as the conversion exports them: the engine
@@ -373,11 +357,14 @@ static void test_mla(void) {
         NsModel nm;
         CHECK(ck && ns_open(&nm, dir, err, sizeof err) == 0, "MLA folder as a checkpoint: %s", err);
         if (ck) {
-            const char* nm1 = "model.layers.1.self_attn.mla.q_lat";
-            const uint16_t* w3 = mova_ckpt_bf16_3d(ck, nm1, 8, ranks[1], 128, err, sizeof err);
+            int l1 = 0;   // the first MLA layer
+            while (!ranks[l1]) ++l1;
+            char nm1[64];
+            snprintf(nm1, sizeof nm1, "model.layers.%d.self_attn.mla.q_lat", l1);
+            const uint16_t* w3 = mova_ckpt_bf16_3d(ck, nm1, 8, ranks[l1], 128, err, sizeof err);
             const NsTensor* t = ns_find(&nm, nm1);
             CHECK(w3 && t && t->slices == 8 && !memcmp(w3, t->s[0].p, (size_t) 8 * ranks[1] * 128 * 2), "3-D read of %s: %s", nm1, err);
-            CHECK(!mova_ckpt_bf16(ck, nm1, ranks[1], 128, err, sizeof err), "a 3-D tensor read as 2-D");
+            CHECK(!mova_ckpt_bf16(ck, nm1, ranks[l1], 128, err, sizeof err), "a 3-D tensor read as 2-D");
             ns_close(&nm);
             mova_ckpt_close(ck);
         }
@@ -402,7 +389,7 @@ static void test_mla(void) {
         if (eb) eng_close(eb);
     }
     int64_t want_kv = 0;
-    for (int l = 0; l < 5; ++l) want_kv += (int64_t) o.kv_tokens * (128 + ranks[l]) * 2;
+    for (int l = 0; l < 5; ++l) want_kv += (int64_t) o.kv_tokens * layer_kv_bytes(ranks[l], ENG_KV_BF16);
     EngMem mem;
     eng_mem(e, &mem);
     CHECK(mem.kv == want_kv, "MLA KV cache %lld bytes, want %lld", (long long) mem.kv, (long long) want_kv);
@@ -500,11 +487,8 @@ static void test_mla(void) {
         if (!eq && strstr(err, "not supported by the CUDA")) { printf("MLA %s cache: not in this engine\n", fn); continue; }
         CHECK(eq != NULL, "MLA eng_open (%s cache): %s", fn, err);
         if (!eq) continue;
-        int64_t want = 0;
-        for (int l = 0; l < 5; ++l) {   // the RoPE key FP8; the latent FP8, or (fp4) FP8 for its first KVQ_FP4_LEAD values
-            const int lead = f == ENG_KV_FP8 || ranks[l] < KVQ_FP4_LEAD ? ranks[l] : KVQ_FP4_LEAD;
-            want += oq.kv_tokens * (128 + 4 + kvq_row_bytes(lead, ranks[l]) + kvq_row_scales(lead, ranks[l]));
-        }
+        int64_t want = 0;   // the RoPE key FP8; the latent FP8, or (fp4) FP8 for its first KVQ_FP4_LEAD values; GQA BF16
+        for (int l = 0; l < 5; ++l) want += oq.kv_tokens * layer_kv_bytes(ranks[l], f);
         EngMem mq;
         eng_mem(eq, &mq);
         CHECK(mq.kv == want, "MLA %s KV cache %lld bytes, want %lld", fn, (long long) mq.kv, (long long) want);
@@ -591,13 +575,15 @@ static void test_mla(void) {
                     CHECK(eng_prefill_begin(ec, 0, ids, 40, NULL) == 0, "MLA capture prefill_begin");
                     while ((left = eng_prefill_next(ec, 0, 7)) > 0) {}
                 }
-                for (int l = 0; l < NL; ++l)
-                    CHECK(eng_mla_capture_read(ec, l, a[pass][l], a[pass][l] + D, a[pass][l] + D + KV, a[pass][l] + D + KV + Q, &rows[pass]) == 0,
-                          "MLA capture read");
+                for (int l = 0; l < NL; ++l) {   // a GQA layer has no MLA inputs: its read fails
+                    const int rc = eng_mla_capture_read(ec, l, a[pass][l], a[pass][l] + D, a[pass][l] + D + KV, a[pass][l] + D + KV + Q, &rows[pass]);
+                    CHECK(ranks[l] ? rc == 0 : rc != 0, "MLA capture read, layer %d (rank %d): %d", l, ranks[l], rc);
+                }
             }
             double worst = 0;
             int zero = 0, vbad = 0;
             for (int l = 0; l < NL; ++l) {
+                if (!ranks[l]) continue;
                 const int n = D + KV + Q + 8 * ranks[l];
                 for (int i = 0; i < n; ++i) {
                     const double x = a[0][l][i], y = a[1][l][i];
@@ -617,7 +603,7 @@ static void test_mla(void) {
             const int xtx = eng_mla_capture(ec, 2) == 0;
             if (!xtx) printf("MLA capture X^T X: not in this engine\n");
             for (int l = 0; l < NL && xtx; ++l)
-                for (int site = 0; site < 4; ++site) {
+                for (int site = 0; site < 4 && ranks[l]; ++site) {
                     const int dim = site == 0 ? D : site == 1 ? KV : site == 2 ? 128 : ranks[l], nb = site < 2 ? 1 : 8;
                     const size_t n = (size_t) nb * dim * dim;
                     const double* sums = a[0][l] + (site == 0 ? 0 : site == 1 ? D : site == 2 ? D + KV : D + KV + Q);
@@ -922,7 +908,17 @@ int main(void) {
     mova_ref_close(ref);
     free(rl); free(rd); free(rm); free(rv); free(el); free(em); free(ev); free(lg);
     test_batch(dir, "GQA", 0, ENG_KV_BF16);
-    test_mla();
+    {
+        static const int ranks[5] = {64, 96, 64, 320, 96};   // 320: the fp4 cache's FP4 latent dims (past KVQ_FP4_LEAD)
+        // hybrid: layers 0 (dense) and 4 (MoVA) keep GQA attention.  A GQA layer between MLA layers works too (the real
+        // T-03 model has ten), but in this small random model it turns the MLA layers' float32-vs-double noise into
+        // near-tie expert flips (39 of 47 rows with GQA in layer 2, against 9 for the all-MLA model) that these bounds
+        // do not allow; its first decode steps match the reference to 5e-3 per layer.  The real model's check is its
+        // held-out score (nslm-mova-score) against the MLX loader's.
+        static const int hybrid[5] = {0, 96, 64, 320, 0};
+        test_mla_ranks(ranks, "out/test/engine_model_mla");
+        test_mla_ranks(hybrid, "out/test/engine_model_mla_hybrid");
+    }
     printf("test_engine: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

@@ -167,10 +167,6 @@ static void lin1(const MovaRef* r, const NsTensor* t, int slice, const float* x,
 MovaRef* mova_ref_open(const char* dir, int threads, char* err, int errlen) {
     MovaRef* r = (MovaRef*) calloc(1, sizeof *r);
     if (mova_cfg_load(&r->c, dir, err, errlen) || ns_open(&r->nm, dir, err, errlen)) { free(r); return NULL; }
-    if (mova_cfg_hybrid(&r->c)) {
-        snprintf(err, (size_t) errlen, "%s: a hybrid MLA model (mla_ranks 0: GQA layers) runs in the MLX loader (oMLX), not yet in the C reference", dir);
-        ns_close(&r->nm); free(r); return NULL;
-    }
     {   // the forward reads every tensor without further checks: all present (stacked experts: a packed folder, not the
         // original checkpoint, which stores them one per expert), of their shapes; the MLA tensors BF16
         MovaTensor* mt = NULL;
@@ -444,7 +440,8 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
         if (l == c->n_layer) break;
         const int sparse = l >= c->first_sparse;
         gnorm(r, x, T_(r, "model.layers.%d.input_layernorm.weight", l), xn, n);
-        if (c->mla) {
+        const int mla = mova_mla_layer(c, l);   // a hybrid model's GQA layers (mla_ranks 0) take the GQA path
+        if (mla) {
             const int rk = c->mla_rank[l];
             Lin L[4] = {{T_(r, "model.layers.%d.self_attn.q_proj.weight", l), 0, xn, n, q, qd, 0},
                         {T_(r, "model.layers.%d.self_attn.gate_proj.weight", l), 0, xn, n, g, qd, 0},
@@ -473,7 +470,7 @@ int mova_ref_forward(MovaRef* r, const int32_t* ids, int n, int h0, float* logit
                     v[(size_t) t * kvd + ci] = bfr(s);
                 }
         }
-        if (c->mla) {
+        if (mla) {
             const int rk = c->mla_rank[l], H = c->n_head;
             if (sparse) lin1(r, T_(r, "model.layers.%d.self_attn.mla.kv_a_v", l), 0, v, n, lat, rk, 1);   // c += kv_a_v v
             heads_map(T_(r, "model.layers.%d.self_attn.mla.q_rope_mix", l), q, n, H, 128, 128, qrp);
