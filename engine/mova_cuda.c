@@ -85,7 +85,8 @@ struct Eng {
     // prompt stages the host rows of the layer it computes in kv_stage
     int kv_fmt;
     int64_t kv_cap, kv_nv;
-    uint64_t kv_row, kv_ksrow;   // bytes per position and layer: K values (MLA: the RoPE key), K scales (Q8, FP8, FP4)
+    uint64_t *kv_krow, *kv_koff, kv_ksum, kv_kmax;   // K (MLA: the RoPE key) bytes per position: layer l's, before l, all, max
+    uint64_t *kv_ksrw, *kv_ksoff, kv_kssum, kv_ksmax;   // K scale bytes per position (Q8, FP8, FP4), likewise
     uint64_t *kv_vrow, *kv_voff, kv_vsum, kv_vmax;   // V (MLA: the latent) bytes per position: layer l's, before layer l, all, max
     uint64_t *kv_vsrow, *kv_vsoff, kv_vssum, kv_vsmax;   // V scale bytes per position (Q8, FP8, FP4), likewise
     uint8_t *kv_vk, *kv_vv, *kv_hk, *kv_hv, *kv_sk, *kv_sv;   // VRAM, host (device addresses), staging: values
@@ -401,8 +402,8 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
 }
 
 // KV bytes per position: of every layer (all), of one layer's staging (per: the widest layer).
-static uint64_t kv_all(const Eng* e) { return (e->kv_row + e->kv_ksrow) * (uint64_t) e->c.n_layer + e->kv_vsum + e->kv_vssum; }
-static uint64_t kv_per(const Eng* e) { return e->kv_row + e->kv_vmax + e->kv_ksrow + e->kv_vsmax; }
+static uint64_t kv_all(const Eng* e) { return e->kv_ksum + e->kv_kssum + e->kv_vsum + e->kv_vssum; }
+static uint64_t kv_per(const Eng* e) { return e->kv_kmax + e->kv_vmax + e->kv_ksmax + e->kv_vsmax; }
 // Whether place_kv will keep part of the KV cache in host memory (its budget, before the prefill buffers exist).
 static int kv_spills(Eng* e) {
     const uint64_t all = kv_all(e);
@@ -419,7 +420,6 @@ static int kv_spills(Eng* e) {
 // so a GB of KV in VRAM saves far more than a GB of expert cache beyond its minimum, NSLM_EXPERT_MIN_MB), the rest in
 // pinned host memory, plus one layer's staging for prompts.  NSLM_KV_VRAM_MB sets the VRAM share explicitly.
 static int place_kv(Eng* e, char* err, int errlen) {
-    const MovaCfg* c = &e->c;
     const uint64_t per = kv_per(e), all = kv_all(e);   // one layer's staging, every layer: one position
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
@@ -439,15 +439,15 @@ static int place_kv(Eng* e, char* err, int errlen) {
     if (nv < 0) nv = 0;
     e->kv_nv = nv;
     e->kv_staged = -1;
-    const uint64_t nh = (uint64_t) (e->kv_cap - nv), L = (uint64_t) c->n_layer;
+    const uint64_t nh = (uint64_t) (e->kv_cap - nv);
     if (nv) {
-        e->kv_vk = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_row * L, &e->mem.kv);
+        e->kv_vk = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_ksum, &e->mem.kv);
         e->kv_vv = (uint8_t*) dalloc(e, (uint64_t) nv * e->kv_vsum, &e->mem.kv);
-        if (e->kv_ksrow) {
-            e->kv_vks = (float*) dalloc(e, (uint64_t) nv * e->kv_ksrow * L, &e->mem.kv);
+        if (e->kv_kssum) {
+            e->kv_vks = (float*) dalloc(e, (uint64_t) nv * e->kv_kssum, &e->mem.kv);
             e->kv_vvs = (float*) dalloc(e, (uint64_t) nv * e->kv_vssum, &e->mem.kv);
         }
-        if (!e->kv_vk || !e->kv_vv || (e->kv_ksrow && (!e->kv_vks || !e->kv_vvs))) {
+        if (!e->kv_vk || !e->kv_vv || (e->kv_kssum && (!e->kv_vks || !e->kv_vvs))) {
             snprintf(err, (size_t) errlen, "KV cache (%lld positions in VRAM): out of GPU memory", (long long) nv);
             return -1;
         }
@@ -455,7 +455,7 @@ static int place_kv(Eng* e, char* err, int errlen) {
     if (nh) {
         void* dp = NULL;
         uint8_t* h[4] = {NULL, NULL, NULL, NULL};
-        const uint64_t sz[4] = {nh * e->kv_row * L, nh * e->kv_vsum, nh * e->kv_ksrow * L, nh * e->kv_vssum};
+        const uint64_t sz[4] = {nh * e->kv_ksum, nh * e->kv_vsum, nh * e->kv_kssum, nh * e->kv_vssum};
         for (int i = 0; i < 4; ++i) {
             if (!sz[i]) continue;
             h[i] = (uint8_t*) halloc(e, sz[i]);
@@ -467,13 +467,13 @@ static int place_kv(Eng* e, char* err, int errlen) {
             h[i] = (uint8_t*) dp;
         }
         e->kv_hk = h[0]; e->kv_hv = h[1]; e->kv_hks = (float*) h[2]; e->kv_hvs = (float*) h[3];
-        e->kv_sk = (uint8_t*) dalloc(e, nh * e->kv_row, &e->mem.kv);
+        e->kv_sk = (uint8_t*) dalloc(e, nh * e->kv_kmax, &e->mem.kv);
         e->kv_sv = (uint8_t*) dalloc(e, nh * e->kv_vmax, &e->mem.kv);
-        if (e->kv_ksrow) {
-            e->kv_sks = (float*) dalloc(e, nh * e->kv_ksrow, &e->mem.kv);
+        if (e->kv_kssum) {
+            e->kv_sks = (float*) dalloc(e, nh * e->kv_ksmax, &e->mem.kv);
             e->kv_svs = (float*) dalloc(e, nh * e->kv_vsmax, &e->mem.kv);
         }
-        if (!e->kv_sk || !e->kv_sv || (e->kv_ksrow && (!e->kv_sks || !e->kv_svs))) {
+        if (!e->kv_sk || !e->kv_sv || (e->kv_kssum && (!e->kv_sks || !e->kv_svs))) {
             snprintf(err, (size_t) errlen, "KV staging: out of GPU memory");
             return -1;
         }
@@ -567,7 +567,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         free(e);
         return NULL;
     }
-    if (!c->mla && c->n_head != ATTF_G * c->n_kv) {
+    if ((!c->mla || mova_cfg_hybrid(c)) && c->n_head != ATTF_G * c->n_kv) {
         snprintf(err, (size_t) errlen, "attention: %d query heads per KV head, the prefill kernel is built for %d", c->n_head / c->n_kv, ATTF_G);
         free(e);
         return NULL;
@@ -600,10 +600,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         LOAD(&L->ln1, "model.layers.%d.input_layernorm.weight", l);
         LOAD(&L->ln2, "model.layers.%d.post_attention_layernorm.weight", l);
         LOAD(&L->q, "model.layers.%d.self_attn.q_proj.weight", l);
-        if (!c->mla) LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
+        const int mla = mova_mla_layer(c, l);   // a hybrid model's GQA layers (mla_ranks 0) load GQA attention
+        if (!mla) LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
         LOAD(&L->o, "model.layers.%d.self_attn.o_proj.weight", l);
         LOAD(&L->g, "model.layers.%d.self_attn.gate_proj.weight", l);
-        if (c->mla) {
+        if (mla) {
             L->mla_r = c->mla_rank[l];
             LOAD(&L->ka_x, "model.layers.%d.self_attn.mla.kv_a_x", l);
             if (L->sparse) LOAD(&L->ka_v, "model.layers.%d.self_attn.mla.kv_a_v", l);
@@ -613,7 +614,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             LOAD(&L->vu, "model.layers.%d.self_attn.mla.v_up", l);
         }
         if (!L->sparse) {
-            if (!c->mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);   // MLA: folded into kv_a_x
+            if (!mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);   // MLA: folded into kv_a_x
             LOAD(&L->mg, "model.layers.%d.mlp.gate_proj.weight", l);
             LOAD(&L->mu, "model.layers.%d.mlp.up_proj.weight", l);
             LOAD(&L->md, "model.layers.%d.mlp.down_proj.weight", l);
@@ -664,28 +665,32 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         return NULL;
     }
     e->kv_fmt = o->kv_format;   // = KV_* (checked above)
-    e->kv_row = (uint64_t) kvd * (e->kv_fmt == KV_Q8 ? 1 : 2);
-    e->kv_ksrow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
-    // V rows per layer: as K's, or MLA's latent of the layer's rank (K: the 128-dim RoPE key): BF16, or FP8 / FP4 codes
+    // K and V rows per layer.  GQA (a GQA model, or a hybrid's layers with mla_ranks 0): kvd values each, BF16 or Q8
+    // (+ f32 scales per head).  MLA: K the 128-dim RoPE key, V the latent of the layer's rank: BF16, or FP8 / FP4 codes
     // with their block scales apart (nslm/kvq.h: the RoPE key all FP8; the latent FP8, or FP4 past its first
-    // KVQ_FP4_LEAD dims)
+    // KVQ_FP4_LEAD dims).  A hybrid's GQA layers stay BF16 under the FP8 / FP4 MLA formats.
     const int kq = c->mla && e->kv_fmt >= KV_FP8;
-    e->kv_vrow = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
-    e->kv_voff = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
-    e->kv_vsrow = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
-    e->kv_vsoff = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
-    if (c->mla) e->kv_row = kq ? (uint64_t) c->mla_rope : (uint64_t) c->mla_rope * 2;
-    if (kq) e->kv_ksrow = (uint64_t) kvq_row_scales(c->mla_rope, c->mla_rope);
+    const uint64_t grow = (uint64_t) kvd * (e->kv_fmt == KV_Q8 ? 1 : 2), gsrow = e->kv_fmt == KV_Q8 ? 4 * (uint64_t) c->n_kv : 0;
+    uint64_t** lay[8] = {&e->kv_krow, &e->kv_koff, &e->kv_ksrw, &e->kv_ksoff, &e->kv_vrow, &e->kv_voff, &e->kv_vsrow, &e->kv_vsoff};
+    for (int i = 0; i < 8; ++i) *lay[i] = (uint64_t*) calloc((size_t) c->n_layer, sizeof(uint64_t));
     int rmax = 0;
     for (int l = 0; l < c->n_layer; ++l) {
         const int r = e->L[l].mla_r, lead = e->kv_fmt == KV_FP4 && r > KVQ_FP4_LEAD ? KVQ_FP4_LEAD : r;
         if (r > rmax) rmax = r;
-        e->kv_vrow[l] = !c->mla ? e->kv_row : kq ? (uint64_t) kvq_row_bytes(lead, r) : (uint64_t) r * 2;
-        e->kv_vsrow[l] = !c->mla ? e->kv_ksrow : kq ? (uint64_t) kvq_row_scales(lead, r) : 0;
+        e->kv_krow[l] = !r ? grow : kq ? (uint64_t) c->mla_rope : (uint64_t) c->mla_rope * 2;
+        e->kv_ksrw[l] = !r ? gsrow : kq ? (uint64_t) kvq_row_scales(c->mla_rope, c->mla_rope) : 0;
+        e->kv_vrow[l] = !r ? grow : kq ? (uint64_t) kvq_row_bytes(lead, r) : (uint64_t) r * 2;
+        e->kv_vsrow[l] = !r ? gsrow : kq ? (uint64_t) kvq_row_scales(lead, r) : 0;
+        e->kv_koff[l] = e->kv_ksum;
+        e->kv_ksoff[l] = e->kv_kssum;
         e->kv_voff[l] = e->kv_vsum;
         e->kv_vsoff[l] = e->kv_vssum;
+        e->kv_ksum += e->kv_krow[l];
+        e->kv_kssum += e->kv_ksrw[l];
         e->kv_vsum += e->kv_vrow[l];
         e->kv_vssum += e->kv_vsrow[l];
+        if (e->kv_krow[l] > e->kv_kmax) e->kv_kmax = e->kv_krow[l];
+        if (e->kv_ksrw[l] > e->kv_ksmax) e->kv_ksmax = e->kv_ksrw[l];
         if (e->kv_vrow[l] > e->kv_vmax) e->kv_vmax = e->kv_vrow[l];
         if (e->kv_vsrow[l] > e->kv_vsmax) e->kv_vsmax = e->kv_vsrow[l];
     }
@@ -811,9 +816,8 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             const char* kvm = getenv("NSLM_KV_VRAM_MB");
             const uint64_t reserve = (uint64_t) (rs ? atoll(rs) : 512) << 20;
             const uint64_t emin = (uint64_t) (em ? atoll(em) : 6144) << 20;
-            const uint64_t cap = (uint64_t) e->kv_cap, L = (uint64_t) c->n_layer;
-            const uint64_t kv[4] = {cap * e->kv_row * L, cap * e->kv_vsum,
-                                    cap * e->kv_ksrow * L, cap * e->kv_vssum};
+            const uint64_t cap = (uint64_t) e->kv_cap;
+            const uint64_t kv[4] = {cap * e->kv_ksum, cap * e->kv_vsum, cap * e->kv_kssum, cap * e->kv_vssum};
             const uint64_t workspace[3] = {(uint64_t) larger * c->n_head * ATT_HD * 2,
                 (uint64_t) larger * c->n_head * ATT_HD * 2,
                 (uint64_t) T * c->n_head * (ATT_HD + 2) * 4};
@@ -1038,13 +1042,13 @@ static int attn_splits(int T, int max_ctx) {
 static KvView kv_view(Eng* e, int l) {
     KvView v;
     memset(&v, 0, sizeof v);
-    v.fmt = e->kv_fmt;
+    v.fmt = !e->L[l].mla_r && e->kv_fmt >= KV_FP8 ? KV_BF16 : e->kv_fmt;   // a hybrid's GQA layers: BF16
     v.nv = (int32_t) e->kv_nv;
     const uint64_t nv = (uint64_t) e->kv_nv, nh = (uint64_t) (e->kv_cap - e->kv_nv);
-    v.a.k = e->kv_vk + nv * e->kv_row * (uint64_t) l;
+    v.a.k = e->kv_vk + nv * e->kv_koff[l];
     v.a.v = e->kv_vv + nv * e->kv_voff[l];
-    if (e->kv_ksrow) {
-        v.a.ks = (float*) ((uint8_t*) e->kv_vks + nv * e->kv_ksrow * (uint64_t) l);
+    if (e->kv_ksrw[l] || e->kv_vsrow[l]) {
+        v.a.ks = (float*) ((uint8_t*) e->kv_vks + nv * e->kv_ksoff[l]);
         v.a.vs = (float*) ((uint8_t*) e->kv_vvs + nv * e->kv_vsoff[l]);
     }
     if (!nh) return v;
@@ -1052,10 +1056,10 @@ static KvView kv_view(Eng* e, int l) {
         v.b.k = e->kv_sk; v.b.v = e->kv_sv; v.b.ks = e->kv_sks; v.b.vs = e->kv_svs;
         return v;
     }
-    v.b.k = e->kv_hk + nh * e->kv_row * (uint64_t) l;
+    v.b.k = e->kv_hk + nh * e->kv_koff[l];
     v.b.v = e->kv_hv + nh * e->kv_voff[l];
-    if (e->kv_ksrow) {
-        v.b.ks = (float*) ((uint8_t*) e->kv_hks + nh * e->kv_ksrow * (uint64_t) l);
+    if (e->kv_ksrw[l] || e->kv_vsrow[l]) {
+        v.b.ks = (float*) ((uint8_t*) e->kv_hks + nh * e->kv_ksoff[l]);
         v.b.vs = (float*) ((uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l]);
     }
     return v;
@@ -1065,13 +1069,13 @@ static int kv_stage_copy(Eng* e, int l, int64_t r0, int64_t r1, int in) {
     if (r1 <= r0) return 0;
     const uint64_t nh = (uint64_t) (e->kv_cap - e->kv_nv);
     const enum cudaMemcpyKind kd = cudaMemcpyDeviceToDevice;   // the host rows are mapped: device addresses
-    uint8_t* hs[4] = {e->kv_hk + nh * e->kv_row * (uint64_t) l, e->kv_hv + nh * e->kv_voff[l],
-                      e->kv_ksrow ? (uint8_t*) e->kv_hks + nh * e->kv_ksrow * (uint64_t) l : NULL,
-                      e->kv_ksrow ? (uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l] : NULL};
+    uint8_t* hs[4] = {e->kv_hk + nh * e->kv_koff[l], e->kv_hv + nh * e->kv_voff[l],
+                      e->kv_ksrw[l] ? (uint8_t*) e->kv_hks + nh * e->kv_ksoff[l] : NULL,
+                      e->kv_vsrow[l] ? (uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l] : NULL};
     uint8_t* ss[4] = {e->kv_sk, e->kv_sv, (uint8_t*) e->kv_sks, (uint8_t*) e->kv_svs};
     for (int i = 0; i < 4; ++i) {
         if (!hs[i]) continue;
-        const uint64_t rb = i == 0 ? e->kv_row : i == 1 ? e->kv_vrow[l] : i == 2 ? e->kv_ksrow : e->kv_vsrow[l], off = (uint64_t) r0 * rb,
+        const uint64_t rb = i == 0 ? e->kv_krow[l] : i == 1 ? e->kv_vrow[l] : i == 2 ? e->kv_ksrw[l] : e->kv_vsrow[l], off = (uint64_t) r0 * rb,
                        len = (uint64_t) (r1 - r0) * rb;
         if (!CK(cudaMemcpyAsync(in ? ss[i] + off : hs[i] + off, in ? hs[i] + off : ss[i] + off, len, kd, e->st))) return -1;
     }
@@ -1200,11 +1204,11 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
     uint16_t* px = packed ? (uint16_t*) e->A : NULL;
     if (packed) kc_pack_input_bf16(e->st, e->xn, px, (size_t) T * d);
     enc_dense_packed(e, &L->q, e->xn, d, e->q, qd, T, 0, px);
-    if (!g->mla) enc_dense_packed(e, &L->k, e->xn, d, e->k, kvd, T, 0, px);
+    if (!L->mla_r) enc_dense_packed(e, &L->k, e->xn, d, e->k, kvd, T, 0, px);
     enc_dense_packed(e, &L->g, e->xn, d, e->gq, qd, T, 0, px);
     tgroup(e, MOVA_TG_VALUES);
     if (!L->sparse) {
-        if (!g->mla) enc_dense_packed(e, &L->v, e->xn, d, e->v, kvd, T, 0, px);   // MLA: v_proj is folded into kv_a_x
+        if (!L->mla_r) enc_dense_packed(e, &L->v, e->xn, d, e->v, kvd, T, 0, px);   // MLA: v_proj is folded into kv_a_x
     } else {
         int32_t* vi = e->vinds + (size_t) l * MAX_ROWS * g->top_kv;
         float* vw = e->vwts + (size_t) l * MAX_ROWS * g->top_kv;
@@ -1220,7 +1224,7 @@ static int encode_layer(Eng* e, int l, int T, float* X, const RowInfo* RI, int m
         }
         kc_vcombine(e->st, e->V, vw, e->v, kvd, g->top_kv, T);
     }
-    if (g->mla) encode_mla_attn(e, l, T, RI, aa.n_splits, max_ctx, px);
+    if (L->mla_r) encode_mla_attn(e, l, T, RI, aa.n_splits, max_ctx, px);
     else {
         tgroup(e, MOVA_TG_ATTN);
         const KvView kv = kv_view(e, l);
@@ -1576,13 +1580,14 @@ int eng_len(Eng* e, int seq) { const Seq* s = seq_of(e, seq); return s ? s->len 
 // below kv_nv are in VRAM, the rest in mapped host memory.
 static int kv_copy(Eng* e, int seq, int p0, int p1, uint8_t* h, int out) {
     const int64_t r0 = seq * e->slot_cap + p0, r1 = r0 + (p1 - p0), nv = e->kv_nv;
-    const uint64_t nh = (uint64_t) (e->kv_cap - nv), sr = e->kv_ksrow;
+    const uint64_t nh = (uint64_t) (e->kv_cap - nv);
     for (int l = 0; l < e->c.n_layer; ++l) {
-        uint8_t* va[4] = {e->kv_vk ? e->kv_vk + (uint64_t) nv * e->kv_row * l : NULL, e->kv_vv ? e->kv_vv + (uint64_t) nv * e->kv_voff[l] : NULL,
-                          sr && e->kv_vks ? (uint8_t*) e->kv_vks + (uint64_t) nv * sr * l : NULL, sr && e->kv_vvs ? (uint8_t*) e->kv_vvs + (uint64_t) nv * e->kv_vsoff[l] : NULL};
-        uint8_t* ha[4] = {e->kv_hk ? e->kv_hk + nh * e->kv_row * l : NULL, e->kv_hv ? e->kv_hv + nh * e->kv_voff[l] : NULL,
-                          sr && e->kv_hks ? (uint8_t*) e->kv_hks + nh * sr * l : NULL, sr && e->kv_hvs ? (uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l] : NULL};
-        const uint64_t rb[4] = {e->kv_row, e->kv_vrow[l], sr, sr ? e->kv_vsrow[l] : 0};
+        const uint64_t ksr = e->kv_ksrw[l], vsr = e->kv_vsrow[l];
+        uint8_t* va[4] = {e->kv_vk ? e->kv_vk + (uint64_t) nv * e->kv_koff[l] : NULL, e->kv_vv ? e->kv_vv + (uint64_t) nv * e->kv_voff[l] : NULL,
+                          ksr && e->kv_vks ? (uint8_t*) e->kv_vks + (uint64_t) nv * e->kv_ksoff[l] : NULL, vsr && e->kv_vvs ? (uint8_t*) e->kv_vvs + (uint64_t) nv * e->kv_vsoff[l] : NULL};
+        uint8_t* ha[4] = {e->kv_hk ? e->kv_hk + nh * e->kv_koff[l] : NULL, e->kv_hv ? e->kv_hv + nh * e->kv_voff[l] : NULL,
+                          ksr && e->kv_hks ? (uint8_t*) e->kv_hks + nh * e->kv_ksoff[l] : NULL, vsr && e->kv_hvs ? (uint8_t*) e->kv_hvs + nh * e->kv_vsoff[l] : NULL};
+        const uint64_t rb[4] = {e->kv_krow[l], e->kv_vrow[l], ksr, vsr};
         for (int i = 0; i < 4; ++i) {
             if (!rb[i]) continue;
             const int64_t m = r1 < nv ? r1 : nv, a = r0 > nv ? r0 : nv;   // VRAM rows [r0, m), host rows [a, r1)
@@ -1777,7 +1782,7 @@ int eng_mla_capture(Eng* e, int on) {   // mova_ext.h
 }
 int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {
     const MovaCfg* c = &e->c;
-    if (!c->mla || !e->cap_sum || l < 0 || l >= c->n_layer) return -1;
+    if (!c->mla || !e->cap_sum || l < 0 || l >= c->n_layer || !e->L[l].mla_r) return -1;   // a GQA layer: no MLA inputs
     const int d = c->d, kvd = c->n_kv * c->head_dim, qd = c->n_head * c->head_dim, od = c->n_head * e->L[l].mla_r;
     const double* sm = e->cap_sum + (uint64_t) l * (uint64_t) e->cap_ld;
     if (x) memcpy(x, sm, sizeof(double) * (size_t) d);
@@ -1789,7 +1794,7 @@ int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double*
 }
 int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) {   // mova_ext.h: the lower triangles, mirrored
     const MovaCfg* c = &e->c;
-    if (!c->mla || e->cap_on != 2 || !e->cap_xt || l < 0 || l >= c->n_layer || site < 0 || site > 3) return -1;
+    if (!c->mla || e->cap_on != 2 || !e->cap_xt || l < 0 || l >= c->n_layer || site < 0 || site > 3 || !e->L[l].mla_r) return -1;
     const int64_t d = c->d, kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head, r = e->L[l].mla_r;
     const int64_t dims[4] = {d, kvd, hd, r}, nbs[4] = {1, 1, H, H};
     const double* src = e->cap_xt + l * e->cap_xtl;

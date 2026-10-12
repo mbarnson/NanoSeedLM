@@ -49,6 +49,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
 - [2026-10-08: Engine KV cache codes](results/2026-10-08-engine-kv-codes.md): `--kv q8`, `fp8` and `fp4`.
 - [2026-10-10: Seeds against affine quantization (R-02)](results/2026-10-10-seeds-vs-affine.md): P4 and P3 seeds
   against oMLX oQe, on GQA and MLA, with pre-registered hypotheses.
+- [2026-10-11: A fused MLA prompt kernel in the MLX loader](results/2026-10-11-mla-fused-prefill.md): prompt speed at
+  32K to 256K, memory, and accuracy, on MLA and hybrid models.
 
 ## For contributors and agents
 

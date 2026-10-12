@@ -123,6 +123,27 @@ int main(int argc, char** argv) {
     }
     CHECK(mparams == want, "MLA parameter count %.6g, want %.6g", mparams, want);
     free(t);
+    // hybrid MLA: rank 0 keeps the layer's GQA attention (k_proj; v_proj where the layer has no value experts)
+    char hr[48 * 8 + 64] = "";
+    for (int l = 0; l < 48; ++l) snprintf(hr + strlen(hr), sizeof hr - strlen(hr), "%s%d", l ? ", " : "", l == 1 || l == 32 ? 0 : 768);
+    snprintf(mjs, (size_t) cn + 1024, "{\"mla_ranks\": [%s], \"mla_rope_dim\": 128, %s", hr, strchr(js, '{') + 1);
+    MovaCfg hy;
+    CHECK(mova_cfg_parse(&hy, mjs, err, sizeof err) == 0, "hybrid parse: %s", err);
+    CHECK(hy.mla && hy.mla_rank[1] == 0 && hy.mla_rank[32] == 0 && hy.mla_rank[31] == 768, "hybrid ranks");
+    CHECK(mova_mla_layer(&hy, 31) && !mova_mla_layer(&hy, 32) && !mova_mla_layer(&hy, 1) && mova_cfg_hybrid(&hy) && !mova_cfg_hybrid(&m),
+          "hybrid helpers");
+    const int nh = mova_tensors(&hy, &t);
+    CHECK(mova_find(t, nh, "model.layers.32.self_attn.k_proj.weight") && !mova_find(t, nh, "model.layers.32.self_attn.mla.kv_a_x") &&
+          !mova_find(t, nh, "model.layers.32.self_attn.v_proj.weight"), "GQA MoVA layer 32: k_proj, values from the experts");
+    CHECK(mova_find(t, nh, "model.layers.1.self_attn.k_proj.weight") && mova_find(t, nh, "model.layers.1.self_attn.v_proj.weight") &&
+          !mova_find(t, nh, "model.layers.1.self_attn.mla.q_lat"), "GQA dense layer 1: k_proj and v_proj");
+    CHECK(!mova_find(t, nh, "model.layers.31.self_attn.k_proj.weight") && mova_find(t, nh, "model.layers.31.self_attn.mla.kv_a_x"), "MLA layer 31");
+    CHECK(nh == nm - 3 - 5, "hybrid tensor count %d (MLA %d)", nh, nm);
+    free(t);
+    char zr[48 * 3 + 8] = "";
+    for (int l = 0; l < 48; ++l) strcat(zr, l ? ", 0" : "0");
+    snprintf(mjs, (size_t) cn + 1024, "{\"mla_ranks\": [%s], %s", zr, strchr(js, '{') + 1);
+    CHECK(mova_cfg_parse(&hy, mjs, err, sizeof err) != 0, "accepted mla_ranks with no MLA layer");
     free(js);
     free(mjs);
     printf("%d tensors, %.4g params; MLA %d tensors, %.4g params: %s\n", n, params, nm, mparams, fails ? "FAIL" : "PASS");

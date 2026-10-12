@@ -111,3 +111,20 @@ The prompt GEMMs of a layer reuse one BF16 copy of their inputs. The kernels ski
 On an RTX 4080 (Q4 attention, FP8 KV cache), short prefill is 9.1% faster, and decode does not change. Token and
 logit checks and the 128K and 256K tests passed. The CPU seed mat-vec is now built only with Clang. Metal
 verification is pending. Commit [`ab6029d`](https://github.com/mbarnson/NanoSeedLM/commit/ab6029d).
+
+## [2026-10-11] loader | A fused MLA prompt kernel, and hybrid MLA models
+
+The MLX loader processes MLA prompts with one Metal kernel per block of keys: 27% to 38% faster at 32K to 256K, and
+1.3 GB to 1.5 GB less transient memory. `mla_ranks` 0 keeps a layer's GQA attention (a hybrid model). The MLX loader
+runs hybrid models; the config parser, the packer and the seed search accept them; the engines refuse them for now.
+Read [A fused MLA prompt kernel in the MLX loader](results/2026-10-11-mla-fused-prefill.md). Pull request
+[#14](https://github.com/mbarnson/NanoSeedLM/pull/14).
+
+## [2026-10-11] engine | Hybrid MLA models in the Metal and CUDA engines
+
+The engines and the C reference run hybrid MLA models (`mla_ranks` 0: the layer keeps GQA attention). A GQA layer
+keeps a BF16 K and V cache when the MLA layers use FP8 or FP4; the CUDA engine now sizes K rows per layer, as it did
+V rows. `test_engine` checks an all-MLA and a hybrid random model against the C reference on Metal and on CUDA (RTX
+PRO 6000). The T-03 hybrid on the 31 held-out windows: P4 seeds on Metal, NLL 2.4094 and KL divergence 0.1118
+(MLX loader 2.4087, 0.1132); BF16 on CUDA, NLL 2.3979 and KL divergence 0.1048 (MLX loader 2.3978, 0.1054).
+Pull request [#14](https://github.com/mbarnson/NanoSeedLM/pull/14).

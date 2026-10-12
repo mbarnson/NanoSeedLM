@@ -373,7 +373,7 @@ static uint64_t kv_srowk(const Eng* e, int n) { return e->kv_fmt >= ENG_KV_FP8 ?
 // Layer l's KV buffers' bytes per position: K (MLA: the RoPE key), V (MLA: the latent), their scales (0: none)
 static void kv_rbs(const Eng* e, int l, uint64_t rb[4]) {
     const MovaCfg* c = &e->c;
-    if (c->mla) {
+    if (e->L[l].mla_r) {
         rb[0] = kv_rowk(e, c->mla_rope); rb[1] = kv_row(e, e->L[l].mla_r);
         rb[2] = kv_srowk(e, c->mla_rope); rb[3] = kv_srow(e, e->L[l].mla_r);
     } else {
@@ -530,7 +530,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             free(e);
             return NULL;
         }
-        if (!c->mla && c->n_head != ATTF_G * c->n_kv) {   // k_attn_prefill shares each K/V tile among ATTF_G query heads
+        if ((!c->mla || mova_cfg_hybrid(c)) && c->n_head != ATTF_G * c->n_kv) {   // k_attn_prefill shares each K/V tile among ATTF_G query heads
             snprintf(err, (size_t) errlen, "attention: %d query heads per KV head, the prefill kernel is built for %d", c->n_head / c->n_kv, ATTF_G);
             free(e);
             return NULL;
@@ -559,10 +559,11 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
             LOAD(&L->ln1, "model.layers.%d.input_layernorm.weight", l);
             LOAD(&L->ln2, "model.layers.%d.post_attention_layernorm.weight", l);
             LOAD(&L->q, "model.layers.%d.self_attn.q_proj.weight", l);
-            if (!c->mla) LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
+            const int mla = mova_mla_layer(c, l);   // a hybrid model's GQA layers (mla_ranks 0) load GQA attention
+            if (!mla) LOAD(&L->k, "model.layers.%d.self_attn.k_proj.weight", l);
             LOAD(&L->o, "model.layers.%d.self_attn.o_proj.weight", l);
             LOAD(&L->g, "model.layers.%d.self_attn.gate_proj.weight", l);
-            if (c->mla) {
+            if (mla) {
                 L->mla_r = c->mla_rank[l];
                 LOAD(&L->ka_x, "model.layers.%d.self_attn.mla.kv_a_x", l);
                 if (L->sparse) LOAD(&L->ka_v, "model.layers.%d.self_attn.mla.kv_a_v", l);
@@ -572,7 +573,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
                 LOAD(&L->vu, "model.layers.%d.self_attn.mla.v_up", l);
             }
             if (!L->sparse) {
-                if (!c->mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
+                if (!mla) LOAD(&L->v, "model.layers.%d.self_attn.v_proj.weight", l);
                 LOAD(&L->mg, "model.layers.%d.mlp.gate_proj.weight", l);
                 LOAD(&L->mu, "model.layers.%d.mlp.up_proj.weight", l);
                 LOAD(&L->md, "model.layers.%d.mlp.down_proj.weight", l);
@@ -1214,11 +1215,11 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
         enc_norm(c, e->x, &L->ln1, e->xn, T);
         cmd_group(c, MOVA_TG_ATTN_PROJ);
         enc_dense(c, &L->q, e->xn, d, e->q, qd, T, false);
-        if (!g->mla) enc_dense(c, &L->k, e->xn, d, e->k, kvd, T, false);
+        if (!L->mla_r) enc_dense(c, &L->k, e->xn, d, e->k, kvd, T, false);
         enc_dense(c, &L->g, e->xn, d, e->gq, qd, T, false);
         cmd_group(c, MOVA_TG_VALUES);
         if (!L->sparse) {
-            if (!g->mla) enc_dense(c, &L->v, e->xn, d, e->v, kvd, T, false);   // MLA: v_proj is folded into kv_a_x
+            if (!L->mla_r) enc_dense(c, &L->v, e->xn, d, e->v, kvd, T, false);   // MLA: v_proj is folded into kv_a_x
         } else {
             const uint64_t ik = (uint64_t) l * MAX_ROWS * g->top_kv * 4, so = (uint64_t) l * MAX_ROWS * g->n_vexp * 4;
             enc_router(c, &L->vr, &L->vb, e->xn, g->n_vexp, g->top_kv, e->vinds, e->vwts, e->vsel, ik, so, T);
@@ -1236,7 +1237,7 @@ static int encode_forward(Eng* e, Cmd* c, int T, int max_ctx, int h0) {
             cbytes(c, 3, dk, 8);
             [c->enc dispatchThreads:MTLSizeMake((NSUInteger) kvd, (NSUInteger) T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
-        if (g->mla) encode_mla_attn(e, c, l, T, ns);
+        if (L->mla_r) encode_mla_attn(e, c, l, T, ns);
         else {
             cmd_group(c, MOVA_TG_ATTN);
             const int32_t hk[2] = {g->n_head, g->n_kv};
@@ -1535,7 +1536,7 @@ int64_t eng_kv_bytes(Eng* e) {
     const MovaCfg* c = &e->c;
     int64_t b = 0;
     for (int l = 0; l < c->n_layer; ++l)
-        b += c->mla ? (int64_t) (kv_rowk(e, c->mla_rope) + kv_srowk(e, c->mla_rope) + kv_row(e, e->L[l].mla_r) + kv_srow(e, e->L[l].mla_r))
+        b += e->L[l].mla_r ? (int64_t) (kv_rowk(e, c->mla_rope) + kv_srowk(e, c->mla_rope) + kv_row(e, e->L[l].mla_r) + kv_srow(e, e->L[l].mla_r))
                     : 2 * (int64_t) c->n_kv * (e->kv_q8 ? c->head_dim + 4 : 2 * c->head_dim);
     return b;
 }
@@ -1783,7 +1784,7 @@ int eng_mla_capture(Eng* e, int on) {
 }
 int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) {
     const MovaCfg* c = &e->c;
-    if (!c->mla || e->cap_on != 2 || !e->cap_xsum || l < 0 || l >= c->n_layer || site < 0 || site > 3) return -1;
+    if (!c->mla || e->cap_on != 2 || !e->cap_xsum || l < 0 || l >= c->n_layer || site < 0 || site > 3 || !e->L[l].mla_r) return -1;
     const int64_t d = c->d, kvd = (int64_t) c->n_kv * c->head_dim, hd = c->head_dim, H = c->n_head, r = e->L[l].mla_r;
     const int64_t dim = site == 0 ? d : site == 1 ? kvd : site == 2 ? hd : r, nb = site < 2 ? 1 : H;
     const int64_t off = site == 0 ? 0 : site == 1 ? d * d : site == 2 ? d * d + kvd * kvd : d * d + kvd * kvd + H * hd * hd;
@@ -1798,7 +1799,7 @@ int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) {
 }
 int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {
     const MovaCfg* c = &e->c;
-    if (!c->mla || !e->cap_sum || l < 0 || l >= c->n_layer) return -1;
+    if (!c->mla || !e->cap_sum || l < 0 || l >= c->n_layer || !e->L[l].mla_r) return -1;   // a GQA layer: no MLA inputs
     const int d = c->d, kvd = c->n_kv * c->head_dim, qd = c->n_head * c->head_dim, od = c->n_head * e->L[l].mla_r;
     const double* s = e->cap_sum + (uint64_t) l * (uint64_t) e->cap_ld;
     if (x) memcpy(x, s, sizeof(double) * (size_t) d);

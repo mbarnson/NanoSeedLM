@@ -768,6 +768,87 @@ def test_mla_omlx_prefix_reuse():
         assert type(merged.extract(0)) is cls and merged.extract(0).offset == 303
 
 
+def test_mla_fused_prefill():
+    """The fused prompt kernel (_MLA_PREFILL) against the float32 reference and the unfused expanded path: causal and
+    unmasked, several key blocks, batch 2, ragged query tiles, the real head shapes and small ones, both quantized
+    caches."""
+    rng = np.random.default_rng(25)
+    g = lambda *s: mx.array(rng.standard_normal(s).astype(np.float32)).astype(mx.bfloat16)
+    saved = ns.FUSED_PREFILL, ns.FUSED_KEYS
+    try:
+        for heads, r, hd, dr in [(32, 768, 128, 128), (8, 64, 32, 32)]:
+            q_lat, v_up = g(heads, r, hd) * 0.05, g(heads, hd, r) * 0.05
+            for b, L, n, keys in [(1, 64, 64, None), (1, 100, 100, None), (2, 70, 333, 128), (1, 257, 1000, 256),
+                                  (1, 64, 2000, 512)]:
+                q, qr, lat, kr = _mla_inputs(rng, b, heads, L, n, r, hd, dr)
+                for mask in ("causal", None):
+                    full = None if mask else mx.array(np.ones((b, 1, L, n), bool))
+                    ref = mx.array(ref_mla(q, qr, lat, kr, q_lat, v_up, hd ** -0.5, full))
+                    ns.FUSED_PREFILL, ns.FUSED_KEYS = False, None
+                    old = ns.mla_attention(q, qr, lat, kr, q_lat, v_up, hd ** -0.5, mask=mask, path="expanded")
+                    ns._kernels.pop("mla_prefill", None)
+                    ns.FUSED_PREFILL, ns.FUSED_KEYS = True, keys
+                    got = ns.mla_attention(q, qr, lat, kr, q_lat, v_up, hd ** -0.5, mask=mask, path="expanded")
+                    assert "mla_prefill" in ns._kernels, "fused kernel not used"
+                    assert got.shape == (b, heads, L, hd) and got.dtype == mx.bfloat16, got.shape
+                    err, err_old = rel_err(ref, got), rel_err(ref, old)
+                    # f32 P.V: at most the unfused path's BF16 error
+                    assert err < 0.01 and err <= err_old * 1.05 + 1e-3, (heads, b, L, n, keys, mask, err, err_old)
+        heads, r, hd, dr = 32, 768, 128, 128
+        q_lat, v_up = g(heads, r, hd) * 0.05, g(heads, hd, r) * 0.05
+        for cls in (ns.MLAQ8Cache, ns.MLARQ4Cache):
+            cache = cls()
+            kq, lq = cache.update_and_fetch(g(1, 1, 600, dr), g(1, 1, 600, r))
+            deq = lambda t, bits: mx.dequantize(*t, group_size=64, bits=bits)
+            kr, lat = deq(kq, cache.rope_bits), deq(lq, cache.bits)
+            if cache.rotate:
+                kr, lat = ns._rotate(kr, inverse=True), ns._rotate(lat, inverse=True)
+            q, qr = g(1, heads, 100, hd), g(1, heads, 100, dr)
+            ref = mx.array(ref_mla(q, qr, lat, kr, q_lat, v_up, hd ** -0.5))
+            ns._kernels.pop("mla_prefill", None)
+            ns.FUSED_PREFILL, ns.FUSED_KEYS = True, 256
+            got = ns.mla_attention(q, qr, lq, kq, q_lat, v_up, hd ** -0.5, mask="causal", cache=cache)
+            assert "mla_prefill" in ns._kernels, cls.__name__
+            assert rel_err(ref, got) < 0.01, cls.__name__
+    finally:
+        ns.FUSED_PREFILL, ns.FUSED_KEYS = saved
+
+def test_load_hybrid():
+    """A hybrid model (mla_ranks 0: the layer keeps GQA attention): the loader keeps k_proj / v_proj there, the cache
+    is a KVCache there and an MLA cache elsewhere, kv_bytes counts BF16 K and V for it, and prompt + decode through
+    the cache match the full forward."""
+    from mlx_lm.utils import load_model
+
+    config = dict(small_config(), mla_ranks=[16, 0], mla_rope_dim=16, mla_kv="bf16")
+    mx.random.seed(6)
+    ref = ns.Model(ns.ModelArgs.from_dict(config))
+    rng = np.random.default_rng(14)
+    m = ref.model.layers[0].self_attn.mla
+    for name, value in m.items():
+        setattr(m, name, mx.array((rng.standard_normal(value.shape) * 0.05).astype(np.float32)))
+    ref.set_dtype(mx.bfloat16)
+    weights = {name.replace("mlp.expert_bias", "mlp.gate.bias").replace("self_attn.v_expert_bias", "self_attn.v_router.bias"):
+               value for name, value in tree_flatten(ref.parameters())}
+    with tempfile.TemporaryDirectory() as d:
+        mx.save_safetensors(f"{d}/model.safetensors", weights, metadata={"format": "mlx"})
+        Path(d, "config.json").write_text(json.dumps(dict(config, model_file="nanoseedlm_k2.py")))
+        shutil.copy(TOOLS / "nanoseedlm_k2.py", d)
+        model, _ = load_model(Path(d), trust_remote_code=True)
+    att0, att1 = model.model.layers[0].self_attn, model.model.layers[1].self_attn
+    assert type(att0).__name__ == "MLAAttention" and type(att1).__name__ != "MLAAttention" and "k_proj" in att1
+    args = ns.ModelArgs.from_dict(config)
+    gqa = 2 * args.num_key_value_heads * args.head_dim * 2
+    assert ns.kv_bytes(args, "q8") == ns.kv_bytes(ns.ModelArgs.from_dict(dict(config, mla_ranks=[16])), "q8") + gqa
+    q8 = ns.mla_caches(ns.ModelArgs.from_dict(dict(config, mla_ranks=[768, 0], mla_kv=dict(ns.KV_FORMATS["q8"]))), 2)
+    assert [type(c).__name__ for c in q8] == ["MLAQ8Cache", "KVCache"]
+    cache = model.make_cache()
+    ids = mx.array([list(range(1, 41))])
+    full = model(ids)
+    assert rel_err(ref(ids), full) < 0.02
+    first = model(ids[:, :39], cache=cache)
+    last = model(ids[:, 39:], cache=cache)
+    assert rel_err(full[:, :39], first) < 0.02 and rel_err(full[:, 39:], last) < 0.02
+
 def test_load_mla():
     _load_mla()
 
