@@ -68,12 +68,14 @@ samples inside the kernel's intervals (31,910 samples per setting; 13,238 for th
 | L1 stack residency | 0 | 0 | 0 |
 
 - From 32 to 64 rows, the memory traffic falls by half, the MMU limiter falls from 85% to 36%, F32 utilization rises from
-  41% to 51%, and the latency falls by 19%. In this range, the repeated reads of keys and values limit the kernel.
+  41% to 51%, and the latency falls by 19%. This supports memory-access pressure contributing to the gain. Doubling BQ
+  also changes the threadgroup size, resource use and scheduling, so the cause is not isolated.
 - From 64 to 128 rows, the traffic falls by 55% to 60% more, but F32 utilization stays at 51% and the latency falls by
-  only 5%. At the default setting, the repeated reads are not the main limit. The last level cache limiter stays high
-  while its bandwidth falls by 60%: a limiter counts work and stalls.
-- The remaining limit is not known. No counter is saturated (F32 and instruction throughput limiters near 50% to 60%),
-  which suggests latency between instructions, but this is not shown. Compiled register counts are not available
+  5.4% at 32K. At 128K the difference (920 ms against 897 ms, 2.5%) is inconclusive: the timing ranges overlap. This
+  does not show whether the reads still limit the kernel at 64 rows (provisional). The last level cache limiter stays
+  high while its bandwidth falls by 60%: a limiter counts work and stalls.
+- The remaining limit is not known. No arithmetic limiter is near 100% (F32 and instruction throughput limiters near
+  50% to 60%). Compiled register counts are not available
   through `mx.fast.metal_kernel`.
 
 Attention-only latency at 2,048 x 131,072 (6 calls): BQ 32 1,122 ms, BQ 64 920 ms, BQ 128 897 ms, MLX
