@@ -1,10 +1,9 @@
 # A fused MLA prompt kernel in the MLX loader (2026-10-11)
 
-**Result.** In the MLX loader, a fused Metal kernel processes MLA prompts 27% to 38% faster at 32K to 256K tokens of
-context, and it uses 1.3 GB to 1.5 GB less transient memory. Decode does not change. The kernel is more accurate
+**Result.** In the MLX loader, a fused Metal kernel processed MLA prompts 27% to 38% faster at 32K to 256K tokens of
+context in single-run observations, and it used 1.3 GB to 1.5 GB less transient memory. Decode does not change. The kernel is more accurate
 than the path that it replaces, but the T-03 healed model scores slightly worse with it (held-out NLL +0.0003, KL
-divergence +0.0009). That model was healed and selected with the old numerics. Prompt processing at long context is
-still limited by attention arithmetic. MLX's own attention kernel in the hybrid model's GQA layers is faster per layer.
+divergence +0.0009). That model was healed and selected with the old numerics. Why the kernel is not faster is not yet known (see Notes).
 
 **Status.** Current.
 
@@ -13,9 +12,10 @@ still limited by attention arithmetic. MLX's own attention kernel in the hybrid 
 - Machine: M4 Max, 128 GB, AC power, MLX 0.32.3, oMLX 0.7.1.dev1 (its K2-Horizon patch).
 - Models: K2-Horizon-MoVA-36B-A4B-MLA-oQ4e (all 48 layers MLA, rank 768), and the oQ4e of the hybrid T-03 model (38
   layers MLA, 10 layers GQA; `mla_ranks` 0). Cache: the loader's default for these runs.
-- Command: NSLMv2 `tools/k02_longmem.py`. It fills each layer's cache to N tokens with values that have the statistics
-  of a real prompt, then times one 2,047-token prompt chunk at N (the prompt worst case) and 8 decode steps. One run
-  each. The unfused runs set `FUSED_PREFILL = False` in the model file.
+- Command: NSLMv2 `tools/k02_longmem.py`. It fills each layer's cache to N tokens with values that have the
+  statistics of a real prompt, then times one 2,047-token prompt chunk at N (the prompt worst case) and 8 decode
+  steps. One run each: single observations, not repeated. The unfused runs set `FUSED_PREFILL = False` in the
+  model file.
 - Machine state for each run is in its `.kv` file (start and end: power, load, other CPU).
 
 ## Results
@@ -52,15 +52,19 @@ The 16K prompt in 2,048-token chunks took 58.5 s unfused and 48.9 s fused (BF16,
 - The kernel stages each 32-key tile of expanded keys (`[k_a ; k_rope]`, 256 values) and values (128) in threadgroup
   memory. It computes the scores and P.V as 8 x 8 simdgroup products in float32, with an online softmax in registers.
   MLX mat-muls expand the latent for each block of keys. The block size comes from `SCORE_BUDGET` (32K keys at 512 MB).
-- Per-kernel counters (Instruments, quiet GPU, 512 queries x 8K keys): the kernel has no register spills (L1 stack
+- Per-kernel counters (Instruments, quiet GPU, **512 queries x 8K keys, not the 2,048 x 32K target shape**): the kernel has no register spills (L1 stack
   residency 0). F32 utilization is 51% (MLX `steel_gemm` 92%, `steel_attention` 85%), occupancy 16%, L1 register
   residency 54%, and the last-level cache limiter 93%. Two variants that cut registers and conversion work, Q and
   K^T as BF16 `simdgroup_load` operands, and the engine's `k_mla_attn` pattern (scores and softmax in threadgroup
-  memory), were not faster on a quiet GPU (210 ms against 210 ms, and 379 ms against 239 ms, at 2,048 x 32K). The
-  likely limit is cache traffic: every query tile reads each head's expanded keys and values again.
+  memory), were not faster on a quiet GPU at 2,048 x 32K (two separate runs with different boundaries: 210 ms against
+  210 ms for v1 and the BF16-operand variant, attention plus expansion; 379 ms against 239 ms for the engine pattern
+  and v1). This rules out those two changes, not register pressure in general: compiled register counts were not
+  measured. A limiter counter counts work and stalls, so the 93% does not show that rereading K/V costs 93% of the
+  time. Cache traffic is a provisional hypothesis. Evidence against it: 64 and 128 query rows per threadgroup (half
+  the logical K/V loads) gave the same time (210 / 212 ms at 32K, 869 / 869 ms at 128K).
 - MLX 0.32.3 `scaled_dot_product_attention` with 256-dim keys and 128-dim values does not use its fused attention.
   It runs `steel_gemm`, `looped_softmax_precise` and `steel_gemm`, with the score matrix in memory. At 2,048 x 32K
   that is 164 ms plus 28 ms of expansion, against 239 ms for this kernel, but it needs about 4 GB of scores per
   layer and block.
-- The T-03 model was healed and selected with the unfused path. A heal that uses the fused path removes the small
-  quality difference.
+- The T-03 model was healed and selected with the unfused path. Whether a heal through the fused path removes the
+  small quality difference is not measured.
