@@ -119,3 +119,12 @@ The MLX loader processes MLA prompts with one Metal kernel per block of keys: 27
 runs hybrid models; the config parser, the packer and the seed search accept them; the engines refuse them for now.
 Read [A fused MLA prompt kernel in the MLX loader](results/2026-10-11-mla-fused-prefill.md). Pull request
 [#14](https://github.com/mbarnson/NanoSeedLM/pull/14).
+
+## [2026-10-11] engine | Hybrid MLA models in the Metal and CUDA engines
+
+The engines and the C reference run hybrid MLA models (`mla_ranks` 0: the layer keeps GQA attention). A GQA layer
+keeps a BF16 K and V cache when the MLA layers use FP8 or FP4; the CUDA engine now sizes K rows per layer, as it did
+V rows. `test_engine` checks an all-MLA and a hybrid random model against the C reference on Metal and on CUDA (RTX
+PRO 6000). The T-03 hybrid on the 31 held-out windows: P4 seeds on Metal, NLL 2.4094 and KL divergence 0.1118
+(MLX loader 2.4087, 0.1132); BF16 on CUDA, NLL 2.3979 and KL divergence 0.1048 (MLX loader 2.3978, 0.1054).
+Pull request [#14](https://github.com/mbarnson/NanoSeedLM/pull/14).
