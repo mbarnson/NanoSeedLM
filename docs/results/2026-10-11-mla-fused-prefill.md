@@ -52,8 +52,15 @@ The 16K prompt in 2,048-token chunks took 58.5 s unfused and 48.9 s fused (BF16,
 - The kernel stages each 32-key tile of expanded keys (`[k_a ; k_rope]`, 256 values) and values (128) in threadgroup
   memory. It computes the scores and P.V as 8 x 8 simdgroup products in float32, with an online softmax in registers.
   MLX mat-muls expand the latent for each block of keys. The block size comes from `SCORE_BUDGET` (32K keys at 512 MB).
-- At 128K, about 3 s of a 51 s chunk is the model's weights, about 8 s is the expansion of the cached latent, and the
-  rest is attention. The kernel reaches about 6 to 8 TFLOPS. A kernel that loads tiles with `simdgroup_load` and uses
-  larger key tiles is the next step.
+- Per-kernel counters (Instruments, quiet GPU, 512 queries x 8K keys): the kernel has no register spills (L1 stack
+  residency 0). F32 utilization is 51% (MLX `steel_gemm` 92%, `steel_attention` 85%), occupancy 16%, L1 register
+  residency 54%, and the last-level cache limiter 93%. Two variants that cut registers and conversion work, Q and
+  K^T as BF16 `simdgroup_load` operands, and the engine's `k_mla_attn` pattern (scores and softmax in threadgroup
+  memory), were not faster on a quiet GPU (210 ms against 210 ms, and 379 ms against 239 ms, at 2,048 x 32K). The
+  likely limit is cache traffic: every query tile reads each head's expanded keys and values again.
+- MLX 0.32.3 `scaled_dot_product_attention` with 256-dim keys and 128-dim values does not use its fused attention.
+  It runs `steel_gemm`, `looped_softmax_precise` and `steel_gemm`, with the score matrix in memory. At 2,048 x 32K
+  that is 164 ms plus 28 ms of expansion, against 239 ms for this kernel, but it needs about 4 GB of scores per
+  layer and block.
 - The T-03 model was healed and selected with the unfused path. A heal that uses the fused path removes the small
   quality difference.
