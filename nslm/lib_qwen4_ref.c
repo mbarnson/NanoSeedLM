@@ -70,16 +70,6 @@ static void norm1p(const float* x, int n, int len, int g, const float* w, float 
     for (int i = 0; i < n; ++i) qwen4_norm1p(x + (size_t) i * len, len, g, w, eps, y + (size_t) i * len);
 }
 
-// RoPE on the first rot values of x (halves rotated against each other), position pos
-static void rope(float* x, int rot, float theta, int pos) {
-    for (int i = 0; i < rot / 2; ++i) {
-        const float inv = (float) pow((double) theta, -2.0 * i / rot), a = (float) pos * inv;   // f32 angles, as MLX
-        const double cs = cos(a), sn = sin(a), x1 = x[i], x2 = x[i + rot / 2];
-        x[i] = (float) (x1 * cs - x2 * sn);
-        x[i + rot / 2] = (float) (x2 * cs + x1 * sn);
-    }
-}
-
 // ---- hyper-connections: mix the hc streams of H[n][hc * d] into one input, and the weights that add a branch back ----
 
 static void hc_mix(Qwen4Ref* r, const char* pre, const float* H, int n, float* mixed, float* inj) {
@@ -136,110 +126,43 @@ static void gdn(Qwen4Ref* r, int l, const float* x, int n, float* out) {
 
 // ---- QSA attention: dense within the budget; past it, each query sees the indexer's top blocks and its own tail -------
 
-// (score, index) pairs, best first.  Equal scores (ReLU zeros are common) go to the higher index, as MLX's argpartition.
-static int cmp_desc(const void* a, const void* b) {
-    const double* x = (const double*) a;
-    const double* y = (const double*) b;
-    return x[0] < y[0] ? 1 : x[0] > y[0] ? -1 : x[1] < y[1] ? 1 : x[1] > y[1] ? -1 : 0;
-}
-
-// visible[t * n + u] = 1 when query t attends to key u
-static void qsa_select(Qwen4Ref* r, const char* pre, const float* x, int n, uint8_t* visible) {
-    const Qwen4Cfg* c = &r->c;
-    const int nh = c->ix_heads, D = c->ix_dim, R = c->ix_ratio, topk = c->ix_budget / c->ix_ratio, w = (nh + 1) * D, nb = n / R;
-    float* ix = (float*) zalloc(sizeof(float) * (size_t) n * w);
-    lin(r, tens(r, "%s.indexer.index_qk_proj.weight", pre), 0, x, n, ix);
-    float* qw = vec(r, tens(r, "%s.indexer.q_layernorm.weight", pre), D);
-    float* kw = vec(r, tens(r, "%s.indexer.k_layernorm.weight", pre), D);
-    float* blk = (float*) zalloc(sizeof(float) * (size_t) (nb ? nb : 1) * D);
-    for (int j = 0; j < nb; ++j) {   // a block key: the mean of its raw keys, normalised, at the block's first position
-        float* bk = blk + (size_t) j * D;
-        for (int i = 0; i < D; ++i) {
-            double m = 0;
-            for (int u = 0; u < R; ++u) m += ix[(size_t) (j * R + u) * w + nh * D + i];
-            bk[i] = (float) (m / R);
-        }
-        norm1p(bk, 1, D, D, kw, c->eps, bk);
-        rope(bk, c->rot_dim, c->rope_theta, j * R);
-    }
-    double* sc = (double*) zalloc(sizeof(double) * 2 * (size_t) (nb ? nb : 1));
-    for (int t = 0; t < n; ++t) {
-        const int done = (t + 1) / R;   // complete blocks visible to query t
-        uint8_t* vis = visible + (size_t) t * n;
-        memset(vis, 0, (size_t) n);
-        if (done <= topk) { memset(vis, 1, (size_t) t + 1); continue; }
-        float* q = ix + (size_t) t * w;
-        for (int h = 0; h < nh; ++h) { norm1p(q + h * D, 1, D, D, qw, c->eps, q + h * D); rope(q + h * D, c->rot_dim, c->rope_theta, t); }
-        for (int j = 0; j < done; ++j) {
-            double s = 0;
-            for (int h = 0; h < nh; ++h) {
-                double d = 0;
-                for (int i = 0; i < D; ++i) d += (double) q[h * D + i] * blk[(size_t) j * D + i];
-                s += d > 0 ? d : 0;
-            }
-            sc[2 * j] = s;
-            sc[2 * j + 1] = j;
-        }
-        qsort(sc, (size_t) done, 2 * sizeof(double), cmp_desc);
-        for (int k = 0; k < topk; ++k) memset(vis + (int) sc[2 * k + 1] * R, 1, (size_t) R);
-        memset(vis + done * R, 1, (size_t) (t + 1 - done * R));
-    }
-    free(ix); free(qw); free(kw); free(blk); free(sc);
-}
-
 static void attention(Qwen4Ref* r, int l, const float* x, int n, float* out) {
     const Qwen4Cfg* c = &r->c;
-    const int Hq = c->n_head, Hkv = c->n_kv, hd = c->head_dim, rep = Hq / Hkv;
+    const int Hq = c->n_head, Hkv = c->n_kv, hd = c->head_dim, D = c->ix_dim, R = c->ix_ratio, iw = (c->ix_heads + 1) * D;
     char pre[96];
     snprintf(pre, sizeof pre, "language_model.model.layers.%d.self_attn", l);
     float* qp = (float*) zalloc(sizeof(float) * (size_t) n * Hq * 2 * hd);
     float* kp = (float*) zalloc(sizeof(float) * (size_t) n * Hkv * hd);
     float* vp = (float*) zalloc(sizeof(float) * (size_t) n * Hkv * hd);
     float* o = (float*) zalloc(sizeof(float) * (size_t) n * Hq * hd);
-    uint8_t* vis = (uint8_t*) zalloc((size_t) n * n);
-    double* p = (double*) zalloc(sizeof(double) * (size_t) n);
+    float* ix = (float*) zalloc(sizeof(float) * (size_t) n * iw);
+    float* raw = (float*) zalloc(sizeof(float) * (size_t) R * D);
+    float* blk = (float*) zalloc(sizeof(float) * (size_t) (n / R + 1) * D);
+    int32_t* sel = (int32_t*) zalloc(sizeof(int32_t) * (size_t) (c->ix_budget / R));
     lin(r, tens(r, "%s.q_proj.weight", pre), 0, x, n, qp);
     lin(r, tens(r, "%s.k_proj.weight", pre), 0, x, n, kp);
     lin(r, tens(r, "%s.v_proj.weight", pre), 0, x, n, vp);
+    lin(r, tens(r, "%s.indexer.index_qk_proj.weight", pre), 0, x, n, ix);
     float* qn = vec(r, tens(r, "%s.q_norm.weight", pre), hd);
     float* kn = vec(r, tens(r, "%s.k_norm.weight", pre), hd);
-    for (int t = 0; t < n; ++t) {
-        for (int h = 0; h < Hq; ++h) {   // q_proj: per head hd query values, then hd gate values
-            float* q = qp + ((size_t) t * Hq + h) * 2 * hd;
-            norm1p(q, 1, hd, hd, qn, c->eps, q);
-            rope(q, c->rot_dim, c->rope_theta, t);
-        }
-        for (int g = 0; g < Hkv; ++g) {
-            float* k = kp + ((size_t) t * Hkv + g) * hd;
-            norm1p(k, 1, hd, hd, kn, c->eps, k);
-            rope(k, c->rot_dim, c->rope_theta, t);
-        }
+    float* iqn = vec(r, tens(r, "%s.indexer.q_layernorm.weight", pre), D);
+    float* ikn = vec(r, tens(r, "%s.indexer.k_layernorm.weight", pre), D);
+    for (int t = 0; t < n; ++t) {   // q_proj: per head hd query values, then hd gate values
+        qwen4_head_norm_rope(c, qp + (size_t) t * Hq * 2 * hd, Hq, 2 * hd, hd, qn, t);
+        qwen4_head_norm_rope(c, kp + (size_t) t * Hkv * hd, Hkv, hd, hd, kn, t);
     }
-    qsa_select(r, pre, x, n, vis);
-    const double scale = 1.0 / sqrt((double) hd);
-    for (int t = 0; t < n; ++t)
-        for (int h = 0; h < Hq; ++h) {
-            const float* q = qp + ((size_t) t * Hq + h) * 2 * hd;
-            const int g = h / rep;
-            double mx = -INFINITY, sum = 0;
-            for (int u = 0; u <= t; ++u) {
-                if (!vis[(size_t) t * n + u]) continue;
-                const float* k = kp + ((size_t) u * Hkv + g) * hd;
-                double d = 0;
-                for (int i = 0; i < hd; ++i) d += (double) q[i] * k[i];
-                p[u] = d * scale;
-                if (p[u] > mx) mx = p[u];
-            }
-            for (int u = 0; u <= t; ++u) if (vis[(size_t) t * n + u]) sum += (p[u] = exp(p[u] - mx));
-            float* oo = o + ((size_t) t * Hq + h) * hd;
-            for (int i = 0; i < hd; ++i) {
-                double a = 0;
-                for (int u = 0; u <= t; ++u) if (vis[(size_t) t * n + u]) a += p[u] * vp[((size_t) u * Hkv + g) * hd + i];
-                oo[i] = (float) (a / sum) * sigm(q[hd + i]);
-            }
-        }
+    for (int j = 0; j < n / R; ++j) {   // block keys from the raw indexer keys (after the query heads)
+        for (int u = 0; u < R; ++u) memcpy(raw + (size_t) u * D, ix + (size_t) (j * R + u) * iw + c->ix_heads * D, sizeof(float) * (size_t) D);
+        qwen4_qsa_block(c, raw, ikn, j, blk + (size_t) j * D);
+    }
+    for (int t = 0; t < n; ++t) {
+        float* iq = ix + (size_t) t * iw;
+        qwen4_head_norm_rope(c, iq, c->ix_heads, D, D, iqn, t);
+        const int nsel = qwen4_qsa_select(c, iq, blk, (t + 1) / R, sel);
+        qwen4_attend(c, qp + (size_t) t * Hq * 2 * hd, kp, vp, t, sel, nsel, o + (size_t) t * Hq * hd);
+    }
     lin(r, tens(r, "%s.o_proj.weight", pre), 0, o, n, out);
-    free(qp); free(kp); free(vp); free(o); free(vis); free(p); free(qn); free(kn);
+    free(qp); free(kp); free(vp); free(o); free(ix); free(raw); free(blk); free(sel); free(qn); free(kn); free(iqn); free(ikn);
 }
 
 // ---- MoE: softmax router, top-k renormalised, silu experts; a shared expert scaled by sigmoid(gate) ------------------
@@ -263,83 +186,54 @@ static void moe(Qwen4Ref* r, int l, const float* x, int n, float* out) {
     snprintf(sh, sizeof sh, "%s.shared_expert", pre);
     float* lg = (float*) zalloc(sizeof(float) * (size_t) n * E);
     float* y = (float*) zalloc(sizeof(float) * (size_t) D);
-    double* pr = (double*) zalloc(sizeof(double) * 2 * (size_t) E);
+    int32_t* ind = (int32_t*) zalloc(sizeof(int32_t) * (size_t) c->top_k);
+    float* wt = (float*) zalloc(sizeof(float) * (size_t) c->top_k);
     lin(r, tens(r, "%s.gate.weight", pre), 0, x, n, lg);
     for (int t = 0; t < n; ++t) {
         const float* xt = x + (size_t) t * D;
         float* ot = out + (size_t) t * D;
-        double mx = -INFINITY, sum = 0, top = 0;
-        for (int e = 0; e < E; ++e) if (lg[t * E + e] > mx) mx = lg[t * E + e];
-        for (int e = 0; e < E; ++e) { pr[2 * e] = exp(lg[t * E + e] - mx); pr[2 * e + 1] = e; sum += pr[2 * e]; }
-        qsort(pr, (size_t) E, 2 * sizeof(double), cmp_desc);
-        for (int k = 0; k < c->top_k; ++k) top += pr[2 * k];
+        qwen4_route(c, lg + (size_t) t * E, ind, wt);
         memset(ot, 0, sizeof(float) * (size_t) D);
-        for (int k = 0; k < c->top_k; ++k) {   // softmax then renormalise over the top k: p / sum of top-k p
-            glu(r, sw, (int) pr[2 * k + 1], c->ff_exp, xt, y);
-            for (int i = 0; i < D; ++i) ot[i] += (float) (pr[2 * k] / top) * y[i];
+        for (int k = 0; k < c->top_k; ++k) {
+            glu(r, sw, ind[k], c->ff_exp, xt, y);
+            for (int i = 0; i < D; ++i) ot[i] += wt[k] * y[i];
         }
         float sg;
         lin(r, tens(r, "%s.shared_expert_gate.weight", pre), 0, xt, 1, &sg);
         glu(r, sh, 0, c->ff_shared, xt, y);
         for (int i = 0; i < D; ++i) ot[i] += sigm(sg) * y[i];
-        (void) sum;
     }
-    free(lg); free(y); free(pr);
+    free(lg); free(y); free(ind); free(wt);
 }
 
 // ---- PLE: n-gram rows -> keys gating a value per stream, plus a dilated causal conv of the gated values --------------
 
 static void ple(Qwen4Ref* r, int l, const int32_t* ids, float* H, int n) {
     const Qwen4Cfg* c = &r->c;
-    const Qwen4Ngram* g = &r->ng[c->ple[l]];
-    const int D = c->d, HD = c->hc * D, P = c->ple_dim, wd = P / g->heads, Kc = c->ple_conv, dil = c->ngram;
+    const int D = c->d, HD = c->hc * D, P = c->ple_dim;
     char pre[96];
     snprintf(pre, sizeof pre, "language_model.model.layers.%d.ple", l);
     float* emb = (float*) zalloc(sizeof(float) * (size_t) n * P);
-    const int64_t base = g->rows / c->ngram_parts, rem = g->rows % c->ngram_parts;   // shard k: base + (k < rem) rows
-    for (int t = 0; t < n; ++t) {
-        int64_t rows[QWEN4_MAX_PLE_HEADS];
-        qwen4_ngram_rows(c, g, ids, t, rows);
-        for (int h = 0; h < g->heads; ++h) {
-            const int64_t big = rem * (base + 1), k = rows[h] < big ? rows[h] / (base + 1) : rem + (rows[h] - big) / base;
-            const int64_t first = k < rem ? k * (base + 1) : big + (k - rem) * base;
-            const NsTensor* s = tens(r, "%s.ple_embedding.ngram_embedding.shards.%lld.weight", pre, (long long) k);
-            if (s && s->cols == wd && rows[h] - first < s->rows) ns_row_f32(&r->rows, s, 0, (int) (rows[h] - first), 0, emb + (size_t) t * P + h * wd);
-            else if (!r->err[0]) snprintf(r->err, sizeof r->err, "%s: PLE shard %lld does not hold row %lld", pre, (long long) k, (long long) rows[h]);
-        }
-    }
+    for (int t = 0; t < n && !r->err[0]; ++t)
+        if (qwen4_ple_embed(&r->nm, &r->rows, NULL, c, &r->ng[c->ple[l]], l, ids, t, emb + (size_t) t * P))
+            snprintf(r->err, sizeof r->err, "%s: a PLE table shard is missing or does not hold a row", pre);
     float* keys = (float*) zalloc(sizeof(float) * (size_t) n * HD);
     float* qs = (float*) zalloc(sizeof(float) * (size_t) n * HD);
     float* vals = (float*) zalloc(sizeof(float) * (size_t) n * D);
     float* gated = (float*) zalloc(sizeof(float) * (size_t) n * HD);
+    float* hist = (float*) zalloc(sizeof(float) * qwen4_ple_hist_len(c));
     float* nk = vec(r, tens(r, "%s.norm_key.weight", pre), HD);
     float* nq = vec(r, tens(r, "%s.norm_query.weight", pre), HD);
     float* nc = vec(r, tens(r, "%s.norm_conv.weight", pre), HD);
-    float* cw = vec(r, tens(r, "%s.conv1d.weight", pre), (int64_t) HD * Kc);
+    float* cw = vec(r, tens(r, "%s.conv1d.weight", pre), (int64_t) HD * c->ple_conv);
     lin(r, tens(r, "%s.key_proj.weight", pre), 0, emb, n, keys);
     lin(r, tens(r, "%s.value_proj.weight", pre), 0, emb, n, vals);
     norm1p(keys, n, HD, D, nk, c->eps, keys);
     norm1p(H, n, HD, D, nq, c->eps, qs);
-    for (int t = 0; t < n; ++t)
-        for (int s = 0; s < c->hc; ++s) {
-            const size_t o = (size_t) t * HD + (size_t) s * D;
-            double d = 0;
-            for (int i = 0; i < D; ++i) d += (double) keys[o + i] * qs[o + i];
-            d /= sqrt((double) D);
-            const double gs = (d > 0 ? 1 : d < 0 ? -1 : 0) * sqrt(fabs(d) > 1e-6 ? fabs(d) : 1e-6);   // a signed square root
-            for (int i = 0; i < D; ++i) gated[o + i] = sigm(gs) * vals[(size_t) t * D + i];
-        }
+    for (int t = 0; t < n; ++t) qwen4_ple_gate(c, keys + (size_t) t * HD, qs + (size_t) t * HD, vals + (size_t) t * D, gated + (size_t) t * HD);
     norm1p(gated, n, HD, D, nc, c->eps, keys);   // keys now holds the conv input
-    for (int t = 0; t < n; ++t)
-        for (int ch = 0; ch < HD; ++ch) {
-            double acc = 0;
-            for (int k = 0; k < Kc; ++k) {
-                const int u = t - (Kc - 1 - k) * dil;
-                if (u >= 0) acc += (double) cw[(size_t) ch * Kc + k] * keys[(size_t) u * HD + ch];
-            }
-            H[(size_t) t * HD + ch] += gated[(size_t) t * HD + ch] + silu(acc);
-        }
-    free(emb); free(keys); free(qs); free(vals); free(gated); free(nk); free(nq); free(nc); free(cw);
+    for (int t = 0; t < n; ++t) qwen4_ple_conv(c, cw, keys + (size_t) t * HD, gated + (size_t) t * HD, hist, H + (size_t) t * HD);
+    free(emb); free(keys); free(qs); free(vals); free(gated); free(hist); free(nk); free(nq); free(nc); free(cw);
 }
 
 // ---- the model -------------------------------------------------------------------------------------------------------

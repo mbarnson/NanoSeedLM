@@ -9,8 +9,13 @@
 
 typedef struct Q4Eng Q4Eng;
 
-// vram_experts: the routed experts in VRAM too (a GPU with room for the whole pack but the PLE table)
-Q4Eng* q4e_open(const char* model_dir, int max_pos, int vram_experts, char* err, int errlen);
+typedef struct {
+    int max_pos;            // context positions (0: 4096)
+    int vram_experts;       // the routed experts in VRAM too (a GPU with room for the pack but the PLE table)
+    const char* ple_gguf;   // the PLE n-gram table from this GGUF (Unsloth's engram files), not from the model folder
+} Q4EOpts;
+
+Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);
 void q4e_close(Q4Eng* e);
 const Qwen4Cfg* q4e_cfg(const Q4Eng* e);
 // Appends ids[0..n-1] to the context; the logits of each row go to logits[n][vocab] (NULL: none).  0, or -1 (q4e_error).

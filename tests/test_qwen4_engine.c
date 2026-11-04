@@ -24,7 +24,8 @@ int main(void) {
     const int n = (int) ei->shape[0], V = (int) el->shape[1];
     const int32_t* ids = (const int32_t*) st_data(&st, ei);
     const float* want = (const float*) st_data(&st, el);
-    Q4Eng* e = q4e_open("tests/data/qwen4_tiny", 256, 0, err, sizeof err);
+    const Q4EOpts o = {256, 0, NULL};
+    Q4Eng* e = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
     if (!e) { printf("FAIL: open: %s\n", err); return 1; }
     float* got = (float*) malloc(sizeof(float) * (size_t) n * V);
     float* again = (float*) malloc(sizeof(float) * (size_t) n * V);

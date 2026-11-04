@@ -45,6 +45,8 @@ struct Q4Eng {
     NsModel nm;
     NsRows rows;
     Qwen4Ngram ng[QWEN4_MAX_LAYERS];
+    PleTable pt;
+    const PleTable* table;   // the GGUF PLE table, or NULL (the folder's)
     Layer L[QWEN4_MAX_LAYERS];
     W embed, head, mix_down, mix_up;
     float* mix_norm;
@@ -193,12 +195,16 @@ static void load_layer(Q4Eng* e, int l) {
     }
 }
 
-Q4Eng* q4e_open(const char* model_dir, int max_pos, int vram_experts, char* err, int errlen) {
+Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) {
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
     const Qwen4Cfg* c = &e->c;
-    e->max_pos = max_pos > 0 ? max_pos : 4096;
-    e->host_experts = !vram_experts;
+    e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
+    e->host_experts = !(o && o->vram_experts);
+    if (o && o->ple_gguf) {
+        if (ple_open(&e->pt, o->ple_gguf, "per_layer_token_embd.weight", err, errlen)) { ns_close(&e->nm); free(e); return NULL; }
+        e->table = &e->pt;
+    }
     ns_rows_init(&e->rows);
     cudaStreamCreate(&e->s);
     e->g24 = (uint32_t*) dmem(e, e->rows.g24, sizeof e->rows.g24);
@@ -210,6 +216,8 @@ Q4Eng* q4e_open(const char* model_dir, int max_pos, int vram_experts, char* err,
     e->mix_norm = load_v(e, (int64_t) c->hc * c->d, "language_model.model.hyper_connection_mixer.hc_norm.weight");
     for (int l = 0; l < c->n_layer && !e->err[0]; ++l) {
         if (c->ple[l] >= 0) qwen4_ngram_init(c, c->ple[l], &e->ng[c->ple[l]]);
+        if (c->ple[l] >= 0 && e->table && (c->ple[l] > 0 || e->table->rows != e->ng[0].rows))
+            fail(e, "the PLE GGUF has %lld rows, the model's table %lld (and one PLE layer)", (long long) e->table->rows, (long long) e->ng[0].rows);
         load_layer(e, l);
     }
     const size_t T = MAXT, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
@@ -241,6 +249,7 @@ void q4e_close(Q4Eng* e) {
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
     free(e->dev); free(e->host); free(e->emb_h); free(e->ids);
     if (e->s) cudaStreamDestroy(e->s);
+    if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
     free(e);
 }
@@ -279,7 +288,7 @@ static int ple(Q4Eng* e, int l, int T) {
     Layer* L = &e->L[l];
     const int HD = c->hc * c->d;
     for (int t = 0; t < T; ++t)
-        if (qwen4_ple_embed(&e->nm, &e->rows, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t, e->emb_h + (size_t) t * c->ple_dim))
+        if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t, e->emb_h + (size_t) t * c->ple_dim))
             return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
     cudaMemcpyAsync(e->emb, e->emb_h, sizeof(float) * (size_t) T * c->ple_dim, cudaMemcpyHostToDevice, e->s);
     mv(e, &L->key, e->emb, e->keys, T);
