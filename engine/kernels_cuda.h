@@ -91,9 +91,10 @@ void kc_mm(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int 
            const uint32_t* G);
 void kc_mm_grouped(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                    int xdiv, const int32_t* perm, const MmTile* tiles, int ntiles, const uint32_t* G);
-// Grouping on the GPU: the count = rows x k selections inds[] (n experts) -> perm (pair ids by expert, ascending within
-// an expert), tiles (runs of <= MMT_BN pairs of one expert) and *ntiles.  kc_mm_grouped_dev takes the tile count from
-// the device (grid = the upper bound, extra blocks exit).
+// Grouping on the GPU: the count = rows x k selections inds[] (n <= BUCKET_MAX_EXPERTS experts) -> perm (pair ids by
+// expert, ascending within an expert), tiles (runs of <= MMT_BN pairs of one expert) and ntiles[0] (ntiles: 2 n + 3 ints).
+// kc_mm_grouped_dev takes the tile count from the device (grid = the upper bound, extra blocks exit).
+#define BUCKET_MAX_EXPERTS 1024
 void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* perm, MmTile* tiles, int32_t* ntiles);
 void kc_mm_grouped_dev(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                        int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* ntiles, int max_tiles,

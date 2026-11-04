@@ -58,7 +58,9 @@ struct Q4Eng {
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
     float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
-    int32_t *d_ids, *ind, *sel, *done, *nsel, *zero;
+    int32_t *d_ids, *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
+    float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
+    MmTile* tiles;
     int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
     cudaEvent_t ev[1024];
     int evstage[1024];
@@ -318,6 +320,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
     const Qwen4Cfg* c = &e->c;
+    if (c->n_exp > BUCKET_MAX_EXPERTS) { snprintf(err, (size_t) errlen, "%d experts, at most %d", c->n_exp, BUCKET_MAX_EXPERTS); ns_close(&e->nm); free(e); return NULL; }
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
     e->host_experts = !(o && o->vram_experts);
     e->cache = e->host_experts && o && o->cache_gb > 0;
@@ -352,10 +355,13 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->br = F(T * c->d); e->qp = F(T * c->n_head * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);
     e->vv = F(T * c->n_kv * c->head_dim); e->o = F(T * c->n_head * c->head_dim); e->ixo = F(T * iw); e->sc = F(T * nb);
     e->emb = F(T * c->ple_dim); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d); e->gated = F(T * HD);
-    e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * (kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared));
+    const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
+    e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * ka); e->Gb = F(T * ka); e->Ub = F(T * ka);
     e->Dx = F(T * c->top_k * c->d); e->sh = F(T * c->d); e->sgv = F(T); e->logits = F(T * c->vocab); e->y = F(T * vd);
     e->cv = F(T * cd); e->qkvb = F(T * cd); e->zb = F(T * vd); e->bb = F(T * c->lin_hv); e->ab = F(T * c->lin_hv);
     e->d_ids = I(T); e->ind = I(T * c->top_k); e->sel = I(T * (c->ix_budget / c->ix_ratio)); e->done = I(T); e->nsel = I(T); e->zero = I(T);
+    e->perm = I(T * c->top_k); e->ntiles = I(2 * (size_t) c->n_exp + 3);
+    e->tiles = (MmTile*) dmem(e, NULL, sizeof(MmTile) * (T * c->top_k / MMT_BN + (size_t) c->n_exp));
 #undef F
 #undef I
     e->emb_h = (float*) malloc(sizeof(float) * T * (size_t) c->ple_dim);
@@ -512,9 +518,21 @@ static void moe(Q4Eng* e, int l, int T) {
         }
     }
     mark(e, ST_ROUTE);
-    kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
-    kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
-    kc_mv_gu(e->s, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->A, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
+    if (T > MV_MAXT) {   // prompt rows: pairs by expert, so each tile reads its expert's weights once (tensor cores)
+        const int mt = P / MMT_BN + c->n_exp;
+        kc_bucket(e->s, e->ind, P, c->n_exp, e->perm, e->tiles, e->ntiles);
+        kc_mm_grouped_dev(e->s, L->eg.fmt, L->eg.tab, c->d, c->ff_exp, e->x, c->d, e->Gb, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eg));
+        kc_mm_grouped_dev(e->s, L->eu.fmt, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->Ub, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eu));
+        kc_swiglu(e->s, e->Gb, e->Ub, e->A, P * c->ff_exp);
+        kc_mm_grouped_dev(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, 1, e->perm, e->tiles, e->ntiles, mt, G(e, &L->ed));
+        mv(e, &L->sh_g, e->x, e->Gb, T);
+        mv(e, &L->sh_u, e->x, e->Ub, T);
+        kc_swiglu(e->s, e->Gb, e->Ub, e->A, T * c->ff_shared);
+    } else {
+        kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
+        kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
+        kc_mv_gu(e->s, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->A, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
+    }
     mv(e, &L->sh_d, e->A, e->sh, T);
     mv(e, &L->sg, e->x, e->sgv, T);
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->sgv, e->br, T);

@@ -507,10 +507,11 @@ static __device__ __forceinline__ void mm_body(int fmt, MmArgs a, WSlice wd, con
 }
 
 // ---- grouping (prefill): selections -> pairs by expert, tile table -----------------------------------------------------
-// work = ntiles buffer: [0] tile count, [1 .. 129] pair offsets per expert, [130 .. 258] tile offsets per expert.
+// work = ntiles buffer (2 n + 3 ints): [0] tile count, [1 .. n + 1] pair offsets per expert, [n + 2 .. 2 n + 2] tile
+// offsets per expert.
 __global__ void __launch_bounds__(1024) k_bucket_count(const int32_t* inds, int count, int n, int32_t* work) {
-    __shared__ int cnt[128];
-    if (threadIdx.x < 128) cnt[threadIdx.x] = 0;
+    __shared__ int cnt[BUCKET_MAX_EXPERTS];
+    for (int x = threadIdx.x; x < n; x += 1024) cnt[x] = 0;
     __syncthreads();
     for (int i = threadIdx.x; i < count; i += 1024) atomicAdd(&cnt[inds[i]], 1);
     __syncthreads();
@@ -518,12 +519,12 @@ __global__ void __launch_bounds__(1024) k_bucket_count(const int32_t* inds, int 
         int o = 0, to = 0;
         for (int x = 0; x < n; ++x) {
             work[1 + x] = o;
-            work[130 + x] = to;
+            work[2 + n + x] = to;
             o += cnt[x];
             to += (cnt[x] + MMT_BN - 1) / MMT_BN;
         }
         work[1 + n] = o;
-        work[130 + n] = to;
+        work[2 + 2 * n] = to;
         work[0] = to;
     }
 }
@@ -531,7 +532,7 @@ __global__ void __launch_bounds__(1024) k_bucket_count(const int32_t* inds, int 
 __global__ void __launch_bounds__(1024) k_bucket_place(const int32_t* inds, int count, const int32_t* work, int32_t* perm, MmTile* tiles) {
     __shared__ int wsum[32];
     __shared__ int base;
-    const int x = (int) blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int x = (int) blockIdx.x, n = (int) gridDim.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     if (tid == 0) base = work[1 + x];
     __syncthreads();
     for (int c0 = 0; c0 < count; c0 += 1024) {
@@ -546,7 +547,7 @@ __global__ void __launch_bounds__(1024) k_bucket_place(const int32_t* inds, int 
         if (tid == 0) base += total;
         __syncthreads();
     }
-    const int o = work[1 + x], cnt = work[2 + x] - o, t0 = work[130 + x];
+    const int o = work[1 + x], cnt = work[2 + x] - o, t0 = work[2 + n + x];
     for (int t = tid; t * MMT_BN < cnt; t += 1024) {
         MmTile tl = {x, o + t * MMT_BN, min(MMT_BN, cnt - t * MMT_BN), 0};
         tiles[t0 + t] = tl;
