@@ -1,8 +1,8 @@
 # NanoSeedLM
 
 NanoSeedLM runs [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) in less memory.
-It also makes MLX models of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) with seed experts
-(an experiment: the engines do not run Qwen3.8-Flash-Next yet). It uses two methods:
+It also makes models of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) with seed experts, for
+mlx-vlm and the CUDA engine (an experiment). It uses two methods:
 
 - [SeedLM](https://arxiv.org/abs/2410.10714) replaces stored weights with seeds. The GPU makes the weights from the
   seeds at run time.

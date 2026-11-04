@@ -221,3 +221,9 @@ On an HF Jobs RTX PRO 6000 (96 GB, experts in VRAM, `tools/hf_qwen4_gen.sh`), `n
 prompt took 0.18 s, and the decode ran at 57.7 tokens per second. This is one run on a shared cloud machine, with no
 record of the machine state, so it is not a benchmark.
 
+## [2026-11-04] engine | Qwen3.8-Flash-Next-NanoSeedLM-P3 runs on the CUDA engine, experts in host memory
+
+On the same kind of machine, with the routed experts in mapped host memory (the default), `nslm-qwen4-gen` loaded the
+P3 pack in 27.1 s. It gave a coherent answer to the same prompt. The prompt ran at 25.4 tokens per second and the
+decode at 22.1 tokens per second. The GPU reads the experts over PCIe for each token. This is one run, not a benchmark.
+
