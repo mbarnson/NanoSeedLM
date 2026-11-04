@@ -1,10 +1,5 @@
-// nslm/qwen4_ref.h - the Qwen3.8-Flash-Next (qwen4_exp) forward on the CPU, in C: the reference the GPU engines are
-// checked against.  It reads an MLX model folder (BF16, MLX affine Q4 / Q8, seed experts; nslm/rows.h) and computes the
-// logits of a token sequence in f32, with dot products in double.  It is slow and single-threaded: for short sequences.
-//
-// One layer is two branches on a state of hc streams (hyper-connections).  Each branch normalises the streams, mixes
-// them into one input (sigmoid weights from a low-rank map), runs the block (Gated DeltaNet or QSA attention, then the
-// MoE) and adds the output back to every stream with its own weight 2 * sigmoid(.).  A final mixer gives the head input.
+// nslm/qwen4_ref.h - the qwen4_exp forward on the CPU from an MLX model folder: the reference of the GPU engines.
+// f32 values, sums in double, one thread; for short sequences.
 #pragma once
 #include <stdint.h>
 

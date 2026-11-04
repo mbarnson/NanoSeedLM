@@ -1,6 +1,5 @@
-// tests/test_qwen4_kernels.c - the Qwen3.8 kernels against nslm/qwen4_ops.h, on every GPU backend that has them
-// (tests/kernel_backend.h): Gated DeltaNet over several tokens at three head widths, the (1 + w) RMSNorm and the
-// hyper-connection steps, and affine Q4 with group 32.  f32 kernels: outputs within 1e-4 of the largest reference value.
+// tests/test_qwen4_kernels.c - the Qwen3.8 kernels against nslm/qwen4_ops.h on each GPU backend that has them.
+// f32 kernels: within 1e-4 of the largest reference value; Q4 group 32 within BF16 rounding.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

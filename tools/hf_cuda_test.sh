@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# tools/hf_cuda_test.sh - builds test targets with CMake on an HF Jobs GPU node (image nvidia/cuda:*-devel) and runs them
-# through CTest, so the CUDA kernels are checked without a local NVIDIA GPU.  SRC is the tree (a mounted bucket).
+# tools/hf_cuda_test.sh - builds and runs CUDA test targets on an HF Jobs GPU node (image nvidia/cuda:*-devel).
 #
 #   SRC=/src [TARGETS="test_qwen4_kernels test_qwen4_ref test_mova_kernels"] bash tools/hf_cuda_test.sh
 set -euo pipefail

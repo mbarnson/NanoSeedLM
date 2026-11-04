@@ -1,5 +1,5 @@
-// engine/kernels_qwen4.h - the CUDA kernels that only Qwen3.8 (qwen4_exp) needs (engine/kernels_qwen4.cu), each the
-// counterpart of an operation of nslm/qwen4_ops.h.  Values are f32 device arrays, T tokens of consecutive rows.
+// engine/kernels_qwen4.h - the CUDA kernels of Qwen3.8 (engine/kernels_qwen4.cu), counterparts of nslm/qwen4_ops.h.
+// f32 device arrays, T tokens of consecutive rows.
 #pragma once
 #include <cuda_runtime_api.h>
 

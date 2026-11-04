@@ -1,5 +1,5 @@
-// nslm/qwen4_ops.h - the qwen4_exp operations of one token, in C: the reference forward (nslm/qwen4_ref.h) is built from
-// them, and the GPU kernels are tested against them.  f32 values, sums in double.
+// nslm/qwen4_ops.h - the qwen4_exp operations of one token: the reference forward is built from them, the GPU kernels
+// are tested against them.
 //
 // Gated DeltaNet keeps, for each value head, a matrix state S that maps keys to values.  Each token decays S by g, then
 // corrects it toward the token's value along its key (the delta rule), and reads it with the query:
@@ -27,10 +27,8 @@ size_t qwen4_gdn_state_len(const Qwen4Cfg* c);
 void qwen4_gdn_token(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
                      float* conv, float* S, float* y);
 
-// Hyper-connections of one token, around the low-rank maps (matrix products, not here):
-//   normed = qwen4_norm1p(H, hc * d, d, hc_norm)   lo = down(normed)   act: lo = silu(lo / hc)
-//   up = up(lo)   mixed = qwen4_hc_mix(normed, up)   inj = block_inject(normed)   gate: inj = 2 sigmoid(inj / hc)
-//   H += qwen4_hc_add(branch, inj)
+// Hyper-connections around the low-rank maps: lo = silu(down(normed) / hc), mixed = mean_s sigmoid(up(lo)) normed,
+// inj = 2 sigmoid(inject(normed) / hc), H_s += inj_s branch
 void qwen4_hc_act(const Qwen4Cfg* c, float* lo);
 void qwen4_hc_mix(const Qwen4Cfg* c, const float* normed, const float* up, float* mixed);
 void qwen4_hc_gate(const Qwen4Cfg* c, float* inj);

@@ -1,7 +1,4 @@
-// nslm/qwen4_cfg.h - Qwen3.8-Flash-Next (qwen4_exp): the validated text configuration, and the PLE n-gram row ids.
-//
-// qwen4_cfg_parse accepts only what the reference implements: text input (MRoPE with equal positions is plain partial
-// RoPE), silu experts, sigmoid output gates, one indexer key head, untied head, top-k renormalisation.
+// nslm/qwen4_cfg.h - the qwen4_exp text configuration (only what the reference implements), and the PLE n-gram rows.
 //
 // PLE n-grams.  A PLE layer adds rows of a large embedding table chosen by a hash of the last `ngram` tokens.  Head h of
 // the n-gram of length n (n = 2 .. ngram, heads_per_ngram heads each) reads row

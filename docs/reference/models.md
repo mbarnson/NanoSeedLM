@@ -17,6 +17,11 @@ IFM/K2-Horizon-MoVA-36B-A4B                              original (GQA)
 
 IFM/K2-Horizon-0.9B                                      original (dense)
 └─ K2-Horizon-0.9B-NSLM-seeds-4bpw                       seeds, 0.54 GB
+
+Qwen/Qwen3.8-Flash-Next                                  original (qwen4_exp)
+└─ mlx-community/Qwen3.8-Flash-Next-4bit-mtp             MLX 4-bit (group 32), with the MTP head
+   ├─ Qwen3.8-Flash-Next-NanoSeedLM-P4                   seed experts (P = 4), the rest as the 4-bit model, 105.7 GB
+   └─ Qwen3.8-Flash-Next-NanoSeedLM-P3                   seed experts (P = 3), the rest as the 4-bit model, 98.2 GB
 ```
 
 The oQe models are for comparison. They let us compare seeds with a calibrated affine quantization of the same MLA
@@ -32,9 +37,11 @@ model.
 | [MLA](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA) (BF16) | `k2_mla.py` | Yes | Not checked | Not checked |
 | [MLA-oQ4e](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-oQ4e), [oQ6e](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-oQ6e), [oQ8e](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-oQ8e) | `k2_mla.py` | Yes | No | No |
 | [0.9B-NSLM-seeds-4bpw](https://huggingface.co/txgsync/K2-Horizon-0.9B-NSLM-seeds-4bpw) | `nanoseedlm_k2.py` | Yes | No | No |
+| [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4), [P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3) | `nanoseedlm_qwen4.py` (mlx-vlm) | Not yet | No | No |
 
-To use a model in oMLX, read [The MLX loader](../guides/mlx.md). To use a model in the engine, read
-[Run and serve](../guides/run-and-serve.md).
+oMLX removes `model_file` from `qwen4_exp` configurations, so it does not load the Qwen3.8 loader yet. Use mlx-vlm
+0.7.12 or later with `--trust-remote-code`. To use a model in oMLX, read [The MLX loader](../guides/mlx.md). To use a
+model in the engine, read [Run and serve](../guides/run-and-serve.md).
 
 ## Which model to choose
 
@@ -42,6 +49,8 @@ To use a model in oMLX, read [The MLX loader](../guides/mlx.md). To use a model 
 - **For the quality nearest to the original:** NSLM-p4mx-q4v. It keeps the original attention.
 - **For a small download to test the seed format:** K2-Horizon-0.9B-NSLM-seeds-4bpw. Its quality is lower than
   IFM's Q4_K_M, and it is slower.
+- **To try seed experts on Qwen3.8-Flash-Next:** Qwen3.8-Flash-Next-NanoSeedLM-P4 or -P3 in mlx-vlm. Their quality is
+  not measured yet.
 - **For daily use with no interest in seeds:** an affine quantization of the original model.
 
 ## Related data
