@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "format.h"
+#include "qwen4_ops.h"
 #include "qwen4_ref.h"
 
 static int fails = 0;
@@ -66,6 +67,13 @@ int main(void) {
         for (int h = 0; h < g.heads; ++h) bad_rows += r[h] != rows[t * g.heads + h];
     }
     CHECK(bad_rows == 0, "%d PLE n-gram rows differ from mlx-vlm's", bad_rows);
+    int pl = 0;   // the layer of PLE 0
+    while (pl + 1 < c.n_layer && c.ple[pl] != 0) ++pl;
+    NsModel m;
+    CHECK(ns_open(&m, DIR_, err, sizeof err) == 0, "%s", err);
+    for (int t = 0; t < n; ++t)
+        CHECK(qwen4_ple_prefetch(&m, NULL, &c, &g, pl, ids, t) == g.heads, "token %d: PLE rows to prefetch not found", t);
+    ns_close(&m);
 
     Qwen4Ref* ref = qwen4_ref_open(DIR_, err, sizeof err);
     CHECK(ref != NULL, "open: %s", err);

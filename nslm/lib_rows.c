@@ -3,6 +3,7 @@
 
 #include <string.h>
 
+#include "format.h"
 #include "lfsr.h"
 #include "search4.h"
 
@@ -72,4 +73,14 @@ void ns_row_f32(const NsRows* r, const NsTensor* t, int slice, int row, int roun
         break;
     }
     }
+}
+
+void ns_row_prefetch(const NsTensor* t, int slice, int row) {
+    const uint64_t K = (uint64_t) t->cols, base = ((uint64_t) slice * (uint64_t) t->rows + (uint64_t) row) * K;
+    if (t->enc == NS_BF16) st_willneed(t->s[0].p + 2 * base, 2 * K);
+    if (t->enc != NS_Q8 && t->enc != NS_Q4) return;
+    const uint64_t g = (uint64_t) t->group, g0 = base / g, gn = (base + K - 1) / g - g0 + 1;
+    st_willneed(t->s[0].p + base * (t->enc == NS_Q8 ? 8 : 4) / 8, K * (t->enc == NS_Q8 ? 8 : 4) / 8);
+    st_willneed(t->s[1].p + 2 * g0, 2 * gn);
+    st_willneed(t->s[2].p + 2 * g0, 2 * gn);
 }

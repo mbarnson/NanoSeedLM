@@ -2,6 +2,8 @@
 // IQ4_NL {f16 d; u8 qs[16]} with a fixed 16-entry codebook.  Elements j and j + 16 share byte j of qs.
 #include "ple.h"
 
+#include "format.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -53,6 +55,12 @@ int ple_open(PleTable* t, const char* path, const char* name, char* err, int err
 }
 
 void ple_close(PleTable* t) { gguf_close(&t->g); memset(t, 0, sizeof *t); }
+
+int ple_prefetch(const PleTable* t, int64_t row) {
+    if (row < 0 || row >= t->rows) return -1;
+    st_willneed(t->data + (size_t) row * t->row_bytes, t->row_bytes);
+    return 0;
+}
 
 int ple_row(const PleTable* t, int64_t row, float* out) {
     if (row < 0 || row >= t->rows) return -1;

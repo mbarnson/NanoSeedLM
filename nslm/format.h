@@ -23,3 +23,5 @@ int st_open_file(StFile* s, const char* path, char* err, int errlen);
 void st_close_file(StFile* s);
 const StEntry* st_find(const StFile* s, const char* name);
 static inline const uint8_t* st_data(const StFile* s, const StEntry* e) { return s->map + s->data + e->begin; }
+// Ask the OS to start reading bytes [p, p + n) of a file mapping (madvise WILLNEED), so a later read does not wait for each page
+void st_willneed(const void* p, uint64_t n);

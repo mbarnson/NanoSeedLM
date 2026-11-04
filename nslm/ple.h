@@ -17,3 +17,4 @@ typedef struct {
 int ple_open(PleTable* t, const char* path, const char* name, char* err, int errlen);
 void ple_close(PleTable* t);
 int ple_row(const PleTable* t, int64_t row, float* out);   // width floats; -1 when row is out of range
+int ple_prefetch(const PleTable* t, int64_t row);          // start reading the row from the file (st_willneed); -1 out of range

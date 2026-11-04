@@ -126,6 +126,11 @@ bad:
     return -1;
 }
 
+void st_willneed(const void* p, uint64_t n) {
+    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) 16383;   // a multiple of 4 KiB and 16 KiB pages
+    if (n) madvise((void*) a, (size_t) ((uintptr_t) p + n - a), MADV_WILLNEED);
+}
+
 void st_close_file(StFile* s) {
     if (s->map) munmap((void*) s->map, s->size);
     free(s->e);

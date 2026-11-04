@@ -70,6 +70,7 @@ int main(void) {
         PleTable t;
         CHECK(ple_open(&t, path, names[k], err, sizeof err) == 0, "%s: %s", names[k], err);
         CHECK(t.rows == 2 && t.width == 32, "%s shape", names[k]);
+        CHECK(ple_prefetch(&t, 1) == 0 && ple_prefetch(&t, 2) != 0, "%s: prefetch range", names[k]);
         for (int r = 0; r < 2; ++r) {
             CHECK(ple_row(&t, r, row) == 0, "%s row %d", names[k], r);
             for (int c = 0; c < 32; ++c) {

@@ -121,10 +121,22 @@ void qwen4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt
     free(pr);
 }
 
+// The folder's table shard of `layer` that holds row `row`, and the row's index in it (*local); NULL when missing
+static const NsTensor* ple_shard(const NsModel* m, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer, int64_t row, int* local) {
+    const int64_t base = g->rows / c->ngram_parts, rem = g->rows % c->ngram_parts, big = rem * (base + 1);   // shard k: base + (k < rem) rows
+    const int64_t k = row < big ? row / (base + 1) : rem + (row - big) / base;
+    const int64_t first = k < rem ? k * (base + 1) : big + (k - rem) * base;
+    char name[160];
+    snprintf(name, sizeof name, "language_model.model.layers.%d.ple.ple_embedding.ngram_embedding.shards.%lld.weight", layer, (long long) k);
+    const NsTensor* s = ns_find(m, name);
+    if (!s || row - first >= s->rows || s->enc == NS_SEED6P8) return NULL;
+    *local = (int) (row - first);
+    return s;
+}
+
 int qwen4_ple_embed(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,
                     const int32_t* ids, int t, float* emb) {
     const int wd = c->ple_dim / g->heads;
-    const int64_t base = g->rows / c->ngram_parts, rem = g->rows % c->ngram_parts, big = rem * (base + 1);   // shard k: base + (k < rem) rows
     int64_t rows[QWEN4_MAX_PLE_HEADS];
     qwen4_ngram_rows(c, g, ids, t, rows);
     for (int h = 0; h < g->heads; ++h) {
@@ -132,15 +144,24 @@ int qwen4_ple_embed(const NsModel* m, const NsRows* rw, const PleTable* table, c
             if (table->width != wd || ple_row(table, rows[h], emb + (size_t) h * wd)) return -1;
             continue;
         }
-        const int64_t k = rows[h] < big ? rows[h] / (base + 1) : rem + (rows[h] - big) / base;
-        const int64_t first = k < rem ? k * (base + 1) : big + (k - rem) * base;
-        char name[160];
-        snprintf(name, sizeof name, "language_model.model.layers.%d.ple.ple_embedding.ngram_embedding.shards.%lld.weight", layer, (long long) k);
-        const NsTensor* s = ns_find(m, name);
-        if (!s || s->cols != wd || rows[h] - first >= s->rows || s->enc == NS_SEED6P8) return -1;
-        ns_row_f32(rw, s, 0, (int) (rows[h] - first), 0, emb + (size_t) h * wd);
+        int local;
+        const NsTensor* s = ple_shard(m, c, g, layer, rows[h], &local);
+        if (!s || s->cols != wd) return -1;
+        ns_row_f32(rw, s, 0, local, 0, emb + (size_t) h * wd);
     }
     return 0;
+}
+
+int qwen4_ple_prefetch(const NsModel* m, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer, const int32_t* ids, int t) {
+    int64_t rows[QWEN4_MAX_PLE_HEADS];
+    int found = 0, local;
+    qwen4_ngram_rows(c, g, ids, t, rows);
+    for (int h = 0; h < g->heads; ++h) {
+        const NsTensor* s = table ? NULL : ple_shard(m, c, g, layer, rows[h], &local);
+        if (table ? ple_prefetch(table, rows[h]) == 0 : s != NULL) ++found;
+        if (s) ns_row_prefetch(s, 0, local);
+    }
+    return found;
 }
 
 void qwen4_ple_gate(const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated) {

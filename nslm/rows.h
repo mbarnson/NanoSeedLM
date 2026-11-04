@@ -10,3 +10,5 @@ typedef struct { uint32_t g24[65536], g32[65536]; } NsRows;   // LFSR stream tab
 void ns_rows_init(NsRows* r);
 // Row `row` of slice `slice` into out[cols].  round = 1 rounds affine values to BF16, as the MoVA kernels dequantize.
 void ns_row_f32(const NsRows* r, const NsTensor* t, int slice, int row, int round, float* out);
+// Start reading that row from the files (st_willneed): BF16 and affine tensors; the others are not prefetched
+void ns_row_prefetch(const NsTensor* t, int slice, int row);

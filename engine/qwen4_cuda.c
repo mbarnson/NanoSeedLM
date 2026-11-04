@@ -522,7 +522,6 @@ static void moe(Q4Eng* e, int l, int T) {
 
 static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     const Qwen4Cfg* c = &e->c;
-    memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) T);
     mark(e, ST_EMBED);
     cudaMemcpyAsync(e->d_ids, ids, sizeof(int32_t) * (size_t) T, cudaMemcpyHostToDevice, e->s);
     kc_embed(e->s, e->embed.fmt, e->embed.w, c->d, e->d_ids, e->x, T);
@@ -560,6 +559,9 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     e->err[0] = 0;
     if (e->pos + n > e->max_pos) return fail(e, "the context is full (%d positions)", e->max_pos);
     for (int i = 0; i < n; ++i) if (ids[i] < 0 || ids[i] >= e->embed.rows) return fail(e, "token %d out of range", ids[i]);
+    memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
+    for (int l = 0; l < e->c.n_layer; ++l)   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
+        for (int t = 0; e->c.ple[l] >= 0 && t < n; ++t) qwen4_ple_prefetch(&e->nm, e->table, &e->c, &e->ng[e->c.ple[l]], l, e->ids, e->pos + t);
     for (int i = 0; i < n; i += MAXT) {
         const int T = n - i < MAXT ? n - i : MAXT;
         if (forward_rows(e, ids + i, T, logits ? logits + (size_t) i * e->c.vocab : NULL)) return -1;
