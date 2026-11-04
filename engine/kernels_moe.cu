@@ -1932,14 +1932,14 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
 #define ADMIT_THREADS 1024
 __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count, int flags) {
     const int prev = flags & CACHE_PROTECT_PREV ? (int) p.tick[0] : -1;
-    __shared__ int need[128];
-    __shared__ int miss[128];
+    __shared__ int need[ADMIT_THREADS];   // per_layer <= ADMIT_THREADS experts (qwen4: 512)
+    __shared__ int miss[ADMIT_THREADS];
     __shared__ int nmiss;
     __shared__ uint32_t bv[32];
     __shared__ int bi[32];
-    __shared__ int wmiss[4], wneed[4];
+    __shared__ int wmiss[ADMIT_THREADS / 32], wneed[ADMIT_THREADS / 32];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    if (tid < 128) need[tid] = 0;
+    need[tid] = 0;
     __syncthreads();
     for (int i = tid; i < count; i += ADMIT_THREADS) need[inds[i]] = 1;
     __syncthreads();
@@ -1950,7 +1950,7 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
     const int s0 = isneed ? p.unit_slot[sl * p.per_layer + tid] : -1, ismiss = isneed && s0 < 0;
     if (isneed && s0 >= 0) p.slot_last[s0] = now;
     const uint32_t mb = __ballot_sync(FULL, ismiss), nb = __ballot_sync(FULL, isneed);
-    if (lane == 0 && w < 4) { wmiss[w] = __popc(mb); wneed[w] = __popc(nb); }
+    if (lane == 0) { wmiss[w] = __popc(mb); wneed[w] = __popc(nb); }
     __syncthreads();
     if (ismiss) {
         int before = __popc(mb & ((1u << lane) - 1u));
@@ -1958,7 +1958,8 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
         miss[before] = tid;
     }
     if (tid == 0) {
-        const int nm = wmiss[0] + wmiss[1] + wmiss[2] + wmiss[3], nn = wneed[0] + wneed[1] + wneed[2] + wneed[3];
+        int nm = 0, nn = 0;
+        for (int k = 0; k < ADMIT_THREADS / 32; ++k) { nm += wmiss[k]; nn += wneed[k]; }
         nmiss = nm;
         p.tick[0] = now;
         p.stats[1] += (uint32_t) nm;

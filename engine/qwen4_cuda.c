@@ -52,7 +52,9 @@ struct Q4Eng {
     float* mix_norm;
     uint32_t *g24, *g32;
     cudaStream_t s;
-    int max_pos, pos, host_experts;
+    int max_pos, pos, host_experts, cache;
+    CachePool pool;   // the expert cache (cache = 1)
+    const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
     float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
@@ -181,9 +183,16 @@ static void load_layer(Q4Eng* e, int l) {
     load_w(e, &L->sh_g, 0, "%s.%d.mlp.shared_expert.gate_proj.weight", p, l);
     load_w(e, &L->sh_u, 0, "%s.%d.mlp.shared_expert.up_proj.weight", p, l);
     load_w(e, &L->sh_d, 0, "%s.%d.mlp.shared_expert.down_proj.weight", p, l);
-    load_w(e, &L->eg, e->host_experts, "%s.%d.mlp.switch_mlp.gate_proj.weight", p, l);
-    load_w(e, &L->eu, e->host_experts, "%s.%d.mlp.switch_mlp.up_proj.weight", p, l);
-    load_w(e, &L->ed, e->host_experts, "%s.%d.mlp.switch_mlp.down_proj.weight", p, l);
+    W* ex[3] = {&L->eg, &L->eu, &L->ed};
+    const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+    for (int i = 0; i < 3; ++i) {
+        char name[160];
+        snprintf(name, sizeof name, "%s.%d.mlp.switch_mlp.%s.weight", p, l, proj[i]);
+        const NsTensor* t = e->et[l][i] = ns_find(&e->nm, name);
+        if (!e->cache) load_w(e, ex[i], e->host_experts, "%s", name);
+        else if (!t || t->enc == NS_SEED6P8 || t->slices != c->n_exp) fail(e, "%s: missing, P = 8, or not %d experts", name, c->n_exp);
+        else { memset(ex[i], 0, sizeof *ex[i]); ex[i]->fmt = t->enc; ex[i]->slices = t->slices; ex[i]->rows = t->rows; ex[i]->cols = t->cols; }
+    }
     if (c->ple[l] >= 0) {
         load_w(e, &L->key, 0, "%s.%d.ple.key_proj.weight", p, l);
         load_w(e, &L->val, 0, "%s.%d.ple.value_proj.weight", p, l);
@@ -195,12 +204,94 @@ static void load_layer(Q4Eng* e, int l) {
     }
 }
 
+// The expert cache (engine/kernels_cuda.h CachePool): unit l * n_exp + x holds expert x's gate, up and down slices of
+// layer l, in a pinned host arena; `slots` of them in VRAM, filled round-robin over the layers, then LRU.
+static void build_cache(Q4Eng* e, double gb) {
+    const Qwen4Cfg* c = &e->c;
+    CachePool* p = &e->pool;
+    const int E = c->n_exp, units = c->n_layer * E;
+    memset(p, 0, sizeof *p);
+    p->per_layer = E;
+    p->ntens = 3;
+    uint64_t ub = 0, len[3][4] = {{0}};
+    for (int i = 0; i < 3; ++i)
+        for (int s = 0; s < 4; ++s) {
+            const NsTensor* t = e->et[0][i];
+            const int seed = t->enc == NS_SEED4 || t->enc == NS_SEED4P4;
+            len[i][s] = seed && s == 2 ? 0 : t->s[s].len / (uint64_t) E;
+            p->off[i][s] = len[i][s] ? (uint32_t) ub : 0xFFFFFFFFu;
+            ub += (len[i][s] + 255) & ~255ull;
+        }
+    p->unit_bytes = ub;
+    const double want = gb * 1e9 / (double) ub;
+    p->slots = want > units ? units : want < E ? E : (int) want;
+    uint8_t* host = NULL;
+    void* dh = NULL;
+    if (cudaHostAlloc((void**) &host, ub * (uint64_t) units, cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&dh, host, 0) != cudaSuccess) {
+        fail(e, "cannot pin %.1f GB of host memory for the experts", ub * (double) units / 1e9);
+        return;
+    }
+    track(&e->host, &e->nhost, &e->chost, host);
+    WSlice* tab = (WSlice*) calloc((size_t) units * 3, sizeof(WSlice));
+    for (int l = 0; l < c->n_layer; ++l)
+        for (int i = 0; i < 3; ++i) {
+            const NsTensor* t = e->et[l][i];
+            if (!t || t->enc != e->et[0][i]->enc || t->s[0].len != e->et[0][i]->s[0].len) { fail(e, "layer %d: experts differ from layer 0's", l); free(tab); return; }
+            for (int x = 0; x < E; ++x) {
+                WSlice* w = &tab[((size_t) l * 3 + i) * E + x];
+                for (int s = 0; s < 4; ++s)
+                    if (len[i][s]) memcpy(host + ((uint64_t) l * E + x) * ub + p->off[i][s], t->s[s].p + len[i][s] * (uint64_t) x, len[i][s]);
+                if (t->enc == NS_SEED4 || t->enc == NS_SEED4P4) memcpy(&w->eb, t->s[2].p + 4 * (size_t) x, 4);
+                if (t->enc == NS_Q4 || t->enc == NS_Q8) w->gs = t->group == 32 ? 5 : 6;
+            }
+        }
+    p->host = (const uint8_t*) dh;
+    p->vram = (uint8_t*) dmem(e, NULL, ub * (uint64_t) p->slots);
+    int32_t* us = (int32_t*) malloc(4 * (size_t) units);
+    int32_t* su = (int32_t*) malloc(4 * (size_t) p->slots);
+    for (int u = 0; u < units; ++u) us[u] = -1;
+    for (int s = 0, x = 0; x < E && s < p->slots; ++x)   // round-robin: every layer starts with the same share
+        for (int l = 0; l < c->n_layer && s < p->slots; ++l, ++s) {
+            const int u = l * E + x;
+            us[u] = s;
+            su[s] = u;
+            if (p->vram) cudaMemcpy(p->vram + (uint64_t) s * ub, host + (uint64_t) u * ub, ub, cudaMemcpyHostToDevice);
+            for (int i = 0; i < 3; ++i)
+                for (int st = 0; st < 4; ++st)
+                    if (len[i][st] && p->vram) tab[((size_t) l * 3 + i) * E + x].p[st] = p->vram + (uint64_t) s * ub + p->off[i][st];
+        }
+    const uint32_t tick0[4] = {CACHE_TICK_BASE, 0, 0, 0};
+    p->unit_slot = (int32_t*) dmem(e, us, 4 * (size_t) units);
+    p->slot_unit = (int32_t*) dmem(e, su, 4 * (size_t) p->slots);
+    p->slot_last = (uint32_t*) dmem(e, NULL, 4 * (size_t) p->slots);
+    p->tick = (uint32_t*) dmem(e, tick0, 16);
+    p->stats = (uint32_t*) dmem(e, NULL, 16);
+    p->jobs = (int32_t*) dmem(e, NULL, 8 * (size_t) E);
+    p->njobs = (int32_t*) dmem(e, NULL, 16);
+    p->tab = (WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) units * 3);
+    for (int l = 0; l < c->n_layer && p->tab; ++l) {
+        e->L[l].eg.tab = p->tab + ((size_t) l * 3 + 0) * E;
+        e->L[l].eu.tab = p->tab + ((size_t) l * 3 + 1) * E;
+        e->L[l].ed.tab = p->tab + ((size_t) l * 3 + 2) * E;
+    }
+    free(us); free(su); free(tab);
+}
+
+void q4e_cache_stats(Q4Eng* e, uint64_t* hits, uint64_t* misses, int* slots) {
+    uint32_t st[2] = {0, 0};
+    if (e->cache) cudaMemcpy(st, e->pool.stats, 8, cudaMemcpyDeviceToHost);
+    *hits = st[0];
+    *misses = st[1];
+    *slots = e->cache ? e->pool.slots : 0;
+}
+
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) {
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
     const Qwen4Cfg* c = &e->c;
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
     e->host_experts = !(o && o->vram_experts);
+    e->cache = e->host_experts && o && o->cache_gb > 0;
     if (o && o->ple_gguf) {
         if (ple_open(&e->pt, o->ple_gguf, "per_layer_token_embd.weight", err, errlen)) { ns_close(&e->nm); free(e); return NULL; }
         e->table = &e->pt;
@@ -220,6 +311,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
             fail(e, "the PLE GGUF has %lld rows, the model's table %lld (and one PLE layer)", (long long) e->table->rows, (long long) e->ng[0].rows);
         load_layer(e, l);
     }
+    if (e->cache && !e->err[0]) build_cache(e, o->cache_gb);
     const size_t T = MAXT, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, iw = (size_t) (c->ix_heads + 1) * c->ix_dim, kf = (size_t) c->top_k * c->ff_exp;
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
@@ -340,11 +432,16 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
     return 0;
 }
 
-static void moe(Q4Eng* e, Layer* L, int T) {
+static void moe(Q4Eng* e, int l, int T) {
     const Qwen4Cfg* c = &e->c;
+    Layer* L = &e->L[l];
     const int k = c->top_k, P = T * k;
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route(e->s, c, e->lg, e->ind, e->wt, T);
+    if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
+        kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
+        kc_cache_copy(e->s, &e->pool, 64);
+    }
     kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
     kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
     kc_mv_gu(e->s, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->A, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
@@ -366,7 +463,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
         kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
         hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
-        moe(e, L, T);
+        moe(e, l, T);
         kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
     }
     hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
