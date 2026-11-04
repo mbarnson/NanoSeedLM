@@ -256,3 +256,9 @@ The test used an HF Jobs RTX PRO 6000 and a 48 GB expert cache. 1,024 tokens of 
 in rows of 8: 15% faster. The KL divergence against the 4-bit model did not change (0.179, against 0.177). So the dense
 projections were not the main cost of a prompt. The expert misses of the cache may be: we did not profile it.
 
+## [2026-11-04] result | Qwen3.8-Flash-Next-NanoSeedLM-P3 in mlx-vlm on the M4 Max
+
+In mlx-vlm on the M4 Max, the P3 pack decodes at 34 tokens per second, as fast as a 4-bit affine quantization. Its MLX
+peak memory is 65.5 GB against 74.3 GB. Spotlight ran during the runs, so the numbers are noisy. Read
+[Qwen3.8-Flash-Next-NanoSeedLM-P3 in mlx-vlm on the M4 Max](results/2026-11-04-qwen38-m4max-mlx-p3.md).
+

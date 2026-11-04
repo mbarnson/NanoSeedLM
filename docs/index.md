@@ -66,6 +66,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   KL divergence, top-1 agreement and perplexity on wikitext-2.
 - [2026-11-04: Qwen3.8-Flash-Next-NanoSeedLM-P3 on the RTX 4080](results/2026-11-04-qwen38-4080-p3.md): decode speed
   with experts in host memory, a VRAM expert cache, and streamed experts.
+- [2026-11-04: Qwen3.8-Flash-Next-NanoSeedLM-P3 in mlx-vlm on the M4 Max](results/2026-11-04-qwen38-m4max-mlx-p3.md):
+  decode speed and peak memory against a 4-bit affine quantization.
 
 ## For contributors and agents
 
