@@ -62,6 +62,9 @@ hf jobs run --detach --flavor cpu-xl --timeout 2h -v ./src:/src -v hf://buckets/
     -e BLK=/b/p4/experts-p4 -e TIER=4 -e OUT=/b/pack-p4 python:3.12 bash /src/tools/hf_qwen4_pack.sh
 ```
 
+From Git Bash on Windows, set `MSYS_NO_PATHCONV=1` first. Otherwise Git Bash changes the job's paths (`/b/...` to
+`B:/...`) and the job stops at once.
+
 ## MLA projections
 
 An MLA model folder also has `model-mla-delta.safetensors`. Read [The model folder format](../reference/model-folder.md).
