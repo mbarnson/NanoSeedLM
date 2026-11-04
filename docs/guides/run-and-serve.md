@@ -97,6 +97,22 @@ uses the blocks of another model.
   [The KV cache](../concepts/kv-cache.md).
 - On a CUDA GPU, read [NVIDIA GPUs](cuda.md) for where the engine keeps the cache.
 
+## Qwen3.8-Flash-Next on CUDA
+
+`nslm-qwen4-gen` runs one prompt through the Qwen3.8-Flash-Next CUDA engine, with greedy decoding. `nslm-chat` and
+`nslm-serve` do not run Qwen3.8-Flash-Next yet.
+
+```bash
+build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why do tide pools matter?"
+```
+
+| Option | Use |
+|---|---|
+| `--vram-experts` | Keep the routed experts in VRAM. The default keeps them in mapped host memory |
+| `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
+| `--ctx N` | Context positions (4096) |
+| `--raw` | No chat template |
+
 ## See also
 
 - [Command-line tools](../reference/tools.md)

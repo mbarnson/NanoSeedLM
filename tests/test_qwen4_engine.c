@@ -1,4 +1,4 @@
-// tests/test_qwen4_engine.c - the Qwen3.8 CUDA engine (engine/qwen4_eng.h) on tests/data/qwen4_tiny against mlx-vlm's
+// tests/test_qwen4_engine.c - the qwen4 CUDA engine (engine/qwen4_eng.h) on tests/data/qwen4_tiny against mlx-vlm's
 // float32 logits, fed in uneven rows; a reset and rows of 8 must give the same logits.  Skipped without a GPU.
 #include <math.h>
 #include <stdio.h>

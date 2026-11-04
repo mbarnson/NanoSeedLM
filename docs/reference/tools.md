@@ -20,13 +20,13 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-mova-kbench` | Speed of one kernel at the MoVA shapes. There is one program for each GPU API. The Metal program also selects Metal kernel variants |
 | `nslm-mova-refcheck` | The GPU engine against a C reference forward on the CPU (KL, argmax, router choices) |
 | `nslm-mova-routes` | Router choices for a prompt and a generation, for expert-cache studies |
-| `nslm-qwen4-gen` | Greedy generation of one prompt through the Qwen3.8 CUDA engine, with prompt and decode speed |
+| `nslm-qwen4-gen` | Greedy generation of one prompt through the Qwen3.8-Flash-Next CUDA engine, with prompt and decode speed |
 
 ## Make models
 
 | Tool | Use |
 |---|---|
-| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8 experts take `--imatrix` |
+| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8-Flash-Next experts take `--imatrix` |
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 | `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, from an MLX base folder |
@@ -40,9 +40,9 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `nanoseedlm_k2.py` | The MLX loader for K2-Horizon |
 | `nanoseedlm_qwen4.py` | The MLX loader for Qwen3.8-Flash-Next (mlx-vlm) |
 | `nanoseedlm_seeds.py` | The seed kernels and modules that the MLX loaders share |
-| `qwen4_golden.py` | A tiny random Qwen3.8 model and its mlx-vlm logits, for `tests/test_qwen4_ref.c` |
+| `qwen4_golden.py` | A tiny random Qwen3.8-Flash-Next model and its mlx-vlm logits, for `tests/test_qwen4_ref.c` |
 | `hf_cuda_test.sh` | Build and run CUDA tests on an HF Jobs GPU node |
-| `hf_qwen4_gen.sh` | Run a Qwen3.8 pack through `nslm-qwen4-gen` on an HF Jobs GPU node |
+| `hf_qwen4_gen.sh` | Run a Qwen3.8-Flash-Next pack through `nslm-qwen4-gen` on an HF Jobs GPU node |
 | `mova_capture.py` | Activation statistics for the expert search, through MLX |
 | `mova_score.py` | Scores in MLX |
 | `mova_export.py` | Inputs for `nslm-mova-score`, `nslm-mova-gen`, `nslm-mova-bench` and route studies |

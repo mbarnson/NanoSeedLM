@@ -39,9 +39,9 @@ model.
 | [0.9B-NSLM-seeds-4bpw](https://huggingface.co/txgsync/K2-Horizon-0.9B-NSLM-seeds-4bpw) | `nanoseedlm_k2.py` | Yes | No | No |
 | [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4), [P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3) | `nanoseedlm_qwen4.py` (mlx-vlm) | Not yet | No | No |
 
-oMLX removes `model_file` from `qwen4_exp` configurations, so it does not load the Qwen3.8 loader yet. Use mlx-vlm
-0.7.12 or later with `--trust-remote-code`. To use a model in oMLX, read [The MLX loader](../guides/mlx.md). To use a
-model in the engine, read [Run and serve](../guides/run-and-serve.md).
+oMLX removes `model_file` from `qwen4_exp` configurations, so it does not load the Qwen3.8-Flash-Next loader yet.
+Use mlx-vlm 0.7.12 or later with `--trust-remote-code`. To use a model in oMLX, read [The MLX loader](../guides/mlx.md).
+To use a model in the engine, read [Run and serve](../guides/run-and-serve.md).
 
 ## Which model to choose
 

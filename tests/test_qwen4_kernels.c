@@ -1,4 +1,4 @@
-// tests/test_qwen4_kernels.c - the Qwen3.8 kernels against nslm/qwen4_ops.h on each GPU backend that has them.
+// tests/test_qwen4_kernels.c - the qwen4 kernels against nslm/qwen4_ops.h on each GPU backend that has them.
 // f32 kernels: within 1e-4 of the largest reference value; Q4 group 32 within BF16 rounding.
 #include <math.h>
 #include <stdio.h>
@@ -85,7 +85,7 @@ static void hc_case(int hc, int d, int rank, int T) {
 static uint16_t f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7FFFu + ((u >> 16) & 1u); return (uint16_t) (u >> 16); }
 static float bf2f(uint16_t h) { uint32_t u = (uint32_t) h << 16; float f; memcpy(&f, &u, 4); return f; }
 
-// MLX affine Q4 with group 32 (the 4-bit Qwen3.8 pack's projections) through the matvec (T <= 8) and the GEMM (T = 16):
+// MLX affine Q4 with group 32 (the 4-bit qwen4 pack's projections) through the matvec (T <= 8) and the GEMM (T = 16):
 // within BF16 rounding of the exact s * q + b products
 static void q4g32_case(int R, int K) {
     const size_t n = (size_t) R * K, ng = n / 32;

@@ -196,7 +196,7 @@ against KLD. Each pack of the family is one point on the front.
 | Step | Work | Where | Cost | Gate |
 |---|---|---|---|---|
 | S0 | Access and baselines | PC | Free | None |
-| S1 | Tools for Qwen3.8 | Cloud session | Free | Tests pass |
+| S1 | Tools for Qwen3.8-Flash-Next | Cloud session | Free | Tests pass |
 | S2 | One-layer probe | HF Job | About $0.20 | G1 |
 | S3 | Seed banks, P4 and P3 | HF Jobs or the RTX 4080 | About $5 for each tier, or about 5 h on the 4080 | |
 | S4 | Full-model quality with emulated packs | PC | Free | G2 |
@@ -213,9 +213,9 @@ against KLD. Each pack of the family is one point on the front.
 3. Run Strata and llama.cpp with UD-Q4_K_XL, UD-IQ4_XS and ISTA IQ3_XXS. Record decode and prompt speed.
 4. Run `nslm-cpu-seed-bench` on the 5800X3D.
 
-### S1. Tools for Qwen3.8
+### S1. Tools for Qwen3.8-Flash-Next
 
-1. `nslm-moe`: a Qwen3.8 tensor adapter for the fused, stacked expert tensors. Write the failing test first.
+1. `nslm-moe`: a Qwen3.8-Flash-Next tensor adapter for the fused, stacked expert tensors. Write the failing test first.
 2. `tools/`: a converter from the Unsloth imatrix (`imatrix_unsloth.gguf_file`, 580 MB) to `actsq_moe.bin`. The
    imatrix holds the sum of x^2 for each input channel of each expert. That is the statistic of the
    activation-weighted search, so no capture run is necessary.
@@ -293,9 +293,9 @@ experimental, and PCIe carries all misses.
 2. The PLE table reader is done (`nslm/ple.h`). It decodes rows of the four Unsloth table files, and it matches
    gguf-py exactly on rows of each file. The reference reads the PLE rows from the model folder.
 3. CUDA first, then Metal. Add each feature that only one engine has to the feature matrix of
-   [Metal and CUDA parity](../concepts/parity.md). The CUDA kernels for Gated DeltaNet, the hyper-connections and
-   affine Q4 with group 32 are done (`engine/kernels_qwen4.cu`). The PLE layer, QSA attention, the MoE router and the
-   engine itself are next.
+   [Metal and CUDA parity](../concepts/parity.md). The CUDA engine is done (`engine/qwen4_eng.h`, `nslm-qwen4-gen`). On
+   the tiny model, its logits are within 2.6% of mlx-vlm's float32 logits. The PLE table comes from the model folder or
+   from an Unsloth engram GGUF. Metal is next.
 4. Each kernel gets a C reference and a test on Metal and on CUDA.
 5. With MTP, greedy output must be identical to plain decode, as `nslm-mova-plcheck` checks for prompt lookup.
 
@@ -346,8 +346,8 @@ HF Jobs prices (per second billing). A job needs a positive credit balance.
 The seed search uses FP32 and integer arithmetic, not tensor cores. So `a100-large` and `h200` give less search for
 each dollar.
 
-The search over the routed experts of K2-Horizon-MoVA (26.5 B weights) took 3.4 h on an M4 Max. Qwen3.8 has 4.6x as
-many expert weights.
+The search over the routed experts of K2-Horizon-MoVA (26.5 B weights) took 3.4 h on an M4 Max. Qwen3.8-Flash-Next
+has 4.6x as many expert weights.
 
 Measured in step S2 (2026-11-04, `rtx-pro-6000`, layer 20, P = 4, 2 workers): 334 s for one layer. `gate_proj` and
 `up_proj` took 233 s each, side by side, and `down_proj` took 100 s. All 48 layers take about 4.5 GPU-hours for each tier.
@@ -391,9 +391,9 @@ as a 16 GB or a 12 GB GPU.
 | Flavor | GPU | VRAM | RAM | Price | Use |
 |---|---|---|---|---|---|
 | `l4x1` | L4 (Ada, the same architecture as the RTX 4080) | 24 GB | 30 GB | $0.80 per hour | MoVA engine tests |
-| `a10g-largex2` | 2x A10G (Ampere). Use one | 48 GB | 92 GB | $3.00 per hour | Qwen3.8 packs in RAM |
-| `l4x4` | 4x L4. Use one | 96 GB | 186 GB | $3.80 per hour | Qwen3.8 on the RTX 4080 architecture |
-| `rtx-pro-6000` | RTX PRO 6000 (Blackwell) | 96 GB | 256 GB | $2.75 per hour | Qwen3.8 correctness tests |
+| `a10g-largex2` | 2x A10G (Ampere). Use one | 48 GB | 92 GB | $3.00 per hour | Qwen3.8-Flash-Next packs in RAM |
+| `l4x4` | 4x L4. Use one | 96 GB | 186 GB | $3.80 per hour | Qwen3.8-Flash-Next on the RTX 4080 architecture |
+| `rtx-pro-6000` | RTX PRO 6000 (Blackwell) | 96 GB | 256 GB | $2.75 per hour | Qwen3.8-Flash-Next correctness tests |
 
 - The T4 flavors have 16 GB, but the T4 is older than Ampere, the minimum of the CUDA engine.
 - Speed on these machines does not predict speed on the PC. The CPUs, the DRAM bandwidth and the PCIe links are not

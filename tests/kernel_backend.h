@@ -148,7 +148,7 @@ int kt_bf16_f32(const uint16_t* x, float* y, int n);
 // 1 where a backend lacks it.
 int kt_xtx(const float* x, int T, int xs, int D, int nb, float* H);
 
-// ---- Qwen3.8 (nslm/qwen4_ops.h; CUDA's engine/kernels_qwen4.cu).  1 where a backend lacks them ----------------------
+// ---- qwen4 (nslm/qwen4_ops.h; CUDA's engine/kernels_qwen4.cu).  1 where a backend lacks them ----------------------
 // T tokens through qwen4_gdn_token: conv and S are updated
 int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
               float* conv, float* S, float* y, int T);

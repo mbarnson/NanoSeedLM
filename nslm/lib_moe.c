@@ -1,4 +1,4 @@
-// nslm/lib_moe.c - MoVA and Qwen3.8 expert helpers (nslm/moe.h).
+// nslm/lib_moe.c - MoVA and qwen4 expert helpers (nslm/moe.h).
 #include "moe.h"
 
 #include <errno.h>

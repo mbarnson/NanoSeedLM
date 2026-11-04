@@ -1,4 +1,4 @@
-// engine/qwen4_eng.h - the Qwen3.8 (qwen4_exp) CUDA engine: an MLX model folder on the GPU, tokens in, logits out.
+// engine/qwen4_eng.h - the qwen4 (qwen4_exp) CUDA engine: an MLX model folder on the GPU, tokens in, logits out.
 // Routed experts in mapped host memory (or VRAM), the rest in VRAM; prompts run in rows of up to Q4E_MAX_ROWS tokens.
 #pragma once
 #include <stdint.h>

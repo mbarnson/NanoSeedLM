@@ -1,4 +1,4 @@
-// engine/kernels_qwen4.cu - CUDA kernels of Qwen3.8 (engine/kernels_qwen4.h), the counterparts of nslm/qwen4_ops.h.
+// engine/kernels_qwen4.cu - CUDA kernels of qwen4 (engine/kernels_qwen4.h), the counterparts of nslm/qwen4_ops.h.
 // f32 values and sums.
 #include <math.h>
 #include <stdint.h>

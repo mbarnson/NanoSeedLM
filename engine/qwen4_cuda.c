@@ -1,5 +1,5 @@
-// engine/qwen4_cuda.c - the Qwen3.8 CUDA engine (engine/qwen4_eng.h): the steps of nslm/qwen4_ref.h on the matrix
-// kernels of engine/kernels_cuda.h and the Qwen3.8 kernels of engine/kernels_qwen4.h.
+// engine/qwen4_cuda.c - the qwen4 CUDA engine (engine/qwen4_eng.h): the steps of nslm/qwen4_ref.h on the matrix
+// kernels of engine/kernels_cuda.h and the qwen4 kernels of engine/kernels_qwen4.h.
 #include "qwen4_eng.h"
 
 #include <stdarg.h>

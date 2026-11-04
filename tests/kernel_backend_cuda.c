@@ -557,7 +557,7 @@ int kt_heads_seed(int tr, int H, int O, int I, const uint16_t* seeds, const uint
     return rc;
 }
 
-// ---- Qwen3.8 ------------------------------------------------------------------------------------------------------------
+// ---- qwen4 -----------------------------------------------------------------------------------------------------------
 
 int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
               float* conv, float* S, float* y, int T) {

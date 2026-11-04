@@ -1,4 +1,4 @@
-// harness/nslm-qwen4-gen.c - greedy generation through the Qwen3.8 CUDA engine (engine/qwen4_eng.h), with timings.
+// harness/nslm-qwen4-gen.c - greedy generation through the qwen4 CUDA engine (engine/qwen4_eng.h), with timings.
 //   nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens 128] [--ctx 4096] [--raw] [--vram-experts] [--ple-gguf FILE]
 //   (--raw: no chat template; --ple-gguf: the PLE table from an Unsloth engram GGUF)
 #include <stdio.h>

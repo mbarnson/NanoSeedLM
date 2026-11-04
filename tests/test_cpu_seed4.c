@@ -144,7 +144,7 @@ int main(void) {
     ok &= check(2560, 96, -22, 4);   // its down (2560 x 768), threaded
     ok &= check(1000, 33, -21, 7);
     ok &= check_tokens(40, 8, 3, 1);
-    ok &= check_tokens(640, 320, 4, 3);   // a Qwen3.8 expert's gate / up (640 x 2560), an MTP verify window
+    ok &= check_tokens(640, 320, 4, 3);   // a qwen4 expert's gate / up (640 x 2560), an MTP verify window
     ok &= check3(37, 10, -19, 1, 1);
     ok &= check3(640, 320, -21, 4, 3);
     printf("test_cpu_seed4: %s\n", ok ? "PASS" : "FAIL");

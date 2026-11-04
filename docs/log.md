@@ -178,14 +178,14 @@ rows. The sequence has an EOS and passes the sparse attention budget. Two detail
 - Equal indexer scores (ReLU zeros) go to the higher block index, as MLX's `argpartition`.
 - The model folder reader takes MLX affine Q4 with group 32. The MoVA engines refuse groups other than 64.
 
-## [2026-11-04] kernel | Qwen3.8 CUDA kernels: Gated DeltaNet, hyper-connections, Q4 group 32
+## [2026-11-04] kernel | Qwen3.8-Flash-Next CUDA kernels: Gated DeltaNet, hyper-connections, Q4 group 32
 
 `engine/kernels_qwen4.cu` has the Gated DeltaNet conv and recurrent step, the head RMSNorm and gate, the (1 + w)
 RMSNorm and the hyper-connection steps. The matvec, GEMM and embedding kernels take affine Q4 with group 32
 (`WSlice.gs`). On an HF Jobs RTX PRO 6000 (`tools/hf_cuda_test.sh`), `test_qwen4_kernels` passed:
 
-- Gated DeltaNet at the Qwen3.8 head widths (128): outputs within 3.8e-7 of `nslm/qwen4_ops.h`, the state within
-  2.2e-7.
+- Gated DeltaNet at the Qwen3.8-Flash-Next head widths (128): outputs within 3.8e-7 of `nslm/qwen4_ops.h`, the state
+  within 2.2e-7.
 - Hyper-connection steps within 1e-7.
 - Q4 group 32 within 3.7e-3 of exact dequantization, from the BF16 output rounding.
 
@@ -198,4 +198,26 @@ HF Jobs searched all 24,576 routed experts on 4 RTX PRO 6000 GPUs: 66 min at P =
 both. The mean activation-weighted relative error is 0.077 at P = 4 and 0.112 at P = 3. The packs are 105.7 GB (P = 4)
 and 98.2 GB (P = 3), against 113.3 GB for the 4-bit MLX model. They are in the storage bucket, not published yet.
 Read [The seed search over the Qwen3.8-Flash-Next experts](results/2026-11-04-qwen38-seed-search.md).
+
+## [2026-11-04] engine | The Qwen3.8-Flash-Next CUDA engine
+
+`engine/qwen4_eng.h` runs a Qwen3.8-Flash-Next MLX folder on CUDA: Gated DeltaNet, QSA attention with the indexer, the
+softmax MoE with the shared expert, the hyper-connections and the PLE layer. `nslm-qwen4-gen` generates greedily with
+timings.
+On an HF Jobs RTX PRO 6000:
+
+- Each new kernel is within 2.1e-7 of its C operation (`nslm/qwen4_ops.h`).
+- On `tests/data/qwen4_tiny`, the logits are within 2.6% of mlx-vlm's float32 logits, with the same argmax on 47 of 48
+  rows. The BF16 rounding of the matvec kernels causes the difference.
+- Any split of the tokens into rows gives the same logits.
+
+The PLE table comes from the model folder or, with `--ple-gguf`, from an Unsloth engram GGUF. The GGUF rows match the
+folder's rows in order (correlation 0.996 on the first rows). Routed experts stay in mapped host memory by default.
+
+## [2026-11-04] engine | Qwen3.8-Flash-Next-NanoSeedLM-P4 runs on the CUDA engine
+
+On an HF Jobs RTX PRO 6000 (96 GB, experts in VRAM, `tools/hf_qwen4_gen.sh`), `nslm-qwen4-gen` loaded the P4 pack in
+11.6 s. It answered "Why do tide pools matter?" with a coherent reasoning block and a correct answer. The 19-token
+prompt took 0.18 s, and the decode ran at 57.7 tokens per second. This is one run on a shared cloud machine, with no
+record of the machine state, so it is not a benchmark.
 

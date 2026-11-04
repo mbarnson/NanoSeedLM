@@ -165,11 +165,11 @@ add_executable(test_mova_kernels tests/test_mova_kernels.c tests/kernel_backend_
 target_link_libraries(test_mova_kernels nslm_engine)
 add_test(NAME test_mova_kernels COMMAND test_mova_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_mova_kernels PROPERTIES SKIP_RETURN_CODE 77)
-add_executable(test_qwen4_kernels tests/test_qwen4_kernels.c tests/kernel_backend_cuda.c)   # Qwen3.8 kernels vs nslm/qwen4_ops.h
+add_executable(test_qwen4_kernels tests/test_qwen4_kernels.c tests/kernel_backend_cuda.c)   # kernels vs nslm/qwen4_ops.h
 target_link_libraries(test_qwen4_kernels nslm_engine)
 add_test(NAME test_qwen4_kernels COMMAND test_qwen4_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen4_kernels PROPERTIES SKIP_RETURN_CODE 77)
-add_executable(test_qwen4_engine tests/test_qwen4_engine.c)   # the Qwen3.8 CUDA engine against mlx-vlm on the tiny model
+add_executable(test_qwen4_engine tests/test_qwen4_engine.c)   # the qwen4 CUDA engine against mlx-vlm on the tiny model
 target_link_libraries(test_qwen4_engine nslm_engine)
 add_test(NAME test_qwen4_engine COMMAND test_qwen4_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen4_engine PROPERTIES SKIP_RETURN_CODE 77)

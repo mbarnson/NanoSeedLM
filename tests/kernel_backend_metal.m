@@ -739,7 +739,7 @@ int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, con
     return 1;   // (as kt_mla_prefill)
 }
 
-// ---- Qwen3.8: no Metal kernels yet (docs/concepts/parity.md) --------------------------------------------------------
+// ---- qwen4: no Metal kernels yet (docs/concepts/parity.md) --------------------------------------------------------
 int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
               float* conv, float* S, float* y, int T) {
     (void) c; (void) w; (void) qkv; (void) z; (void) a; (void) b; (void) conv; (void) S; (void) y; (void) T;

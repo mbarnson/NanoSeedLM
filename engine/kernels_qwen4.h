@@ -1,4 +1,4 @@
-// engine/kernels_qwen4.h - the CUDA kernels of Qwen3.8 (engine/kernels_qwen4.cu), counterparts of nslm/qwen4_ops.h.
+// engine/kernels_qwen4.h - the CUDA kernels of qwen4 (engine/kernels_qwen4.cu), counterparts of nslm/qwen4_ops.h.
 // f32 device arrays, T tokens of consecutive rows.
 #pragma once
 #include <cuda_runtime_api.h>
