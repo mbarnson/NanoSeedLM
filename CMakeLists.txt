@@ -110,7 +110,8 @@ else()   # Linux: ICU's headers and libraries (Ubuntu / Debian: libicu-dev), fou
 endif()
 
 foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke nslm-mova-kbench
-          nslm-mova-refcheck nslm-mova-routes nslm-mova-mlacapture nslm-qwen4-gen)
+          nslm-mova-refcheck nslm-mova-routes nslm-mova-mlacapture nslm-qwen4-gen
+          nslm-qwen4-kld)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()
