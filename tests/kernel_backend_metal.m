@@ -20,17 +20,20 @@ static id<MTLBuffer> buf(const void* p, size_t n) {
     else memset(b.contents, 0, n > 0 ? n : 16);
     return b;
 }
-static id<MTLComputePipelineState> pipe_(const char* name, int fmt, int T) {
+// gs: the affine group of Q8 / Q4 weights (function constant 2); 0 or 64 leave it unset (group 64, as the engine)
+static id<MTLComputePipelineState> pipe_g(const char* name, int fmt, int T, int gs) {
     MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
-    short f = (short) fmt, t = (short) T;
+    short f = (short) fmt, t = (short) T, g = (short) gs;
     [cv setConstantValue:&f type:MTLDataTypeShort atIndex:0];
     [cv setConstantValue:&t type:MTLDataTypeShort atIndex:1];
+    if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
     NSError* err = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name] constantValues:cv error:&err];
     id<MTLComputePipelineState> p = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
     if (!p) printf("FAIL: pipeline %s: %s\n", name, err ? err.localizedDescription.UTF8String : "not found");
     return p;
 }
+static id<MTLComputePipelineState> pipe_(const char* name, int fmt, int T) { return pipe_g(name, fmt, T, 0); }
 typedef void (^Enc)(id<MTLComputeCommandEncoder>);
 static int run(Enc enc) {
     id<MTLCommandBuffer> cb = [queue commandBuffer];
@@ -83,7 +86,7 @@ static MW mw(const KtWeight* w) {
 }
 static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuffer> xb, id<MTLBuffer> yb, id<MTLBuffer> sel) {
     const MW m = mw(w);
-    id<MTLComputePipelineState> p = pipe_("k_mv", w->fmt, T);
+    id<MTLComputePipelineState> p = pipe_g("k_mv", w->fmt, T, w->group);
     if (!p) return -1;
     return run(^(id<MTLComputeCommandEncoder> e) {
         [e setComputePipelineState:p];
@@ -96,7 +99,7 @@ static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuf
     });
 }
 int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
-    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
+    if (w->group && w->group != 32 && w->group != 64) return 1;   // affine groups 32 and 64
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn), sel = buf((int32_t[]) {0}, 4);
     MvArgs a = {w->K, w->R, T, 1, w->K, w->R, 0, add};
@@ -144,7 +147,7 @@ int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float
 static int mm_dispatch(const KtWeight* w, MmArgs a, int dense, int gy, id<MTLBuffer> xb, id<MTLBuffer> yb, id<MTLBuffer> pb,
                        id<MTLBuffer> tb) {
     const MW m = mw(w);
-    id<MTLComputePipelineState> p = pipe_("k_mm", w->fmt, dense);
+    id<MTLComputePipelineState> p = pipe_g("k_mm", w->fmt, dense, w->group);
     if (!p) return -1;
     return run(^(id<MTLComputeCommandEncoder> e) {
         [e setComputePipelineState:p]; [e setBytes:&a length:sizeof a atIndex:0];
@@ -156,7 +159,7 @@ static int mm_dispatch(const KtWeight* w, MmArgs a, int dense, int gy, id<MTLBuf
     });
 }
 int kt_mm(const KtWeight* w, int T, const float* x, float* y) {
-    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
+    if (w->group && w->group != 32 && w->group != 64) return 1;   // affine groups 32 and 64
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn);
     MmArgs a = {w->K, w->R, T, w->K, w->R, 1, 1, 0};

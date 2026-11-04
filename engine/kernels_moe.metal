@@ -8,7 +8,7 @@
 using namespace metal;
 #endif
 
-// Weight formats (per tensor): BF16; MLX affine Q8 / Q4, group 64, dequantized to BF16 as mx.dequantize does;
+// Weight formats (per tensor): BF16; MLX affine Q8 / Q4, group 64 (Q4 also 32: AFF_GS), dequantized to BF16 as mx.dequantize does;
 // SEED4 / SEED4P4: LFSR seeds, expanded from the per-seed stream table.
 enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6P8 = 5 };   // = NS_* (nslm/model_st.h)
 #define MV_MAXT 8          // dense matvec: tokens per weight-row load
@@ -121,6 +121,11 @@ typedef struct { int slice, start, count, pad; } MmTile;   // grouped GEMM: one 
 
 constant short FC_FMT [[function_constant(0)]];
 constant short FC_T [[function_constant(1)]];
+// The affine group of Q8 / Q4 weights in k_mv, k_mv_gu and k_mm: 64, or 32 when function constant 2 says so (the 4-bit
+// MLX packs).  The Metal engine leaves it unset.
+constant short FC_GS [[function_constant(2)]];
+constant uint AFF_GS = is_function_constant_defined(FC_GS) ? (uint) FC_GS : 64u;
+static_assert(MV_Q4_BPL <= 4, "a lane's MV_Q4_BPL blocks must stay in one group of 32");
 // MLA quantized caches: the RoPE key FP8; the latent FP8 (KV_FP8) or its first MLA_FP4_LEAD dims FP8, the rest FP4
 #define KLH ATT_HD
 #define LLH(r) (FC_FMT == KV_FP8 ? (r) : min(MLA_FP4_LEAD, (r)))
@@ -295,7 +300,7 @@ static inline void wblock(short fmt, device const uchar* W, device const ushort*
         const uint u[4] = {v.x, v.y, v.z, v.w};
         for (int i = 0; i < 4; ++i) { w[2 * i] = as_type<float>(u[i] << 16); w[2 * i + 1] = as_type<float>(u[i] & 0xFFFF0000u); }
     } else {
-        const ulong gi = (row * (ulong) K + (ulong) j * 8) / 64;
+        const ulong gi = (row * (ulong) K + (ulong) j * 8) / AFF_GS;
         const float s = bf(S[gi]), b = bf(B[gi]);
         if (fmt == MF_Q8) {
             const uint2 q = *(device const uint2*) ((device const uint*) W + (row * (ulong) K) / 4 + (ulong) j * 2);
@@ -466,7 +471,7 @@ static inline float mv_lane(short fmt, device const uchar* W, device const ushor
     }
     if (fmt == MF_Q4) {
         for (int j0 = (int) lane * MV_Q4_BPL; j0 < nbk; j0 += 32 * MV_Q4_BPL) {
-            const ulong gi = (row * (ulong) K + (ulong) j0 * 8) / 64;
+            const ulong gi = (row * (ulong) K + (ulong) j0 * 8) / AFF_GS;   // MV_Q4_BPL blocks stay in one group of 32
             const float s = bf(S[gi]), b = bf(B[gi]);
             device const uint* qp = (device const uint*) W + (row * (ulong) K) / 8 + (ulong) j0;
             for (int k = 0; k < MV_Q4_BPL; ++k) {
@@ -590,7 +595,7 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
         // MV_Q4_BPL consecutive blocks per lane per step (one wider load; the same group's scale and bias)
         for (int j0 = (int) lane * MV_Q4_BPL; j0 < nbk; j0 += 32 * MV_Q4_BPL) {
             for (int i = 0; i < NR; ++i) {
-                const ulong gi = (row[i] * (ulong) a.K + (ulong) j0 * 8) / 64;
+                const ulong gi = (row[i] * (ulong) a.K + (ulong) j0 * 8) / AFF_GS;
                 const float s = bf(S[gi]), b = bf(B[gi]);
                 device const uint* qp = (device const uint*) W + (row[i] * (ulong) a.K) / 8 + (ulong) j0;
                 uint qws[MV_Q4_BPL];
