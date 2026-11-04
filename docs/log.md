@@ -249,3 +249,10 @@ With all experts in pinned host memory, the P3 pack decodes at 9.8 tokens per se
 VRAM expert cache gives 29.4 tokens per second at 8 GB and 31.7 at 10 GB. Two runs of each case gave the same text.
 Read [Qwen3.8-Flash-Next-NanoSeedLM-P3 on the RTX 4080](results/2026-11-04-qwen38-4080-p3.md).
 
+## [2026-11-04] engine | Qwen3.8-Flash-Next prompt rows of up to 128 tokens
+
+The qwen4 engine now runs up to 128 rows in one forward, with the tensor-core GEMM for the dense projections past 8 rows.
+The test used an HF Jobs RTX PRO 6000 and a 48 GB expert cache. 1,024 tokens of the P4 pack took 13.4 s, against 15.6 s
+in rows of 8: 15% faster. The KL divergence against the 4-bit model did not change (0.179, against 0.177). So the dense
+projections were not the main cost of a prompt. The expert misses of the cache may be: we did not profile it.
+
