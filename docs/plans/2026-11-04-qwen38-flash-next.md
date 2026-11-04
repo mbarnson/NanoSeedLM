@@ -292,7 +292,9 @@ experimental, and PCIe carries all misses.
 2. The PLE table reader is done (`nslm/ple.h`). It decodes rows of the four Unsloth table files, and it matches
    gguf-py exactly on rows of each file. The reference reads the PLE rows from the model folder.
 3. CUDA first, then Metal. Add each feature that only one engine has to the feature matrix of
-   [Metal and CUDA parity](../concepts/parity.md).
+   [Metal and CUDA parity](../concepts/parity.md). The CUDA kernels for Gated DeltaNet, the hyper-connections and
+   affine Q4 with group 32 are done (`engine/kernels_qwen4.cu`). The PLE layer, QSA attention, the MoE router and the
+   engine itself are next.
 4. Each kernel gets a C reference and a test on Metal and on CUDA.
 5. With MTP, greedy output must be identical to plain decode, as `nslm-mova-plcheck` checks for prompt lookup.
 

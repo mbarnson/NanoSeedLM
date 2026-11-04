@@ -178,3 +178,17 @@ rows. The sequence has an EOS and passes the sparse attention budget. Two detail
 - Equal indexer scores (ReLU zeros) go to the higher block index, as MLX's `argpartition`.
 - The model folder reader takes MLX affine Q4 with group 32. The MoVA engines refuse groups other than 64.
 
+## [2026-11-04] kernel | Qwen3.8 CUDA kernels: Gated DeltaNet, hyper-connections, Q4 group 32
+
+`engine/kernels_qwen4.cu` has the Gated DeltaNet conv and recurrent step, the head RMSNorm and gate, the (1 + w)
+RMSNorm and the hyper-connection steps. The matvec, GEMM and embedding kernels take affine Q4 with group 32
+(`WSlice.gs`). On an HF Jobs RTX PRO 6000 (`tools/hf_cuda_test.sh`), `test_qwen4_kernels` passed:
+
+- Gated DeltaNet at the Qwen3.8 head widths (128): outputs within 3.8e-7 of `nslm/qwen4_ops.h`, the state within
+  2.2e-7.
+- Hyper-connection steps within 1e-7.
+- Q4 group 32 within 3.7e-3 of exact dequantization, from the BF16 output rounding.
+
+`test_mova_kernels` passed on the same run, so the group change kept the MoVA kernels as they were. Metal does not have
+these kernels yet.
+
