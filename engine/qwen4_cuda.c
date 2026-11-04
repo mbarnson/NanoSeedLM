@@ -59,12 +59,21 @@ struct Q4Eng {
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
     float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
     int32_t *d_ids, *ind, *sel, *done, *nsel, *zero;
+    int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
+    cudaEvent_t ev[1024];
+    int evstage[1024];
+    double stage_ms[8];
     void** dev;   // allocations, freed at close
     int ndev, cdev;
     void** host;
     int nhost, chost;
     char err[256];
 };
+
+// the stages of a forward, for Q4E_PROFILE
+enum { ST_EMBED, ST_PLE, ST_HC, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
+static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "attention", "gated deltanet", "router + cache",
+                                         "experts", "head"};
 
 static int fail(Q4Eng* e, const char* fmt, ...) {
     if (!e->err[0]) {
@@ -350,6 +359,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 #undef F
 #undef I
     e->emb_h = (float*) malloc(sizeof(float) * T * (size_t) c->ple_dim);
+    e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
+    for (int i = 0; e->prof && i < 1024; ++i) cudaEventCreate(&e->ev[i]);
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     if (!e->err[0] && cudaDeviceSynchronize() != cudaSuccess) fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     if (e->err[0]) { snprintf(err, (size_t) errlen, "%s", e->err); q4e_close(e); return NULL; }
@@ -359,6 +370,14 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 void q4e_close(Q4Eng* e) {
     if (!e) return;
     cudaDeviceSynchronize();
+    if (e->prof) {
+        double total = 0;
+        for (int i = 0; i < ST_N; ++i) total += e->stage_ms[i];
+        fprintf(stderr, "Q4E_PROFILE: %.0f ms on the GPU stream\n", total);
+        for (int i = 0; i < ST_N; ++i)
+            if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
+        for (int i = 0; i < 1024; ++i) cudaEventDestroy(e->ev[i]);
+    }
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
     free(e->dev); free(e->host); free(e->emb_h); free(e->ids);
@@ -381,6 +400,22 @@ void q4e_reset(Q4Eng* e) {
     }
     cudaStreamSynchronize(e->s);
     e->pos = 0;
+}
+
+// ---- the stage profiler (Q4E_PROFILE=1): an event after each stage, the time to the previous event added to it -------
+
+static void mark(Q4Eng* e, int stage) {
+    if (!e->prof || e->nev >= 1024) return;
+    cudaEventRecord(e->ev[e->nev], e->s);
+    e->evstage[e->nev++] = stage;
+}
+static void prof_collect(Q4Eng* e) {   // after the stream's sync
+    for (int i = 1; i < e->nev; ++i) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e->ev[i - 1], e->ev[i]);
+        e->stage_ms[e->evstage[i]] += ms;
+    }
+    e->nev = 0;
 }
 
 // ---- the forward of up to MAXT rows ----------------------------------------------------------------------------------
@@ -460,6 +495,7 @@ static void moe(Q4Eng* e, int l, int T) {
     const int k = c->top_k, P = T * k;
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route(e->s, c, e->lg, e->ind, e->wt, T);
+    mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
         kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
         if (!e->stream) kc_cache_copy(e->s, &e->pool, 64);
@@ -475,6 +511,7 @@ static void moe(Q4Eng* e, int l, int T) {
             }
         }
     }
+    mark(e, ST_ROUTE);
     kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
     kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
     kc_mv_gu(e->s, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->A, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
@@ -486,26 +523,35 @@ static void moe(Q4Eng* e, int l, int T) {
 static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     const Qwen4Cfg* c = &e->c;
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) T);
+    mark(e, ST_EMBED);
     cudaMemcpyAsync(e->d_ids, ids, sizeof(int32_t) * (size_t) T, cudaMemcpyHostToDevice, e->s);
     kc_embed(e->s, e->embed.fmt, e->embed.w, c->d, e->d_ids, e->x, T);
     kq4_tile(e->s, c->hc, c->d, e->x, e->H, T);
+    mark(e, ST_EMBED);
     for (int l = 0; l < c->n_layer; ++l) {
         Layer* L = &e->L[l];
         if (c->ple[l] >= 0 && ple(e, l, T)) return -1;
+        mark(e, ST_PLE);
         hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
+        mark(e, ST_HC);
         if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
+        mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
         kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
         hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
+        mark(e, ST_HC);
         moe(e, l, T);
         kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
+        mark(e, ST_EXPERT);
     }
     if (logits) {   // prompt rows without logits skip the mixer and the head
         hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
         mv(e, &e->head, e->x, e->logits, T);
         cudaMemcpyAsync(logits, e->logits, sizeof(float) * (size_t) T * c->vocab, cudaMemcpyDeviceToHost, e->s);
+        mark(e, ST_HEAD);
     }
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
+    prof_collect(e);
     e->pos += T;
     return 0;
 }
