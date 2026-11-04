@@ -2,10 +2,12 @@
 
 **Goal.** Make a family of SeedLM packs for
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next). On a PC with one 16 GB GPU and 128 GB
-of DDR4, one pack must decode faster than a published quantization of similar quality. The user chooses the
-precision of the PLE table to fit the free disk space.
+of DDR4, one pack must decode faster than a published quantization of similar quality. A second target is a Mac with
+128 GB of unified memory. The user chooses the precision of the PLE table to fit the free disk space.
 
-**Status.** Draft. No step is done. Each gate gets a results page when we measure it.
+**Status.** Draft. No gate is measured yet. A first probe for H3 is done:
+[Hadamard rotation and P = 4 seeds](../results/2026-11-04-qwen38-rotation-probe.md). Each gate gets a results page
+when we measure it.
 
 Qwen3.8-Flash-Next keeps most of its weights in 24,576 small experts, and each token uses 480 of them. On a PC, most
 experts stay in RAM. The speed of decode then depends on how many bytes of experts come from DRAM for each token.
@@ -314,7 +316,7 @@ KLD(seed pack) - KLD(baseline), paired by window, is at most 0.002.
 |---|---|---|
 | H1 | The P4 pack (4.5 bits) is not worse than UD-Q4_K_XL (about 5.1 bits) | Not worse |
 | H2 | The P3 pack (4.0 bits) is not worse than UD-IQ4_XS (about 3.9 bits) | Not worse |
-| H3 | A Hadamard rotation does not decrease the weighted error of P4 seeds on one layer | Exploratory |
+| H3 | A Hadamard rotation does not decrease the weighted error of P4 seeds on one layer | Exploratory. A probe of 4 experts supports it |
 | H4 | The chosen pack decodes at least as fast as UD-Q4_K_XL in Strata on the same PC | G4 |
 | H5 | The cost of each smaller PLE table, as a KLD difference against the BF16 table | Report only |
 
@@ -367,6 +369,39 @@ A cloud session cannot reach the PC by itself. These are the four ways to run a 
    cloud session starts the workflow and reads its logs. On a public repository, do not let pull requests from
    forks use the runner.
 4. **By hand.** A cloud session writes a script. You run it on the PC and commit its output.
+
+### HF machines for PC-like tests
+
+HF Jobs can run the CUDA engine with a limit on VRAM. `NSLM_VRAM_RESERVE_MB` keeps VRAM free, so a 24 GB GPU can act
+as a 16 GB or a 12 GB GPU.
+
+| Flavor | GPU | VRAM | RAM | Price | Use |
+|---|---|---|---|---|---|
+| `l4x1` | L4 (Ada, the same architecture as the RTX 4080) | 24 GB | 30 GB | $0.80 per hour | MoVA engine tests |
+| `a10g-largex2` | 2x A10G (Ampere). Use one | 48 GB | 92 GB | $3.00 per hour | Qwen3.8 packs in RAM |
+| `l4x4` | 4x L4. Use one | 96 GB | 186 GB | $3.80 per hour | Qwen3.8 on the RTX 4080 architecture |
+| `rtx-pro-6000` | RTX PRO 6000 (Blackwell) | 96 GB | 256 GB | $2.75 per hour | Qwen3.8 correctness tests |
+
+- The T4 flavors have 16 GB, but the T4 is older than Ampere, the minimum of the CUDA engine.
+- Speed on these machines does not predict speed on the PC. The CPUs, the DRAM bandwidth and the PCIe links are not
+  the same. Use them for correctness tests and for A/B tests on one flavor. G3 and G4 need the PC.
+- A job is a batch run, so each job pays for the build and the download. Keep packs in a mounted storage bucket.
+- HF Jobs has no CUDA machine with unified memory (no GH200, GB200 or DGX Spark).
+
+## The unified-memory track
+
+NanoSeedLM was first written for unified memory. On a 128 GB M4 Max:
+
+- The P4 pack (about 76 GB) and the IQ4_NL PLE table (28.8 GB) fit in memory together, about 105 GB. The BF16 table
+  does not fit with the pack, so its rows come from the SSD.
+- There is no split between the CPU and PCIe. The GPU computes all experts, so GPU arithmetic for seeds is the limit.
+- The M4 Max runs P4 experts at about 287 G weights/s (commit `c6f9c12`). The 2.36 B routed weights then take about
+  8 ms for each token. That is at most about 120 tok/s from the experts alone (an estimate).
+- On MoVA, seed decode on Apple Silicon is 14% to 21% slower than affine Q4. So on the Mac the claim is a smaller
+  pack at equal quality, not a faster pack.
+- After S7, measure KLD and speed on the M4 Max against Strata and llama.cpp (Metal) with UD-Q4_K_XL.
+- A CUDA machine with unified memory, for example a DGX Spark, needs a CUDA path like the Metal path, with no expert
+  cache. Add it to the parity matrix when it exists.
 
 ## Risks
 

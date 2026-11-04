@@ -135,3 +135,10 @@ A plan to make a family of seed packs for Qwen3.8-Flash-Next, with gates before 
 include the PLE table. The user downloads one of the four Unsloth table files to fit the disk. The plan also records
 a quick check of the CPU P = 4 mat-vec in a cloud session: 3.3 G weights/s for each AVX2 thread. Read
 [the plan](plans/2026-11-04-qwen38-flash-next.md).
+
+## [2026-11-04] result | Hadamard rotation and P = 4 seeds on Qwen3.8-Flash-Next experts
+
+On 4 experts of layer 20, a block Hadamard rotation did not change the plain error of P = 4 seeds. An
+activation-weighted fit without rotation gave 6% to 10% less activation-weighted error. The expert weights are
+already near-Gaussian (kurtosis 3.0 to 3.06). Read
+[Hadamard rotation and P = 4 seeds](results/2026-11-04-qwen38-rotation-probe.md).

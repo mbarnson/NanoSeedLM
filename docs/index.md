@@ -58,6 +58,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   against oMLX oQe, on GQA and MLA, with pre-registered hypotheses.
 - [2026-10-11: A fused MLA prompt kernel in the MLX loader](results/2026-10-11-mla-fused-prefill.md): prompt speed at
   32K to 256K, memory, and accuracy, on MLA and hybrid models.
+- [2026-11-04: Hadamard rotation and P = 4 seeds on Qwen3.8-Flash-Next](results/2026-11-04-qwen38-rotation-probe.md):
+  weight error of 4 experts, with and without rotation and activation weighting.
 
 ## For contributors and agents
 
