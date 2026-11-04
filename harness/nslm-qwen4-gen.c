@@ -45,14 +45,11 @@ int main(int argc, char** argv) {
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
     const Qwen4Cfg* c = q4e_cfg(e);
     fprintf(stderr, "loaded in %.1f s; prompt %d tokens\n", now_s() - t0, n);
-    float* logits = (float*) malloc(sizeof(float) * (size_t) Q4E_MAX_ROWS * c->vocab);
+    float* logits = (float*) malloc(sizeof(float) * (size_t) c->vocab);
     t0 = now_s();
     int rc = 0;
-    for (int i = 0; i < n && !rc; i += Q4E_MAX_ROWS) {   // only the last row's logits are needed; rows of up to 8
-        const int T = n - i < Q4E_MAX_ROWS ? n - i : Q4E_MAX_ROWS;
-        rc = q4e_forward(e, ids + i, T, logits);
-        if (!rc && i + T == n) memmove(logits, logits + (size_t) (T - 1) * c->vocab, sizeof(float) * (size_t) c->vocab);
-    }
+    if (n > 1) rc = q4e_forward(e, ids, n - 1, NULL);   // the prompt; the last token's logits start the decode
+    if (!rc) rc = q4e_forward(e, ids + n - 1, 1, logits);
     const double tp = now_s() - t0;
     const int32_t im_end = tok_encode(tok, "<|im_end|>", 0, ids + n, 1) == 1 ? ids[n] : -1;
     int gen = 0;

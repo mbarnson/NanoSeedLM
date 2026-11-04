@@ -3,7 +3,7 @@
 #pragma once
 #include <stdint.h>
 
-#define Q4E_MAX_ROWS 8   // = MV_MAXT (engine/kernels_moe.metal)
+#define Q4E_MAX_ROWS 128   // rows of one forward: up to MV_MAXT (8) on the matvec kernels, more on the GEMM
 
 #include "qwen4_cfg.h"
 
