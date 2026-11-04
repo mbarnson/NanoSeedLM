@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# tools/hf_qwen4_pack.sh - nslm-qwen4-pack on an HF Jobs CPU node (image python:3.12): downloads the MLX base folder,
-# packs it with the seed blocks in BLK (a mounted bucket), then copies the folder to OUT (a mounted bucket).
-#
+# tools/hf_qwen4_pack.sh - nslm-qwen4-pack on an HF Jobs CPU node, from and to mounted buckets (image python:3.12).
 #   SRC=/src BASE=REPO@REVISION BLK=/in/p4/experts-p4 TIER=4 OUT=/out/pack-p4 bash tools/hf_qwen4_pack.sh
 set -euo pipefail
 pip install -q "huggingface_hub[hf_xet]" >/dev/null 2>&1

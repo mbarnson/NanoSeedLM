@@ -1,10 +1,5 @@
-// nslm/qwen4_pack.c - nslm-qwen4-pack: an MLX folder of Qwen3.8-Flash-Next (qwen4_exp) whose routed experts are seeds.
-//
+// nslm/qwen4_pack.c - nslm-qwen4-pack: an MLX qwen4_exp base folder with each layer's switch_mlp replaced by seeds.
 //   nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR) --out DIR [--loader tools/nanoseedlm_qwen4.py] [--shard-gb 4.5]
-//
-// --base: an MLX qwen4_exp folder (mlx-community/Qwen3.8-Flash-Next-4bit).  --blk / --blk4: nslm-moe's P = 3 / P = 4
-// L{l}_{proj}.blk(4).  Every base tensor is copied as it is, except the switch_mlp projections of each layer with all
-// three block files.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

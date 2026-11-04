@@ -127,9 +127,8 @@ for (uint r = 0; r < 4; ++r) {
 }
 """
 
-# One threadgroup per (BM-row block, tile of one expert's sorted pairs). tiles[e] / starts[e]: the expert's first
-# tile / pair (cumulative; entry E is the total). The weight tile is decode's BF16, the multiply f32 simdgroup MMA
-# (4 simdgroups of 32 rows x 32 pairs), stored from the accumulators.
+# One threadgroup per (BM-row block, tile of one expert's sorted pairs; tiles / starts cumulative per expert): BF16
+# weight tiles, f32 simdgroup MMA (4 simdgroups of 32 rows x 32 pairs).
 _GEMM = """
 const uint tid = thread_index_in_threadgroup, sgi = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
 const int t = int(threadgroup_position_in_grid.y);
@@ -184,9 +183,8 @@ _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) {
 }
 """
 
-# out[t] = sum_j T(y[inverse[t K + j]] * T(w[t][j])): K2's routed (y * w).sum(-2) on the expert-sorted rows, rounded as
-# mlx does it (products in T, then a sequential sum in T), 4 columns per thread. The rounding to T is explicit
-# (round_to): the compiler may keep a loop-carried bfloat in f32.
+# out[t] = sum_j T(y[inverse[t K + j]] * T(w[t][j])): (y * w).sum(-2) on expert-sorted rows, rounded to T as mlx does
+# (explicitly: the compiler may keep a loop-carried bfloat in f32); 4 columns per thread.
 _COMBINE = """
 const uint d = thread_position_in_grid.x * 4, t = thread_position_in_grid.y;
 if (d >= D) return;

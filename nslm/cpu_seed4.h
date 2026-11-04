@@ -36,8 +36,7 @@ void cpu_seed4_tiled_free(CpuSeed4Tiled* t);
 // tiled layout with coefs = the nibble words and no codes; the mat-vec and mat-mul below take either P.
 void cpu_seed3_tile(CpuSeed4Tiled* t, const uint16_t* seeds, const uint16_t* nibs, int bias, int rows, int kb);
 void cpu_seed4_tiled_matvec_mt(const CpuSeed4Tiled* t, const uint32_t* table, const float* x, float* y, int threads);
-// ntok (<= CPU_SEED4_MAX_TOK) tokens at once: x [ntok][kb * 8], y [ntok][rows].  Each block's LFSR states are made once
-// for all the tokens (an MTP verify window): per token, 2 tokens give 1.3x and 4 tokens 2x the one-token rate (AVX2).
-// Each token's rows equal cpu_seed4_tiled_matvec_mt's, bit for bit.
+// ntok (<= CPU_SEED4_MAX_TOK) tokens, x [ntok][kb * 8] -> y [ntok][rows]: each block's LFSR states made once for all of
+// them; each token's rows equal cpu_seed4_tiled_matvec_mt's, bit for bit.
 #define CPU_SEED4_MAX_TOK 8
 void cpu_seed4_tiled_matmul_mt(const CpuSeed4Tiled* t, const uint32_t* table, const float* x, int ntok, float* y, int threads);

@@ -14,9 +14,8 @@ typedef struct {
     double seconds;
 } MoeBlkHeader;
 
-// Stream s (model_st.h) of an nslm-moe block file image of E slices of rows x cols.  P = 3 (.blk, SEED4): 0 seeds,
-// 1 nibble words, 2 int32 bias per slice.  P = 4 (.blk4, SEED4P4): the same with coefficient words, then 3 exponent
-// codes (block 2j in the low nibble of byte j).  -1 when blk is not that file.
+// Stream s (model_st.h order) of an nslm-moe block file of E slices of rows x cols: P = 3 (.blk, SEED4) or P = 4
+// (.blk4, SEED4P4, exponent codes low nibble first).  -1 when blk is not that file.
 int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int cols, int s, uint8_t* dst);
 
 // Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.

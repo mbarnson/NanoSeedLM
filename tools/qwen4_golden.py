@@ -1,5 +1,4 @@
 # tools/qwen4_golden.py - a tiny random qwen4_exp model in the 4-bit pack formats, and its mlx-vlm float32 logits.
-#
 #   python tools/qwen4_golden.py tests/data/qwen4_tiny   (the logits go to tests/data/qwen4_tiny_golden.safetensors)
 import json
 import os

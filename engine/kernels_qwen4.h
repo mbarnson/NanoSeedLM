@@ -12,9 +12,8 @@ extern "C" {
 typedef struct {
     const float *conv_w, *A_log, *dt_bias, *norm_w;   // as Qwen4GdnW, in f32
 } Q4GdnDev;
-// T tokens in order through a Gated DeltaNet layer (qwen4_gdn_token): qkv[T][conv_dim], z[T][hv * dv], a and b [T][hv]
-// -> y[T][hv * dv].  conv and S (layouts of qwen4_ops.h) are updated; cv is scratch of T x conv_dim floats.
-// -1 when the head widths are not supported (dk 32, 64 or 128; dv a multiple of 32, at most 1024; conv kernel <= 8).
+// qwen4_gdn_token for T tokens in order (conv and S updated; cv: T x conv_dim scratch).  -1 unless dk is 32, 64 or
+// 128, dv a multiple of 32 up to 1024 and the conv kernel at most 8.
 int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b,
             float* conv, float* S, float* cv, float* y, int T);
 // y[t] = qwen4_norm1p(x[t], len, g, w, eps) for t < T (y may be x)

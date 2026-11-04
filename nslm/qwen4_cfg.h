@@ -1,10 +1,4 @@
 // nslm/qwen4_cfg.h - the qwen4_exp text configuration (only what the reference implements), and the PLE n-gram rows.
-//
-// PLE n-grams.  A PLE layer adds rows of a large embedding table chosen by a hash of the last `ngram` tokens.  Head h of
-// the n-gram of length n (n = 2 .. ngram, heads_per_ngram heads each) reads row
-//     off[h] + (XOR over p < n of tok[t - p] * mult[p]) mod size[h],
-// where size[h] is a prime, mult[p] an odd multiplier from splitmix64, and tok[t - p] is EOS once the walk back from t
-// passes an EOS (a document starts a new context).  The rows of all heads, side by side, form the layer's embedding.
 #pragma once
 #include <stdint.h>
 
@@ -29,6 +23,8 @@ typedef struct {
 int qwen4_cfg_parse(Qwen4Cfg* c, const char* json, char* err, int errlen);   // config.json text (text_config or flat)
 int qwen4_cfg_load(Qwen4Cfg* c, const char* model_dir, char* err, int errlen);
 
+// PLE hash (splitmix64 PRNG): head h of the n-gram of length n reads row off[h] + (XOR_{p<n} tok[t-p] mult[p]) mod
+// size[h], size[h] prime, mult[p] odd from splitmix64; at or past an EOS the context is EOS.  The heads' rows concatenate.
 typedef struct {
     int heads;                                        // (ngram - 1) * heads_per_ngram
     int64_t mult[QWEN4_MAX_NGRAM], size[QWEN4_MAX_PLE_HEADS], off[QWEN4_MAX_PLE_HEADS];

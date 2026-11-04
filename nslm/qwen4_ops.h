@@ -1,10 +1,5 @@
 // nslm/qwen4_ops.h - the qwen4_exp operations of one token: the reference forward is built from them, the GPU kernels
 // are tested against them.
-//
-// Gated DeltaNet keeps, for each value head, a matrix state S that maps keys to values.  Each token decays S by g, then
-// corrects it toward the token's value along its key (the delta rule), and reads it with the query:
-//     S = g S,   S += beta (v - S k) k^T,   y = S q
-// with g = exp(-exp(A_log) softplus(a + dt_bias)) and beta = sigmoid(b) per head.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -22,7 +17,8 @@ typedef struct {
     const float *A_log, *dt_bias;   // [hv]
     const float *norm_w;    // [dv], a plain RMSNorm weight
 } Qwen4GdnW;
-// The state of one layer: conv[(K - 1)][conv_dim] (the last K - 1 inputs, oldest first) and S[hv][dk][dv]
+// Gated DeltaNet (delta rule) per value head: S = g S; S += beta (v - S k) k^T; y = S q, with g = exp(-exp(A_log)
+// softplus(a + dt_bias)), beta = sigmoid(b).  A layer's state: conv[(K - 1)][conv_dim] (oldest first), S[hv][dk][dv].
 size_t qwen4_gdn_conv_len(const Qwen4Cfg* c);
 size_t qwen4_gdn_state_len(const Qwen4Cfg* c);
 // One token: qkv[conv_dim], z[hv * dv], a[hv], b[hv] (the projections) -> y[hv * dv] (normed and gated by sigmoid(z));

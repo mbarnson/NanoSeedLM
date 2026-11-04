@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# tools/hf_qwen4_gen.sh - a qwen4 pack through the CUDA engine on an HF Jobs GPU node: copies the pack from a mounted
-# bucket to local disk, builds nslm-qwen4-gen and generates.  SRC: the tree; PACK: the pack folder; GEN_ARGS: more options.
-#
+# tools/hf_qwen4_gen.sh - a pack (copied from a mounted bucket) through nslm-qwen4-gen on an HF Jobs GPU node.
 #   SRC=/b/src PACK=/b/pack-p4 PROMPT="Why do tide pools matter?" [GEN_ARGS="--vram-experts"] bash tools/hf_qwen4_gen.sh
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive

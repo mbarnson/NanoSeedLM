@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # tools/hf_cuda_test.sh - builds and runs CUDA test targets on an HF Jobs GPU node (image nvidia/cuda:*-devel).
-#
 #   SRC=/src [TARGETS="test_qwen4_kernels test_qwen4_engine test_qwen4_ref test_mova_kernels"] bash tools/hf_cuda_test.sh
 set -euo pipefail
 TARGETS=${TARGETS:-"test_qwen4_kernels test_qwen4_engine test_qwen4_ref test_mova_kernels"}
