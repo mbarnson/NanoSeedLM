@@ -231,8 +231,8 @@ decode at 22.1 tokens per second. The GPU reads the experts over PCIe for each t
 
 `--expert-cache-gb` keeps the most recently used routed experts in VRAM, on the MoVA `CachePool` (`k_cache_admit` now
 takes 512 experts per layer). The other experts stay in pinned host memory. With the smallest cache, the tiny model's
-logits are the same bit for bit. On an HF Jobs RTX PRO 6000 with the P3 pack and an 8 GB cache (3,255 of 24,576
-experts), the decode ran at 41.6 tokens per second against 22.1 without the cache. The prompt ran at 48.5 tokens per
-second against 25.4. The cache hit 69% of the expert reads, and the greedy output was the same text. This is one run,
+logits are the same bit for bit. The measurement used an HF Jobs RTX PRO 6000, the P3 pack and an 8 GB cache (3,255
+of 24,576 experts). The decode ran at 41.6 tokens per second against 22.1 without the cache. The prompt ran at 48.5
+tokens per second against 25.4. The cache hit 69% of the expert reads, and the greedy output was the same text. This is one run,
 not a benchmark, and the PCIe link of this machine is not that of an RTX 4080.
 
