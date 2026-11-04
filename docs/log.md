@@ -243,3 +243,9 @@ The CUDA engine ran both models on 1,024 tokens of wikitext-2. The mean KL diver
 2.396 to 2.500 and 2.480. The reference is a quantized model, not BF16. Read
 [The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model](results/2026-11-04-qwen38-kld-vs-4bit.md).
 
+## [2026-11-04] result | Qwen3.8-Flash-Next-NanoSeedLM-P3 on the RTX 4080
+
+With all experts in pinned host memory, the P3 pack decodes at 9.8 tokens per second on the RTX 4080 (PCIe 4.0). A
+VRAM expert cache gives 29.4 tokens per second at 8 GB and 31.7 at 10 GB. Two runs of each case gave the same text.
+Read [Qwen3.8-Flash-Next-NanoSeedLM-P3 on the RTX 4080](results/2026-11-04-qwen38-4080-p3.md).
+
