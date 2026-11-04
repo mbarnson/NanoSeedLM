@@ -17,9 +17,6 @@
 #include "rows.h"
 
 #define MAXT Q4E_MAX_ROWS
-#if Q4E_MAX_ROWS != MV_MAXT
-#error Q4E_MAX_ROWS must equal MV_MAXT
-#endif
 
 typedef struct {   // a weight: its format and shape, slice 0, and a device table of all its slices
     int fmt, slices, rows, cols;
@@ -138,8 +135,10 @@ static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
 }
 
 static const uint32_t* G(const Q4Eng* e, const W* w) { return w->fmt == MF_SEED4P4 ? e->g32 : e->g24; }
+// y[T][rows] = W x[T][cols]: the matvec for up to MV_MAXT rows, the tensor-core GEMM (BF16 inputs) for more
 static void mv(Q4Eng* e, const W* w, const float* x, float* y, int T) {
-    kc_mv(e->s, w->fmt, w->w, w->cols, w->rows, x, w->cols, y, w->rows, T, 0, G(e, w));
+    if (T <= MV_MAXT) kc_mv(e->s, w->fmt, w->w, w->cols, w->rows, x, w->cols, y, w->rows, T, 0, G(e, w));
+    else kc_mm(e->s, w->fmt, w->w, w->cols, w->rows, x, w->cols, y, w->rows, T, 0, G(e, w));
 }
 
 static void load_layer(Q4Eng* e, int l) {
@@ -500,9 +499,11 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         moe(e, l, T);
         kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
     }
-    hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
-    mv(e, &e->head, e->x, e->logits, T);
-    if (logits) cudaMemcpyAsync(logits, e->logits, sizeof(float) * (size_t) T * c->vocab, cudaMemcpyDeviceToHost, e->s);
+    if (logits) {   // prompt rows without logits skip the mixer and the head
+        hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
+        mv(e, &e->head, e->x, e->logits, T);
+        cudaMemcpyAsync(logits, e->logits, sizeof(float) * (size_t) T * c->vocab, cudaMemcpyDeviceToHost, e->s);
+    }
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     e->pos += T;
