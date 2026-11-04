@@ -161,3 +161,9 @@ use it, so the user can choose the table precision to fit the disk.
 one-token kernel's, bit for bit. On a cloud Xeon with 4 vCPUs (AVX2 build, load average below 0.1), for each token:
 1 token 3.3 G weights/s (12.3 on 4 threads), 2 tokens 4.4 (16.8), 4 tokens 6.5 (24.6). One token keeps the
 one-token kernel, which is 12% faster than the general one.
+
+## [2026-11-04] kernel | P = 3 seeds on the CPU
+
+`cpu_seed3_tile` puts SEED4 (P = 3) matrices in the tiled CPU layout, and the CPU mat-vec and mat-mul take them. The
+rows match the scalar spec within 8e-7. On the same cloud Xeon (4 vCPUs, AVX2 build, load average 0.07), for each
+token: 13.9, 21.5 and 32.3 G weights/s at 1, 2 and 4 tokens, against 12.4, 16.8 and 25.1 at P = 4.

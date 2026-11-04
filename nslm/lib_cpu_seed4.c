@@ -172,7 +172,7 @@ void cpu_seed4_tile(CpuSeed4Tiled* t, const uint16_t* seeds, const uint16_t* coe
     t->seeds = malloc((size_t) tiles * kb * T * 2);
     t->coefs = calloc((size_t) tiles * kb * T, 2);
     t->codes = calloc((size_t) tiles * (kb / 2) * T, 1);
-    t->bias = bias, t->rows = rows, t->kb = kb, t->tiles = tiles;
+    t->bias = bias, t->rows = rows, t->kb = kb, t->tiles = tiles, t->p = 4;
     for (int tile = 0; tile < tiles; ++tile)
         for (int b = 0; b < kb; ++b)
             for (int i = 0; i < T; ++i) {
@@ -190,6 +190,22 @@ void cpu_seed4_tile(CpuSeed4Tiled* t, const uint16_t* seeds, const uint16_t* coe
 void cpu_seed4_tiled_free(CpuSeed4Tiled* t) {
     free(t->seeds), free(t->coefs), free(t->codes);
     memset(t, 0, sizeof *t);
+}
+
+void cpu_seed3_tile(CpuSeed4Tiled* t, const uint16_t* seeds, const uint16_t* nibs, int bias, int rows, int kb) {
+    const int T = CPU_SEED4_T, tiles = (rows + T - 1) / T;
+    t->seeds = malloc((size_t) tiles * kb * T * 2);
+    t->coefs = calloc((size_t) tiles * kb * T, 2);
+    t->codes = NULL;
+    t->bias = bias, t->rows = rows, t->kb = kb, t->tiles = tiles, t->p = 3;
+    for (int tile = 0; tile < tiles; ++tile)
+        for (int b = 0; b < kb; ++b)
+            for (int i = 0; i < T; ++i) {
+                const int r = tile * T + i;
+                const size_t o = ((size_t) tile * kb + b) * T + i;
+                t->seeds[o] = r < rows ? seeds[(size_t) r * kb + b] : 1;   // padding: a valid seed, zero coefficients
+                if (r < rows) t->coefs[o] = nibs[(size_t) r * kb + b];
+            }
 }
 
 // One tile: the arithmetic of rows16, with vector loads.
@@ -261,7 +277,9 @@ static void* tworker(void* arg) {
     return NULL;
 }
 
+static void run_n(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads);
 void cpu_seed4_tiled_matvec_mt(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, float* y, int threads) {
+    if (m->p == 3) { run_n(m, table, x, 1, y, threads); return; }
     float* xs = malloc(m->kb * sizeof(float));
     block_sums(x, m->kb, xs);
     TJob j = {m, table, x, xs, y, 0};
@@ -328,6 +346,50 @@ static void tile_rows_n(const CpuSeed4Tiled* m, int tile, const uint32_t* table,
     for (int k = 0; k < ntok; ++k) memcpy(out + (size_t) k * T, &acc[k], sizeof acc[k]);
 }
 
+// P = 3: states 1..24 (v[3c + p] = state 3c + p + 1), the nibble word's code and 3 coefficients; else as tile_rows_n.
+static void tile_rows3_n(const CpuSeed4Tiled* m, int tile, const uint32_t* table, const float* x, const float* xs, int ntok,
+                         float* out) {
+    const int kb = m->kb, T = CPU_SEED4_T;
+    const uint16_t* sp = m->seeds + (size_t) tile * kb * T;
+    const uint16_t* qp = m->coefs + (size_t) tile * kb * T;
+    f16v acc[CPU_SEED4_MAX_TOK];
+    for (int k = 0; k < ntok; ++k) acc[k] = 0.0f;
+    for (int b = 0; b < kb; ++b) {
+        h16v s16, q16;
+        memcpy(&s16, sp + (size_t) b * T, sizeof s16);
+        memcpy(&q16, qp + (size_t) b * T, sizeof q16);
+        const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
+        u16v t;
+        for (int i = 0; i < VW; ++i) t[i] = table[sp[(size_t) b * T + i]];
+        const u16v lo = s | t << 16;
+        f16v v[24];
+#define GEN(c)                                                                                   \
+        v[3 * (c)] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 1));                                    \
+        v[3 * (c) + 1] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 2));                                \
+        v[3 * (c) + 2] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 3));
+        GEN(0) GEN(1) GEN(2) GEN(3) GEN(4) GEN(5) GEN(6) GEN(7)
+#undef GEN
+        const i16v qi = (i16v) q;
+        const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v);
+        const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);
+        const f16v qs = 1.5f * ((q0 + q1) + q2);
+        const f16v sc = (f16v) ((u16v) (m->bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32;
+        for (int k = 0; k < ntok; ++k) {
+            const float* xb = x + (size_t) k * kb * 8 + 8 * b;
+            f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                const f16v xc = xb[c];
+                a0 = fma16(xc, v[3 * c], a0);
+                a1 = fma16(xc, v[3 * c + 1], a1);
+                a2 = fma16(xc, v[3 * c + 2], a2);
+            }
+            const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - qs * xs[(size_t) k * kb + b];
+            acc[k] = fma16(d, sc, acc[k]);
+        }
+    }
+    for (int k = 0; k < ntok; ++k) memcpy(out + (size_t) k * T, &acc[k], sizeof acc[k]);
+}
+
 typedef struct {
     const CpuSeed4Tiled* m;
     const uint32_t* table;
@@ -346,7 +408,7 @@ static void* nworker(void* arg) {
         if (t0 >= j->m->tiles) break;
         const int t1 = t0 + TILE_CHUNK < j->m->tiles ? t0 + TILE_CHUNK : j->m->tiles;
         for (int tile = t0; tile < t1; ++tile) {
-            tile_rows_n(j->m, tile, j->table, j->x, j->xs, j->ntok, out);
+            (j->m->p == 3 ? tile_rows3_n : tile_rows_n)(j->m, tile, j->table, j->x, j->xs, j->ntok, out);
             const int r0 = tile * T, n = j->m->rows - r0 < T ? j->m->rows - r0 : T;
             for (int k = 0; k < j->ntok; ++k) memcpy(j->y + (size_t) k * j->m->rows + r0, out + (size_t) k * T, n * sizeof(float));
         }
@@ -354,8 +416,14 @@ static void* nworker(void* arg) {
     return NULL;
 }
 
+static void run_n(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads);
+
 void cpu_seed4_tiled_matmul_mt(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads) {
-    if (ntok == 1) { cpu_seed4_tiled_matvec_mt(m, table, x, y, threads); return; }   // 12% faster: no state array
+    if (ntok == 1 && m->p == 4) cpu_seed4_tiled_matvec_mt(m, table, x, y, threads);   // 12% faster: no state array
+    else run_n(m, table, x, ntok, y, threads);
+}
+
+static void run_n(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads) {
     float* xs = malloc((size_t) ntok * m->kb * sizeof(float));
     for (int k = 0; k < ntok; ++k) block_sums(x + (size_t) k * m->kb * 8, m->kb, xs + (size_t) k * m->kb);
     NJob j = {m, table, x, xs, y, ntok, 0};
