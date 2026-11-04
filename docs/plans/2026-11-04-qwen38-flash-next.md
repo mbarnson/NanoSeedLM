@@ -282,6 +282,8 @@ experimental, and PCIe carries all misses.
 1. Qwen3.6-35B-A3B first. It has the Gated DeltaNet layers, the gated attention, the MoE with a shared expert and the
    MTP layer. Its BF16 weights (72 GB) fit in 128 GB of RAM, so the reference and the tests run on the PC.
 2. Then the parts that only Qwen3.8 has: the hyper-connections, the indexer, the PLE weights and the PLE table reader.
+   The PLE table reader is done (`nslm/ple.h`). It decodes rows of the four Unsloth table files, and it matches
+   gguf-py exactly on rows of each file.
 3. CUDA first, then Metal. Add each feature that only one engine has to the feature matrix of
    [Metal and CUDA parity](../concepts/parity.md).
 4. Each kernel gets a C reference and a test on Metal and on CUDA.

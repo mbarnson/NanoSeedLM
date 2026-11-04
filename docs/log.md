@@ -148,3 +148,9 @@ already near-Gaussian (kurtosis 3.0 to 3.06). Read
 `nslm-moe` reads the expert shapes of a `qwen4_exp` model from `config.json`, and the fused expert tensors by slice.
 `--imatrix` takes the activation weights from a llama.cpp imatrix GGUF (`nslm/gguf.h`). `tools/hf_seedbank.sh` takes
 `IMATRIX` and `ONLY`. A CPU run on layer 20 of the BF16 checkpoint read 1,852 imatrix tensors and the expert counts.
+
+## [2026-11-04] engine | PLE table rows from the Unsloth engram files
+
+`nslm/ple.h` reads rows of `per_layer_token_embd.weight` (160 x 320 M) from a GGUF file in BF16, Q8_0, Q5_1 or IQ4_NL.
+On rows at the start, the middle and the end of each Unsloth file, it matched gguf-py exactly. The engine port will
+use it, so the user can choose the table precision to fit the disk.
