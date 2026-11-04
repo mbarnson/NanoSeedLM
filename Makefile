@@ -27,7 +27,8 @@ HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harn
 HARN_HDRS := $(wildcard harness/*.h)
 ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h
 
-METALLIBS := $(RES)/kernels_moe.metallib $(RES)/search.metallib $(RES)/search4.metallib $(RES)/searchp.metallib
+METALLIBS := $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib $(RES)/search.metallib $(RES)/search4.metallib \
+             $(RES)/searchp.metallib
 ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes \
              nslm-mova-mlacapture
 TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-qwen4-pack nslm-bits-probe nslm-cpu-seed-bench)
@@ -45,6 +46,10 @@ build: $(METALLIBS) $(TOOLS)
 $(RES)/kernels_moe.metallib: engine/kernels_moe.metal
 	@mkdir -p $(@D)
 	$(METAL) -c $< -o $(@D)/kernels_moe.air && xcrun -sdk macosx metallib $(@D)/kernels_moe.air -o $@
+# the qwen4 kernels without fast math: they match nslm/qwen4_ops.h within 1e-5 (RoPE at large positions, exp, rsqrt)
+$(RES)/kernels_qwen4.metallib: engine/kernels_qwen4.metal
+	@mkdir -p $(@D)
+	$(METAL) -fno-fast-math -c $< -o $(@D)/kernels_qwen4.air && xcrun -sdk macosx metallib $(@D)/kernels_qwen4.air -o $@
 $(RES)/search.metallib: nslm/search.metal nslm/search_gpu.h nslm/lfsr.h
 	@mkdir -p $(@D)
 	$(METAL) -fno-fast-math -Inslm -c $< -o $(@D)/search.air && xcrun -sdk macosx metallib $(@D)/search.air -o $@
@@ -131,12 +136,12 @@ $(BIN)/test_search4_gpu: tests/test_search4_gpu.c $(OBJ)/search4_metal.o $(LIB_O
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(OBJ)/search4_metal.o $(LIB_O) $(LIBS) -lpthread -o $@
 $(BIN)/test_mova_kernels: tests/test_mova_kernels.c tests/kernel_backend_metal.m tests/kernel_backend.h engine/kernels_moe.metal \
-                          $(LIB_O) $(RES)/kernels_moe.metallib
+                          engine/kernels_qwen4.metal $(LIB_O) $(RES)/kernels_moe.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c tests/test_mova_kernels.c -o $(OBJ)/test_mova_kernels.o
 	$(CC) $(OBJCFLAGS) -Itests tests/kernel_backend_metal.m $(OBJ)/test_mova_kernels.o $(LIB_O) $(LIBS) -o $@
 $(BIN)/test_qwen4_kernels: tests/test_qwen4_kernels.c tests/kernel_backend_metal.m tests/kernel_backend.h engine/kernels_moe.metal \
-                           $(LIB_O) $(RES)/kernels_moe.metallib
+                           engine/kernels_qwen4.metal $(LIB_O) $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c tests/test_qwen4_kernels.c -o $(OBJ)/test_qwen4_kernels.o
 	$(CC) $(OBJCFLAGS) -Itests tests/kernel_backend_metal.m $(OBJ)/test_qwen4_kernels.o $(LIB_O) $(LIBS) -o $@

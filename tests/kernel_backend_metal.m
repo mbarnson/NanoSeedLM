@@ -1,17 +1,19 @@
-// tests/kernel_backend_metal.m - tests/kernel_backend.h on the Metal kernels (engine/kernels_moe.metal, from
-// out/res/kernels_moe.metallib), dispatched as the Metal engine dispatches them.  Shared-storage buffers: outputs are
-// read straight from them.
+// tests/kernel_backend_metal.m - tests/kernel_backend.h on the Metal kernels (engine/kernels_moe.metal and
+// engine/kernels_qwen4.metal, from out/res/*.metallib), dispatched as the Metal engine dispatches them.  Shared-storage
+// buffers: outputs are read straight from them.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "kernel_backend.h"
+#include "kernels_qwen4.metal"   // Q4*Args
 #include "lfsr.h"
 
 static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
-static id<MTLLibrary> lib;
+static id<MTLLibrary> lib, lib4;   // kernels_moe.metallib; kernels_qwen4.metallib (nil: the qwen4 calls fail)
 static id<MTLBuffer> g24, g32;   // the seed tables: lfsr_stream24 (SEED4) and lfsr_stream32 (SEED4P4)
 
 static id<MTLBuffer> buf(const void* p, size_t n) {
@@ -62,11 +64,12 @@ int kt_open(char* err, int errlen) {
     NSError* e = nil;
     lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"out/res/kernels_moe.metallib"] error:&e];
     if (!lib) { snprintf(err, (size_t) errlen, "no out/res/kernels_moe.metallib"); return -1; }
+    lib4 = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"out/res/kernels_qwen4.metallib"] error:&e];
     g24 = table(stream24);
     g32 = table(stream32);
     return 0;
 }
-void kt_close(void) { lib = nil; queue = nil; dev = nil; g24 = g32 = nil; }
+void kt_close(void) { lib = lib4 = nil; queue = nil; dev = nil; g24 = g32 = nil; }
 const char* kt_name(void) { return "Metal"; }
 int kt_mm_tile(void) { return MM_BN; }
 int kt_attn_key_tile(void) { return ATTF_BK; }
@@ -746,42 +749,202 @@ int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, con
     return 1;   // (as kt_mla_prefill)
 }
 
-// ---- qwen4: no Metal kernels yet (docs/concepts/parity.md) --------------------------------------------------------
+// ---- qwen4 (engine/kernels_qwen4.metal, from out/res/kernels_qwen4.metallib) ---------------------------------------
+
+static id<MTLComputePipelineState> pipe4(const char* name) {
+    if (!lib4) { printf("FAIL: no out/res/kernels_qwen4.metallib\n"); return nil; }
+    NSError* err = nil;
+    id<MTLFunction> fn = [lib4 newFunctionWithName:[NSString stringWithUTF8String:name]];
+    id<MTLComputePipelineState> p = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+    if (!p) printf("FAIL: pipeline %s: %s\n", name, err ? err.localizedDescription.UTF8String : "not found");
+    return p;
+}
+// The pipeline, the args at buffer 0 and the buffers at 1 ..
+static void enc4(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p, const void* args, size_t an, NSArray<id<MTLBuffer>>* bs) {
+    [e setComputePipelineState:p];
+    [e setBytes:args length:an atIndex:0];
+    for (NSUInteger i = 0; i < bs.count; ++i) [e setBuffer:bs[i] offset:0 atIndex:i + 1];
+}
+#define TGS(x, y) MTLSizeMake((NSUInteger) (x), (NSUInteger) (y), 1)
+// The inverse RoPE frequencies as the C ops round them (f32 of a double power)
+static id<MTLBuffer> rope_inv(const Qwen4Cfg* c) {
+    float inv[512];
+    for (int i = 0; i < c->rot_dim / 2; ++i) inv[i] = (float) pow((double) c->rope_theta, -2.0 * i / c->rot_dim);
+    return buf(inv, 4 * (size_t) (c->rot_dim / 2));
+}
+
 int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
               float* conv, float* S, float* y, int T) {
-    (void) c; (void) w; (void) qkv; (void) z; (void) a; (void) b; (void) conv; (void) S; (void) y; (void) T;
-    return 1;
+    const int dk = c->lin_dk, dv = c->lin_dv, K = c->lin_conv, hv = c->lin_hv;
+    if (K < 1 || K > 8 || dv % 32 || dv > 1024 || (dk != 32 && dk != 64 && dk != 128)) {
+        printf("FAIL: kt_q4_gdn: head widths not supported\n");
+        return -1;
+    }
+    const size_t cd = (size_t) 2 * c->lin_hk * dk + (size_t) hv * dv, vd = (size_t) hv * dv;
+    const size_t nc = qwen4_gdn_conv_len(c), ns = qwen4_gdn_state_len(c);
+    id<MTLComputePipelineState> pc = pipe4("k_q4_gdn_conv"), pn = pipe4("k_q4_gdn_norm");
+    id<MTLComputePipelineState> ps = pipe4(dk == 32 ? "k_q4_gdn_step_32" : dk == 64 ? "k_q4_gdn_step_64" : "k_q4_gdn_step_128");
+    if (!pc || !ps || !pn) return -1;
+    id<MTLBuffer> wb = buf(w->conv_w, 4 * cd * K), Ab = buf(w->A_log, 4 * (size_t) hv), db = buf(w->dt_bias, 4 * (size_t) hv),
+                  nb = buf(w->norm_w, 4 * (size_t) dv), qb = buf(qkv, 4 * cd * T), zb = buf(z, 4 * vd * T),
+                  ab = buf(a, 4 * (size_t) hv * T), bb = buf(b, 4 * (size_t) hv * T), cb = buf(conv, 4 * nc), Sb = buf(S, 4 * ns),
+                  cvb = buf(NULL, 4 * cd * T), yb = buf(NULL, 4 * vd * T);
+    const Q4ConvArgs ca = {(int) cd, K, T, 0};
+    const Q4GdnArgs ga = {(int) cd, c->lin_hk * dk, (int) vd, hv, hv / c->lin_hk, dv, T, 0};
+    const Q4GNormArgs na = {hv, dv, c->eps, 0};
+    const int split = dk == 128 ? 2 : 1;
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, pc, &ca, sizeof ca, @[wb, qb, cb, cvb]);
+            [e dispatchThreads:TGS(cd, 1) threadsPerThreadgroup:TGS(256, 1)];
+            enc4(e, ps, &ga, sizeof ga, @[cvb, ab, bb, Ab, db, Sb, yb]);
+            [e dispatchThreadgroups:TGS(hv, dv / 32) threadsPerThreadgroup:TGS(32 * split, 1)];
+            enc4(e, pn, &na, sizeof na, @[nb, zb, yb]);
+            [e dispatchThreadgroups:TGS(hv, T) threadsPerThreadgroup:TGS(dv, 1)];
+        }))
+        return -1;
+    memcpy(conv, cb.contents, 4 * nc);
+    memcpy(S, Sb.contents, 4 * ns);
+    memcpy(y, yb.contents, 4 * vd * T);
+    return 0;
 }
 int kt_q4_norm1p(const float* x, int len, int g, const float* w, float eps, float* y, int T) {
-    (void) x; (void) len; (void) g; (void) w; (void) eps; (void) y; (void) T;
-    return 1;
+    id<MTLComputePipelineState> p = pipe4("k_q4_norm1p");
+    if (!p) return -1;
+    id<MTLBuffer> xb = buf(x, 4 * (size_t) len * T), wb = buf(w, 4 * (size_t) len), yb = buf(NULL, 4 * (size_t) len * T);
+    const Q4NormArgs na = {len, g, eps, 0};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, p, &na, sizeof na, @[xb, wb, yb]);
+            [e dispatchThreadgroups:TGS(T * (len / g), 1) threadsPerThreadgroup:TGS(256, 1)];
+        }))
+        return -1;
+    memcpy(y, yb.contents, 4 * (size_t) len * T);
+    return 0;
 }
 int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up, float* mixed, float* inj, float* H,
              const float* branch, int T) {
-    (void) c; (void) lo; (void) normed; (void) up; (void) mixed; (void) inj; (void) H; (void) branch; (void) T;
-    return 1;
+    const size_t HD = (size_t) c->hc * c->d, nl = (size_t) c->hc_rank * T, ni = (size_t) c->hc * T, nm = (size_t) c->d * T;
+    id<MTLComputePipelineState> pa = pipe4("k_q4_hc_act"), pm = pipe4("k_q4_hc_mix"), pg = pipe4("k_q4_hc_gate"), pd = pipe4("k_q4_hc_add");
+    if (!pa || !pm || !pg || !pd) return -1;
+    id<MTLBuffer> lb = buf(lo, 4 * nl), nb = buf(normed, 4 * HD * T), ub = buf(up, 4 * HD * T), mb = buf(NULL, 4 * nm),
+                  ib = buf(inj, 4 * ni), Hb = buf(H, 4 * HD * T), bb = buf(branch, 4 * nm);
+    const float ih = 1.0f / (float) c->hc;
+    const Q4HcArgs act = {c->hc, c->d, (int) nl, ih}, gate = {c->hc, c->d, (int) ni, ih}, mix = {c->hc, c->d, 0, ih};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, pa, &act, sizeof act, @[lb]);
+            [e dispatchThreads:TGS(nl, 1) threadsPerThreadgroup:TGS(256, 1)];
+            enc4(e, pm, &mix, sizeof mix, @[nb, ub, mb]);
+            [e dispatchThreads:TGS(c->d, T) threadsPerThreadgroup:TGS(256, 1)];
+            enc4(e, pg, &gate, sizeof gate, @[ib]);
+            [e dispatchThreads:TGS(ni, 1) threadsPerThreadgroup:TGS(256, 1)];
+            enc4(e, pd, &mix, sizeof mix, @[Hb, bb, ib]);
+            [e dispatchThreads:TGS(c->d, T) threadsPerThreadgroup:TGS(256, 1)];
+        }))
+        return -1;
+    memcpy(lo, lb.contents, 4 * nl);
+    memcpy(mixed, mb.contents, 4 * nm);
+    memcpy(inj, ib.contents, 4 * ni);
+    memcpy(H, Hb.contents, 4 * HD * T);
+    return 0;
 }
 int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T) {
-    (void) c; (void) x; (void) rs; (void) nh; (void) hs; (void) hd; (void) w; (void) pos0; (void) T;
-    return 1;
+    if (hd > 1024 || c->rot_dim > hd || c->rot_dim % 2 || c->rot_dim > 1024) { printf("FAIL: kt_q4_head_norm_rope: widths\n"); return -1; }
+    id<MTLComputePipelineState> p = pipe4("k_q4_head_norm_rope");
+    if (!p) return -1;
+    id<MTLBuffer> xb = buf(x, 4 * (size_t) rs * T), wb = buf(w, 4 * (size_t) hd), ib = rope_inv(c);
+    const Q4RopeArgs ra = {rs, hs, hd, c->rot_dim, pos0, 1, c->eps, 0};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, p, &ra, sizeof ra, @[xb, wb, ib]);
+            [e dispatchThreadgroups:TGS(nh, T) threadsPerThreadgroup:TGS(128, 1)];
+        }))
+        return -1;
+    memcpy(x, xb.contents, 4 * (size_t) rs * T);
+    return 0;
 }
 int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T) {
-    (void) c; (void) logits; (void) ind; (void) wt; (void) T;
-    return 1;
+    if (c->top_k > 32) { printf("FAIL: kt_q4_route: top_k above 32\n"); return -1; }
+    id<MTLComputePipelineState> p = pipe4("k_q4_route");
+    if (!p) return -1;
+    const size_t nk = (size_t) T * c->top_k;
+    id<MTLBuffer> lb = buf(logits, 4 * (size_t) T * c->n_exp), ib = buf(NULL, 4 * nk), wb = buf(NULL, 4 * nk);
+    const Q4RouteArgs ra = {c->n_exp, c->top_k, {0, 0}};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, p, &ra, sizeof ra, @[lb, ib, wb]);
+            [e dispatchThreadgroups:TGS(T, 1) threadsPerThreadgroup:TGS(32, 1)];
+        }))
+        return -1;
+    memcpy(ind, ib.contents, 4 * nk);
+    memcpy(wt, wb.contents, 4 * nk);
+    return 0;
 }
 int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, const float* w, const float* cin,
               float* hist, float* H, int T) {
-    (void) c; (void) keys; (void) qs; (void) vals; (void) gated; (void) w; (void) cin; (void) hist; (void) H; (void) T;
-    return 1;
+    if ((c->ple_conv - 1) * c->ngram > 32) { printf("FAIL: kt_q4_ple: conv history above 32\n"); return -1; }
+    id<MTLComputePipelineState> pg = pipe4("k_q4_ple_gate"), pc = pipe4("k_q4_ple_conv");
+    if (!pg || !pc) return -1;
+    const size_t HD = (size_t) c->hc * c->d, nh = qwen4_ple_hist_len(c);
+    id<MTLBuffer> kb = buf(keys, 4 * HD * T), qb = buf(qs, 4 * HD * T), vb = buf(vals, 4 * (size_t) c->d * T), gb = buf(NULL, 4 * HD * T),
+                  wb = buf(w, 4 * HD * c->ple_conv), cb = buf(cin, 4 * HD * T), hb = buf(hist, 4 * nh), Hb = buf(H, 4 * HD * T);
+    const Q4PleGateArgs ga = {c->hc, c->d, {0, 0}};
+    const Q4PleConvArgs ca = {(int) HD, c->ple_conv, c->ngram, T};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, pg, &ga, sizeof ga, @[kb, qb, vb, gb]);
+            [e dispatchThreadgroups:TGS(c->hc, T) threadsPerThreadgroup:TGS(256, 1)];
+            enc4(e, pc, &ca, sizeof ca, @[wb, cb, gb, hb, Hb]);
+            [e dispatchThreads:TGS(HD, 1) threadsPerThreadgroup:TGS(256, 1)];
+        }))
+        return -1;
+    memcpy(gated, gb.contents, 4 * HD * T);
+    memcpy(hist, hb.contents, 4 * nh);
+    memcpy(H, Hb.contents, 4 * HD * T);
+    return 0;
 }
 int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float* blk, const float* iq, int rs, const int32_t* done,
               int32_t* sel, int T) {
-    (void) c; (void) raw; (void) w; (void) nb; (void) blk; (void) iq; (void) rs; (void) done; (void) sel; (void) T;
-    return 1;
+    const int D = c->ix_dim, k = c->ix_budget / c->ix_ratio;
+    if (D > 1024 || c->rot_dim > D) { printf("FAIL: kt_q4_qsa: widths\n"); return -1; }
+    int maxdone = 0;
+    for (int t = 0; t < T; ++t) if (done[t] > maxdone) maxdone = done[t];
+    id<MTLComputePipelineState> pm = pipe4("k_q4_qsa_mean"), pr = pipe4("k_q4_head_norm_rope"), ps = pipe4("k_q4_qsa_scores"),
+                                pt = pipe4("k_q4_qsa_topk");
+    if (!pm || !pr || !ps || !pt) return -1;
+    id<MTLBuffer> rb = buf(raw, 4 * (size_t) nb * c->ix_ratio * D), wb = buf(w, 4 * (size_t) D), bb = buf(NULL, 4 * (size_t) nb * D),
+                  ib = rope_inv(c), qb = buf(iq, 4 * (size_t) rs * T), db = buf(done, 4 * (size_t) T),
+                  scb = buf(NULL, 4 * (size_t) T * (maxdone ? maxdone : 1)), sb = buf(sel, 4 * (size_t) T * k);
+    const Q4QsaMeanArgs ma = {D, c->ix_ratio, {0, 0}};
+    const Q4RopeArgs ra = {D, D, D, c->rot_dim, 0, c->ix_ratio, c->eps, 0};   // block j at position j * ratio
+    const Q4QsaArgs qa = {c->ix_heads, D, rs, maxdone, k, {0, 0, 0}};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, pm, &ma, sizeof ma, @[rb, bb]);
+            [e dispatchThreadgroups:TGS(nb, 1) threadsPerThreadgroup:TGS(128, 1)];
+            enc4(e, pr, &ra, sizeof ra, @[bb, wb, ib]);
+            [e dispatchThreadgroups:TGS(1, nb) threadsPerThreadgroup:TGS(128, 1)];
+            if (maxdone > 0) {
+                enc4(e, ps, &qa, sizeof qa, @[qb, bb, db, scb]);
+                [e dispatchThreadgroups:TGS((maxdone + 7) / 8, T) threadsPerThreadgroup:TGS(256, 1)];
+                enc4(e, pt, &qa, sizeof qa, @[scb, db, sb]);
+                [e dispatchThreadgroups:TGS(T, 1) threadsPerThreadgroup:TGS(256, 1)];
+            }
+        }))
+        return -1;
+    memcpy(blk, bb.contents, 4 * (size_t) nb * D);
+    memcpy(sel, sb.contents, 4 * (size_t) T * k);
+    return 0;
 }
 int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
                  const int32_t* nsel, float* o, int T) {
-    (void) c; (void) q; (void) K; (void) V; (void) npos; (void) pos0; (void) sel; (void) nsel; (void) o; (void) T;
-    return 1;
+    if (c->head_dim % 32 || c->head_dim > 256) { printf("FAIL: kt_q4_attend: head_dim not supported\n"); return -1; }
+    id<MTLComputePipelineState> p = pipe4("k_q4_attend");
+    if (!p) return -1;
+    const size_t kv = (size_t) npos * c->n_kv * c->head_dim, no = (size_t) T * c->n_head * c->head_dim;
+    const int topk = c->ix_budget / c->ix_ratio;
+    id<MTLBuffer> qb = buf(q, 4 * no * 2), Kb = buf(K, 4 * kv), Vb = buf(V, 4 * kv), sb = buf(sel, 4 * (size_t) T * topk),
+                  nb = buf(nsel, 4 * (size_t) T), ob = buf(NULL, 4 * no);
+    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), 0};
+    if (run(^(id<MTLComputeCommandEncoder> e) {
+            enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob]);
+            [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
+        }))
+        return -1;
+    memcpy(o, ob.contents, 4 * no);
+    return 0;
 }
-

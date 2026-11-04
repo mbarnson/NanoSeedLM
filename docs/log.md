@@ -262,3 +262,23 @@ In mlx-vlm on the M4 Max, the P3 pack decodes at 34 tokens per second, as fast a
 peak memory is 65.5 GB against 74.3 GB. Spotlight ran during the runs, so the numbers are noisy. Read
 [Qwen3.8-Flash-Next-NanoSeedLM-P3 in mlx-vlm on the M4 Max](results/2026-11-04-qwen38-m4max-mlx-p3.md).
 
+## [2026-11-04] kernel | Qwen3.8-Flash-Next Metal kernels, and Q4 group 32 on Metal
+
+`engine/kernels_qwen4.metal` has the Metal counterparts of the `engine/kernels_qwen4.cu` kernels that
+`test_qwen4_kernels` checks:
+
+- The Gated DeltaNet conv, step and output norm.
+- The (1 + w) RMSNorm and the hyper-connection steps.
+- The head RMSNorm with RoPE, and the router.
+- The PLE gate and conv.
+- The QSA block keys and the top-k block select.
+- The sparse attention.
+
+The file compiles without fast math. Metal has no double type, so the host computes the RoPE inverse frequencies as
+the C ops do. The Metal matvec and GEMM take affine Q4 with group 32 through function constant 2. The Metal engine
+does not set it, so its kernels keep group 64.
+
+On the M4 Max, `test_qwen4_kernels` passed. Each qwen4 kernel is within 6.4e-7 of `nslm/qwen4_ops.h`. Q4 group 32 is
+within 3.7e-3 of exact dequantization, from the BF16 output rounding. The rest of the `make test` output is the same
+as on main. The Metal engine does not run Qwen3.8-Flash-Next yet. The MoE combine, the stream tile and the Q4
+embedding are not on Metal yet.

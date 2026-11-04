@@ -1,0 +1,339 @@
+// engine/kernels_qwen4.metal - Metal kernels of qwen4 (out/res/kernels_qwen4.metallib), the counterparts of
+// nslm/qwen4_ops.h and of CUDA's engine/kernels_qwen4.cu.  f32 values and sums, compiled without fast math.
+// C includes this file for the argument structs only.
+#ifndef NSLM_KERNELS_QWEN4_METAL
+#define NSLM_KERNELS_QWEN4_METAL
+
+typedef struct { int cd, K, T, pad; } Q4ConvArgs;                    // GDN causal conv: channels, kernel, tokens
+typedef struct { int cd, kd, vd, hv, rep, dv, T, pad; } Q4GdnArgs;    // GDN step: conv_dim, hk * dk, hv * dv, ...
+typedef struct { int hv, dv; float eps; int pad; } Q4GNormArgs;       // GDN output norm
+typedef struct { int len, g; float eps; int pad; } Q4NormArgs;        // RMSNorm (1 + w) in groups of g
+typedef struct { int hc, d, n; float inv_hc; } Q4HcArgs;              // hyper-connection pointwise steps
+typedef struct { int rs, hs, hd, rot, pos0, pstep; float eps; int pad; } Q4RopeArgs;   // row t at pos0 + t * pstep
+typedef struct { int E, k, pad[2]; } Q4RouteArgs;                     // experts, top k (<= 32)
+typedef struct { int hc, d, pad[2]; } Q4PleGateArgs;
+typedef struct { int HD, K, dil, T; } Q4PleConvArgs;                  // (K - 1) * dil <= 32
+typedef struct { int D, R, pad[2]; } Q4QsaMeanArgs;                   // block keys: ix_dim, ix_ratio
+typedef struct { int nh, D, rs, maxdone, k, pad[3]; } Q4QsaArgs;      // scores and top k
+typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int pad; } Q4AttArgs;   // hd a multiple of 32, <= 256
+
+#ifdef __METAL_VERSION__
+#include <metal_stdlib>
+using namespace metal;
+
+static inline float sigm(float x) { return 1.0f / (1.0f + exp(-x)); }
+// The sum of v over the threadgroup (nsg simdgroups of 32), the same value in every thread
+static inline float tg_sum(float v, threadgroup float* red, uint lane, uint sg, uint nsg) {
+    v = simd_sum(v);
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // an earlier tg_sum's reads of red are done
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0;
+    for (uint k = 0; k < nsg; ++k) s += red[k];
+    return s;
+}
+
+// ---- Gated DeltaNet ---------------------------------------------------------------------------------------------------
+
+// One thread per channel, the T tokens in order: cv = silu(causal conv of the last K inputs); conv keeps the last K - 1.
+kernel void k_q4_gdn_conv(constant Q4ConvArgs& a [[buffer(0)]], device const float* w [[buffer(1)]], device const float* qkv [[buffer(2)]],
+                          device float* conv [[buffer(3)]], device float* cv [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    const int ch = (int) gid, cd = a.cd, K = a.K;
+    if (ch >= cd) return;
+    float st[7], wk[8];
+    for (int k = 0; k < K - 1; ++k) st[k] = conv[(ulong) k * cd + ch];
+    for (int k = 0; k < K; ++k) wk[k] = w[(ulong) ch * K + k];
+    for (int t = 0; t < a.T; ++t) {
+        const float x = qkv[(ulong) t * cd + ch];
+        float acc = wk[K - 1] * x;
+        for (int k = 0; k < K - 1; ++k) acc += wk[k] * st[k];
+        cv[(ulong) t * cd + ch] = acc * sigm(acc);
+        for (int k = 0; k + 1 < K - 1; ++k) st[k] = st[k + 1];
+        if (K > 1) st[K - 2] = x;
+    }
+    for (int k = 0; k < K - 1; ++k) conv[(ulong) k * cd + ch] = st[k];
+}
+
+// Threadgroup = 32 value rows of head hv (grid hv x dv / 32); SPLIT threads (adjacent lanes) hold one row's state column
+// S[hv][.][i] over the T tokens, DK / SPLIT values each.  y gets the raw read S q; k_q4_gdn_norm normalises and gates it.
+#define GDN_STEP_ARGS                                                                                                      \
+    constant Q4GdnArgs& a [[buffer(0)]], device const float* cv [[buffer(1)]], device const float* aa [[buffer(2)]],      \
+        device const float* bb [[buffer(3)]], device const float* A_log [[buffer(4)]],                                    \
+        device const float* dt_bias [[buffer(5)]], device float* S [[buffer(6)]], device float* y [[buffer(7)]],          \
+        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+template <int DK, int SPLIT>
+kernel void k_q4_gdn_step(GDN_STEP_ARGS) {
+    constexpr int DJ = DK / SPLIT;
+    const int hv = (int) tg.x, p = (int) tid % SPLIT, i = (int) tg.y * 32 + (int) tid / SPLIT, kh = hv / a.rep;
+    threadgroup float q[DK], k[DK];
+    float s[DJ];
+    device float* St = S + (ulong) hv * DK * a.dv + (ulong) p * DJ * a.dv + i;
+    for (int j = 0; j < DJ; ++j) s[j] = St[(ulong) j * a.dv];
+    const float A = exp(A_log[hv]), dtb = dt_bias[hv];
+    for (int t = 0; t < a.T; ++t) {
+        device const float* c = cv + (ulong) t * a.cd;
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous token's reads of q and k are done
+        for (int j = (int) tid; j < DK; j += 32 * SPLIT) { q[j] = c[kh * DK + j]; k[j] = c[a.kd + kh * DK + j]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float qq = 0, kk = 0;
+        for (int j = 0; j < DK; ++j) { qq += q[j] * q[j]; kk += k[j] * k[j]; }
+        const float sq = rsqrt(qq + 1e-6f) * rsqrt((float) DK), sk = rsqrt(kk + 1e-6f);   // L2 norms; q also dk^-0.5
+        const float ap = aa[(ulong) t * a.hv + hv] + dtb, sp = ap > 20.0f ? ap : log(1.0f + exp(ap));
+        const float g = exp(-A * sp), beta = sigm(bb[(ulong) t * a.hv + hv]);
+        threadgroup const float* kp = k + p * DJ;
+        threadgroup const float* qp = q + p * DJ;
+        float kv = 0;
+        for (int j = 0; j < DJ; ++j) kv += s[j] * kp[j];
+        if (SPLIT == 2) kv += simd_shuffle_xor(kv, (ushort) 1);
+        const float delta = (c[2 * a.kd + hv * a.dv + i] - g * kv * sk) * beta;
+        float yq = 0;
+        for (int j = 0; j < DJ; ++j) { s[j] = g * s[j] + delta * kp[j] * sk; yq += s[j] * qp[j]; }
+        if (SPLIT == 2) yq += simd_shuffle_xor(yq, (ushort) 1);
+        if (p == 0) y[(ulong) t * a.vd + (ulong) hv * a.dv + i] = yq * sq;
+    }
+    for (int j = 0; j < DJ; ++j) St[(ulong) j * a.dv] = s[j];
+}
+template [[host_name("k_q4_gdn_step_32")]] kernel void k_q4_gdn_step<32, 1>(GDN_STEP_ARGS);
+template [[host_name("k_q4_gdn_step_64")]] kernel void k_q4_gdn_step<64, 1>(GDN_STEP_ARGS);
+template [[host_name("k_q4_gdn_step_128")]] kernel void k_q4_gdn_step<128, 2>(GDN_STEP_ARGS);
+
+// Threadgroup (head, token), thread = value row (dv threads): RMSNorm over the head (plain weight), gated by sigmoid(z)
+kernel void k_q4_gdn_norm(constant Q4GNormArgs& a [[buffer(0)]], device const float* norm_w [[buffer(1)]], device const float* z [[buffer(2)]],
+                          device float* y [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[32];
+    const ulong o = ((ulong) tg.y * a.hv + tg.x) * a.dv + tid;
+    const float v = y[o], r = rsqrt(tg_sum(v * v, red, lane, sg, (uint) a.dv / 32) / a.dv + a.eps);
+    y[o] = v * r * norm_w[tid] * sigm(z[o]);
+}
+
+// ---- RMSNorm (1 + w) and the hyper-connection pointwise steps --------------------------------------------------------
+
+// Threadgroup = one group of g values of one token (256 threads)
+kernel void k_q4_norm1p(constant Q4NormArgs& a [[buffer(0)]], device const float* x [[buffer(1)]], device const float* w [[buffer(2)]],
+                        device float* y [[buffer(3)]], uint b [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[32];
+    const int groups = a.len / a.g, t = (int) b / groups, o = ((int) b % groups) * a.g;
+    device const float* xi = x + (ulong) t * a.len + o;
+    float ss = 0;
+    for (int k = (int) tid; k < a.g; k += 256) ss += xi[k] * xi[k];
+    const float r = rsqrt(tg_sum(ss, red, lane, sg, 8) / a.g + a.eps);
+    for (int k = (int) tid; k < a.g; k += 256) y[(ulong) t * a.len + o + k] = xi[k] * r * (1.0f + w[o + k]);
+}
+
+kernel void k_q4_hc_act(constant Q4HcArgs& a [[buffer(0)]], device float* lo [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if ((int) i < a.n) { const float x = lo[i] * a.inv_hc; lo[i] = x * sigm(x); }
+}
+kernel void k_q4_hc_gate(constant Q4HcArgs& a [[buffer(0)]], device float* inj [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if ((int) i < a.n) inj[i] = 2.0f * sigm(inj[i] * a.inv_hc);
+}
+// grid (d, T): mixed[t][i] = mean_s sigmoid(up[t][s][i]) normed[t][s][i]
+kernel void k_q4_hc_mix(constant Q4HcArgs& a [[buffer(0)]], device const float* normed [[buffer(1)]], device const float* up [[buffer(2)]],
+                        device float* mixed [[buffer(3)]], uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y;
+    if (i >= a.d) return;
+    const ulong o = (ulong) t * a.hc * a.d + i;
+    float m = 0;
+    for (int s = 0; s < a.hc; ++s) m += sigm(up[o + (ulong) s * a.d]) * normed[o + (ulong) s * a.d];
+    mixed[(ulong) t * a.d + i] = m / a.hc;
+}
+// grid (d, T): H[t][s][i] += branch[t][i] inj[t][s]
+kernel void k_q4_hc_add(constant Q4HcArgs& a [[buffer(0)]], device float* H [[buffer(1)]], device const float* branch [[buffer(2)]],
+                        device const float* inj [[buffer(3)]], uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y;
+    if (i >= a.d) return;
+    const float b = branch[(ulong) t * a.d + i];
+    for (int s = 0; s < a.hc; ++s) H[((ulong) t * a.hc + s) * a.d + i] += b * inj[t * a.hc + s];
+}
+
+// ---- head norm + RoPE, the router ----------------------------------------------------------------------------------
+
+// Threadgroup (head, row), 128 threads: RMSNorm (1 + w) of the head, then RoPE of its first rot values at position
+// pos0 + row * pstep.  inv[rot / 2]: the inverse frequencies, rounded to f32 by the host as the C ops do; f32 angles.
+kernel void k_q4_head_norm_rope(constant Q4RopeArgs& a [[buffer(0)]], device float* x [[buffer(1)]], device const float* w [[buffer(2)]],
+                                device const float* inv [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[32], v[1024];
+    device float* xh = x + (ulong) tg.y * a.rs + (ulong) tg.x * a.hs;
+    float ss = 0;
+    for (int i = (int) tid; i < a.hd; i += 128) ss += xh[i] * xh[i];
+    const float r = rsqrt(tg_sum(ss, red, lane, sg, 4) / a.hd + a.eps);
+    for (int i = (int) tid; i < a.hd; i += 128) v[i] = xh[i] * r * (1.0f + w[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int pos = a.pos0 + (int) tg.y * a.pstep, h2 = a.rot / 2;
+    for (int i = (int) tid; i < a.hd; i += 128) {
+        float o = v[i];
+        if (i < a.rot) {
+            const float ang = (float) pos * inv[i % h2], cs = cos(ang), sn = sin(ang);
+            o = i < h2 ? v[i] * cs - v[i + h2] * sn : v[i] * cs + v[i - h2] * sn;
+        }
+        xh[i] = o;
+    }
+}
+
+// One simdgroup per row: k rounds of an arg max of the logits (ties to the higher expert); weights exp(l - max)
+// renormalised over the k
+kernel void k_q4_route(constant Q4RouteArgs& a [[buffer(0)]], device const float* logits [[buffer(1)]], device int* ind [[buffer(2)]],
+                       device float* wt [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    device const float* l = logits + (ulong) t * a.E;
+    float mx = -INFINITY;
+    for (int e = (int) lane; e < a.E; e += 32) mx = max(mx, l[e]);
+    mx = simd_max(mx);
+    int chosen[32];
+    float w[32], top = 0;
+    for (int r = 0; r < a.k; ++r) {
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int e = (int) lane; e < a.E; e += 32) {
+            bool taken = false;
+            for (int q = 0; q < r; ++q) taken |= chosen[q] == e;
+            if (!taken && (l[e] > bv || (l[e] == bv && e > bi))) { bv = l[e]; bi = e; }
+        }
+        for (ushort o = 16; o > 0; o >>= 1) {   // every lane ends with the same (value, index)
+            const float ov = simd_shuffle_xor(bv, o);
+            const int oi = simd_shuffle_xor(bi, o);
+            if (ov > bv || (ov == bv && oi > bi)) { bv = ov; bi = oi; }
+        }
+        chosen[r] = bi;
+        w[r] = exp(bv - mx);
+        top += w[r];
+    }
+    if (lane == 0)
+        for (int r = 0; r < a.k; ++r) { ind[(ulong) t * a.k + r] = chosen[r]; wt[(ulong) t * a.k + r] = w[r] / top; }
+}
+
+// ---- PLE ---------------------------------------------------------------------------------------------------------------
+
+// Threadgroup (stream, token), 256 threads: gated = sigmoid(signed sqrt(keys . qs / sqrt(d))) vals
+kernel void k_q4_ple_gate(constant Q4PleGateArgs& a [[buffer(0)]], device const float* keys [[buffer(1)]], device const float* qs [[buffer(2)]],
+                          device const float* vals [[buffer(3)]], device float* gated [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[32];
+    const ulong o = ((ulong) tg.y * a.hc + tg.x) * a.d;
+    float dot = 0;
+    for (int i = (int) tid; i < a.d; i += 256) dot += keys[o + i] * qs[o + i];
+    const float g = tg_sum(dot, red, lane, sg, 8) / sqrt((float) a.d);
+    const float gs = sigm(g == 0.0f ? 0.0f : copysign(sqrt(max(fabs(g), 1e-6f)), g));   // a signed square root
+    for (int i = (int) tid; i < a.d; i += 256) gated[o + i] = gs * vals[(ulong) tg.y * a.d + i];
+}
+
+// One thread per channel, tokens in order: H += gated + silu(causal conv, dilation dil); the last (K - 1) * dil inputs in
+// registers
+kernel void k_q4_ple_conv(constant Q4PleConvArgs& a [[buffer(0)]], device const float* w [[buffer(1)]], device const float* cin [[buffer(2)]],
+                          device const float* gated [[buffer(3)]], device float* hist [[buffer(4)]], device float* H [[buffer(5)]],
+                          uint gid [[thread_position_in_grid]]) {
+    const int ch = (int) gid, HD = a.HD, K = a.K;
+    if (ch >= HD) return;
+    const int L = (K - 1) * a.dil;
+    float st[32];
+    for (int j = 0; j < L; ++j) st[j] = hist[(ulong) j * HD + ch];
+    for (int t = 0; t < a.T; ++t) {
+        const float x = cin[(ulong) t * HD + ch];
+        float acc = w[(ulong) ch * K + K - 1] * x;
+        for (int k = 0; k < K - 1; ++k) acc += w[(ulong) ch * K + k] * st[L - (K - 1 - k) * a.dil];
+        H[(ulong) t * HD + ch] += gated[(ulong) t * HD + ch] + acc * sigm(acc);
+        for (int j = 0; j + 1 < L; ++j) st[j] = st[j + 1];
+        if (L > 0) st[L - 1] = x;
+    }
+    for (int j = 0; j < L; ++j) hist[(ulong) j * HD + ch] = st[j];
+}
+
+// ---- QSA ---------------------------------------------------------------------------------------------------------------
+
+// Threadgroup = block j: blk[j] = the mean of raw keys j * R .. j * R + R - 1 (k_q4_head_norm_rope then norms and rotates it)
+kernel void k_q4_qsa_mean(constant Q4QsaMeanArgs& a [[buffer(0)]], device const float* raw [[buffer(1)]], device float* blk [[buffer(2)]],
+                          uint j [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    for (int i = (int) tid; i < a.D; i += 128) {
+        float m = 0;
+        for (int u = 0; u < a.R; ++u) m += raw[((ulong) j * a.R + u) * a.D + i];
+        blk[(ulong) j * a.D + i] = m / a.R;
+    }
+}
+
+// Simdgroup per (row, block), 8 blocks a threadgroup: sum over heads of relu(q_h . blk_j)
+kernel void k_q4_qsa_scores(constant Q4QsaArgs& a [[buffer(0)]], device const float* iq [[buffer(1)]], device const float* blk [[buffer(2)]],
+                            device const int* done [[buffer(3)]], device float* sc [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    const int t = (int) tg.y, j = (int) tg.x * 8 + (int) sg;
+    if (j >= done[t]) return;
+    float s = 0;
+    for (int h = 0; h < a.nh; ++h) {
+        float d = 0;
+        for (int i = (int) lane; i < a.D; i += 32) d += iq[(ulong) t * a.rs + h * a.D + i] * blk[(ulong) j * a.D + i];
+        s += max(simd_sum(d), 0.0f);
+    }
+    if (lane == 0) sc[(ulong) t * a.maxdone + j] = s;
+}
+// Threadgroup per row (256 threads): the k-th largest score by a radix select on its bits (scores are >= 0), then every
+// score above it and, of the equal ones, those of the highest blocks.  Rows with done <= k are left as they are.
+kernel void k_q4_qsa_topk(constant Q4QsaArgs& a [[buffer(0)]], device const float* sc [[buffer(1)]], device const int* done [[buffer(2)]],
+                          device int* sel [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[32];
+    threadgroup atomic_int nout;
+    const int n = done[t];
+    if (n <= a.k) return;
+    device const uint* u = (device const uint*) (sc + (ulong) t * a.maxdone);
+    uint p = 0;
+    for (int b = 31; b >= 0; --b) {
+        const uint cand = p | (1u << b);
+        float cnt = 0;
+        for (int j = (int) tid; j < n; j += 256) cnt += u[j] >= cand ? 1.0f : 0.0f;
+        if (tg_sum(cnt, red, lane, sg, 8) >= (float) a.k) p = cand;
+    }
+    if (tid == 0) atomic_store_explicit(&nout, 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device int* out = sel + (ulong) t * a.k;
+    for (int j = (int) tid; j < n; j += 256)
+        if (u[j] > p) out[atomic_fetch_add_explicit(&nout, 1, memory_order_relaxed)] = j;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (tid == 0)
+        for (int j = n - 1, m = atomic_load_explicit(&nout, memory_order_relaxed); j >= 0 && m < a.k; --j)
+            if (u[j] == p) out[m++] = j;
+}
+
+// ---- attention ---------------------------------------------------------------------------------------------------------
+
+// Threadgroup (head, row), 8 simdgroups: each takes every 8th visible key with an online softmax (lanes hold hd / 32
+// dims of q and of the output), then the simdgroups merge; the output is gated by sigmoid of the query's gate half
+kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* K [[buffer(2)]],
+                        device const float* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
+                        device float* o [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sm[8], sl[8], sacc[8][256];
+    const int h = (int) tg.x, t = (int) tg.y, w = (int) sg, dl = a.hd / 32, g = h / (a.nh / a.nkv);
+    const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    device const float* qh = q + ((ulong) t * a.nh + h) * 2 * a.hd;
+    float qv[8], acc[8], m = -INFINITY, l = 0;
+    for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
+    for (int k = w; k < n; k += 8) {
+        const int key = k < ns * a.R ? sel[(ulong) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+        device const float* kk = K + ((ulong) key * a.nkv + g) * a.hd;
+        float d = 0;
+        for (int i = 0; i < dl; ++i) d += qv[i] * kk[lane + 32 * i];
+        d = simd_sum(d) * a.scale;
+        const float mn = max(m, d), cf = exp(m - mn), p = exp(d - mn);
+        device const float* vv = V + ((ulong) key * a.nkv + g) * a.hd;
+        for (int i = 0; i < dl; ++i) acc[i] = acc[i] * cf + p * vv[lane + 32 * i];
+        l = l * cf + p;
+        m = mn;
+    }
+    if (lane == 0) { sm[w] = m; sl[w] = l; }
+    for (int i = 0; i < dl; ++i) sacc[w][lane + 32 * i] = acc[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M = -INFINITY;
+    for (int x = 0; x < 8; ++x) M = max(M, sm[x]);
+    float L = 0;
+    for (int x = 0; x < 8; ++x) L += sm[x] == -INFINITY ? 0.0f : sl[x] * exp(sm[x] - M);
+    for (int i = (int) tid; i < a.hd; i += 256) {
+        float v = 0;
+        for (int x = 0; x < 8; ++x) if (sm[x] != -INFINITY) v += sacc[x][i] * exp(sm[x] - M);
+        o[((ulong) t * a.nh + h) * a.hd + i] = v / L * sigm(qh[a.hd + i]);
+    }
+}
+
+#endif   // __METAL_VERSION__
+#endif   // NSLM_KERNELS_QWEN4_METAL
