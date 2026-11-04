@@ -96,6 +96,7 @@ static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuf
     });
 }
 int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn), sel = buf((int32_t[]) {0}, 4);
     MvArgs a = {w->K, w->R, T, 1, w->K, w->R, 0, add};
@@ -736,4 +737,20 @@ int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, con
     (void) a; (void) qfmt; (void) qc; (void) qs; (void) qb; (void) vfmt; (void) vc; (void) vs; (void) vb; (void) c; (void) n;
     (void) Kn; (void) Vd;
     return 1;   // (as kt_mla_prefill)
+}
+
+// ---- Qwen3.8: no Metal kernels yet (docs/concepts/parity.md) --------------------------------------------------------
+int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
+              float* conv, float* S, float* y, int T) {
+    (void) c; (void) w; (void) qkv; (void) z; (void) a; (void) b; (void) conv; (void) S; (void) y; (void) T;
+    return 1;
+}
+int kt_q4_norm1p(const float* x, int len, int g, const float* w, float eps, float* y, int T) {
+    (void) x; (void) len; (void) g; (void) w; (void) eps; (void) y; (void) T;
+    return 1;
+}
+int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up, float* mixed, float* inj, float* H,
+             const float* branch, int T) {
+    (void) c; (void) lo; (void) normed; (void) up; (void) mixed; (void) inj; (void) H; (void) branch; (void) T;
+    return 1;
 }

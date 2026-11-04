@@ -32,9 +32,9 @@ ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score 
              nslm-mova-mlacapture
 TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-qwen4-pack nslm-bits-probe nslm-cpu-seed-bench)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c tests/test_searchp_gpu.c \
-                            tests/test_mova_kernels.c,$(wildcard tests/test_*.c))
+                            tests/test_mova_kernels.c tests/test_qwen4_kernels.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
-             $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels
+             $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels
 
 .PHONY: all build test test-mlx clean
 all: build
@@ -134,6 +134,11 @@ $(BIN)/test_mova_kernels: tests/test_mova_kernels.c tests/kernel_backend_metal.m
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c tests/test_mova_kernels.c -o $(OBJ)/test_mova_kernels.o
 	$(CC) $(OBJCFLAGS) -Itests tests/kernel_backend_metal.m $(OBJ)/test_mova_kernels.o $(LIB_O) $(LIBS) -o $@
+$(BIN)/test_qwen4_kernels: tests/test_qwen4_kernels.c tests/kernel_backend_metal.m tests/kernel_backend.h engine/kernels_moe.metal \
+                           $(LIB_O) $(RES)/kernels_moe.metallib
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c tests/test_qwen4_kernels.c -o $(OBJ)/test_qwen4_kernels.o
+	$(CC) $(OBJCFLAGS) -Itests tests/kernel_backend_metal.m $(OBJ)/test_qwen4_kernels.o $(LIB_O) $(LIBS) -o $@
 
 $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 	$(PY) tools/mova_affine_golden.py --out $(OUT)/test/affine

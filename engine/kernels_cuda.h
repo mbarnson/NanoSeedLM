@@ -19,7 +19,8 @@ extern "C" {
 typedef struct {
     const void* p[4];
     int32_t eb;        // seeds: the slice's exponent bias
-    int32_t pad[3];
+    int32_t gs;        // Q8 / Q4: log2 of the affine group (5: 32, 6: 64); 0 is 64
+    int32_t pad[2];
 } WSlice;
 
 // ---- the expert cache: a pool of fixed-size VRAM slots over a host arena that holds every expert ----------------------

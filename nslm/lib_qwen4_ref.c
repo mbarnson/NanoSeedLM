@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "model_st.h"
+#include "qwen4_ops.h"
 #include "rows.h"
 
 struct Qwen4Ref {
@@ -65,16 +66,8 @@ static float* vec(Qwen4Ref* r, const NsTensor* t, int64_t n) {
     return v;
 }
 
-// Qwen4 RMSNorm (weights centred at 0): each group of g values of x[n][len] * rsqrt(mean square + eps) * (1 + w)
 static void norm1p(const float* x, int n, int len, int g, const float* w, float eps, float* y) {
-    for (int i = 0; i < n; ++i)
-        for (int a = 0; a < len; a += g) {
-            const float* xi = x + (size_t) i * len + a;
-            double ss = 0;
-            for (int k = 0; k < g; ++k) ss += (double) xi[k] * xi[k];
-            const double s = 1.0 / sqrt(ss / g + eps);
-            for (int k = 0; k < g; ++k) y[(size_t) i * len + a + k] = (float) (xi[k] * s * (1.0 + w[a + k]));
-        }
+    for (int i = 0; i < n; ++i) qwen4_norm1p(x + (size_t) i * len, len, g, w, eps, y + (size_t) i * len);
 }
 
 // RoPE on the first rot values of x (halves rotated against each other), position pos
@@ -98,33 +91,25 @@ static void hc_mix(Qwen4Ref* r, const char* pre, const float* H, int n, float* m
     float* up = (float*) zalloc(sizeof(float) * (size_t) n * HD);
     norm1p(H, n, HD, c->d, nw, c->eps, normed);
     lin(r, tens(r, "%s.input_mix_weight_down.weight", pre), 0, normed, n, lo);
-    for (int i = 0; i < n * c->hc_rank; ++i) lo[i] = silu(lo[i] / c->hc);
+    for (int t = 0; t < n; ++t) qwen4_hc_act(c, lo + (size_t) t * c->hc_rank);
     lin(r, tens(r, "%s.input_mix_weight_up.weight", pre), 0, lo, n, up);
-    for (int t = 0; t < n; ++t)
-        for (int i = 0; i < c->d; ++i) {
-            double m = 0;
-            for (int s = 0; s < c->hc; ++s) m += (double) sigm(up[(size_t) t * HD + s * c->d + i]) * normed[(size_t) t * HD + s * c->d + i];
-            mixed[(size_t) t * c->d + i] = (float) (m / c->hc);
-        }
+    for (int t = 0; t < n; ++t) qwen4_hc_mix(c, normed + (size_t) t * HD, up + (size_t) t * HD, mixed + (size_t) t * c->d);
     if (inj) {
         lin(r, tens(r, "%s.block_inject_weight.weight", pre), 0, normed, n, inj);
-        for (int i = 0; i < n * c->hc; ++i) inj[i] = 2.0f * sigm(inj[i] / c->hc);
+        for (int t = 0; t < n; ++t) qwen4_hc_gate(c, inj + (size_t) t * c->hc);
     }
     free(nw); free(normed); free(lo); free(up);
 }
 
 static void hc_add(const Qwen4Cfg* c, float* H, int n, const float* branch, const float* inj) {
-    for (int t = 0; t < n; ++t)
-        for (int s = 0; s < c->hc; ++s)
-            for (int i = 0; i < c->d; ++i) H[((size_t) t * c->hc + s) * c->d + i] += branch[(size_t) t * c->d + i] * inj[t * c->hc + s];
+    for (int t = 0; t < n; ++t) qwen4_hc_add(c, H + (size_t) t * c->hc * c->d, branch + (size_t) t * c->d, inj + (size_t) t * c->hc);
 }
 
-// ---- Gated DeltaNet: a causal conv, then per value head a [dv][dk] state decayed by g and corrected toward v (delta rule)
+// ---- Gated DeltaNet (nslm/qwen4_ops.h): the projections, the token steps, the output projection --------------------
 
 static void gdn(Qwen4Ref* r, int l, const float* x, int n, float* out) {
     const Qwen4Cfg* c = &r->c;
-    const int Hk = c->lin_hk, Hv = c->lin_hv, Dk = c->lin_dk, Dv = c->lin_dv, K = c->lin_conv;
-    const int kd = Hk * Dk, vd = Hv * Dv, cd = 2 * kd + vd, rep = Hv / Hk;
+    const int Hv = c->lin_hv, K = c->lin_conv, vd = Hv * c->lin_dv, cd = 2 * c->lin_hk * c->lin_dk + vd;
     char pre[96];
     snprintf(pre, sizeof pre, "language_model.model.layers.%d.linear_attn", l);
     float* qkv = (float*) zalloc(sizeof(float) * (size_t) n * cd);
@@ -139,48 +124,14 @@ static void gdn(Qwen4Ref* r, int l, const float* x, int n, float* out) {
     float* cw = vec(r, tens(r, "%s.conv1d.weight", pre), (int64_t) cd * K);
     float* alog = vec(r, tens(r, "%s.A_log", pre), Hv);
     float* dtb = vec(r, tens(r, "%s.dt_bias", pre), Hv);
-    float* nw = vec(r, tens(r, "%s.norm.weight", pre), Dv);
-    double* S = (double*) zalloc(sizeof(double) * (size_t) Hv * Dv * Dk);
-    float* cv = (float*) zalloc(sizeof(float) * (size_t) cd);
-    for (int t = 0; t < n; ++t) {
-        for (int ch = 0; ch < cd; ++ch) {   // depthwise causal conv over the last K inputs, then silu
-            double acc = 0;
-            for (int k = 0; k < K; ++k) {
-                const int u = t - (K - 1) + k;
-                if (u >= 0) acc += (double) cw[(size_t) ch * K + k] * qkv[(size_t) u * cd + ch];
-            }
-            cv[ch] = silu(acc);
-        }
-        for (int h = 0; h < 2 * Hk; ++h) {   // L2-normalise q and k heads; q also scaled by dk^-0.5
-            float* v = cv + (size_t) h * Dk;
-            double ss = 0;
-            for (int j = 0; j < Dk; ++j) ss += (double) v[j] * v[j];
-            const double s = 1.0 / sqrt(ss + 1e-6) * (h < Hk ? 1.0 / sqrt((double) Dk) : 1.0);
-            for (int j = 0; j < Dk; ++j) v[j] = (float) (v[j] * s);
-        }
-        for (int hv = 0; hv < Hv; ++hv) {
-            const float* q = cv + (size_t) (hv / rep) * Dk;
-            const float* k = cv + kd + (size_t) (hv / rep) * Dk;
-            const float* v = cv + 2 * kd + (size_t) hv * Dv;
-            const double ap = aa[t * Hv + hv] + dtb[hv], sp = ap > 20 ? ap : log1p(exp(ap));
-            const double g = exp(-exp((double) alog[hv]) * sp), beta = sigm(bb[t * Hv + hv]);
-            double* St = S + (size_t) hv * Dv * Dk;
-            float* yo = y + (size_t) t * vd + (size_t) hv * Dv;
-            double ss = 0;
-            for (int i = 0; i < Dv; ++i) {
-                double* row = St + (size_t) i * Dk, kv = 0, yq = 0;
-                for (int j = 0; j < Dk; ++j) { row[j] *= g; kv += row[j] * k[j]; }
-                const double delta = (v[i] - kv) * beta;
-                for (int j = 0; j < Dk; ++j) { row[j] += delta * k[j]; yq += row[j] * q[j]; }
-                yo[i] = (float) yq;
-                ss += yq * yq;
-            }
-            const double s = 1.0 / sqrt(ss / Dv + c->eps);   // RMSNorm (plain weight), gated by sigmoid(z)
-            for (int i = 0; i < Dv; ++i) yo[i] = (float) (yo[i] * s * nw[i] * sigm(z[(size_t) t * vd + (size_t) hv * Dv + i]));
-        }
-    }
+    float* nw = vec(r, tens(r, "%s.norm.weight", pre), c->lin_dv);
+    float* conv = (float*) zalloc(sizeof(float) * qwen4_gdn_conv_len(c));
+    float* S = (float*) zalloc(sizeof(float) * qwen4_gdn_state_len(c));
+    const Qwen4GdnW gw = {cw, alog, dtb, nw};
+    for (int t = 0; t < n; ++t)
+        qwen4_gdn_token(c, &gw, qkv + (size_t) t * cd, z + (size_t) t * vd, aa + (size_t) t * Hv, bb + (size_t) t * Hv, conv, S, y + (size_t) t * vd);
     lin(r, tens(r, "%s.out_proj.weight", pre), 0, y, n, out);
-    free(qkv); free(z); free(bb); free(aa); free(y); free(cw); free(alog); free(dtb); free(nw); free(S); free(cv);
+    free(qkv); free(z); free(bb); free(aa); free(y); free(cw); free(alog); free(dtb); free(nw); free(S); free(conv);
 }
 
 // ---- QSA attention: dense within the budget; past it, each query sees the indexer's top blocks and its own tail -------
