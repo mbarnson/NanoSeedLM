@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include "kernels_moe.metal"   // MF_*, MvArgs, MmArgs, MmTile, RouterArgs, AttnArgs, RowInfo, MV_MAXT
+#include "qwen4_ops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,6 +22,7 @@ typedef struct {
     int fmt, S, R, K;
     const void *w, *s, *b, *e;
     size_t wn, sn, bn, en;   // bytes
+    int group;               // Q8 / Q4: the affine group, 32 or 64 (0 is 64); a backend without group 32 returns 1
 } KtWeight;
 
 // 0, or -1 with err ("no CUDA device" / "no Metal device" when there is no GPU: the test is then skipped)
@@ -145,6 +147,29 @@ int kt_bf16_f32(const uint16_t* x, float* y, int n);
 // nb blocks of D columns (D a multiple of 32), on H's lower 32 x 32 tiles (i / 32 >= j / 32); the rest of H unchanged.
 // 1 where a backend lacks it.
 int kt_xtx(const float* x, int T, int xs, int D, int nb, float* H);
+
+// ---- qwen4 (nslm/qwen4_ops.h; CUDA's engine/kernels_qwen4.cu).  1 where a backend lacks them ----------------------
+// T tokens through qwen4_gdn_token: conv and S are updated
+int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
+              float* conv, float* S, float* y, int T);
+int kt_q4_norm1p(const float* x, int len, int g, const float* w, float eps, float* y, int T);
+// the hyper-connection steps on T tokens: qwen4_hc_act on lo, qwen4_hc_mix into mixed, qwen4_hc_gate on inj, then
+// qwen4_hc_add of branch into H with the gated inj
+int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up, float* mixed, float* inj, float* H,
+             const float* branch, int T);
+// qwen4_head_norm_rope on each row t of x (row stride rs) at position pos0 + t, in place
+int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T);
+int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
+// qwen4_ple_gate into gated, then qwen4_ple_conv of cin (hist and H updated), T tokens
+int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, const float* w, const float* cin,
+              float* hist, float* H, int T);
+// QSA: nb block keys from raw[nb * ix_ratio][ix_dim] into blk, then qwen4_qsa_select for T rows (iq at row stride rs,
+// done[t] blocks) into sel[t][budget / ratio]
+int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float* blk, const float* iq, int rs, const int32_t* done,
+              int32_t* sel, int T);
+// qwen4_attend for rows at positions pos0 + t over caches of npos positions
+int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
+                 const int32_t* nsel, float* o, int T);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,6 @@
 // harness/nslm-cpu-seed-bench.c - CPU P = 4 seed mat-vec throughput (G weights / s) by thread count, on random
-// seed matrices shaped like MoVA's routed experts (gate / up: 768 x 2560, down: 2560 x 768) and its decode step.
+// seed matrices shaped like MoVA's routed experts (gate / up: 768 x 2560, down: 2560 x 768) and its decode step; and
+// per token for 2 and 4 tokens at once (an MTP verify window), at P = 4 and P = 3.  Prints the load average.
 //
 //   nslm-cpu-seed-bench [threads,...] [reps]
 #include <stdio.h>
@@ -35,9 +36,16 @@ int main(int argc, char** argv) {
     memset(codes, 0x77, n / 2 + 1);
     for (int i = 0; i < kb * 8; ++i) x[i] = (float) (i % 17) / 17.0f - 0.5f;
     const uint32_t* table = cpu_seed4_table();
-    CpuSeed4Tiled tm;
+    CpuSeed4Tiled tm, t3;
     cpu_seed4_tile(&tm, seeds, coefs, codes, -22, rows, kb);
+    cpu_seed3_tile(&t3, seeds, coefs, -22, rows, kb);   // the same words as P = 3 nibble words
     printf("matrix %d x %d (%.1f M weights, %.1f MB of seed data)\n", rows, kb * 8, n * 8 / 1e6, n * 4.5 / 1e6);
+    FILE* la = fopen("/proc/loadavg", "r");   // Linux; elsewhere read uptime(1) before the run
+    char lb[64] = "n/a";
+    if (la) { if (!fgets(lb, sizeof lb, la)) strcpy(lb, "n/a\n"); fclose(la); } else strcat(lb, "\n");
+    printf("load average: %s", lb);
+    float* xt = malloc((size_t) 4 * kb * 8 * 4), *yt = malloc((size_t) 4 * rows * 4);
+    for (int i = 0; i < 4 * kb * 8; ++i) xt[i] = (float) (i % 23) / 23.0f - 0.5f;
     char buf[256];
     strncpy(buf, tl, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
@@ -61,6 +69,18 @@ int main(int argc, char** argv) {
             if (dt < best) best = dt;
         }
         printf("  tiled    %.2f ms per step, %.1f G weights/s\n", best * 1e3, n * 8 / best / 1e9);
+        for (int pp = 4; pp >= 3; --pp)
+            for (int nt = pp == 4 ? 2 : 1; nt <= 4; nt *= 2) {
+                best = 1e9;
+                for (int i = 0; i < reps; ++i) {
+                    const double t0 = now();
+                    cpu_seed4_tiled_matmul_mt(pp == 4 ? &tm : &t3, table, xt, nt, yt, th);
+                    const double dt = now() - t0;
+                    if (dt < best) best = dt;
+                }
+                printf("  P = %d, %d token%s %.2f ms per step, %.1f G weights/s per token\n", pp, nt, nt > 1 ? "s" : "",
+                       best * 1e3, n * 8 * nt / best / 1e9);
+            }
     }
     return 0;
 }

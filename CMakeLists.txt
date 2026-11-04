@@ -65,7 +65,7 @@ target_link_libraries(nslm PUBLIC ${PLATFORM_LIBS})
 
 # ---- tests (pure C) -------------------------------------------------------------------------------------------------
 enable_testing()
-foreach(t affine kvq lfsr linalg model_st moe search search4 searchp sha256)
+foreach(t affine gguf kvq lfsr linalg model_st moe ple qwen4_ref search search4 searchp sha256)
   add_executable(test_${t} tests/test_${t}.c)
   target_link_libraries(test_${t} nslm)
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
@@ -87,7 +87,7 @@ foreach(t chat_template tool_calls)
 endforeach()
 
 # ---- the CUDA engine ------------------------------------------------------------------------------------------------
-add_library(nslm_engine STATIC engine/mova_cuda.c engine/kernels_moe.cu)
+add_library(nslm_engine STATIC engine/mova_cuda.c engine/qwen4_cuda.c engine/kernels_moe.cu engine/kernels_qwen4.cu)
 target_include_directories(nslm_engine PUBLIC engine nslm)
 target_link_libraries(nslm_engine PUBLIC nslm CUDA::cudart_static)
 set_target_properties(nslm_engine PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -110,7 +110,8 @@ else()   # Linux: ICU's headers and libraries (Ubuntu / Debian: libicu-dev), fou
 endif()
 
 foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke nslm-mova-kbench
-          nslm-mova-refcheck nslm-mova-routes nslm-mova-mlacapture)
+          nslm-mova-refcheck nslm-mova-routes nslm-mova-mlacapture nslm-qwen4-gen
+          nslm-qwen4-kld)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()
@@ -140,6 +141,8 @@ add_test(NAME test_dense_help COMMAND nslm-dense -h)
 set_tests_properties(test_dense_help PROPERTIES WILL_FAIL TRUE)   # usage exits 2; a startup crash still fails
 add_executable(nslm-mova-pack nslm/mova_pack.c)
 target_link_libraries(nslm-mova-pack nslm)
+add_executable(nslm-qwen4-pack nslm/qwen4_pack.c)
+target_link_libraries(nslm-qwen4-pack nslm)
 add_executable(nslm-bits-probe nslm/bits_probe.c)
 target_link_libraries(nslm-bits-probe nslm)
 
@@ -163,6 +166,14 @@ add_executable(test_mova_kernels tests/test_mova_kernels.c tests/kernel_backend_
 target_link_libraries(test_mova_kernels nslm_engine)
 add_test(NAME test_mova_kernels COMMAND test_mova_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_mova_kernels PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_qwen4_kernels tests/test_qwen4_kernels.c tests/kernel_backend_cuda.c)   # kernels vs nslm/qwen4_ops.h
+target_link_libraries(test_qwen4_kernels nslm_engine)
+add_test(NAME test_qwen4_kernels COMMAND test_qwen4_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen4_kernels PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_qwen4_engine tests/test_qwen4_engine.c)   # the qwen4 CUDA engine against mlx-vlm on the tiny model
+target_link_libraries(test_qwen4_engine nslm_engine)
+add_test(NAME test_qwen4_engine COMMAND test_qwen4_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen4_engine PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_tokenizer tests/test_tokenizer.c)
 target_link_libraries(test_tokenizer nslm_harness)
 add_test(NAME test_tokenizer COMMAND test_tokenizer WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

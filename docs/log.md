@@ -128,3 +128,118 @@ V rows. `test_engine` checks an all-MLA and a hybrid random model against the C 
 PRO 6000). The T-03 hybrid on the 31 held-out windows: P4 seeds on Metal, NLL 2.4094 and KL divergence 0.1118
 (MLX loader 2.4087, 0.1132); BF16 on CUDA, NLL 2.3979 and KL divergence 0.1048 (MLX loader 2.3978, 0.1054).
 Pull request [#14](https://github.com/mbarnson/NanoSeedLM/pull/14).
+
+## [2026-11-04] docs | Plan: SeedLM packs for Qwen3.8-Flash-Next
+
+A plan to make a family of seed packs for Qwen3.8-Flash-Next, with gates before each large cost. The pack does not
+include the PLE table. The user downloads one of the four Unsloth table files to fit the disk. The plan also records
+a quick check of the CPU P = 4 mat-vec in a cloud session: 3.3 G weights/s for each AVX2 thread. Read
+[the plan](plans/2026-11-04-qwen38-flash-next.md).
+
+## [2026-11-04] result | Hadamard rotation and P = 4 seeds on Qwen3.8-Flash-Next experts
+
+On 4 experts of layer 20, a block Hadamard rotation did not change the plain error of P = 4 seeds. An
+activation-weighted fit without rotation gave 6% to 10% less activation-weighted error. The expert weights are
+already near-Gaussian (kurtosis 3.0 to 3.06). Read
+[Hadamard rotation and P = 4 seeds](results/2026-11-04-qwen38-rotation-probe.md).
+
+## [2026-11-04] engine | Qwen3.8-Flash-Next experts in the seed search
+
+`nslm-moe` reads the expert shapes of a `qwen4_exp` model from `config.json`, and the fused expert tensors by slice.
+`--imatrix` takes the activation weights from a llama.cpp imatrix GGUF (`nslm/gguf.h`). `tools/hf_seedbank.sh` takes
+`IMATRIX` and `ONLY`. A CPU run on layer 20 of the BF16 checkpoint read 1,852 imatrix tensors and the expert counts.
+
+## [2026-11-04] engine | PLE table rows from the Unsloth engram files
+
+`nslm/ple.h` reads rows of `per_layer_token_embd.weight` (160 x 320 M) from a GGUF file in BF16, Q8_0, Q5_1 or IQ4_NL.
+On rows at the start, the middle and the end of each Unsloth file, it matched gguf-py exactly. The engine port will
+use it, so the user can choose the table precision to fit the disk.
+
+## [2026-11-04] kernel | CPU seed mat-vec for several tokens
+
+`cpu_seed4_tiled_matmul_mt` makes the LFSR states of each block once for up to 8 tokens. Each token's rows equal the
+one-token kernel's, bit for bit. On a cloud Xeon with 4 vCPUs (AVX2 build, load average below 0.1), for each token:
+1 token 3.3 G weights/s (12.3 on 4 threads), 2 tokens 4.4 (16.8), 4 tokens 6.5 (24.6). One token keeps the
+one-token kernel, which is 12% faster than the general one.
+
+## [2026-11-04] kernel | P = 3 seeds on the CPU
+
+`cpu_seed3_tile` puts SEED4 (P = 3) matrices in the tiled CPU layout, and the CPU mat-vec and mat-mul take them. The
+rows match the scalar spec within 8e-7. On the same cloud Xeon (4 vCPUs, AVX2 build, load average 0.07), for each
+token: 13.9, 21.5 and 32.3 G weights/s at 1, 2 and 4 tokens, against 12.4, 16.8 and 25.1 at P = 4.
+
+## [2026-11-04] engine | A C reference forward of Qwen3.8-Flash-Next
+
+`nslm/qwen4_ref.h` computes the `qwen4_exp` forward on the CPU from an MLX model folder. The GPU engines will be checked
+against it. `tools/qwen4_golden.py` makes a tiny random model in the formats of the 4-bit MLX pack, and its float32
+logits from mlx-vlm (`tests/data/qwen4_tiny`). The reference matches them within 6e-7, with the same argmax on all 48
+rows. The sequence has an EOS and passes the sparse attention budget. Two details mattered:
+
+- Equal indexer scores (ReLU zeros) go to the higher block index, as MLX's `argpartition`.
+- The model folder reader takes MLX affine Q4 with group 32. The MoVA engines refuse groups other than 64.
+
+## [2026-11-04] kernel | Qwen3.8-Flash-Next CUDA kernels: Gated DeltaNet, hyper-connections, Q4 group 32
+
+`engine/kernels_qwen4.cu` has the Gated DeltaNet conv and recurrent step, the head RMSNorm and gate, the (1 + w)
+RMSNorm and the hyper-connection steps. The matvec, GEMM and embedding kernels take affine Q4 with group 32
+(`WSlice.gs`). On an HF Jobs RTX PRO 6000 (`tools/hf_cuda_test.sh`), `test_qwen4_kernels` passed:
+
+- Gated DeltaNet at the Qwen3.8-Flash-Next head widths (128): outputs within 3.8e-7 of `nslm/qwen4_ops.h`, the state
+  within 2.2e-7.
+- Hyper-connection steps within 1e-7.
+- Q4 group 32 within 3.7e-3 of exact dequantization, from the BF16 output rounding.
+
+`test_mova_kernels` passed on the same run, so the group change kept the MoVA kernels as they were. Metal does not have
+these kernels yet.
+
+## [2026-11-04] result | The seed search over the Qwen3.8-Flash-Next experts
+
+HF Jobs searched all 24,576 routed experts on 4 RTX PRO 6000 GPUs: 66 min at P = 4, 83 min at P = 3, about $28 for
+both. The mean activation-weighted relative error is 0.077 at P = 4 and 0.112 at P = 3. The packs are 105.7 GB (P = 4)
+and 98.2 GB (P = 3), against 113.3 GB for the 4-bit MLX model. They are in the storage bucket, not published yet.
+Read [The seed search over the Qwen3.8-Flash-Next experts](results/2026-11-04-qwen38-seed-search.md).
+
+## [2026-11-04] engine | The Qwen3.8-Flash-Next CUDA engine
+
+`engine/qwen4_eng.h` runs a Qwen3.8-Flash-Next MLX folder on CUDA: Gated DeltaNet, QSA attention with the indexer, the
+softmax MoE with the shared expert, the hyper-connections and the PLE layer. `nslm-qwen4-gen` generates greedily with
+timings.
+On an HF Jobs RTX PRO 6000:
+
+- Each new kernel is within 2.1e-7 of its C operation (`nslm/qwen4_ops.h`).
+- On `tests/data/qwen4_tiny`, the logits are within 2.6% of mlx-vlm's float32 logits, with the same argmax on 47 of 48
+  rows. The BF16 rounding of the matvec kernels causes the difference.
+- Any split of the tokens into rows gives the same logits.
+
+The PLE table comes from the model folder or, with `--ple-gguf`, from an Unsloth engram GGUF. The GGUF rows match the
+folder's rows in order (correlation 0.996 on the first rows). Routed experts stay in mapped host memory by default.
+
+## [2026-11-04] engine | Qwen3.8-Flash-Next-NanoSeedLM-P4 runs on the CUDA engine
+
+On an HF Jobs RTX PRO 6000 (96 GB, experts in VRAM, `tools/hf_qwen4_gen.sh`), `nslm-qwen4-gen` loaded the P4 pack in
+11.6 s. It answered "Why do tide pools matter?" with a coherent reasoning block and a correct answer. The 19-token
+prompt took 0.18 s, and the decode ran at 57.7 tokens per second. This is one run on a shared cloud machine, with no
+record of the machine state, so it is not a benchmark.
+
+## [2026-11-04] engine | Qwen3.8-Flash-Next-NanoSeedLM-P3 runs on the CUDA engine, experts in host memory
+
+On the same kind of machine, with the routed experts in mapped host memory (the default), `nslm-qwen4-gen` loaded the
+P3 pack in 27.1 s. It gave a coherent answer to the same prompt. The prompt ran at 25.4 tokens per second and the
+decode at 22.1 tokens per second. The GPU reads the experts over PCIe for each token. This is one run, not a benchmark.
+
+## [2026-11-04] engine | A VRAM cache of host experts: 22.1 to 41.6 tokens per second on P3
+
+`--expert-cache-gb` keeps the most recently used routed experts in VRAM, on the MoVA `CachePool` (`k_cache_admit` now
+takes 512 experts per layer). The other experts stay in pinned host memory. With the smallest cache, the tiny model's
+logits are the same bit for bit. The measurement used an HF Jobs RTX PRO 6000, the P3 pack and an 8 GB cache (3,255
+of 24,576 experts). The decode ran at 41.6 tokens per second against 22.1 without the cache. The prompt ran at 48.5
+tokens per second against 25.4. The cache hit 69% of the expert reads, and the greedy output was the same text. This is one run,
+not a benchmark, and the PCIe link of this machine is not that of an RTX 4080.
+
+## [2026-11-04] result | The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model
+
+The CUDA engine ran both models on 1,024 tokens of wikitext-2. The mean KL divergence against the 4-bit MLX model is
+0.177 for P4 and 0.237 for P3. The top-1 token agrees on 91.9% and 88.2% of the tokens. The perplexity rises from
+2.396 to 2.500 and 2.480. The reference is a quantized model, not BF16. Read
+[The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model](results/2026-11-04-qwen38-kld-vs-4bit.md).
+

@@ -162,6 +162,54 @@ int main(void) {
         remove_dir(path);
     }
 
+    // NS_RAW: a tensor copied as it is (any dtype and shape), beside a seed tensor; read back as plain safetensors
+    {
+        const NsSpec two[2] = {{"vision.patch_embed.proj.weight", NS_RAW, 1, 1, 1}, {"layers.0.mlp.switch_mlp.up_proj.weight", NS_SEED4P4, 2, 16, 64}};
+        const NsRaw raw[2] = {{"F32", 5, {2, 3, 1, 1, 4}, 2 * 3 * 4 * 4}, {NULL, 0, {0}, 0}};
+        order = -1;
+        snprintf(path, sizeof path, "%s_raw", dir);
+        mkdir(path, 0755);
+        CHECK(ns_write(path, two, 1, 1u << 20, NULL, fill, &order, err, sizeof err) != 0, "raw tensor without NsRaw written");
+        CHECK(ns_write_raw(path, two, raw, 2, 1u << 20, NULL, fill, &order, err, sizeof err) == 0, "raw write: %s", err);
+        char shard[2100];
+        snprintf(shard, sizeof shard, "%s/model-00001-of-00001.safetensors", path);
+        StFile st;
+        CHECK(st_open_file(&st, shard, err, sizeof err) == 0, "raw read: %s", err);
+        const StEntry* e = st_find(&st, "vision.patch_embed.proj.weight");
+        CHECK(e && !strcmp(e->dtype, "F32") && e->ndim == 5 && e->shape[4] == 4 && e->end - e->begin == 96, "raw entry");
+        if (e) CHECK(st_data(&st, e)[5] == byte_of(0, 0, 5), "raw data");
+        CHECK(st_find(&st, "layers.0.mlp.switch_mlp.up_proj.seeds") && st_find(&st, "layers.0.mlp.switch_mlp.up_proj.codes"),
+              "seed streams beside a raw tensor");
+        st_close_file(&st);
+        remove_dir(path);
+    }
+
+    // MLX affine groups (written raw, read as Q4 / Q8): Q4 group 32, Q8 group 64, Q4 group 64; codes U32, scales BF16
+    {
+        const NsSpec sp[9] = {
+            {"a.weight", NS_RAW, 1, 1, 1}, {"a.scales", NS_RAW, 1, 1, 1}, {"a.biases", NS_RAW, 1, 1, 1},
+            {"b.weight", NS_RAW, 1, 1, 1}, {"b.scales", NS_RAW, 1, 1, 1}, {"b.biases", NS_RAW, 1, 1, 1},
+            {"c.weight", NS_RAW, 1, 1, 1}, {"c.scales", NS_RAW, 1, 1, 1}, {"c.biases", NS_RAW, 1, 1, 1}};
+        const NsRaw raw[9] = {
+            {"U32", 3, {2, 8, 16}, 2 * 8 * 16 * 4}, {"BF16", 3, {2, 8, 4}, 2 * 8 * 4 * 2}, {"BF16", 3, {2, 8, 4}, 2 * 8 * 4 * 2},
+            {"U32", 2, {4, 32}, 4 * 32 * 4}, {"BF16", 2, {4, 2}, 4 * 2 * 2}, {"BF16", 2, {4, 2}, 4 * 2 * 2},
+            {"U32", 2, {4, 16}, 4 * 16 * 4}, {"BF16", 2, {4, 2}, 4 * 2 * 2}, {"BF16", 2, {4, 2}, 4 * 2 * 2}};
+        order = -1;
+        snprintf(path, sizeof path, "%s_groups", dir);
+        mkdir(path, 0755);
+        CHECK(ns_write_raw(path, sp, raw, 9, 1u << 20, NULL, fill, &order, err, sizeof err) == 0, "groups write: %s", err);
+        CHECK(ns_open(&m, path, err, sizeof err) == 0, "groups open: %s", err);
+        const NsTensor* a = ns_find(&m, "a.weight");
+        const NsTensor* b = ns_find(&m, "b.weight");
+        const NsTensor* c = ns_find(&m, "c.weight");
+        CHECK(a && a->enc == NS_Q4 && a->group == 32 && a->slices == 2 && a->rows == 8 && a->cols == 128, "Q4 group 32");
+        CHECK(b && b->enc == NS_Q8 && b->group == 64 && b->rows == 4 && b->cols == 128, "Q8 group 64");
+        CHECK(c && c->enc == NS_Q4 && c->group == 64 && c->rows == 4 && c->cols == 128, "Q4 group 64");
+        if (a) CHECK(a->s[1].len == 2 * 8 * 4 * 2 && a->s[1].p[3] == byte_of(1, 0, 3), "Q4 group 32 scales");
+        ns_close(&m);
+        remove_dir(path);
+    }
+
     printf("test_model_st: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

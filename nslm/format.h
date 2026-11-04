@@ -7,7 +7,7 @@ typedef struct {
     char name[96];
     char dtype[8];
     int ndim;
-    int64_t shape[4];
+    int64_t shape[8];
     uint64_t begin, end;     // byte offsets relative to the data section
 } StEntry;
 

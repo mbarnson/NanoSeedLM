@@ -37,6 +37,8 @@ static __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(FULL, v, o));
     return v;
 }
+// log2 of a slice's affine group (WSlice.gs; 0 is 64)
+static __device__ __forceinline__ int gsh(const WSlice& w) { return w.gs ? w.gs : 6; }
 static __device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 static __device__ __forceinline__ float sum8(float4 a, float4 b) { return (a.x + b.x) + (a.y + b.y) + (a.z + b.z) + (a.w + b.w); }
 // the exact value of a 4-bit field as f32, from the 2^23 trick (no convert)
@@ -89,7 +91,7 @@ static __device__ __forceinline__ void wblock(int fmt, const WSlice* w, int r, i
         for (int i = 0; i < 4; ++i) { o[2 * i] = __uint_as_float(u[i] << 16); o[2 * i + 1] = __uint_as_float(u[i] & 0xFFFF0000u); }
         return;
     }
-    const size_t gi = ((size_t) r * K + (size_t) j * 8) / 64;
+    const size_t gi = ((size_t) r * K + (size_t) j * 8) >> gsh(*w);
     const float s = bf(((const uint16_t*) w->p[1])[gi]), b = bf(((const uint16_t*) w->p[2])[gi]);
     if (fmt == MF_Q8) {
         const uint2 q = *(const uint2*) ((const uint32_t*) w->p[0] + ((size_t) r * K) / 4 + (size_t) j * 2);
@@ -167,7 +169,7 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
         const uint16_t* B = (const uint16_t*) w->p[2];
         const uint32_t* qr = (const uint32_t*) w->p[0] + ((size_t) r * K) / 8;
         for (int j0 = lane * 2; j0 < nbk; j0 += 64) {
-            const size_t gi = ((size_t) r * K + (size_t) j0 * 8) / 64;
+            const size_t gi = ((size_t) r * K + (size_t) j0 * 8) >> gsh(*w);
             const float s = bf(S[gi]), b = bf(B[gi]);
             const uint2 qq = *(const uint2*) (qr + j0);
             const uint32_t qw[2] = {qq.x, qq.y};
@@ -189,7 +191,7 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
         const uint4* qr = (const uint4*) ((const uint32_t*) w->p[0] + ((size_t) r * K) / 4);
 #pragma unroll 2
         for (int jq = lane; jq < nbk / 2; jq += 32) {
-            const size_t gi = ((size_t) r * K + (size_t) jq * 16) / 64;
+            const size_t gi = ((size_t) r * K + (size_t) jq * 16) >> gsh(*w);
             float wq[16];
             q8w16(qr[jq], bf(S[gi]), bf(B[gi]), wq);
             acc += q8x16(wq, xb + (size_t) jq * 16);
@@ -258,7 +260,7 @@ static __device__ __forceinline__ void mv_body(int fmt, MvArgs a, WSlice wd, con
         const uint16_t* B = (const uint16_t*) w.p[2];
         const uint4* qr = (const uint4*) ((const uint32_t*) w.p[0] + ((size_t) r * a.K) / 4);
         for (int jq = lane; jq < nbk / 2; jq += 32) {
-            const size_t gi = ((size_t) r * a.K + (size_t) jq * 16) / 64;
+            const size_t gi = ((size_t) r * a.K + (size_t) jq * 16) >> gsh(w);
             float wq[16];
             q8w16(qr[jq], bf(S[gi]), bf(B[gi]), wq);
 #pragma unroll
@@ -290,7 +292,7 @@ static __device__ __forceinline__ void mv_body(int fmt, MvArgs a, WSlice wd, con
         const uint16_t* B = (const uint16_t*) w.p[2];
         const uint32_t* qr = (const uint32_t*) w.p[0] + ((size_t) r * a.K) / 8;
         for (int j0 = lane * 2; j0 < nbk; j0 += 64) {
-            const size_t gi = ((size_t) r * a.K + (size_t) j0 * 8) / 64;
+            const size_t gi = ((size_t) r * a.K + (size_t) j0 * 8) >> gsh(w);
             const float s = bf(S[gi]), b = bf(B[gi]);
             const uint2 qq = *(const uint2*) (qr + j0);
             const uint32_t qw[2] = {qq.x, qq.y};
@@ -596,8 +598,12 @@ __global__ void k_embed(int fmt, WSlice w, int d, const int32_t* ids, float* x) 
     if (fmt == MF_Q8) {
         const uint32_t wq = ((const uint32_t*) w.p[0])[(row * (size_t) d + c) / 4];
         const float q = (float) ((wq >> (8 * (c % 4))) & 255u);
-        const size_t gi = (row * (size_t) d + c) / 64;
+        const size_t gi = (row * (size_t) d + c) >> gsh(w);
         v = bfr(bf(((const uint16_t*) w.p[1])[gi]) * q + bf(((const uint16_t*) w.p[2])[gi]));
+    } else if (fmt == MF_Q4) {
+        const uint32_t wq = ((const uint32_t*) w.p[0])[(row * (size_t) d + c) / 8];
+        const size_t gi = (row * (size_t) d + c) >> gsh(w);
+        v = bfr(bf(((const uint16_t*) w.p[1])[gi]) * (float) ((wq >> (4 * (c % 8))) & 15u) + bf(((const uint16_t*) w.p[2])[gi]));
     } else v = bf(((const uint16_t*) w.p[0])[row * (size_t) d + c]);
     x[(size_t) t * d + c] = v;
 }
@@ -1029,14 +1035,14 @@ __global__ void k_kv_f32(int fmt, const uint8_t* C, const uint8_t* S, int n, int
 // The KvView of an MLA layer: k holds the RoPE key (ATT_HD BF16 per position), v the latent (r BF16 per position).
 
 // Values e .. e + 3 / e .. e + 7 (e a multiple of 4 / 8) of a BF16, Q8 or Q4 tensor (w.p: values, or codes, BF16 scales
-// and biases per 64; nslm/model_st.h), as wblock dequantizes them: bf16(scale x code + bias), exact BF16 values.
+// and biases per group; nslm/model_st.h), as wblock dequantizes them: bf16(scale x code + bias), exact BF16 values.
 static __device__ __forceinline__ float4 welem4(int fmt, const WSlice& w, size_t e) {
     if (fmt == MF_BF16) {
         const uint2 u = *(const uint2*) ((const uint16_t*) w.p[0] + e);
         return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000u), __uint_as_float(u.y << 16),
                            __uint_as_float(u.y & 0xFFFF0000u));
     }
-    const float sc = bf(((const uint16_t*) w.p[1])[e / 64]), bi = bf(((const uint16_t*) w.p[2])[e / 64]);
+    const float sc = bf(((const uint16_t*) w.p[1])[e >> gsh(w)]), bi = bf(((const uint16_t*) w.p[2])[e >> gsh(w)]);
     const uint32_t q = fmt == MF_Q8 ? *(const uint32_t*) ((const uint8_t*) w.p[0] + e) : *(const uint16_t*) ((const uint8_t*) w.p[0] + e / 2);
     const int b = fmt == MF_Q8 ? 8 : 4;
     const uint32_t m = (1u << b) - 1u;
@@ -1279,7 +1285,7 @@ __global__ void k_sumsq(const float* X, int n, int T, int xs, float* out) {
 __global__ void __launch_bounds__(MMT_THREADS) k_heads_mm(HmvArgs h, MmArgs a, int fmt, WSlice W, const float* X, const float* g,
                                                           float* Y) {
     const size_t n = (size_t) h.O * h.I * (size_t) blockIdx.z;   // values before this head
-    WSlice w;
+    WSlice w;   // MLA heads are group 64 (mova_cuda.c refuses others), so w.gs stays 0
     memset(&w, 0, sizeof w);
     w.p[0] = (const uint8_t*) W.p[0] + (fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : n / 2);
     if (fmt != MF_BF16) { w.p[1] = (const uint16_t*) W.p[1] + n / 64; w.p[2] = (const uint16_t*) W.p[2] + n / 64; }
@@ -1923,17 +1929,17 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
 }
 
 // ---- expert cache ------------------------------------------------------------------------------------------------------
-#define ADMIT_THREADS 1024
+#define ADMIT_THREADS CACHE_MAX_PER_LAYER
 __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count, int flags) {
     const int prev = flags & CACHE_PROTECT_PREV ? (int) p.tick[0] : -1;
-    __shared__ int need[128];
-    __shared__ int miss[128];
+    __shared__ int need[ADMIT_THREADS];   // per_layer <= ADMIT_THREADS experts (qwen4: 512)
+    __shared__ int miss[ADMIT_THREADS];
     __shared__ int nmiss;
     __shared__ uint32_t bv[32];
     __shared__ int bi[32];
-    __shared__ int wmiss[4], wneed[4];
+    __shared__ int wmiss[ADMIT_THREADS / 32], wneed[ADMIT_THREADS / 32];
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    if (tid < 128) need[tid] = 0;
+    need[tid] = 0;
     __syncthreads();
     for (int i = tid; i < count; i += ADMIT_THREADS) need[inds[i]] = 1;
     __syncthreads();
@@ -1944,7 +1950,7 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
     const int s0 = isneed ? p.unit_slot[sl * p.per_layer + tid] : -1, ismiss = isneed && s0 < 0;
     if (isneed && s0 >= 0) p.slot_last[s0] = now;
     const uint32_t mb = __ballot_sync(FULL, ismiss), nb = __ballot_sync(FULL, isneed);
-    if (lane == 0 && w < 4) { wmiss[w] = __popc(mb); wneed[w] = __popc(nb); }
+    if (lane == 0) { wmiss[w] = __popc(mb); wneed[w] = __popc(nb); }
     __syncthreads();
     if (ismiss) {
         int before = __popc(mb & ((1u << lane) - 1u));
@@ -1952,7 +1958,8 @@ __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int 
         miss[before] = tid;
     }
     if (tid == 0) {
-        const int nm = wmiss[0] + wmiss[1] + wmiss[2] + wmiss[3], nn = wneed[0] + wneed[1] + wneed[2] + wneed[3];
+        int nm = 0, nn = 0;
+        for (int k = 0; k < ADMIT_THREADS / 32; ++k) { nm += wmiss[k]; nn += wneed[k]; }
         nmiss = nm;
         p.tick[0] = now;
         p.stats[1] += (uint32_t) nm;

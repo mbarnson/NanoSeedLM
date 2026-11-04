@@ -13,6 +13,8 @@
 //       map with one exponent bias search together; --codec p3 / p8 in place of --p4: P = 3 (.blk, SEED4 nibble words) or
 //       P = 8 (.blk8: 32-bit coefficient words, then the exponent codes) blocks (nslm/searchp.h, nslm/gptq.h)
 //   nslm-moe --expand --blk DIR --out DIR [--scope gu] [--p4]   OUT/L{l}_{proj}.safetensors: 'w' [E][rows][cols] BF16
+//   Qwen3.8-Flash-Next (config.json model_type qwen4_exp, --scope gu|gud|d): --imatrix FILE (a llama.cpp imatrix GGUF)
+//       in place of --act; experts stacked as gate_up_proj [E][2F][D] (gate rows first) and down_proj [E][D][F].
 //
 // Each expert matrix (768 x 2560 gate/up, 2560 x 768 down, 1024 x 2560 value experts) is searched as its own tensor by
 // the Metal search (search_gpu.h; search4_gpu.h with --p4): full seed budget, exponents {e, e-1, e+1}, the 3^P refit,
@@ -35,6 +37,7 @@
 #include <time.h>
 
 #include "format.h"
+#include "gguf.h"
 #include "gptq.h"
 #include "gptq4.h"
 #include "linalg.h"
@@ -44,15 +47,6 @@
 #include "search4.h"
 #include "search4_gpu.h"
 #include "searchp_gpu.h"
-
-typedef struct {
-    char magic[8];   // "NSLMBLKM"
-    uint32_t rows, cols, n_experts;
-    uint32_t n_seeds, n_exp, refit;
-    int32_t exp_delta[3];
-    float n0;
-    double seconds;
-} MoeBlkHeader;
 
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
     for (int i = 1; i + 1 < argc; ++i) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -77,14 +71,15 @@ enum { P_GATE, P_UP, P_DOWN, P_V, P_KAX, P_KAV, P_KR, P_QM, P_QL, P_VU, NPROJ };
 static const char* kProj[NPROJ] = {"gate_proj", "up_proj", "down_proj", "v_experts", "kv_a_x", "kv_a_v", "k_rope_proj",
                                    "q_rope_mix", "q_lat", "v_up"};
 static struct { int on, n_layer, d, kvd, qd, H; int64_t rows; int r[64]; double *x[64], *v[64], *q[64], *o[64]; } g_mla;
+static int g_qwen, g_D = 2560, g_F = 768, g_E = 100, g_L = 48;   // routed experts: MoVA, or qwen4_exp's config.json
 static int proj_rows(int l, int p) {
-    return p == P_DOWN ? 2560 : p == P_V ? 1024 : p < P_KAX ? 768 : p == P_KAX || p == P_KAV || p == P_QL ? g_mla.r[l] : 128;
+    return p == P_DOWN ? g_D : p == P_V ? 1024 : p < P_KAX ? g_F : p == P_KAX || p == P_KAV || p == P_QL ? g_mla.r[l] : 128;
 }
 static int proj_cols(int l, int p) {
-    return p == P_DOWN ? 768 : p < P_KAX ? 2560 : p == P_KAX || p == P_KR ? g_mla.d : p == P_KAV ? g_mla.kvd
+    return p == P_DOWN ? g_F : p < P_KAX ? g_D : p == P_KAX || p == P_KR ? g_mla.d : p == P_KAV ? g_mla.kvd
            : p == P_VU ? g_mla.r[l] : 128;
 }
-static int proj_experts(int p) { return p == P_V ? 64 : p < P_KAX ? 100 : p >= P_QM ? g_mla.H : 1; }
+static int proj_experts(int p) { return p == P_V ? 64 : p < P_KAX ? g_E : p >= P_QM ? g_mla.H : 1; }
 static void tensor_name(char* s, int n, int l, int p, int e) {
     if (p >= P_KAX) snprintf(s, (size_t) n, "model.layers.%d.self_attn.mla.%s", l, kProj[p]);
     else if (p == P_V) snprintf(s, (size_t) n, "model.layers.%d.self_attn.v_experts.%d.weight", l, e);
@@ -105,7 +100,8 @@ static int scope_mask(const char* s) {
 
 static char* g_index;
 static const char* g_model;
-static struct { char name[128]; StFile st; int open; } g_shard[64];   // the shard file name (as file below)
+#define MAX_SHARDS 256
+static struct { char name[128]; StFile st; int open; } g_shard[MAX_SHARDS];   // the shard file name (as file below)
 static int g_nshard;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -122,8 +118,8 @@ static char* read_all(const char* path) {
     return b;
 }
 
-// BF16 tensor -> f32 (rows * cols; slice e of a 3-D tensor [slices][rows][cols] when slices > 1).  NULL on error.
-static float* load_tensor(const char* name, int rows, int cols, int slices, int ex) {
+// BF16 rows [r0, r0 + rows) of a [trows][cols] tensor, or of slice ex of a [slices][trows][cols] one, as f32.  NULL on error.
+static float* load_tensor(const char* name, int rows, int cols, int slices, int ex, int trows, int r0) {
     char file[128], err[512], path[2048];
     if (nslm_moe_index_lookup(g_index, name, file, sizeof file)) { fprintf(stderr, "%s: not in the index\n", name); return NULL; }
     pthread_mutex_lock(&g_mu);
@@ -131,7 +127,8 @@ static float* load_tensor(const char* name, int rows, int cols, int slices, int 
     while (k < g_nshard && strcmp(g_shard[k].name, file)) ++k;
     if (k == g_nshard) {
         snprintf(path, sizeof path, "%s/%s", g_model, file);
-        if (g_nshard == 64 || st_open_file(&g_shard[k].st, path, err, sizeof err)) {
+        if (g_nshard == MAX_SHARDS) snprintf(err, sizeof err, "more than %d shards", MAX_SHARDS);
+        if (g_nshard == MAX_SHARDS || st_open_file(&g_shard[k].st, path, err, sizeof err)) {
             pthread_mutex_unlock(&g_mu);
             fprintf(stderr, "%s\n", err);
             return NULL;
@@ -144,15 +141,38 @@ static float* load_tensor(const char* name, int rows, int cols, int slices, int 
     pthread_mutex_unlock(&g_mu);
     const StEntry* e = st_find(st, name);
     const StEntry* t = e;
-    if (!t || strcmp(t->dtype, "BF16") || (slices > 1 ? t->ndim != 3 || t->shape[0] != slices || t->shape[1] != rows || t->shape[2] != cols
-                                                      : t->ndim != 2 || t->shape[0] != rows || t->shape[1] != cols)) {
+    if (!t || strcmp(t->dtype, "BF16") || (slices > 1 ? t->ndim != 3 || t->shape[0] != slices || t->shape[1] != trows || t->shape[2] != cols
+                                                      : t->ndim != 2 || t->shape[0] != trows || t->shape[1] != cols)) {
         fprintf(stderr, "%s: missing or unexpected shape\n", name);
         return NULL;
     }
-    const uint16_t* b = (const uint16_t*) st_data(st, t) + (size_t) (slices > 1 ? ex : 0) * rows * cols;
+    const uint16_t* b = (const uint16_t*) st_data(st, t) + ((size_t) (slices > 1 ? ex : 0) * trows + (size_t) r0) * cols;
     float* w = (float*) malloc(sizeof(float) * (size_t) rows * cols);
     for (size_t i = 0; i < (size_t) rows * cols; ++i) w[i] = nslm_bf2f(b[i]);
     return w;
+}
+
+// Slice e (an expert or a head) of projection p in layer l.
+static float* load_proj(int l, int p, int e) {
+    char name[128];
+    const int rows = proj_rows(l, p), cols = proj_cols(l, p), E = proj_experts(p);
+    if (g_qwen) {
+        snprintf(name, sizeof name, "model.language_model.layers.%d.mlp.experts.%s", l, p == P_DOWN ? "down_proj" : "gate_up_proj");
+        return load_tensor(name, rows, cols, E, e, p == P_DOWN ? rows : 2 * rows, p == P_UP ? rows : 0);
+    }
+    tensor_name(name, sizeof name, l, p, e);
+    return load_tensor(name, rows, cols, E > 1 && p >= P_KAX ? E : 1, e, rows, 0);
+}
+
+// qwen4_exp (Qwen3.8-Flash-Next): the expert shapes from config.json.  MoVA keeps the defaults.
+static int load_geometry(const char* dir) {
+    char path[2048];
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    char* s = read_all(path);
+    const int rc = s ? nslm_qwen_experts(s, &g_D, &g_F, &g_E, &g_L) : 0;
+    free(s);
+    g_qwen = rc == 1;
+    return rc < 0 || g_L > 64 ? -1 : 0;
 }
 
 // ---- calibration statistics (tools/mova_capture.py, "NSLMMOE1") -----------------------------------------------------
@@ -215,9 +235,27 @@ static int read_act(const char* path) {
     return 0;
 }
 
+// --imatrix: per-expert sums of x^2 ("in_sum2", [E][cols]) and token counts ([E]) of projection p's input.
+static Gguf g_imat;
+static int imat_get(int l, int p, const float** sum, const float** cnt) {
+    char a[96], b[96];
+    const char* t = p == P_GATE ? "gate" : p == P_UP ? "up" : "down";
+    snprintf(a, sizeof a, "blk.%d.ffn_%s_exps.weight.in_sum2", l, t);
+    snprintf(b, sizeof b, "blk.%d.ffn_%s_exps.weight.counts", l, t);
+    *sum = gguf_f32(&g_imat, a, (int64_t) g_E * proj_cols(l, p));
+    *cnt = gguf_f32(&g_imat, b, g_E);
+    return *sum && *cnt ? 0 : -1;
+}
+static void imat_h(int l, int p, int e, double n0, float* h) {
+    const float *sum, *cnt;
+    imat_get(l, p, &sum, &cnt);
+    nslm_imatrix_h(sum, cnt, g_E, proj_cols(l, p), e, n0, h);
+}
+
 // h (cols floats) of expert e of projection p in layer l, with the shrinkage prior.
 static int g_w2;   // --weighting w2: weight each routed token by its routing weight squared
 static void act_h(int l, int p, int e, double n0, float* h) {
+    if (g_imat.map) { imat_h(l, p, e, n0, h); return; }
     if (p >= P_KAX) {   // MLA: each input column's mean square over the calibration rows (every row reaches every layer)
         const int n = proj_cols(l, p);
         const double* sum = p == P_KAX || p == P_KR ? g_mla.x[l] : p == P_KAV ? g_mla.v[l]
@@ -416,10 +454,8 @@ static void* job_worker(void* arg) {
         double gsearch = 0;
         if (g_xtx && p >= P_KAX) {   // GPTQ: every slice at once, then the same error report as below
             float** w0 = (float**) calloc((size_t) E, sizeof(float*));
-            for (int e = 0; e < E && !atomic_load(&j->failed); ++e) {
-                tensor_name(name, sizeof name, l, p, e);
-                if (!(w0[e] = load_tensor(name, rows, cols, E > 1 ? E : 1, e))) atomic_store(&j->failed, 1);
-            }
+            for (int e = 0; e < E && !atomic_load(&j->failed); ++e)
+                if (!(w0[e] = load_proj(l, p, e))) atomic_store(&j->failed, 1);
             const Search4Opts o4 = {j->o->n_seeds, j->o->n_exp, {j->o->exp_delta[0], j->o->exp_delta[1], j->o->exp_delta[2]}, j->o->refit};
             if (!atomic_load(&j->failed) && (g_pc ? gptqp_job(gpup, &o4, l, p, rows, cols, E, nb, bias, seed, cw, ec, w0, err, sizeof err)
                                                   : gptq_job(gpu4, &o4, l, p, rows, cols, E, nb, bias, seed, nib, ec, w0, err, sizeof err))) {
@@ -450,8 +486,8 @@ static void* job_worker(void* arg) {
         }
         for (int e = 0; e < E && !(g_xtx && p >= P_KAX); ++e) {
             if (j->e1 >= 0 && (e < j->e0 || e > j->e1)) continue;
-            tensor_name(name, sizeof name, l, p, e);
-            float* w = load_tensor(name, rows, cols, E > 1 && p >= P_KAX ? E : 1, e);
+            snprintf(name, sizeof name, "L%d %s %d", l, kProj[p], e);
+            float* w = load_proj(l, p, e);
             if (!w) { atomic_store(&j->failed, 1); break; }
             int64_t clamped = 0;
             bias[e] = nslm_choose_bias(w, (int64_t) nb, &clamped);
@@ -473,7 +509,8 @@ static void* job_worker(void* arg) {
                 int64_t n = 0;
                 double hmin = 1e30, hmax = 0;
                 for (int c = 0; c < cols; ++c) { hmin = hh[c] < hmin ? hh[c] : hmin; hmax = hh[c] > hmax ? hh[c] : hmax; }
-                n = p == P_V ? g_act[l].vcount[e] : g_act[l].count[e];
+                const float *ss, *cc;
+                n = g_imat.map ? (imat_get(l, p, &ss, &cc), (int64_t) cc[e]) : p == P_V ? g_act[l].vcount[e] : g_act[l].count[e];
                 printf("  L%d %s expert %3d: %7.2f s  routed %7lld  h min %.3e max %.3e  bias %d clamped %lld\n", l, kProj[p], e,
                        now_s() - ts, (long long) n, hmin, hmax, bias[e], (long long) clamped);
             }
@@ -545,8 +582,8 @@ static int check(const char* spec, const SearchOpts* o, double n0, const char* m
     if (p == NPROJ) { fprintf(stderr, "unknown projection %s\n", pn); return 2; }
     const int rows = proj_rows(l, p), cols = proj_cols(l, p), ng = cols / NSLM_C;
     char name[128], err[512];
-    tensor_name(name, sizeof name, l, p, e);
-    float* w = load_tensor(name, rows, cols, 1, 0);
+    snprintf(name, sizeof name, "L%d %s %d", l, kProj[p], e);
+    float* w = load_proj(l, p, e);
     if (!w) return 2;
     int64_t clamped = 0;
     const int bias = nslm_choose_bias(w, (int64_t) rows * cols / NSLM_C, &clamped);
@@ -636,24 +673,31 @@ int main(int argc, char** argv) {
         return expand(blk, out, mask);
     }
     g_model = opt(argc, argv, "--model", NULL);
-    const char* actp = opt(argc, argv, "--act", NULL);
-    if (!g_model || !actp) {
-        fprintf(stderr, "usage: nslm-moe --model DIR --act FILE (--out DIR | --check L,PROJ,E,K) [--scope gu] [--workers 4] [--n0 64]\n");
+    const char* actp = opt(argc, argv, "--act", NULL), *imat = opt(argc, argv, "--imatrix", NULL);
+    if (!g_model || !actp == !imat) {
+        fprintf(stderr, "usage: nslm-moe --model DIR (--act FILE | --imatrix FILE) (--out DIR | --check L,PROJ,E,K) [--scope gu] [--workers 4] [--n0 64]\n");
         return 2;
     }
-    char path[2048];
+    char path[2048], err[512] = "";
     snprintf(path, sizeof path, "%s/model.safetensors.index.json", g_model);
     if (!(g_index = read_all(path))) { fprintf(stderr, "cannot read %s\n", path); return 2; }
-    if (read_act(actp)) { fprintf(stderr, "bad --act %s\n", actp); return 2; }
+    if (load_geometry(g_model)) { fprintf(stderr, "%s/config.json: bad qwen4_exp expert shapes\n", g_model); return 2; }
+    if (g_qwen != !!imat) { fprintf(stderr, "--imatrix goes with a qwen4_exp model, --act with MoVA\n"); return 2; }
+    if (g_qwen && (mask & ~(1 << P_GATE | 1 << P_UP | 1 << P_DOWN))) { fprintf(stderr, "qwen4_exp: --scope gu|gud|d\n"); return 2; }
+    if (imat ? gguf_open(&g_imat, imat, err, sizeof err) : read_act(actp)) { fprintf(stderr, "bad %s %s\n", imat ? "--imatrix" : "--act", err); return 2; }
+    if (imat) { g_l0 = 0; g_nl = g_L; }
     SearchOpts o = {atoi(opt(argc, argv, "--seeds", "65535")), 3, {0, -1, 1}, 1};
     const double n0 = atof(opt(argc, argv, "--n0", "64"));
     g_w2 = !strcmp(opt(argc, argv, "--weighting", "plain"), "w2");
+    if (g_w2 && imat) { fprintf(stderr, "--weighting w2 needs --act (routing weights)\n"); return 2; }
     char lib[1024];
     snprintf(lib, sizeof lib, "%s/search.metallib", opt(argc, argv, "--res", "out/res"));
     g_p4 = has_flag(argc, argv, "--p4");
     snprintf(g_lib4, sizeof g_lib4, "%s/search4.metallib", opt(argc, argv, "--res", "out/res"));
-    printf("calibration: %lld tokens, layers %d-%d; weighting %s; prior n0 %.0f; budget %d seeds; exponents e+0 e-1 e+1; refit 1\n",
-           (long long) g_tokens, g_l0, g_l0 + g_nl - 1, g_w2 ? "w2" : "plain", n0, o.n_seeds);
+    if (imat) printf("calibration: imatrix %s (%d tensors), layers %d-%d; prior n0 %.0f; budget %d seeds; exponents e+0 e-1 e+1; refit 1\n",
+                     imat, g_imat.n, g_l0, g_l0 + g_nl - 1, n0, o.n_seeds);
+    else printf("calibration: %lld tokens, layers %d-%d; weighting %s; prior n0 %.0f; budget %d seeds; exponents e+0 e-1 e+1; refit 1\n",
+                (long long) g_tokens, g_l0, g_l0 + g_nl - 1, g_w2 ? "w2" : "plain", n0, o.n_seeds);
     if (opt(argc, argv, "--check", NULL)) return check(opt(argc, argv, "--check", NULL), &o, n0, lib);
 
     const char* out = opt(argc, argv, "--out", NULL);
@@ -678,6 +722,8 @@ int main(int argc, char** argv) {
             char nm[128], file[128];
             tensor_name(nm, sizeof nm, l, p, 0);
             if (p >= P_KAX && nslm_moe_index_lookup(g_index, nm, file, sizeof file)) continue;   // kv_a_v: MoVA layers only
+            const float *s0, *c0;
+            if (g_imat.map && imat_get(l, p, &s0, &c0)) { fprintf(stderr, "--imatrix: no %s statistics for layer %d\n", kProj[p], l); return 2; }
             items[n++] = (JobItem){l, p};
         }
     int si = 0, sn = 1;   // --shard I/N: jobs I, I + N, ... (one process per GPU)

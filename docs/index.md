@@ -36,6 +36,13 @@ Facts to look up.
 - [Source layout](reference/source-layout.md): the folders of the repository.
 - [Related work](reference/related-work.md): papers and projects on seeds and computed weights.
 
+## Plans
+
+Work that is not done yet, with its gates and hypotheses.
+
+- [2026-11-04: SeedLM packs for Qwen3.8-Flash-Next](plans/2026-11-04-qwen38-flash-next.md): steps, gates, costs and
+  the PLE table choice, for a PC with a 16 GB GPU.
+
 ## Results
 
 Dated measurements. Each page gives the result, its status, the setup and the data.
@@ -51,6 +58,12 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   against oMLX oQe, on GQA and MLA, with pre-registered hypotheses.
 - [2026-10-11: A fused MLA prompt kernel in the MLX loader](results/2026-10-11-mla-fused-prefill.md): prompt speed at
   32K to 256K, memory, and accuracy, on MLA and hybrid models.
+- [2026-11-04: Hadamard rotation and P = 4 seeds on Qwen3.8-Flash-Next](results/2026-11-04-qwen38-rotation-probe.md):
+  weight error of 4 experts, with and without rotation and activation weighting.
+- [2026-11-04: The seed search over the Qwen3.8-Flash-Next experts](results/2026-11-04-qwen38-seed-search.md): P = 4
+  and P = 3 on 4 RTX PRO 6000 GPUs, errors, costs and pack sizes.
+- [2026-11-04: The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model](results/2026-11-04-qwen38-kld-vs-4bit.md):
+  KL divergence, top-1 agreement and perplexity on wikitext-2.
 
 ## For contributors and agents
 

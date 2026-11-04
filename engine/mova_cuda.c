@@ -311,6 +311,7 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
     const MovaCfg* c = &e->c;
     const int nsl = c->n_layer - c->first_sparse, units = nsl * per_layer;
     memset(p, 0, sizeof *p);
+    if (per_layer > CACHE_MAX_PER_LAYER) { snprintf(err, (size_t) errlen, "expert cache: %d experts per layer, at most %d", per_layer, CACHE_MAX_PER_LAYER); return -1; }
     p->per_layer = per_layer;
     p->ntens = ntens;
     uint64_t cur = 0;
@@ -531,6 +532,10 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         return -1;
     }
     const int f = nt->enc;
+    if ((f == MF_Q8 || f == MF_Q4) && nt->group != 64) {
+        snprintf(err, (size_t) errlen, "%s: affine group %d not supported (group 64 only)", name, nt->group);
+        return -1;
+    }
     if (f < MF_BF16 || f > MF_SEED4P4) {
         snprintf(err, (size_t) errlen, "%s: encoding %d not supported by the CUDA engine (supported: BF16, SEED4, Q8, Q4, SEED4P4)",
                  name, f);

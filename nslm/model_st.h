@@ -2,9 +2,9 @@
 //
 // A logical tensor NAME.weight is stored as safetensors entries by encoding (lead = [slices] when slices > 1):
 //   BF16     NAME.weight   BF16  lead + [rows, cols]   (any name; 1 x cols tensors are [cols])
-//   Q8, Q4   NAME.weight   U32   lead + [rows, cols * bits / 32]   (MLX affine, group 64)
-//            NAME.scales   BF16  lead + [rows, cols / 64]
-//            NAME.biases   BF16  lead + [rows, cols / 64]
+//   Q8, Q4   NAME.weight   U32   lead + [rows, cols * bits / 32]   (MLX affine, group 64; the reader also takes Q4 group 32)
+//            NAME.scales   BF16  lead + [rows, cols / group]
+//            NAME.biases   BF16  lead + [rows, cols / group]
 //            (a Q8 / Q4 tensor whose name does not end in .weight, as MLA's projections: codes as NAME, then
 //            NAME.scales and NAME.biases)
 //   SEED4    NAME.seeds    U16   [slices, rows, cols / 8]   (P = 3; lfsr.h)
@@ -23,6 +23,7 @@
 #include "format.h"
 
 enum { NS_BF16 = 0, NS_SEED4 = 1, NS_Q8 = 2, NS_Q4 = 3, NS_SEED4P4 = 4, NS_SEED6P8 = 5 };   // = MF_* (engine/kernels_moe.metal)
+#define NS_RAW 6   // writer only: a tensor copied as it is (ns_write_raw)
 #define NS_PAGE 16384
 
 typedef struct {
@@ -37,6 +38,7 @@ typedef struct {
 typedef struct {
     char name[96];
     int enc, slices, rows, cols;
+    int group;             // Q8 / Q4: the affine group (64, or 32 for Q4); 0 for other encodings
     NsStream s[4];
 } NsTensor;
 
@@ -59,8 +61,17 @@ typedef struct {
     const char* name;
     int enc, slices, rows, cols;
 } NsSpec;
+typedef struct {   // an NS_RAW tensor: copied as it is
+    const char* dtype;
+    int ndim;
+    int64_t shape[8];
+    uint64_t bytes;
+} NsRaw;
 typedef int (*NsFill)(void* ctx, int tensor, int stream, uint8_t* dst, uint64_t len);
 // Shards of at most shard_bytes (a larger tensor gets its own shard) in dir, and the index.  meta: extra
 // "__metadata__" string pairs as a JSON object body (e.g. "\"k\": \"v\""), or NULL.
 int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, const char* meta, NsFill fill, void* ctx,
              char* err, int errlen);
+// ns_write with raw[i] describing each NS_RAW tensor t[i] (raw may be NULL when there is none).
+int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, const char* meta, NsFill fill,
+                 void* ctx, char* err, int errlen);

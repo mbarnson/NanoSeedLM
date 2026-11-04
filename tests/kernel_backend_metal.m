@@ -96,6 +96,7 @@ static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuf
     });
 }
 int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn), sel = buf((int32_t[]) {0}, 4);
     MvArgs a = {w->K, w->R, T, 1, w->K, w->R, 0, add};
@@ -104,6 +105,7 @@ int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
     return 0;
 }
 int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float* x, float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) P * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * w->K), yb = buf(NULL, yn), sb = buf(sel, 4 * (size_t) P);
     MvArgs a = {w->K, w->R, P, xdiv, w->K, w->R, 0, 0};
@@ -112,6 +114,7 @@ int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const floa
     return 0;
 }
 int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float* x, float* out) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const int fmt = w->fmt, R = w->R, K = w->K;
     const size_t yn = 4 * (size_t) P * R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * K), yb = buf(NULL, yn), sb = buf(sel, 4 * (size_t) P);
@@ -153,6 +156,7 @@ static int mm_dispatch(const KtWeight* w, MmArgs a, int dense, int gy, id<MTLBuf
     });
 }
 int kt_mm(const KtWeight* w, int T, const float* x, float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn);
     MmArgs a = {w->K, w->R, T, w->K, w->R, 1, 1, 0};
@@ -162,6 +166,7 @@ int kt_mm(const KtWeight* w, int T, const float* x, float* y) {
 }
 int kt_mm_grouped(const KtWeight* w, int P, int xdiv, const int32_t* perm, const MmTile* tiles, int nt, const float* x,
                   float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) P * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * w->K), yb = buf(NULL, yn);
     MmArgs a = {w->K, w->R, 0, w->K, w->R, xdiv, 0, 0};
@@ -737,3 +742,43 @@ int kt_mla_decomp_q(MlaArgs a, int qfmt, const void* qc, const uint16_t* qs, con
     (void) Kn; (void) Vd;
     return 1;   // (as kt_mla_prefill)
 }
+
+// ---- qwen4: no Metal kernels yet (docs/concepts/parity.md) --------------------------------------------------------
+int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const float* z, const float* a, const float* b,
+              float* conv, float* S, float* y, int T) {
+    (void) c; (void) w; (void) qkv; (void) z; (void) a; (void) b; (void) conv; (void) S; (void) y; (void) T;
+    return 1;
+}
+int kt_q4_norm1p(const float* x, int len, int g, const float* w, float eps, float* y, int T) {
+    (void) x; (void) len; (void) g; (void) w; (void) eps; (void) y; (void) T;
+    return 1;
+}
+int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up, float* mixed, float* inj, float* H,
+             const float* branch, int T) {
+    (void) c; (void) lo; (void) normed; (void) up; (void) mixed; (void) inj; (void) H; (void) branch; (void) T;
+    return 1;
+}
+int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T) {
+    (void) c; (void) x; (void) rs; (void) nh; (void) hs; (void) hd; (void) w; (void) pos0; (void) T;
+    return 1;
+}
+int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T) {
+    (void) c; (void) logits; (void) ind; (void) wt; (void) T;
+    return 1;
+}
+int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, const float* w, const float* cin,
+              float* hist, float* H, int T) {
+    (void) c; (void) keys; (void) qs; (void) vals; (void) gated; (void) w; (void) cin; (void) hist; (void) H; (void) T;
+    return 1;
+}
+int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float* blk, const float* iq, int rs, const int32_t* done,
+              int32_t* sel, int T) {
+    (void) c; (void) raw; (void) w; (void) nb; (void) blk; (void) iq; (void) rs; (void) done; (void) sel; (void) T;
+    return 1;
+}
+int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
+                 const int32_t* nsel, float* o, int T) {
+    (void) c; (void) q; (void) K; (void) V; (void) npos; (void) pos0; (void) sel; (void) nsel; (void) o; (void) T;
+    return 1;
+}
+

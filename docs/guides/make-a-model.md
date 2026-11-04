@@ -25,6 +25,43 @@ not need this guide to run a model.
    out/bin/nslm-mova-pack --model SNAPSHOT --config p4mx --blk4 out/blocks --q4 v --out MODEL_DIR
    ```
 
+## Qwen3.8-Flash-Next experts
+
+The search reads the fused expert tensors of the BF16 checkpoint. The Unsloth imatrix gives the activation weights, so
+no capture run is necessary.
+
+```bash
+out/bin/nslm-moe --model SNAPSHOT --imatrix imatrix_unsloth.gguf_file --out out/blocks --scope gud --p4
+```
+
+On HF Jobs, `tools/hf_seedbank.sh` takes `IMATRIX=unsloth/Qwen3.8-Flash-Next-GGUF:imatrix_unsloth.gguf_file` and
+`ONLY=mlp.experts.`. With `ONLY`, the job downloads only the shards that hold experts.
+
+The release searches used these commands. `./src` is a copy of the repository (`git archive HEAD`). The bucket keeps
+the block files. `JOBS=moe3` gives P = 3, and `JOBS=moe4` gives P = 4.
+
+```bash
+hf jobs run --detach --flavor rtx-pro-6000x4 --timeout 95m -v ./src:/src -v hf://buckets/USER/BUCKET:/out \
+    -e SRC=/src -e MODEL=Qwen/Qwen3.8-Flash-Next@de4b8e4d43b917e7706784d8bb445c9af86a3540 -e ONLY=mlp.experts. \
+    -e IMATRIX=unsloth/Qwen3.8-Flash-Next-GGUF:imatrix_unsloth.gguf_file -e OUT=/out/p4 -e JOBS=moe4 -e WORKERS=2 \
+    nvidia/cuda:12.8.1-devel-ubuntu24.04 bash /src/tools/hf_seedbank.sh
+```
+
+To pack, start from an MLX folder of the model (`mlx-community/Qwen3.8-Flash-Next-4bit-mtp`). The packer copies its
+tensors and replaces the routed experts with seeds. `--blk` takes P = 3 blocks, and `--blk4` takes P = 4 blocks.
+
+```bash
+out/bin/nslm-qwen4-pack --base MLX_DIR --blk4 out/blocks --out MODEL_DIR
+```
+
+On HF Jobs, `tools/hf_qwen4_pack.sh` packs on a CPU node, from and to mounted buckets:
+
+```bash
+hf jobs run --detach --flavor cpu-xl --timeout 2h -v ./src:/src -v hf://buckets/USER/BUCKET:/b \
+    -e SRC=/src -e BASE=mlx-community/Qwen3.8-Flash-Next-4bit-mtp@825df623302aeebc434f44ca9122827b04f9a0f1 \
+    -e BLK=/b/p4/experts-p4 -e TIER=4 -e OUT=/b/pack-p4 python:3.12 bash /src/tools/hf_qwen4_pack.sh
+```
+
 ## MLA projections
 
 An MLA model folder also has `model-mla-delta.safetensors`. Read [The model folder format](../reference/model-folder.md).

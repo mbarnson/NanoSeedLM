@@ -19,7 +19,8 @@ extern "C" {
 typedef struct {
     const void* p[4];
     int32_t eb;        // seeds: the slice's exponent bias
-    int32_t pad[3];
+    int32_t gs;        // Q8 / Q4: log2 of the affine group (5: 32, 6: 64); 0 is 64
+    int32_t pad[2];
 } WSlice;
 
 // ---- the expert cache: a pool of fixed-size VRAM slots over a host arena that holds every expert ----------------------
@@ -48,6 +49,7 @@ typedef struct {
 // rows x k selections inds[] of sparse layer sl.  flags: CACHE_PROTECT_PREV (never replace the units of the pool's
 // previous admit: their layer may still be computing beside a prefetch).
 enum { CACHE_PROTECT_PREV = 2 };
+#define CACHE_MAX_PER_LAYER 1024   // k_cache_admit's experts per layer (its thread count); callers check it
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int flags);
 // blocks: the copy's grid (fewer leave SMs to kernels running beside it on another stream)
 void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks);
@@ -69,7 +71,7 @@ typedef struct {
     int32_t nv, fmt;
 } KvView;
 
-// x[t][:] = the embedding row of ids[t] (BF16 or Q8)
+// x[t][:] = the embedding row of ids[t] (BF16, Q8 or Q4)
 void kc_embed(cudaStream_t s, int fmt, WSlice w, int d, const int32_t* ids, float* x, int T);
 // grouped RMSNorm (2 groups)
 void kc_gnorm(cudaStream_t s, int d, float eps, const float* x, const uint16_t* w, float* y, int T);

@@ -23,6 +23,7 @@
 
 #include "gptq.h"
 #include "linalg.h"
+#include "moe.h"
 #include "mova_cfg.h"
 #include "mova_ckpt.h"
 #include "search.h"
@@ -30,15 +31,6 @@
 #include "search4_gpu.h"
 #include "searchp.h"
 #include "searchp_gpu.h"
-
-typedef struct {
-    char magic[8];
-    uint32_t rows, cols, n_experts;
-    uint32_t n_seeds, n_exp, refit;
-    int32_t exp_delta[3];
-    float n0;
-    double seconds;
-} MoeBlkHeader;   // nslm/moe.c
 
 static int has_flag(int argc, char** argv, const char* n) { for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], n)) return 1; return 0; }
 static const char* opt(int argc, char** argv, const char* n, const char* d) {
