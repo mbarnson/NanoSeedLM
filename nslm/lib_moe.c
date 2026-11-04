@@ -1,9 +1,44 @@
-// nslm/lib_moe.c - MoVA helpers (nslm/moe.h).
+// nslm/lib_moe.c - MoVA and Qwen3.8 expert helpers (nslm/moe.h).
 #include "moe.h"
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "json.h"
+
+int nslm_qwen_experts(const char* config_json, int* d, int* ff, int* n_exp, int* n_layer) {
+    char err[128];
+    Json* j = json_parse(config_json, strlen(config_json), err, sizeof err);
+    const Json* t = json_get(j, "text_config") ? json_get(j, "text_config") : j;
+    const char* mt = json_gets(t, "model_type");
+    int rc = j ? 0 : -1;
+    if (mt && !strncmp(mt, "qwen4_exp", 9)) {
+        const char* key[4] = {"hidden_size", "moe_intermediate_size", "num_experts", "num_hidden_layers"};
+        int* dst[4] = {d, ff, n_exp, n_layer};
+        rc = 1;
+        for (int k = 0; k < 4; ++k) {
+            const Json* v = json_get(t, key[k]);
+            if (!v || v->t != J_INT || v->i < 1 || v->i > 1 << 20 || (k < 2 && v->i % 8)) rc = -1;
+            else *dst[k] = (int) v->i;
+        }
+    }
+    json_free(j);
+    return rc;
+}
+
+void nslm_imatrix_h(const float* sum, const float* cnt, int E, int cols, int e, double n0, float* h) {
+    double n = 0, *prior = (double*) calloc((size_t) cols, sizeof(double)), *own = (double*) malloc(sizeof(double) * (size_t) cols);
+    for (int k = 0; k < E; ++k) {
+        n += cnt[k];
+        for (int c = 0; c < cols; ++c) prior[c] += sum[(size_t) k * cols + c];
+    }
+    for (int c = 0; c < cols; ++c) { prior[c] /= n > 0 ? n : 1; own[c] = sum[(size_t) e * cols + c]; }
+    nslm_moe_blend(own, (int64_t) cnt[e], prior, n0, cols, h);
+    free(prior);
+    free(own);
+}
 
 int nslm_moe_index_lookup(const char* index_json, const char* name, char* file, int filelen) {
     const size_t nl = strlen(name);

@@ -36,6 +36,25 @@ int main(void) {
     nslm_moe_blend(sum, 4, prior, 0.0, 3, h);    // no prior: the routed mean
     CHECK(h[0] == 2.5f && h[1] == 0.0f && h[2] == 1.0f, "blend n0=0");
 
+    // ---- qwen4_exp expert shapes from config.json ----
+    int d = 0, ff = 0, ne = 0, nl = 0;
+    const char* qcfg = "{\"model_type\": \"qwen4_exp\", \"text_config\": {\"model_type\": \"qwen4_exp_text\", \"hidden_size\": 2560, "
+                       "\"moe_intermediate_size\": 640, \"num_experts\": 512, \"num_hidden_layers\": 48}}";
+    CHECK(nslm_qwen_experts(qcfg, &d, &ff, &ne, &nl) == 1 && d == 2560 && ff == 640 && ne == 512 && nl == 48,
+          "qwen4_exp shapes %d %d %d %d", d, ff, ne, nl);
+    CHECK(nslm_qwen_experts("{\"model_type\": \"k2_horizon\", \"hidden_size\": 2560}", &d, &ff, &ne, &nl) == 0, "MoVA is not qwen4_exp");
+    CHECK(nslm_qwen_experts("{\"text_config\": {\"model_type\": \"qwen4_exp_text\", \"hidden_size\": 2560}}", &d, &ff, &ne, &nl) == -1,
+          "missing shapes accepted");
+    CHECK(nslm_qwen_experts("not json", &d, &ff, &ne, &nl) == -1, "bad JSON accepted");
+
+    // ---- imatrix h: expert 1's mean x^2, shrunk toward the mean over all experts' tokens ----
+    const float isum[2 * 3] = {4, 8, 12, 30, 0, 6}, icnt[2] = {2, 3};   // [E = 2][cols = 3], tokens per expert
+    nslm_imatrix_h(isum, icnt, 2, 3, 1, 5.0, h);
+    for (int c = 0; c < 3; ++c) {
+        const double pri = (isum[c] + isum[3 + c]) / 5.0, want = (isum[3 + c] + 5.0 * pri) / 8.0;
+        CHECK(fabs(h[c] - want) < 1e-6 * (want + 1e-9), "imatrix h c%d %g want %g", c, h[c], want);
+    }
+
     // ---- 3-D BF16 safetensors round trip ----
     const int d0 = 3, d1 = 5, d2 = 8;
     uint16_t* w = (uint16_t*) malloc(2 * (size_t) d0 * d1 * d2);

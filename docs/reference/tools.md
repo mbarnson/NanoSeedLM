@@ -25,7 +25,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 
 | Tool | Use |
 |---|---|
-| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`) |
+| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8 experts take `--imatrix` |
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 

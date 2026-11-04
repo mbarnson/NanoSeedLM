@@ -25,6 +25,18 @@ not need this guide to run a model.
    out/bin/nslm-mova-pack --model SNAPSHOT --config p4mx --blk4 out/blocks --q4 v --out MODEL_DIR
    ```
 
+## Qwen3.8-Flash-Next experts
+
+The search reads the fused expert tensors of the BF16 checkpoint. The Unsloth imatrix gives the activation weights, so
+no capture run is necessary.
+
+```bash
+out/bin/nslm-moe --model SNAPSHOT --imatrix imatrix_unsloth.gguf_file --out out/blocks --scope gud --p4
+```
+
+On HF Jobs, `tools/hf_seedbank.sh` takes `IMATRIX=unsloth/Qwen3.8-Flash-Next-GGUF:imatrix_unsloth.gguf_file` and
+`ONLY=mlp.experts.`. With `ONLY`, the job downloads only the shards that hold experts.
+
 ## MLA projections
 
 An MLA model folder also has `model-mla-delta.safetensors`. Read [The model folder format](../reference/model-folder.md).

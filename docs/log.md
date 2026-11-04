@@ -142,3 +142,9 @@ On 4 experts of layer 20, a block Hadamard rotation did not change the plain err
 activation-weighted fit without rotation gave 6% to 10% less activation-weighted error. The expert weights are
 already near-Gaussian (kurtosis 3.0 to 3.06). Read
 [Hadamard rotation and P = 4 seeds](results/2026-11-04-qwen38-rotation-probe.md).
+
+## [2026-11-04] engine | Qwen3.8-Flash-Next experts in the seed search
+
+`nslm-moe` reads the expert shapes of a `qwen4_exp` model from `config.json`, and the fused expert tensors by slice.
+`--imatrix` takes the activation weights from a llama.cpp imatrix GGUF (`nslm/gguf.h`). `tools/hf_seedbank.sh` takes
+`IMATRIX` and `ONLY`. A CPU run on layer 20 of the BF16 checkpoint read 1,852 imatrix tensors and the expert counts.

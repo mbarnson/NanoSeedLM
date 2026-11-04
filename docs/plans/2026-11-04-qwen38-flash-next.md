@@ -5,7 +5,7 @@
 of DDR4, one pack must decode faster than a published quantization of similar quality. A second target is a Mac with
 128 GB of unified memory. The user chooses the precision of the PLE table to fit the free disk space.
 
-**Status.** Draft. No gate is measured yet. A first probe for H3 is done:
+**Status.** Draft. No gate is measured yet. S1 items 1 to 3 are done. A first probe for H3 is done:
 [Hadamard rotation and P = 4 seeds](../results/2026-11-04-qwen38-rotation-probe.md). Each gate gets a results page
 when we measure it.
 
