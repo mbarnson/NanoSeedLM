@@ -37,6 +37,13 @@ out/bin/nslm-moe --model SNAPSHOT --imatrix imatrix_unsloth.gguf_file --out out/
 On HF Jobs, `tools/hf_seedbank.sh` takes `IMATRIX=unsloth/Qwen3.8-Flash-Next-GGUF:imatrix_unsloth.gguf_file` and
 `ONLY=mlp.experts.`. With `ONLY`, the job downloads only the shards that hold experts.
 
+To pack, start from an MLX folder of the model (`mlx-community/Qwen3.8-Flash-Next-4bit-mtp`). The packer copies its
+tensors and replaces the routed experts with seeds. `--blk` takes P = 3 blocks, and `--blk4` takes P = 4 blocks.
+
+```bash
+out/bin/nslm-qwen4-pack --base MLX_DIR --blk4 out/blocks --out MODEL_DIR
+```
+
 ## MLA projections
 
 An MLA model folder also has `model-mla-delta.safetensors`. Read [The model folder format](../reference/model-folder.md).

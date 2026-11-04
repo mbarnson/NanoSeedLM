@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "format.h"
 #include "moe.h"
@@ -53,6 +54,64 @@ int main(void) {
     for (int c = 0; c < 3; ++c) {
         const double pri = (isum[c] + isum[3 + c]) / 5.0, want = (isum[3 + c] + 5.0 * pri) / 8.0;
         CHECK(fabs(h[c] - want) < 1e-6 * (want + 1e-9), "imatrix h c%d %g want %g", c, h[c], want);
+    }
+
+    // ---- .blk4 -> SEED4P4 streams: seeds, coefficient words, int32 bias per slice, exponent codes 2 per byte ----
+    {
+        enum { E = 2, R = 2, C = 16, NB = R * C / 8 };
+        static uint8_t img[sizeof(MoeBlkHeader) + 12 * E + 5 * NB * E];
+        MoeBlkHeader* hd = (MoeBlkHeader*) img;
+        memcpy(hd->magic, "NSLMBLK4", 8);
+        hd->rows = R; hd->cols = C; hd->n_experts = E;
+        uint8_t* b = img + sizeof *hd;
+        const int32_t bias[E] = {-20, -19};
+        memcpy(b, bias, sizeof bias);
+        uint16_t* seed = (uint16_t*) (b + 12 * E), *nib = seed + NB * E;
+        uint8_t* ec = (uint8_t*) (nib + NB * E);
+        for (int k = 0; k < NB * E; ++k) { seed[k] = (uint16_t) (100 + k); nib[k] = (uint16_t) (0x1000 + k); ec[k] = (uint8_t) k; }
+        uint16_t s0[NB * E], s1[NB * E];
+        int32_t s2[E];
+        uint8_t s3[NB * E / 2];
+        CHECK(!nslm_blk_stream(img, sizeof img, 4, E, R, C, 0, (uint8_t*) s0) && s0[5] == 105, "blk4 seeds");
+        CHECK(!nslm_blk_stream(img, sizeof img, 4, E, R, C, 1, (uint8_t*) s1) && s1[7] == 0x1007, "blk4 coefficient words");
+        CHECK(!nslm_blk_stream(img, sizeof img, 4, E, R, C, 2, (uint8_t*) s2) && s2[1] == -19, "blk4 bias");
+        CHECK(!nslm_blk_stream(img, sizeof img, 4, E, R, C, 3, s3) && s3[0] == 0x10 && s3[3] == 0x76, "blk4 codes: block 2j low nibble");
+        CHECK(nslm_blk_stream(img, sizeof img, 4, E, R, 2 * C, 0, (uint8_t*) s0) != 0, "blk4 of other shape accepted");
+        CHECK(nslm_blk_stream(img, sizeof img - 1, 4, E, R, C, 0, (uint8_t*) s0) != 0, "short blk4 accepted");
+    }
+
+    // ---- .blk (P = 3) -> SEED4 streams: seeds, nibble words, int32 bias per slice ----
+    {
+        enum { E = 2, R = 2, C = 16, NB = R * C / 8 };
+        static uint8_t img[sizeof(MoeBlkHeader) + 12 * E + 4 * NB * E];
+        MoeBlkHeader* hd = (MoeBlkHeader*) img;
+        memcpy(hd->magic, "NSLMBLKM", 8);
+        hd->rows = R; hd->cols = C; hd->n_experts = E;
+        uint16_t* seed = (uint16_t*) (img + sizeof *hd + 12 * E), *nib = seed + NB * E;
+        for (int k = 0; k < NB * E; ++k) { seed[k] = (uint16_t) (7 + k); nib[k] = (uint16_t) (0x2000 + k); }
+        uint16_t s0[NB * E], s1[NB * E];
+        CHECK(!nslm_blk_stream(img, sizeof img, 3, E, R, C, 0, (uint8_t*) s0) && s0[3] == 10, "blk seeds");
+        CHECK(!nslm_blk_stream(img, sizeof img, 3, E, R, C, 1, (uint8_t*) s1) && s1[6] == 0x2006, "blk nibble words");
+        CHECK(nslm_blk_stream(img, sizeof img, 4, E, R, C, 0, (uint8_t*) s0) != 0, "a .blk read as .blk4");
+    }
+
+    // ---- the MLX loader ships with nanoseedlm_seeds.py ----
+    {
+        mkdir("out/test_moe_loader", 0755);
+        mkdir("out/test_moe_pack", 0755);
+        remove("out/test_moe_loader/nanoseedlm_seeds.py");   // a clean start on reruns
+        FILE* lf = fopen("out/test_moe_loader/nanoseedlm_x.py", "wb");
+        fputs("x = 1\n", lf);
+        fclose(lf);
+        CHECK(nslm_copy_loader("out/test_moe_loader/nanoseedlm_x.py", "out/test_moe_pack") != 0, "loader without the seed core copied");
+        lf = fopen("out/test_moe_loader/nanoseedlm_seeds.py", "wb");
+        fputs("y = 2\n", lf);
+        fclose(lf);
+        CHECK(nslm_copy_loader("out/test_moe_loader/nanoseedlm_x.py", "out/test_moe_pack") == 0, "copy loader");
+        FILE* a = fopen("out/test_moe_pack/nanoseedlm_x.py", "rb"), *b = fopen("out/test_moe_pack/nanoseedlm_seeds.py", "rb");
+        CHECK(a && b, "loader and seed core in the pack");
+        if (a) fclose(a);
+        if (b) fclose(b);
     }
 
     // ---- 3-D BF16 safetensors round trip ----

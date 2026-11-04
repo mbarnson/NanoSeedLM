@@ -28,6 +28,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8 experts take `--imatrix` |
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
+| `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, from an MLX base folder |
 
 Read [Make a model folder](../guides/make-a-model.md).
 
@@ -35,7 +36,9 @@ Read [Make a model folder](../guides/make-a-model.md).
 
 | Tool | Use |
 |---|---|
-| `nanoseedlm_k2.py` | The MLX loader |
+| `nanoseedlm_k2.py` | The MLX loader for K2-Horizon |
+| `nanoseedlm_qwen4.py` | The MLX loader for Qwen3.8-Flash-Next (mlx-vlm) |
+| `nanoseedlm_seeds.py` | The seed kernels and modules that the MLX loaders share |
 | `mova_capture.py` | Activation statistics for the expert search, through MLX |
 | `mova_score.py` | Scores in MLX |
 | `mova_export.py` | Inputs for `nslm-mova-score`, `nslm-mova-gen`, `nslm-mova-bench` and route studies |

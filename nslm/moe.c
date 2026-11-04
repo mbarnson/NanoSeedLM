@@ -48,15 +48,6 @@
 #include "search4_gpu.h"
 #include "searchp_gpu.h"
 
-typedef struct {
-    char magic[8];   // "NSLMBLKM"
-    uint32_t rows, cols, n_experts;
-    uint32_t n_seeds, n_exp, refit;
-    int32_t exp_delta[3];
-    float n0;
-    double seconds;
-} MoeBlkHeader;
-
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
     for (int i = 1; i + 1 < argc; ++i) if (!strcmp(argv[i], name)) return argv[i + 1];
     return def;

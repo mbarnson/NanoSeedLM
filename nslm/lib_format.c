@@ -95,14 +95,14 @@ int st_open_file(StFile* s, const char* path, char* err, int errlen) {
                 } else if (!strcmp(f, "shape") || !strcmp(f, "data_offsets")) {
                     if (*p != '[') goto bad;
                     ++p;
-                    int64_t v[4];
+                    int64_t v[8];
                     int k = 0;
                     for (;;) {
                         p = skip_ws(p, e);
                         if (*p == ']') { ++p; break; }
                         char* q;
                         const long long x = strtoll(p, &q, 10);
-                        if (q == p || k >= 4) goto bad;
+                        if (q == p || k >= 8) goto bad;
                         v[k++] = x;
                         p = skip_ws(q, e);
                         if (*p == ',') ++p;

@@ -9,10 +9,12 @@ not need to patch the app.
 | Loader | Models | Source |
 |---|---|---|
 | `nanoseedlm_k2.py` | Seed models: GQA p4mx-q4v, MLA-P4, MLA-P3, K2-Horizon-0.9B | `tools/nanoseedlm_k2.py` in this repository |
+| `nanoseedlm_qwen4.py` | Qwen3.8-Flash-Next with seed experts, through mlx-vlm | `tools/nanoseedlm_qwen4.py` in this repository |
 | `k2_mla.py` | MLA models without seeds: MLA BF16, oQ4e, oQ6e, oQ8e | The model repositories |
 
-Both loaders need the K2-Horizon model code of MLX (`mlx_lm.models.k2_horizon`). [oMLX](https://github.com/jundot/omlx)
-supplies it. The mlx-lm package does not include it.
+The two K2 loaders need the K2-Horizon model code of MLX (`mlx_lm.models.k2_horizon`). [oMLX](https://github.com/jundot/omlx)
+supplies it. The mlx-lm package does not include it. `nanoseedlm_qwen4.py` needs `mlx_vlm.models.qwen4_exp` (mlx-vlm
+0.7.12 or later, or oMLX).
 
 ## oMLX
 

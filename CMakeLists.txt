@@ -140,6 +140,8 @@ add_test(NAME test_dense_help COMMAND nslm-dense -h)
 set_tests_properties(test_dense_help PROPERTIES WILL_FAIL TRUE)   # usage exits 2; a startup crash still fails
 add_executable(nslm-mova-pack nslm/mova_pack.c)
 target_link_libraries(nslm-mova-pack nslm)
+add_executable(nslm-qwen4-pack nslm/qwen4_pack.c)
+target_link_libraries(nslm-qwen4-pack nslm)
 add_executable(nslm-bits-probe nslm/bits_probe.c)
 target_link_libraries(nslm-bits-probe nslm)
 

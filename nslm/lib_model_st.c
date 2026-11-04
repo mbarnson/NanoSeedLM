@@ -237,13 +237,18 @@ int ns_mappable(const NsModel* m, const NsStream* s) {
 typedef struct {
     char name[176];
     const char* dtype;
-    int64_t shape[3];
+    int64_t shape[8];
     int ndim;
     uint64_t len, off;   // off: relative to the data section
     int tensor, stream, shard;
 } Ent;
 
-static void ent_shape(Ent* e, const NsSpec* t, int s) {
+static uint64_t spec_len(const NsSpec* t, const NsRaw* r, int s) {
+    return t->enc == NS_RAW ? (s ? 0 : r->bytes) : ns_stream_len(t->enc, t->slices, t->rows, t->cols, s);
+}
+
+static void ent_shape(Ent* e, const NsSpec* t, const NsRaw* r, int s) {
+    if (t->enc == NS_RAW) { e->ndim = r->ndim; memcpy(e->shape, r->shape, sizeof(int64_t) * (size_t) r->ndim); return; }
     const int seed = t->enc == NS_SEED4 || t->enc == NS_SEED4P4 || t->enc == NS_SEED6P8;
     const int lead = t->slices > 1 || seed;
     int64_t last = t->cols;
@@ -269,6 +274,11 @@ static int write_index(const char* dir, const Ent* ents, int ne, char shards[][6
 
 int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, const char* meta, NsFill fill, void* ctx,
              char* err, int errlen) {
+    return ns_write_raw(dir, t, NULL, n, shard_bytes, meta, fill, ctx, err, errlen);
+}
+
+int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, const char* meta, NsFill fill,
+                 void* ctx, char* err, int errlen) {
     Ent* ents = (Ent*) calloc((size_t) n * 4, sizeof(Ent));
     int ne = 0, nsh = 0;
     uint64_t cur = 0, total = 0;
@@ -279,22 +289,28 @@ int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, cons
             return -1;
         }
         uint64_t tb = 0;
-        for (int s = 0; s < 4; ++s) tb += ns_stream_len(t[i].enc, t[i].slices, t[i].rows, t[i].cols, s);
+        const NsRaw* r = t[i].enc == NS_RAW && raw ? &raw[i] : NULL;
+        if (t[i].enc == NS_RAW && (!r || r->ndim < 0 || r->ndim > 8 || !r->dtype)) {
+            snprintf(err, (size_t) errlen, "%s: a raw tensor needs a dtype and at most 8 dimensions", t[i].name);
+            free(ents);
+            return -1;
+        }
+        for (int s = 0; s < 4; ++s) tb += spec_len(&t[i], r, s);
         if (nsh == 0 || (cur > 0 && cur + tb > shard_bytes)) { ++nsh; cur = 0; }
         cur += tb;
         total += tb;
         for (int s = 0; s < 4; ++s) {
-            const uint64_t len = ns_stream_len(t[i].enc, t[i].slices, t[i].rows, t[i].cols, s);
+            const uint64_t len = spec_len(&t[i], r, s);
             if (!len) continue;
             Ent* e = &ents[ne++];
             const size_t L = strlen(t[i].name);
-            if (t[i].enc == NS_BF16) snprintf(e->name, sizeof e->name, "%s", t[i].name);
+            if (t[i].enc == NS_BF16 || t[i].enc == NS_RAW) snprintf(e->name, sizeof e->name, "%s", t[i].name);
             else if (L > 7 && ends(t[i].name, ".weight")) snprintf(e->name, sizeof e->name, "%.*s%s", (int) (L - 7), t[i].name, SUF[t[i].enc][s]);
             else if (t[i].enc == NS_Q8 || t[i].enc == NS_Q4)   // a name without .weight (MLA projections): X, X.scales, X.biases
                 snprintf(e->name, sizeof e->name, "%s%s", t[i].name, s ? SUF[t[i].enc][s] : "");
             else { snprintf(err, (size_t) errlen, "%s: a seed-encoded tensor must be named *.weight", t[i].name); free(ents); return -1; }
-            e->dtype = DT[t[i].enc][s];
-            ent_shape(e, &t[i], s);
+            e->dtype = r ? r->dtype : DT[t[i].enc][s];
+            ent_shape(e, &t[i], r, s);
             e->len = len;
             e->tensor = i;
             e->stream = s;

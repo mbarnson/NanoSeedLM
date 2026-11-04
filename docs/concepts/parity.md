@@ -50,6 +50,7 @@ same results as the engine.
 | MLA KV cache fp8, fp4 | Yes | Yes | No |
 | MLA KV cache q8, rq4 | No | No | Yes |
 | Hybrid MLA (`mla_ranks` 0: GQA layers) | Yes | Yes | Yes |
+| Qwen3.8-Flash-Next with P = 3 / 4 seed experts | No | No | Yes (mlx-vlm) |
 | Fused kernel for MLA prompts | `k_mla_prefill` | `k_mla_prefill` | `_MLA_PREFILL` |
 | Paged KV cache | Yes (macOS 26.4 or later) | No | No |
 | OpenAI-compatible server | `nslm-serve` | `nslm-serve` | oMLX |

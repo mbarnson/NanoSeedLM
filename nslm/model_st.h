@@ -23,6 +23,7 @@
 #include "format.h"
 
 enum { NS_BF16 = 0, NS_SEED4 = 1, NS_Q8 = 2, NS_Q4 = 3, NS_SEED4P4 = 4, NS_SEED6P8 = 5 };   // = MF_* (engine/kernels_moe.metal)
+#define NS_RAW 6   // writer only: a tensor copied as it is (ns_write_raw)
 #define NS_PAGE 16384
 
 typedef struct {
@@ -59,8 +60,17 @@ typedef struct {
     const char* name;
     int enc, slices, rows, cols;
 } NsSpec;
+typedef struct {   // an NS_RAW tensor: copied as it is
+    const char* dtype;
+    int ndim;
+    int64_t shape[8];
+    uint64_t bytes;
+} NsRaw;
 typedef int (*NsFill)(void* ctx, int tensor, int stream, uint8_t* dst, uint64_t len);
 // Shards of at most shard_bytes (a larger tensor gets its own shard) in dir, and the index.  meta: extra
 // "__metadata__" string pairs as a JSON object body (e.g. "\"k\": \"v\""), or NULL.
 int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, const char* meta, NsFill fill, void* ctx,
              char* err, int errlen);
+// ns_write with raw[i] describing each NS_RAW tensor t[i] (raw may be NULL when there is none).
+int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, const char* meta, NsFill fill,
+                 void* ctx, char* err, int errlen);

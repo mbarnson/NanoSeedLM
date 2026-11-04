@@ -162,6 +162,28 @@ int main(void) {
         remove_dir(path);
     }
 
+    // NS_RAW: a tensor copied as it is (any dtype and shape), beside a seed tensor; read back as plain safetensors
+    {
+        const NsSpec two[2] = {{"vision.patch_embed.proj.weight", NS_RAW, 1, 1, 1}, {"layers.0.mlp.switch_mlp.up_proj.weight", NS_SEED4P4, 2, 16, 64}};
+        const NsRaw raw[2] = {{"F32", 5, {2, 3, 1, 1, 4}, 2 * 3 * 4 * 4}, {NULL, 0, {0}, 0}};
+        order = -1;
+        snprintf(path, sizeof path, "%s_raw", dir);
+        mkdir(path, 0755);
+        CHECK(ns_write(path, two, 1, 1u << 20, NULL, fill, &order, err, sizeof err) != 0, "raw tensor without NsRaw written");
+        CHECK(ns_write_raw(path, two, raw, 2, 1u << 20, NULL, fill, &order, err, sizeof err) == 0, "raw write: %s", err);
+        char shard[2100];
+        snprintf(shard, sizeof shard, "%s/model-00001-of-00001.safetensors", path);
+        StFile st;
+        CHECK(st_open_file(&st, shard, err, sizeof err) == 0, "raw read: %s", err);
+        const StEntry* e = st_find(&st, "vision.patch_embed.proj.weight");
+        CHECK(e && !strcmp(e->dtype, "F32") && e->ndim == 5 && e->shape[4] == 4 && e->end - e->begin == 96, "raw entry");
+        if (e) CHECK(st_data(&st, e)[5] == byte_of(0, 0, 5), "raw data");
+        CHECK(st_find(&st, "layers.0.mlp.switch_mlp.up_proj.seeds") && st_find(&st, "layers.0.mlp.switch_mlp.up_proj.codes"),
+              "seed streams beside a raw tensor");
+        st_close_file(&st);
+        remove_dir(path);
+    }
+
     printf("test_model_st: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

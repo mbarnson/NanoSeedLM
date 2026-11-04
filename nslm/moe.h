@@ -1,7 +1,28 @@
 // nslm/moe.h - MoVA helpers: sharded-checkpoint index lookup, per-expert calibration statistics, and the
 // expanded-expert safetensors files.
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
+
+// The header of nslm-moe's .blk / .blk4 / .blk8 block files.
+typedef struct {
+    char magic[8];   // "NSLMBLKM", "NSLMBLK4", "NSLMBLK8"
+    uint32_t rows, cols, n_experts;
+    uint32_t n_seeds, n_exp, refit;
+    int32_t exp_delta[3];
+    float n0;
+    double seconds;
+} MoeBlkHeader;
+
+// Stream s (model_st.h) of an nslm-moe block file image of E slices of rows x cols.  P = 3 (.blk, SEED4): 0 seeds,
+// 1 nibble words, 2 int32 bias per slice.  P = 4 (.blk4, SEED4P4): the same with coefficient words, then 3 exponent
+// codes (block 2j in the low nibble of byte j).  -1 when blk is not that file.
+int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int cols, int s, uint8_t* dst);
+
+// Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.
+int nslm_copy_loader(const char* loader, const char* dir);
+// Copies the tokenizer, template and processor files that exist in from (all optional) into to.
+void nslm_copy_model_files(const char* from, const char* to);
 
 // The shard file of tensor `name` in a model.safetensors.index.json text (the weight_map entry).  0 when found.
 int nslm_moe_index_lookup(const char* index_json, const char* name, char* file, int filelen);

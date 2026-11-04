@@ -20,6 +20,7 @@ import mova_common  # noqa: E402
 
 mova_common.register()
 import nanoseedlm_k2 as ns  # noqa: E402
+import nanoseedlm_seeds as seeds  # noqa: E402
 
 R32 = np.float32(1.0) / np.float32(32767.0)
 
@@ -115,7 +116,7 @@ def rel_err(a, b):
 
 
 def test_table():
-    t = np.array(ns.lfsr_table())
+    t = np.array(seeds.lfsr_table())
     for seed in (1, 2, 0xACE1, 0xFFFF):
         s, g = seed, 0
         for k in range(32):
@@ -137,7 +138,7 @@ def test_matvec():
         w = ref_decode(*parts)
         x = mx.array(rng.standard_normal((9, 48)).astype(np.float32)).astype(dtype)
         idx = rng.integers(0, 5, 9).astype(np.uint32)
-        got = ns.gather_matvec(x, mx.array(idx), *map(mx.array, parts))
+        got = seeds.gather_matvec(x, mx.array(idx), *map(mx.array, parts))
         want = np.einsum("mk,mnk->mn", np.array(x.astype(mx.float32)), w[idx])
         assert rel_err(mx.array(want), got) < (2e-2 if dtype != mx.float32 else 1e-5), dtype
 
@@ -169,7 +170,7 @@ def test_gather_gemm():
         for pairs in (33, 150, 700):
             idx = sorted_pairs(rng, pairs, 5, empty=(2,))
             x = mx.array(rng.standard_normal((pairs, 96)).astype(np.float32)).astype(dtype)
-            got = ns.gather_gemm(x, mx.array(idx), *map(mx.array, parts))
+            got = seeds.gather_gemm(x, mx.array(idx), *map(mx.array, parts))
             want = np.einsum("mk,mnk->mn", np.array(x.astype(mx.float32)), w[idx])
             assert got.shape == (pairs, 37) and got.dtype == dtype
             assert rel_err(mx.array(want), got) < (4e-3 if dtype == mx.bfloat16 else 1e-5), (dtype, pairs)
@@ -184,9 +185,9 @@ def test_combine_sorted():
             order = mx.argsort(idx.reshape(-1))
             ys = mx.array(rng.standard_normal((tokens * k, 64)).astype(np.float32)).astype(dtype)
             w = mx.array(rng.random((tokens, k)).astype(np.float32))
-            y = ns._unsort(ys, order, idx.shape)
+            y = seeds._unsort(ys, order, idx.shape)
             want = (y * w.astype(dtype)[..., None]).sum(axis=-2)
-            got = ns.combine_sorted(ys, order, w)
+            got = seeds.combine_sorted(ys, order, w)
             assert got.shape == want.shape and got.dtype == dtype
             assert bool(mx.all(got == want).item()), (dtype, tokens, k, rel_err(want, got))
 

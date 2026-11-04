@@ -83,3 +83,53 @@ int nslm_st_write_bf16_3d(const char* path, const char* name, int d0, int d1, in
     }
     return 0;
 }
+
+int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int cols, int s, uint8_t* dst) {
+    const size_t e = (size_t) E, nb = (size_t) rows * (size_t) cols / 8;
+    const MoeBlkHeader* h = (const MoeBlkHeader*) blk;
+    if ((p != 3 && p != 4) || (p == 3 && s > 2) || len != sizeof *h + 12 * e + (p == 4 ? 5 : 4) * nb * e ||
+        memcmp(h->magic, p == 4 ? "NSLMBLK4" : "NSLMBLKM", 8) || h->rows != (uint32_t) rows || h->cols != (uint32_t) cols ||
+        h->n_experts != (uint32_t) E)
+        return -1;
+    const uint8_t* base = blk + sizeof *h;
+    if (s == 0 || s == 1) memcpy(dst, base + 12 * e + (s == 1 ? 2 * nb * e : 0), 2 * nb * e);
+    else if (s == 2) memcpy(dst, base, 4 * e);
+    else {
+        const uint8_t* ec = base + 12 * e + 4 * nb * e;
+        for (size_t k = 0; k < nb * e; k += 2) dst[k / 2] = (uint8_t) ((ec[k] & 15) | ((k + 1 < nb * e ? ec[k + 1] & 15 : 0) << 4));
+    }
+    return 0;
+}
+
+static int copy_file(const char* from, const char* to) {
+    FILE* a = fopen(from, "rb");
+    if (!a) return -1;
+    FILE* b = fopen(to, "wb");
+    if (!b) { fclose(a); return -1; }
+    char buf[1 << 16];
+    for (size_t n; (n = fread(buf, 1, sizeof buf, a)) > 0;) fwrite(buf, 1, n, b);
+    fclose(a);
+    return fclose(b);
+}
+
+int nslm_copy_loader(const char* loader, const char* dir) {
+    const char* sl = strrchr(loader, '/');
+    char from[2048], to[2048];
+    snprintf(from, sizeof from, "%.*snanoseedlm_seeds.py", sl ? (int) (sl - loader + 1) : 0, loader);
+    snprintf(to, sizeof to, "%s/%s", dir, sl ? sl + 1 : loader);
+    if (copy_file(loader, to)) return -1;
+    snprintf(to, sizeof to, "%s/nanoseedlm_seeds.py", dir);
+    return copy_file(from, to);
+}
+
+void nslm_copy_model_files(const char* from, const char* to) {
+    static const char* files[] = {"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
+                                  "generation_config.json", "preprocessor_config.json", "processor_config.json",
+                                  "video_preprocessor_config.json", "vocab.json", "merges.txt"};
+    char a[2048], b[2048];
+    for (size_t i = 0; i < sizeof files / sizeof files[0]; ++i) {
+        snprintf(a, sizeof a, "%s/%s", from, files[i]);
+        snprintf(b, sizeof b, "%s/%s", to, files[i]);
+        copy_file(a, b);
+    }
+}

@@ -44,17 +44,9 @@
 #include "json.h"
 #include "model_st.h"
 #include "search4.h"
+#include "moe.h"
 #include "mova_cfg.h"
 #include "mova_ckpt.h"
-
-typedef struct {
-    char magic[8];
-    uint32_t rows, cols, n_experts;
-    uint32_t n_seeds, n_exp, refit;
-    int32_t exp_delta[3];
-    float n0;
-    double seconds;
-} MoeBlkHeader;   // nslm/moe.c
 
 static int has_flag(int argc, char** argv, const char* name) {
     for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], name)) return 1;
@@ -190,20 +182,14 @@ static int streams_blk4(Ctx* c, const MovaTensor* t, int s, uint8_t* dst, uint64
         c->blkbuf = (uint8_t*) malloc(c->blklen);
         const size_t got = fread(c->blkbuf, 1, c->blklen, f);
         fclose(f);
-        const MoeBlkHeader* h = (const MoeBlkHeader*) c->blkbuf;
-        if (got != c->blklen || memcmp(h->magic, "NSLMBLK4", 8) || h->rows != (uint32_t) t->rows || h->cols != (uint32_t) t->cols ||
-            h->n_experts != (uint32_t) E || c->blklen != sizeof *h + 12 * E + 5 * nb * E) {
+        if (got != c->blklen || nslm_blk_stream(c->blkbuf, c->blklen, 4, (int) E, t->rows, t->cols, 0, dst)) {
             fprintf(stderr, "%s: not the expected P = 4 seed file\n", path);
             return -1;
         }
+        return 0;
     }
-    const uint8_t* base = c->blkbuf + sizeof(MoeBlkHeader);
-    if (s == 0 || s == 1) { memcpy(dst, base + 12 * E + (s == 1 ? 2 * nb * E : 0), len); return 0; }
-    if (s == 2) { memcpy(dst, base, 4 * E); return 0; }              // int32 bias per slice
-    const uint8_t* ec = base + 12 * E + 4 * nb * E;
-    uint8_t* nib = dst;
-    for (size_t k = 0; k < nb * E; k += 2) nib[k / 2] = (uint8_t) ((ec[k] & 15) | ((k + 1 < nb * E ? ec[k + 1] & 15 : 0) << 4));
-    return 0;
+    (void) nb; (void) len;
+    return nslm_blk_stream(c->blkbuf, c->blklen, 4, (int) E, t->rows, t->cols, s, dst);
 }
 
 // SEED6P8 streams from a .blk8 (one slice): s0 seeds, s1 32-bit coefficient words, s2 int32 bias, s3 exponent codes.
@@ -285,34 +271,18 @@ static int fill(void* ctx, int ti, int s, uint8_t* dst, uint64_t len) {
         c->blkbuf = (uint8_t*) malloc(c->blklen);
         const size_t got = fread(c->blkbuf, 1, c->blklen, f);
         fclose(f);
-        const MoeBlkHeader* h = (const MoeBlkHeader*) c->blkbuf;
-        const size_t nb = (size_t) t->rows * t->cols / 8, E = (size_t) t->slices;
-        if (got != c->blklen || memcmp(h->magic, "NSLMBLKM", 8) || h->rows != (uint32_t) t->rows || h->cols != (uint32_t) t->cols ||
-            h->n_experts != (uint32_t) t->slices || h->n_seeds != 65535 ||
-            c->blklen != sizeof *h + 12 * E + 4 * nb * E) {
+        if (got != c->blklen || ((const MoeBlkHeader*) c->blkbuf)->n_seeds != 65535 ||
+            nslm_blk_stream(c->blkbuf, c->blklen, 3, t->slices, t->rows, t->cols, 0, dst)) {
             fprintf(stderr, "%s: not the expected seed file\n", path);
             return -1;
         }
+        return 0;
     }
-    const size_t E = (size_t) t->slices, nb = (size_t) t->rows * t->cols / 8;
-    const uint8_t* base = c->blkbuf + sizeof(MoeBlkHeader);
-    if (s == 2) memcpy(dst, base, 4 * E);                                   // int32 bias per slice
-    else memcpy(dst, base + 12 * E + (s == 1 ? 2 * nb * E : 0), len);       // seeds, then nibbles
-    return 0;
+    (void) len;
+    return nslm_blk_stream(c->blkbuf, c->blklen, 3, t->slices, t->rows, t->cols, s, dst);
 }
 
 int g_enc[2048];
-
-static int copy_file(const char* from, const char* to) {
-    FILE* a = fopen(from, "rb");
-    if (!a) return -1;
-    FILE* b = fopen(to, "wb");
-    if (!b) { fclose(a); return -1; }
-    char buf[1 << 16];
-    for (size_t n; (n = fread(buf, 1, sizeof buf, a)) > 0;) fwrite(buf, 1, n, b);
-    fclose(a);
-    return fclose(b);
-}
 
 // config.json of the source with MLX's quantization block and, for seeds, the loader.
 static int write_config(const char* model, const char* out, const NsSpec* t, int n, int seeds, int mla, const char* loader_name) {
@@ -478,16 +448,8 @@ int main(int argc, char** argv) {
     const char* sl = strrchr(loader, '/');
     const char* loader_name = sl ? sl + 1 : loader;
     if (write_config(model, out, spec, n, seeds, cfg.mla, loader_name)) { fprintf(stderr, "%s/config.json: cannot write\n", out); return 1; }
-    static const char* files[] = {"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
-                                  "generation_config.json"};
-    char from[2048], to[2048];
-    for (size_t i = 0; i < sizeof files / sizeof files[0]; ++i) {
-        snprintf(from, sizeof from, "%s/%s", model, files[i]);
-        snprintf(to, sizeof to, "%s/%s", out, files[i]);
-        copy_file(from, to);   // optional files
-    }
-    snprintf(to, sizeof to, "%s/%s", out, loader_name);
-    if (seeds && copy_file(loader, to)) { fprintf(stderr, "%s: cannot copy the MLX loader\n", loader); return 1; }
+    nslm_copy_model_files(model, out);
+    if (seeds && nslm_copy_loader(loader, out)) { fprintf(stderr, "%s: cannot copy the MLX loader and nanoseedlm_seeds.py\n", loader); return 1; }
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     printf("wrote %s in %.1f s\n", out, (double) ts1.tv_sec + 1e-9 * (double) ts1.tv_nsec - t0);
     free(c.words); free(c.scales); free(c.biases); free(c.blkbuf); free(all);
