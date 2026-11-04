@@ -531,6 +531,10 @@ static int load_tensor(Eng* e, const MovaTensor* all, int n, const char* name, M
         return -1;
     }
     const int f = nt->enc;
+    if ((f == MF_Q8 || f == MF_Q4) && nt->group != 64) {
+        snprintf(err, (size_t) errlen, "%s: affine group %d not supported (group 64 only)", name, nt->group);
+        return -1;
+    }
     if (f < MF_BF16 || f > MF_SEED4P4) {
         snprintf(err, (size_t) errlen, "%s: encoding %d not supported by the CUDA engine (supported: BF16, SEED4, Q8, Q4, SEED4P4)",
                  name, f);

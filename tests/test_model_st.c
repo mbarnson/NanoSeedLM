@@ -184,6 +184,32 @@ int main(void) {
         remove_dir(path);
     }
 
+    // MLX affine groups (written raw, read as Q4 / Q8): Q4 group 32, Q8 group 64, Q4 group 64; codes U32, scales BF16
+    {
+        const NsSpec sp[9] = {
+            {"a.weight", NS_RAW, 1, 1, 1}, {"a.scales", NS_RAW, 1, 1, 1}, {"a.biases", NS_RAW, 1, 1, 1},
+            {"b.weight", NS_RAW, 1, 1, 1}, {"b.scales", NS_RAW, 1, 1, 1}, {"b.biases", NS_RAW, 1, 1, 1},
+            {"c.weight", NS_RAW, 1, 1, 1}, {"c.scales", NS_RAW, 1, 1, 1}, {"c.biases", NS_RAW, 1, 1, 1}};
+        const NsRaw raw[9] = {
+            {"U32", 3, {2, 8, 16}, 2 * 8 * 16 * 4}, {"BF16", 3, {2, 8, 4}, 2 * 8 * 4 * 2}, {"BF16", 3, {2, 8, 4}, 2 * 8 * 4 * 2},
+            {"U32", 2, {4, 32}, 4 * 32 * 4}, {"BF16", 2, {4, 2}, 4 * 2 * 2}, {"BF16", 2, {4, 2}, 4 * 2 * 2},
+            {"U32", 2, {4, 16}, 4 * 16 * 4}, {"BF16", 2, {4, 2}, 4 * 2 * 2}, {"BF16", 2, {4, 2}, 4 * 2 * 2}};
+        order = -1;
+        snprintf(path, sizeof path, "%s_groups", dir);
+        mkdir(path, 0755);
+        CHECK(ns_write_raw(path, sp, raw, 9, 1u << 20, NULL, fill, &order, err, sizeof err) == 0, "groups write: %s", err);
+        CHECK(ns_open(&m, path, err, sizeof err) == 0, "groups open: %s", err);
+        const NsTensor* a = ns_find(&m, "a.weight");
+        const NsTensor* b = ns_find(&m, "b.weight");
+        const NsTensor* c = ns_find(&m, "c.weight");
+        CHECK(a && a->enc == NS_Q4 && a->group == 32 && a->slices == 2 && a->rows == 8 && a->cols == 128, "Q4 group 32");
+        CHECK(b && b->enc == NS_Q8 && b->group == 64 && b->rows == 4 && b->cols == 128, "Q8 group 64");
+        CHECK(c && c->enc == NS_Q4 && c->group == 64 && c->rows == 4 && c->cols == 128, "Q4 group 64");
+        if (a) CHECK(a->s[1].len == 2 * 8 * 4 * 2 && a->s[1].p[3] == byte_of(1, 0, 3), "Q4 group 32 scales");
+        ns_close(&m);
+        remove_dir(path);
+    }
+
     printf("test_model_st: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

@@ -270,6 +270,10 @@ static int from_model(Eng* e, const char* name, MW* w, char* err, int errlen) {
         t = ns_find(&e->nm, wn);
     }
     if (!t) return 1;
+    if ((t->enc == NS_Q8 || t->enc == NS_Q4) && t->group != 64) {
+        snprintf(err, (size_t) errlen, "%s: affine group %d not supported (group 64 only)", name, t->group);
+        return -1;
+    }
     *w = (MW){0};
     w->fmt = t->enc; w->slices = t->slices; w->rows = t->rows; w->cols = t->cols;
     for (int s = 0; s < 4; ++s) {

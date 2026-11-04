@@ -2,9 +2,9 @@
 //
 // A logical tensor NAME.weight is stored as safetensors entries by encoding (lead = [slices] when slices > 1):
 //   BF16     NAME.weight   BF16  lead + [rows, cols]   (any name; 1 x cols tensors are [cols])
-//   Q8, Q4   NAME.weight   U32   lead + [rows, cols * bits / 32]   (MLX affine, group 64)
-//            NAME.scales   BF16  lead + [rows, cols / 64]
-//            NAME.biases   BF16  lead + [rows, cols / 64]
+//   Q8, Q4   NAME.weight   U32   lead + [rows, cols * bits / 32]   (MLX affine, group 64; the reader also takes Q4 group 32)
+//            NAME.scales   BF16  lead + [rows, cols / group]
+//            NAME.biases   BF16  lead + [rows, cols / group]
 //            (a Q8 / Q4 tensor whose name does not end in .weight, as MLA's projections: codes as NAME, then
 //            NAME.scales and NAME.biases)
 //   SEED4    NAME.seeds    U16   [slices, rows, cols / 8]   (P = 3; lfsr.h)
@@ -38,6 +38,7 @@ typedef struct {
 typedef struct {
     char name[96];
     int enc, slices, rows, cols;
+    int group;             // Q8 / Q4: the affine group (64, or 32 for Q4); 0 for other encodings
     NsStream s[4];
 } NsTensor;
 

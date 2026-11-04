@@ -167,3 +167,14 @@ one-token kernel, which is 12% faster than the general one.
 `cpu_seed3_tile` puts SEED4 (P = 3) matrices in the tiled CPU layout, and the CPU mat-vec and mat-mul take them. The
 rows match the scalar spec within 8e-7. On the same cloud Xeon (4 vCPUs, AVX2 build, load average 0.07), for each
 token: 13.9, 21.5 and 32.3 G weights/s at 1, 2 and 4 tokens, against 12.4, 16.8 and 25.1 at P = 4.
+
+## [2026-11-04] engine | A C reference forward of Qwen3.8-Flash-Next
+
+`nslm/qwen4_ref.h` computes the `qwen4_exp` forward on the CPU from an MLX model folder. The GPU engines will be checked
+against it. `tools/qwen4_golden.py` makes a tiny random model in the formats of the 4-bit MLX pack, and its float32
+logits from mlx-vlm (`tests/data/qwen4_tiny`). The reference matches them within 6e-7, with the same argmax on all 48
+rows. The sequence has an EOS and passes the sparse attention budget. Two details mattered:
+
+- Equal indexer scores (ReLU zeros) go to the higher block index, as MLX's `argpartition`.
+- The model folder reader takes MLX affine Q4 with group 32. The MoVA engines refuse groups other than 64.
+

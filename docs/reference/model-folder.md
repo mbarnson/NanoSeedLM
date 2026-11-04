@@ -10,7 +10,7 @@ Each tensor `NAME.weight` is stored in one of these encodings:
 | Encoding | Entries |
 |---|---|
 | BF16 | `NAME.weight` |
-| Affine Q8, Q4 (group 64, MLX layout) | `NAME.weight` (U32), `NAME.scales`, `NAME.biases` |
+| Affine Q8, Q4 (group 64, MLX layout; the reader also takes Q4 group 32) | `NAME.weight` (U32), `NAME.scales`, `NAME.biases` |
 | Seeds, P = 4 (`SEED4P4`, 4.5 bits per weight) | `NAME.seeds` (U16), `NAME.coefs` (U16), `NAME.codes` (U8), `NAME.exp_bias` (I32) |
 | Seeds, P = 3 (`SEED4`, 4.0 bits per weight) | `NAME.seeds` (U16), `NAME.nibbles` (U16: 3 int4 coefficients and the exponent code in bits 0 to 3), `NAME.exp_bias` (I32) |
 

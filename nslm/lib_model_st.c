@@ -29,18 +29,19 @@ static const char* DT[6][4] = {
     [NS_SEED6P8] = {"U16", "U32", "I32", "U8"},
 };
 
-uint64_t ns_stream_len(int enc, int slices, int rows, int cols, int s) {
+static uint64_t stream_len(int enc, int slices, int rows, int cols, int group, int s) {
     const uint64_t n = (uint64_t) slices * (uint64_t) rows * (uint64_t) cols;
     switch (enc) {
     case NS_BF16: return s == 0 ? 2 * n : 0;
-    case NS_Q8: return s == 0 ? n : s < 3 ? 2 * (n / 64) : 0;
-    case NS_Q4: return s == 0 ? n / 2 : s < 3 ? 2 * (n / 64) : 0;
+    case NS_Q8: return s == 0 ? n : s < 3 ? 2 * (n / (uint64_t) group) : 0;
+    case NS_Q4: return s == 0 ? n / 2 : s < 3 ? 2 * (n / (uint64_t) group) : 0;
     case NS_SEED4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : 0;
     case NS_SEED4P4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
     case NS_SEED6P8: return s == 0 ? 2 * (n / 8) : s == 1 ? 4 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
     default: return 0;
     }
 }
+uint64_t ns_stream_len(int enc, int slices, int rows, int cols, int s) { return stream_len(enc, slices, rows, cols, 64, s); }
 static uint64_t pad(uint64_t n) { return (n + NS_PAGE - 1) & ~(uint64_t) (NS_PAGE - 1); }
 static int ends(const char* s, const char* suf) {
     const size_t a = strlen(s), b = strlen(suf);
@@ -114,18 +115,18 @@ static int dims(const StEntry* e, int want_last, int64_t* s, int64_t* r, int64_t
 }
 
 static int add(NsModel* m, const NsModel* src, const Ref* refs, int nr, const char* base, const char* name, int enc,
-               int64_t S, int64_t R, int64_t C, char* err, int errlen) {
+               int group, int64_t S, int64_t R, int64_t C, char* err, int errlen) {
     NsTensor t;
     memset(&t, 0, sizeof t);
     if (strlen(name) >= sizeof t.name) { snprintf(err, (size_t) errlen, "%s: name too long", name); return -1; }
     snprintf(t.name, sizeof t.name, "%s", name);
-    t.enc = enc; t.slices = (int) S; t.rows = (int) R; t.cols = (int) C;
+    t.enc = enc; t.slices = (int) S; t.rows = (int) R; t.cols = (int) C; t.group = group;
     for (int s = 0; s < 4 && SUF[enc][s]; ++s) {
         char nm[160];
         const int bare = !s && !strcmp(name, base);   // an affine tensor not named *.weight: its codes are named X
         snprintf(nm, sizeof nm, "%s%s", base, bare ? "" : SUF[enc][s]);
         const Ref* r = lookup(refs, nr, nm);
-        const uint64_t want = ns_stream_len(enc, t.slices, t.rows, t.cols, s);
+        const uint64_t want = stream_len(enc, t.slices, t.rows, t.cols, group, s);
         if (!r || strcmp(r->e->dtype, DT[enc][s]) || r->e->end - r->e->begin != want) {
             snprintf(err, (size_t) errlen, "%s: missing, or not %s with %llu bytes", nm, DT[enc][s], (unsigned long long) want);
             return -1;
@@ -177,7 +178,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
             snprintf(base, sizeof base, "%.*s", (int) (L - (seeds ? 6 : 7)), nm);
             snprintf(logical, sizeof logical, "%s.weight", base);
             if (dims(e, 1, &S, &R, &C)) { snprintf(err, (size_t) errlen, "%s: bad shape", nm); free(refs); goto done; }
-            int enc;
+            int enc, group = 0;
             if (seeds) {
                 char k[176];
                 snprintf(k, sizeof k, "%s.codes", base);
@@ -191,12 +192,14 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
                 snprintf(k, sizeof k, "%s.weight", base);
                 const Ref* w = lookup(refs, nr, k);
                 if (!w && (w = lookup(refs, nr, base))) snprintf(logical, sizeof logical, "%s", base);   // codes named X
-                C *= 64;
-                const int64_t bits = w && w->e->ndim >= 1 ? w->e->shape[w->e->ndim - 1] * 32 / C : 0;
-                if (bits != 4 && bits != 8) { snprintf(err, (size_t) errlen, "%s: not affine Q4 or Q8", base); free(refs); goto done; }
-                enc = bits == 8 ? NS_Q8 : NS_Q4;
+                // bits * group = 32 * (code words per row) / (groups per row): 128 is Q4 g32, 256 Q4 g64, 512 Q8 g64
+                const int64_t bg = w && w->e->ndim >= 1 && C ? w->e->shape[w->e->ndim - 1] * 32 / C : 0;
+                if (bg != 128 && bg != 256 && bg != 512) { snprintf(err, (size_t) errlen, "%s: not affine Q4 or Q8", base); free(refs); goto done; }
+                enc = bg == 512 ? NS_Q8 : NS_Q4;
+                group = bg == 128 ? 32 : 64;
+                C *= group;
             }
-            if (add(m, m, refs, nr, base, logical, enc, S, R, C, err, errlen)) { free(refs); goto done; }
+            if (add(m, m, refs, nr, base, logical, enc, group, S, R, C, err, errlen)) { free(refs); goto done; }
         } else if (!strcmp(e->dtype, "BF16")) {
             if (ends(nm, ".biases")) {   // a quantized tensor's biases
                 char k[176];
@@ -204,7 +207,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
                 if (lookup(refs, nr, k)) continue;
             }
             if (dims(e, 0, &S, &R, &C)) continue;   // scalars and >3-D tensors are not model weights here
-            if (add(m, m, refs, nr, nm, nm, NS_BF16, S, R, C, err, errlen)) { free(refs); goto done; }
+            if (add(m, m, refs, nr, nm, nm, NS_BF16, 0, S, R, C, err, errlen)) { free(refs); goto done; }
         }
     }
     free(refs);

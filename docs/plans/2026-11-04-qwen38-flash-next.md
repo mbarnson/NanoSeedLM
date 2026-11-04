@@ -5,7 +5,8 @@
 of DDR4, one pack must decode faster than a published quantization of similar quality. A second target is a Mac with
 128 GB of unified memory. The user chooses the precision of the PLE table to fit the free disk space.
 
-**Status.** Draft. No gate is measured yet. S1 items 1 to 3 and S2's speed measurement are done. S3 runs. A first probe for H3 is done:
+**Status.** Draft. No gate is measured yet. S1 items 1 to 3, S2's speed measurement and the S3 searches are done. The
+P4 pack is in the storage bucket, and the P3 pack runs. The C reference of S7 is done. A first probe for H3 is done:
 [Hadamard rotation and P = 4 seeds](../results/2026-11-04-qwen38-rotation-probe.md). Each gate gets a results page
 when we measure it.
 
@@ -284,11 +285,12 @@ experimental, and PCIe carries all misses.
 
 ### S7. Engine port
 
-1. Qwen3.6-35B-A3B first. It has the Gated DeltaNet layers, the gated attention, the MoE with a shared expert and the
-   MTP layer. Its BF16 weights (72 GB) fit in 128 GB of RAM, so the reference and the tests run on the PC.
-2. Then the parts that only Qwen3.8 has: the hyper-connections, the indexer, the PLE weights and the PLE table reader.
-   The PLE table reader is done (`nslm/ple.h`). It decodes rows of the four Unsloth table files, and it matches
-   gguf-py exactly on rows of each file.
+1. A C reference of the full `qwen4_exp` forward: Gated DeltaNet, QSA attention with the indexer, the MoE with a
+   shared expert, the hyper-connections and the PLE layer. Done (`nslm/qwen4_ref.h`). On a tiny random model in the
+   formats of the 4-bit MLX pack (`tools/qwen4_golden.py`), its logits match mlx-vlm in float32 within 6e-7. The sequence
+   has an EOS and passes the sparse budget. A Qwen3.6 model first is no longer necessary.
+2. The PLE table reader is done (`nslm/ple.h`). It decodes rows of the four Unsloth table files, and it matches
+   gguf-py exactly on rows of each file. The reference reads the PLE rows from the model folder.
 3. CUDA first, then Metal. Add each feature that only one engine has to the feature matrix of
    [Metal and CUDA parity](../concepts/parity.md).
 4. Each kernel gets a C reference and a test on Metal and on CUDA.
@@ -351,9 +353,9 @@ Measured in step S2 (2026-11-04, `rtx-pro-6000`, layer 20, P = 4, 2 workers): 33
 | Item | Cost |
 |---|---|
 | S2, one layer | About $0.45 (measured) |
-| S3, P4, on `rtx-pro-6000x4` | About $14 (estimate from S2) |
-| S3, P3, on `rtx-pro-6000x4` | About $14 (estimate from S2) |
-| Packing, on a CPU flavor, for each tier | About $1 (estimate) |
+| S3, P4, on `rtx-pro-6000x4` | About $12.50 (measured: 66 min) |
+| S3, P3, on `rtx-pro-6000x4` | About $15.50 (measured: 83 min) |
+| Packing, on `cpu-xl`, for each tier | About $0.40 (measured for P4: 22 min) |
 
 A BF16 reference or a GPTQ capture costs about $20 for each hour. They need more credits.
 

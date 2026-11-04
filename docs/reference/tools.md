@@ -39,6 +39,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `nanoseedlm_k2.py` | The MLX loader for K2-Horizon |
 | `nanoseedlm_qwen4.py` | The MLX loader for Qwen3.8-Flash-Next (mlx-vlm) |
 | `nanoseedlm_seeds.py` | The seed kernels and modules that the MLX loaders share |
+| `qwen4_golden.py` | A tiny random Qwen3.8 model and its mlx-vlm logits, for `tests/test_qwen4_ref.c` |
 | `mova_capture.py` | Activation statistics for the expert search, through MLX |
 | `mova_score.py` | Scores in MLX |
 | `mova_export.py` | Inputs for `nslm-mova-score`, `nslm-mova-gen`, `nslm-mova-bench` and route studies |
