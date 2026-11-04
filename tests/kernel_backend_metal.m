@@ -105,6 +105,7 @@ int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
     return 0;
 }
 int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float* x, float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) P * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * w->K), yb = buf(NULL, yn), sb = buf(sel, 4 * (size_t) P);
     MvArgs a = {w->K, w->R, P, xdiv, w->K, w->R, 0, 0};
@@ -113,6 +114,7 @@ int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const floa
     return 0;
 }
 int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float* x, float* out) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const int fmt = w->fmt, R = w->R, K = w->K;
     const size_t yn = 4 * (size_t) P * R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * K), yb = buf(NULL, yn), sb = buf(sel, 4 * (size_t) P);
@@ -154,6 +156,7 @@ static int mm_dispatch(const KtWeight* w, MmArgs a, int dense, int gy, id<MTLBuf
     });
 }
 int kt_mm(const KtWeight* w, int T, const float* x, float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn);
     MmArgs a = {w->K, w->R, T, w->K, w->R, 1, 1, 0};
@@ -163,6 +166,7 @@ int kt_mm(const KtWeight* w, int T, const float* x, float* y) {
 }
 int kt_mm_grouped(const KtWeight* w, int P, int xdiv, const int32_t* perm, const MmTile* tiles, int nt, const float* x,
                   float* y) {
+    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) P * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * w->K), yb = buf(NULL, yn);
     MmArgs a = {w->K, w->R, 0, w->K, w->R, xdiv, 0, 0};
