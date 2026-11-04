@@ -1,6 +1,6 @@
 // harness/nslm-qwen4-gen.c - greedy generation through the qwen4 CUDA engine (engine/qwen4_eng.h), with timings.
 //   nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens 128] [--ctx 4096] [--raw] [--vram-experts] [--ple-gguf FILE]
-//                  [--expert-cache-gb N]
+//                  [--expert-cache-gb N [--stream-experts]]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +14,7 @@ int main(int argc, char** argv) {
     const char *model = NULL, *prompt = NULL, *ple = NULL;
     int max_tokens = 128, ctx = 4096, raw = 0, vram = 0;
     double cache_gb = 0;
+    int stream = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
@@ -23,6 +24,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--vram-experts")) vram = 1;
         else if (!strcmp(argv[i], "--ple-gguf") && i + 1 < argc) ple = argv[++i];
         else if (!strcmp(argv[i], "--expert-cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--stream-experts")) stream = 1;
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw]\n"); return 2; }
@@ -38,7 +40,7 @@ int main(int argc, char** argv) {
     const int n = tok_encode(tok, text, 0, ids, ctx);
     if (n < 1 || n + max_tokens > ctx) { fprintf(stderr, "prompt of %d tokens does not fit --ctx %d\n", n, ctx); return 1; }
     double t0 = now_s();
-    const Q4EOpts o = {ctx, vram, ple, cache_gb};
+    const Q4EOpts o = {ctx, vram, ple, cache_gb, stream};
     Q4Eng* e = q4e_open(model, &o, err, sizeof err);
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
     const Qwen4Cfg* c = q4e_cfg(e);

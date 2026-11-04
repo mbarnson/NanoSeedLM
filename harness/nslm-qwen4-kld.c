@@ -1,5 +1,5 @@
 // harness/nslm-qwen4-kld.c - KL divergence of a qwen4 model against a reference on one text, through the CUDA engine.
-//   nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens 1024] [--expert-cache-gb N] [--vram-experts]
+//   nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens 1024] [--expert-cache-gb N [--stream-experts]] [--vram-experts]
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     const char *ref = NULL, *model = NULL, *text = NULL;
     int ntok = 1024;
-    Q4EOpts o = {0, 0, NULL, 0};
+    Q4EOpts o = {0, 0, NULL, 0, 0};
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = argv[++i];
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) ntok = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--expert-cache-gb") && i + 1 < argc) o.cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--vram-experts")) o.vram_experts = 1;
+        else if (!strcmp(argv[i], "--stream-experts")) o.stream_experts = 1;
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N]\n"); return 2; }

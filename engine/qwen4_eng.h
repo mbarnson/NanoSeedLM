@@ -14,6 +14,7 @@ typedef struct {
     int vram_experts;       // the routed experts in VRAM too (a GPU with room for the pack but the PLE table)
     const char* ple_gguf;   // the PLE n-gram table from this GGUF (Unsloth's engram files), not from the model folder
     double cache_gb;        // > 0: a VRAM cache of host experts (LRU, at least one layer's experts); 0: read host memory
+    int stream_experts;     // with cache_gb: misses read from the folder's files, no pinned copy (RAM below the experts)
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);

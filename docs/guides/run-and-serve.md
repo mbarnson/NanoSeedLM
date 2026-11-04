@@ -110,6 +110,7 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 |---|---|
 | `--vram-experts` | Keep the routed experts in VRAM. The default keeps them in mapped host memory |
 | `--expert-cache-gb N` | Cache N GB of the host experts in VRAM (least recently used). At least one layer's experts |
+| `--stream-experts` | With a cache: read the missing experts from the model files. Use it when RAM is smaller than the experts |
 | `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
 | `--ctx N` | Context positions (4096) |
 | `--raw` | No chat template |

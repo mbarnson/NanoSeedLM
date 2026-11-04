@@ -52,8 +52,11 @@ struct Q4Eng {
     float* mix_norm;
     uint32_t *g24, *g32;
     cudaStream_t s;
-    int max_pos, pos, host_experts, cache;
+    int max_pos, pos, host_experts, cache, stream;
     CachePool pool;   // the expert cache (cache = 1)
+    uint64_t ulen[3][4];   // bytes of each expert stream in a unit
+    uint8_t* stage;        // stream = 1: pinned staging of the units one admit brings
+    int32_t* hjobs;        // stream = 1: the admit's jobs, read back (pinned)
     const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
@@ -205,6 +208,15 @@ static void load_layer(Q4Eng* e, int l) {
     }
 }
 
+// Unit u (layer u / n_exp, expert u % n_exp) assembled from the folder's mapping into dst, in the pool's layout
+static const uint8_t* unit_bytes(Q4Eng* e, int u, uint8_t* dst) {
+    const int E = e->c.n_exp, l = u / E, x = u % E;
+    for (int i = 0; i < 3; ++i)
+        for (int s = 0; s < 4; ++s)
+            if (e->ulen[i][s]) memcpy(dst + e->pool.off[i][s], e->et[l][i]->s[s].p + e->ulen[i][s] * (uint64_t) x, e->ulen[i][s]);
+    return dst;
+}
+
 // The expert cache (engine/kernels_cuda.h CachePool): unit l * n_exp + x holds expert x's gate, up and down slices of
 // layer l, in a pinned host arena; `slots` of them in VRAM, filled round-robin over the layers, then LRU.
 static void build_cache(Q4Eng* e, double gb) {
@@ -227,13 +239,19 @@ static void build_cache(Q4Eng* e, double gb) {
     p->unit_bytes = ub;
     const double want = gb * 1e9 / (double) ub;
     p->slots = want > units ? units : want < E ? E : (int) want;
+    memcpy(e->ulen, len, sizeof len);
+    const int nstage = E < MAXT * c->top_k ? E : MAXT * c->top_k;   // the most units one admit brings
     uint8_t* host = NULL;
     void* dh = NULL;
-    if (cudaHostAlloc((void**) &host, ub * (uint64_t) units, cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&dh, host, 0) != cudaSuccess) {
-        fail(e, "cannot pin %.1f GB of host memory for the experts", ub * (double) units / 1e9);
+    if (e->stream) {   // no arena: units are assembled from the folder's mapping
+        if (cudaHostAlloc((void**) &e->stage, ub * (uint64_t) nstage, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc((void**) &e->hjobs, 8 * (size_t) E + 16, cudaHostAllocDefault) != cudaSuccess) { fail(e, "cannot pin the staging buffer"); return; }
+        track(&e->host, &e->nhost, &e->chost, e->stage);
+        track(&e->host, &e->nhost, &e->chost, e->hjobs);
+    } else if (cudaHostAlloc((void**) &host, ub * (uint64_t) units, cudaHostAllocMapped) != cudaSuccess || cudaHostGetDevicePointer(&dh, host, 0) != cudaSuccess) {
+        fail(e, "cannot pin %.1f GB of host memory for the experts (--stream-experts reads them from the files)", ub * (double) units / 1e9);
         return;
-    }
-    track(&e->host, &e->nhost, &e->chost, host);
+    } else track(&e->host, &e->nhost, &e->chost, host);
     WSlice* tab = (WSlice*) calloc((size_t) units * 3, sizeof(WSlice));
     for (int l = 0; l < c->n_layer; ++l)
         for (int i = 0; i < 3; ++i) {
@@ -242,7 +260,7 @@ static void build_cache(Q4Eng* e, double gb) {
             if ((t->enc == NS_Q4 || t->enc == NS_Q8) && t->group != 32 && t->group != 64) { fail(e, "%s: affine group %d not supported", t->name, t->group); free(tab); return; }
             for (int x = 0; x < E; ++x) {
                 WSlice* w = &tab[((size_t) l * 3 + i) * E + x];
-                for (int s = 0; s < 4; ++s)
+                for (int s = 0; s < 4 && host; ++s)
                     if (len[i][s]) memcpy(host + ((uint64_t) l * E + x) * ub + p->off[i][s], t->s[s].p + len[i][s] * (uint64_t) x, len[i][s]);
                 if (t->enc == NS_SEED4 || t->enc == NS_SEED4P4) memcpy(&w->eb, t->s[2].p + 4 * (size_t) x, 4);
                 if (t->enc == NS_Q4 || t->enc == NS_Q8) w->gs = t->group == 32 ? 5 : 6;
@@ -258,7 +276,7 @@ static void build_cache(Q4Eng* e, double gb) {
             const int u = l * E + x;
             us[u] = s;
             su[s] = u;
-            if (p->vram) cudaMemcpy(p->vram + (uint64_t) s * ub, host + (uint64_t) u * ub, ub, cudaMemcpyHostToDevice);
+            if (p->vram) cudaMemcpy(p->vram + (uint64_t) s * ub, host ? host + (uint64_t) u * ub : unit_bytes(e, u, e->stage), ub, cudaMemcpyHostToDevice);
             for (int i = 0; i < 3; ++i)
                 for (int st = 0; st < 4; ++st)
                     if (len[i][st] && p->vram) tab[((size_t) l * 3 + i) * E + x].p[st] = p->vram + (uint64_t) s * ub + p->off[i][st];
@@ -295,6 +313,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
     e->host_experts = !(o && o->vram_experts);
     e->cache = e->host_experts && o && o->cache_gb > 0;
+    e->stream = e->cache && o->stream_experts;
+    if (o && o->stream_experts && !e->cache) { snprintf(err, (size_t) errlen, "--stream-experts needs --expert-cache-gb"); ns_close(&e->nm); free(e); return NULL; }
     if (o && o->ple_gguf) {
         if (ple_open(&e->pt, o->ple_gguf, "per_layer_token_embd.weight", err, errlen)) { ns_close(&e->nm); free(e); return NULL; }
         e->table = &e->pt;
@@ -443,7 +463,18 @@ static void moe(Q4Eng* e, int l, int T) {
     kq4_route(e->s, c, e->lg, e->ind, e->wt, T);
     if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
         kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
-        kc_cache_copy(e->s, &e->pool, 64);
+        if (!e->stream) kc_cache_copy(e->s, &e->pool, 64);
+        else {   // the admit's (unit, slot) jobs back to the host, the units from the files, then to their slots
+            cudaMemcpyAsync(e->hjobs, e->pool.njobs, 4, cudaMemcpyDeviceToHost, e->s);
+            cudaMemcpyAsync(e->hjobs + 4, e->pool.jobs, 8 * (size_t) c->n_exp, cudaMemcpyDeviceToHost, e->s);
+            cudaStreamSynchronize(e->s);   // also: the last layer's copies out of the staging buffer are done
+            const uint64_t ub = e->pool.unit_bytes;
+            for (int j = 0; j < e->hjobs[0]; ++j) {
+                uint8_t* st = e->stage + (uint64_t) j * ub;
+                unit_bytes(e, e->hjobs[4 + 2 * j], st);
+                cudaMemcpyAsync(e->pool.vram + (uint64_t) e->hjobs[5 + 2 * j] * ub, st, ub, cudaMemcpyHostToDevice, e->s);
+            }
+        }
     }
     kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
     kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));

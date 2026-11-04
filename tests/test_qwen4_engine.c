@@ -24,7 +24,7 @@ int main(void) {
     const int n = (int) ei->shape[0], V = (int) el->shape[1];
     const int32_t* ids = (const int32_t*) st_data(&st, ei);
     const float* want = (const float*) st_data(&st, el);
-    const Q4EOpts o = {256, 0, NULL, 0};
+    const Q4EOpts o = {256, 0, NULL, 0, 0};
     Q4Eng* e = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
     if (!e) { printf("FAIL: open: %s\n", err); return 1; }
     float* got = (float*) malloc(sizeof(float) * (size_t) n * V);
@@ -53,7 +53,8 @@ int main(void) {
     CHECK(worst < 3e-2 * scale && argmax_diff <= n / 16, "logits differ from mlx-vlm beyond the BF16 matvec rounding");
     CHECK(same < 1e-5 * scale, "the row split changes the logits");
     q4e_close(e);
-    const Q4EOpts oc = {256, 0, NULL, 1e-9};   // the smallest cache: one layer's experts for all layers, evicting all along
+    for (int stream = 0; stream < 2; ++stream) {   // the smallest cache (one layer's experts for all), pinned or from the files
+    const Q4EOpts oc = {256, 0, NULL, 1e-9, stream};
     e = q4e_open("tests/data/qwen4_tiny", &oc, err, sizeof err);
     CHECK(e != NULL, "open with a cache: %s", err);
     if (e) {
@@ -63,10 +64,11 @@ int main(void) {
         uint64_t hits, misses;
         int slots;
         q4e_cache_stats(e, &hits, &misses, &slots);
-        printf("expert cache of %d slots: %llu hits, %llu misses; logits against no cache %.1e\n", slots, (unsigned long long) hits,
-               (unsigned long long) misses, dc);
+        printf("expert cache of %d slots%s: %llu hits, %llu misses; logits against no cache %.1e\n", slots, stream ? ", streamed" : "",
+               (unsigned long long) hits, (unsigned long long) misses, dc);
         CHECK(dc == 0 && misses > 0 && slots == q4e_cfg(e)->n_exp, "the expert cache changes the logits, or never misses");
         q4e_close(e);
+    }
     }
     free(got);
     free(again);
