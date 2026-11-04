@@ -50,9 +50,9 @@ same results as the engine.
 | MLA KV cache fp8, fp4 | Yes | Yes | No |
 | MLA KV cache q8, rq4 | No | No | Yes |
 | Hybrid MLA (`mla_ranks` 0: GQA layers) | Yes | Yes | Yes |
-| Qwen3.8-Flash-Next with P = 3 / 4 seed experts | No | No | Yes (mlx-vlm) |
-| Qwen3.8-Flash-Next engine (`engine/qwen4_eng.h`, `nslm-qwen4-gen`) | No | Yes | Yes (mlx-vlm) |
+| Qwen3.8-Flash-Next with P = 3 / 4 seed experts | No | Yes (`nslm-qwen4-gen`) | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next PLE table from an Unsloth engram GGUF | No | Yes (`--ple-gguf`) | No (mlx-vlm's SSD PLE view) |
+| Qwen3.8-Flash-Next VRAM cache of host experts | No | Yes (`--expert-cache-gb`) | No |
 | Affine Q4 with group 32 (the 4-bit MLX packs) | No | Yes (matvec, GEMM, embedding) | Yes |
 | Fused kernel for MLA prompts | `k_mla_prefill` | `k_mla_prefill` | `_MLA_PREFILL` |
 | Paged KV cache | Yes (macOS 26.4 or later) | No | No |
