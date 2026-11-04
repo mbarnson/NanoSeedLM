@@ -26,6 +26,7 @@ Rules for people and AI agents who change this repository.
 | `docs/guides/` | How to do a task | When the commands change |
 | `docs/reference/` | Facts to look up: models, tools, variables, formats | When the facts change |
 | `docs/results/YYYY-MM-DD-slug.md` | One dated measurement | Only the status line, after it is written |
+| `docs/plans/YYYY-MM-DD-slug.md` | A plan, written before the work: goal, steps, gates, hypotheses, costs | The status line and the steps, when a step finishes |
 
 ## How to add a result
 

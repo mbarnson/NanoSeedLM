@@ -128,3 +128,10 @@ V rows. `test_engine` checks an all-MLA and a hybrid random model against the C 
 PRO 6000). The T-03 hybrid on the 31 held-out windows: P4 seeds on Metal, NLL 2.4094 and KL divergence 0.1118
 (MLX loader 2.4087, 0.1132); BF16 on CUDA, NLL 2.3979 and KL divergence 0.1048 (MLX loader 2.3978, 0.1054).
 Pull request [#14](https://github.com/mbarnson/NanoSeedLM/pull/14).
+
+## [2026-11-04] docs | Plan: SeedLM packs for Qwen3.8-Flash-Next
+
+A plan to make a family of seed packs for Qwen3.8-Flash-Next, with gates before each large cost. The pack does not
+include the PLE table. The user downloads one of the four Unsloth table files to fit the disk. The plan also records
+a quick check of the CPU P = 4 mat-vec in a cloud session: 3.3 G weights/s for each AVX2 thread. Read
+[the plan](plans/2026-11-04-qwen38-flash-next.md).

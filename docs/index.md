@@ -36,6 +36,13 @@ Facts to look up.
 - [Source layout](reference/source-layout.md): the folders of the repository.
 - [Related work](reference/related-work.md): papers and projects on seeds and computed weights.
 
+## Plans
+
+Work that is not done yet, with its gates and hypotheses.
+
+- [2026-11-04: SeedLM packs for Qwen3.8-Flash-Next](plans/2026-11-04-qwen38-flash-next.md): steps, gates, costs and
+  the PLE table choice, for a PC with a 16 GB GPU.
+
 ## Results
 
 Dated measurements. Each page gives the result, its status, the setup and the data.
