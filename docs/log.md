@@ -236,3 +236,10 @@ of 24,576 experts). The decode ran at 41.6 tokens per second against 22.1 withou
 tokens per second against 25.4. The cache hit 69% of the expert reads, and the greedy output was the same text. This is one run,
 not a benchmark, and the PCIe link of this machine is not that of an RTX 4080.
 
+## [2026-11-04] result | The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model
+
+The CUDA engine ran both models on 1,024 tokens of wikitext-2. The mean KL divergence against the 4-bit MLX model is
+0.177 for P4 and 0.237 for P3. The top-1 token agrees on 91.9% and 88.2% of the tokens. The perplexity rises from
+2.396 to 2.500 and 2.480. The reference is a quantized model, not BF16. Read
+[The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model](results/2026-11-04-qwen38-kld-vs-4bit.md).
+

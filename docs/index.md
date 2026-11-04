@@ -62,6 +62,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   weight error of 4 experts, with and without rotation and activation weighting.
 - [2026-11-04: The seed search over the Qwen3.8-Flash-Next experts](results/2026-11-04-qwen38-seed-search.md): P = 4
   and P = 3 on 4 RTX PRO 6000 GPUs, errors, costs and pack sizes.
+- [2026-11-04: The Qwen3.8-Flash-Next seed packs against the 4-bit MLX model](results/2026-11-04-qwen38-kld-vs-4bit.md):
+  KL divergence, top-1 agreement and perplexity on wikitext-2.
 
 ## For contributors and agents
 

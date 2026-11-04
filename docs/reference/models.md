@@ -50,7 +50,8 @@ To use a model in the engine, read [Run and serve](../guides/run-and-serve.md).
 - **For a small download to test the seed format:** K2-Horizon-0.9B-NSLM-seeds-4bpw. Its quality is lower than
   IFM's Q4_K_M, and it is slower.
 - **To try seed experts on Qwen3.8-Flash-Next:** Qwen3.8-Flash-Next-NanoSeedLM-P4 or -P3, in mlx-vlm or with
-  `nslm-qwen4-gen` on CUDA. Their quality is not measured yet.
+  `nslm-qwen4-gen` on CUDA. Against the 4-bit MLX model, P4 agrees on the top token 91.9% of the time. KL divergence
+  against BF16 is not measured yet.
 - **For daily use with no interest in seeds:** an affine quantization of the original model.
 
 ## Related data
