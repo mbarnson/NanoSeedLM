@@ -59,7 +59,8 @@ int main(void) {
            worst, scale, argmax_diff, n, same);
     printf("one GEMM row of %d: max |CUDA - mlx-vlm| %.2e, argmax differs in %d rows\n", n, wbig, argmax_big);
     CHECK(worst < 3e-2 * scale && argmax_diff <= n / 16, "logits differ from mlx-vlm beyond the BF16 matvec rounding");
-    CHECK(wbig < 3e-2 * scale && argmax_big <= n / 16, "GEMM-row logits differ from mlx-vlm beyond the BF16 rounding");
+    // the GEMM rounds every projection's inputs to BF16 too, on top of the BF16 outputs: twice the matvec bound
+    CHECK(wbig < 6e-2 * scale && argmax_big <= n / 16, "GEMM-row logits differ from mlx-vlm beyond the BF16 rounding");
     CHECK(same < 1e-5 * scale, "the row split changes the logits");
     q4e_close(e);
     for (int stream = 0; stream < 2; ++stream) {   // the smallest cache (one layer's experts for all), pinned or from the files
