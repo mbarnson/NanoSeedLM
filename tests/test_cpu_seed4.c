@@ -67,6 +67,30 @@ static int check(int rows, int kb, int bias, int threads) {
     return ok;
 }
 
+// ntok tokens at once (tiled): each token's rows equal a one-token call, bit for bit.
+static int check_tokens(int rows, int kb, int ntok, int threads) {
+    const int n = rows * kb;
+    uint16_t* seeds = malloc(n * 2), *coefs = malloc(n * 2);
+    uint8_t* codes = malloc((n + 1) / 2);
+    float* x = malloc((size_t) ntok * kb * 8 * 4), *y = malloc((size_t) ntok * rows * 4), *y1 = malloc(rows * 4);
+    for (int i = 0; i < n; ++i) { seeds[i] = (uint16_t) (1 + rnd() % 65535); coefs[i] = (uint16_t) rnd(); }
+    for (int i = 0; i < (n + 1) / 2; ++i) codes[i] = (uint8_t) rnd();
+    for (int i = 0; i < ntok * kb * 8; ++i) x[i] = (float) ((int) (rnd() % 20001) - 10000) / 10000.0f;
+    CpuSeed4Tiled tm;
+    cpu_seed4_tile(&tm, seeds, coefs, codes, -21, rows, kb);
+    const uint32_t* table = cpu_seed4_table();
+    cpu_seed4_tiled_matmul_mt(&tm, table, x, ntok, y, threads);
+    int same = 1;
+    for (int t = 0; t < ntok; ++t) {
+        cpu_seed4_tiled_matvec_mt(&tm, table, x + (size_t) t * kb * 8, y1, 1);
+        for (int r = 0; r < rows; ++r) same &= y[(size_t) t * rows + r] == y1[r];
+    }
+    printf("rows %d kb %d tokens %d threads %d: %s\n", rows, kb, ntok, threads, same ? "ok" : "FAIL");
+    cpu_seed4_tiled_free(&tm);
+    free(seeds); free(coefs); free(codes); free(x); free(y); free(y1);
+    return same;
+}
+
 int main(void) {
     uint32_t* t = cpu_seed4_table();
     for (int s = 1; s < 65536; s += 997)
@@ -77,6 +101,8 @@ int main(void) {
     ok &= check(768, 320, -22, 1);   // an expert's gate / up (768 x 2560)
     ok &= check(2560, 96, -22, 4);   // its down (2560 x 768), threaded
     ok &= check(1000, 33, -21, 7);
+    ok &= check_tokens(40, 8, 3, 1);
+    ok &= check_tokens(640, 320, 4, 3);   // a Qwen3.8 expert's gate / up (640 x 2560), an MTP verify window
     printf("test_cpu_seed4: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

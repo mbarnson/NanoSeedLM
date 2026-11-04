@@ -1,5 +1,6 @@
 // harness/nslm-cpu-seed-bench.c - CPU P = 4 seed mat-vec throughput (G weights / s) by thread count, on random
-// seed matrices shaped like MoVA's routed experts (gate / up: 768 x 2560, down: 2560 x 768) and its decode step.
+// seed matrices shaped like MoVA's routed experts (gate / up: 768 x 2560, down: 2560 x 768) and its decode step; and
+// per token for 2 and 4 tokens at once (an MTP verify window).  Prints the load average (machine state).
 //
 //   nslm-cpu-seed-bench [threads,...] [reps]
 #include <stdio.h>
@@ -38,6 +39,12 @@ int main(int argc, char** argv) {
     CpuSeed4Tiled tm;
     cpu_seed4_tile(&tm, seeds, coefs, codes, -22, rows, kb);
     printf("matrix %d x %d (%.1f M weights, %.1f MB of seed data)\n", rows, kb * 8, n * 8 / 1e6, n * 4.5 / 1e6);
+    FILE* la = fopen("/proc/loadavg", "r");   // Linux; elsewhere read uptime(1) before the run
+    char lb[64] = "n/a";
+    if (la) { if (!fgets(lb, sizeof lb, la)) strcpy(lb, "n/a\n"); fclose(la); } else strcat(lb, "\n");
+    printf("load average: %s", lb);
+    float* xt = malloc((size_t) 4 * kb * 8 * 4), *yt = malloc((size_t) 4 * rows * 4);
+    for (int i = 0; i < 4 * kb * 8; ++i) xt[i] = (float) (i % 23) / 23.0f - 0.5f;
     char buf[256];
     strncpy(buf, tl, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
@@ -61,6 +68,16 @@ int main(int argc, char** argv) {
             if (dt < best) best = dt;
         }
         printf("  tiled    %.2f ms per step, %.1f G weights/s\n", best * 1e3, n * 8 / best / 1e9);
+        for (int nt = 2; nt <= 4; nt *= 2) {
+            best = 1e9;
+            for (int i = 0; i < reps; ++i) {
+                const double t0 = now();
+                cpu_seed4_tiled_matmul_mt(&tm, table, xt, nt, yt, th);
+                const double dt = now() - t0;
+                if (dt < best) best = dt;
+            }
+            printf("  %d tokens %.2f ms per step, %.1f G weights/s per token\n", nt, best * 1e3, n * 8 * nt / best / 1e9);
+        }
     }
     return 0;
 }

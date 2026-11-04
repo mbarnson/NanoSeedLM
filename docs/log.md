@@ -154,3 +154,10 @@ already near-Gaussian (kurtosis 3.0 to 3.06). Read
 `nslm/ple.h` reads rows of `per_layer_token_embd.weight` (160 x 320 M) from a GGUF file in BF16, Q8_0, Q5_1 or IQ4_NL.
 On rows at the start, the middle and the end of each Unsloth file, it matched gguf-py exactly. The engine port will
 use it, so the user can choose the table precision to fit the disk.
+
+## [2026-11-04] kernel | CPU seed mat-vec for several tokens
+
+`cpu_seed4_tiled_matmul_mt` makes the LFSR states of each block once for up to 8 tokens. Each token's rows equal the
+one-token kernel's, bit for bit. On a cloud Xeon with 4 vCPUs (AVX2 build, load average below 0.1), for each token:
+1 token 3.3 G weights/s (12.3 on 4 threads), 2 tokens 4.4 (16.8), 4 tokens 6.5 (24.6). One token keeps the
+one-token kernel, which is 12% faster than the general one.

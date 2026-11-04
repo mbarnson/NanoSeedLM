@@ -273,6 +273,8 @@ The output is a Pareto front and the members of the family.
 1. In the CUDA engine, on K2-Horizon-MoVA first: the CPU computes a share of the missed experts, and PCIe carries the
    rest. Measure decode speed for a range of shares.
 2. A CPU mat-vec for several tokens, for MTP verify windows. The CPU makes the states once for all the tokens.
+   Done: `cpu_seed4_tiled_matmul_mt`. On a cloud Xeon (AVX2 build), 2 tokens give 1.3x and 4 tokens give 2.0x the
+   one-token rate for each token. Only experts that more than one token of the window uses get this gain.
 
 **Gate G3.** Decode reaches at least 85% of the DRAM limit at the measured hit rate. If G3 fails, the CPU path stays
 experimental, and PCIe carries all misses.
