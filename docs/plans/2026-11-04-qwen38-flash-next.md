@@ -275,8 +275,8 @@ The output is a Pareto front and the members of the family.
 2. A CPU mat-vec for several tokens, for MTP verify windows. The CPU makes the states once for all the tokens.
    Done: `cpu_seed4_tiled_matmul_mt`. On a cloud Xeon (AVX2 build), 2 tokens give 1.3x and 4 tokens give 2.0x the
    one-token rate for each token. Only experts that more than one token of the window uses get this gain.
-   P = 3 on the CPU (`cpu_seed3_tile`) is faster again: 13.9, 21.5 and 32.3 G weights/s for each token at 1, 2 and
-   4 tokens on 4 vCPUs, against 12.4, 16.8 and 25.1 at P = 4. P = 3 also reads 11% fewer bytes. So P = 3 is the
+   P = 3 on the CPU (`cpu_seed3_tile`) is faster again. On 4 vCPUs, it gives 13.9, 21.5 and 32.3 G weights/s for each
+   token at 1, 2 and 4 tokens. P = 4 gives 12.4, 16.8 and 25.1. P = 3 also reads 11% fewer bytes. So P = 3 is the
    better tier for experts that the CPU computes.
 
 **Gate G3.** Decode reaches at least 85% of the DRAM limit at the measured hit rate. If G3 fails, the CPU path stays
