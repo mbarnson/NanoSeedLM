@@ -60,6 +60,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   32K to 256K, memory, and accuracy, on MLA and hybrid models.
 - [2026-11-04: Hadamard rotation and P = 4 seeds on Qwen3.8-Flash-Next](results/2026-11-04-qwen38-rotation-probe.md):
   weight error of 4 experts, with and without rotation and activation weighting.
+- [2026-11-04: The seed search over the Qwen3.8-Flash-Next experts](results/2026-11-04-qwen38-seed-search.md): P = 4
+  and P = 3 on 4 RTX PRO 6000 GPUs, errors, costs and pack sizes.
 
 ## For contributors and agents
 

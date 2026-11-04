@@ -6,7 +6,8 @@ of DDR4, one pack must decode faster than a published quantization of similar qu
 128 GB of unified memory. The user chooses the precision of the PLE table to fit the free disk space.
 
 **Status.** Draft. No gate is measured yet. S1 items 1 to 3, S2's speed measurement and the S3 searches are done. The
-P4 pack is in the storage bucket, and the P3 pack runs. The C reference of S7 is done. A first probe for H3 is done:
+P4 and P3 packs are in the storage bucket ([the seed search](../results/2026-11-04-qwen38-seed-search.md)). The C
+reference of S7 is done. A first probe for H3 is done:
 [Hadamard rotation and P = 4 seeds](../results/2026-11-04-qwen38-rotation-probe.md). Each gate gets a results page
 when we measure it.
 
@@ -357,7 +358,7 @@ Measured in step S2 (2026-11-04, `rtx-pro-6000`, layer 20, P = 4, 2 workers): 33
 | S2, one layer | About $0.45 (measured) |
 | S3, P4, on `rtx-pro-6000x4` | About $12.50 (measured: 66 min) |
 | S3, P3, on `rtx-pro-6000x4` | About $15.50 (measured: 83 min) |
-| Packing, on `cpu-xl`, for each tier | About $0.40 (measured for P4: 22 min) |
+| Packing, on `cpu-xl`, for each tier | About $0.35 (measured: 20 to 21 min) |
 
 A BF16 reference or a GPTQ capture costs about $20 for each hour. They need more credits.
 

@@ -192,3 +192,10 @@ RMSNorm and the hyper-connection steps. The matvec, GEMM and embedding kernels t
 `test_mova_kernels` passed on the same run, so the group change kept the MoVA kernels as they were. Metal does not have
 these kernels yet.
 
+## [2026-11-04] result | The seed search over the Qwen3.8-Flash-Next experts
+
+HF Jobs searched all 24,576 routed experts on 4 RTX PRO 6000 GPUs: 66 min at P = 4, 83 min at P = 3, about $28 for
+both. The mean activation-weighted relative error is 0.077 at P = 4 and 0.112 at P = 3. The packs are 105.7 GB (P = 4)
+and 98.2 GB (P = 3), against 113.3 GB for the 4-bit MLX model. They are in the storage bucket, not published yet.
+Read [The seed search over the Qwen3.8-Flash-Next experts](results/2026-11-04-qwen38-seed-search.md).
+
