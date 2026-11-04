@@ -1,6 +1,6 @@
 # NanoSeedLM
 
-> NanoSeedLM runs IFM/K2-Horizon-MoVA-36B-A4B in less memory. It replaces stored weights with SeedLM seeds that the GPU expands at run time. It also runs a TransMLA conversion of the model, with a KV cache less than half the size. It has a C99 engine with Metal and CUDA kernels, and an MLX loader in each Hugging Face model repository for oMLX (Trust Remote Code). It also makes models of Qwen3.8-Flash-Next with seed experts, for mlx-vlm and the CUDA engine (nslm-qwen4-gen). The Metal engine does not run them yet. Seed models are not faster or more accurate than affine quantization. They are often a little smaller at similar quality.
+> NanoSeedLM runs mixture-of-experts models in less memory. It replaces stored weights with SeedLM seeds that the GPU expands at run time. It supports IFM/K2-Horizon-MoVA-36B-A4B (also as a TransMLA conversion, with a KV cache less than half the size), K2-Horizon-0.9B and Qwen3.8-Flash-Next (seed experts). It has a C99 engine with Metal and CUDA kernels. Each Hugging Face model repository has an MLX loader for oMLX or mlx-vlm (Trust Remote Code). Qwen3.8-Flash-Next runs in mlx-vlm and on the CUDA engine (nslm-qwen4-gen). The Metal engine and oMLX do not run it yet. Seed models are not faster or more accurate than affine quantization. They are often a little smaller at similar quality.
 
 Facts to keep in mind:
 

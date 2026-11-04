@@ -1,20 +1,28 @@
 # NanoSeedLM
 
-NanoSeedLM runs [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) in less memory.
-It also makes models of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) with seed experts, for
-mlx-vlm and the CUDA engine (an experiment). It uses two methods:
+NanoSeedLM runs mixture-of-experts language models in less memory. It uses two methods:
 
 - [SeedLM](https://arxiv.org/abs/2410.10714) replaces stored weights with seeds. The GPU makes the weights from the
   seeds at run time.
 - [TransMLA](https://arxiv.org/abs/2502.07864) converts the model's attention to multi-head latent attention (MLA).
-  The MLA model keeps less than half the KV cache of the original.
+  The MLA model keeps less than half the KV cache of the original. Only the K2-Horizon-MoVA models use it.
 
 The project has three parts:
 
 - An inference engine in C99, with Metal kernels for Apple Silicon and CUDA kernels for NVIDIA GPUs.
 - An MLX loader in each [Hugging Face model repository](docs/reference/models.md), for use in
-  [oMLX](https://github.com/jundot/omlx).
+  [oMLX](https://github.com/jundot/omlx) or mlx-vlm.
 - The tools that make the seeds and pack the models.
+
+## Supported models
+
+| Model family | Methods | oMLX or MLX | Metal engine | CUDA engine |
+|---|---|---|---|---|
+| [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) | Seeds, MLA | oMLX | Yes | Yes (p4mx-q4v; the MLA packs are not checked) |
+| [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | Seed experts | mlx-vlm (oMLX not yet) | Not yet | Yes (`nslm-qwen4-gen` only) |
+| [IFM/K2-Horizon-0.9B](https://huggingface.co/IFM/K2-Horizon-0.9B) | Seeds | oMLX | No | No |
+
+[The model list](docs/reference/models.md) gives each published model and the runtimes that load it.
 
 ## Should you use it?
 
@@ -22,10 +30,10 @@ For daily use, probably not. A seed model is not faster than an affine quantizat
 its quality is not better. A seed model is often a little smaller than an affine model of similar quality. That is
 the gain.
 
-If you want the fastest or the most accurate K2-Horizon on your machine, use an affine quantization of the original
-model. Use NanoSeedLM for one of these purposes:
+If you want the fastest or the most accurate version of a model on your machine, use an affine quantization of the
+original model. Use NanoSeedLM for one of these purposes:
 
-- To get the longest context that your Mac can hold.
+- To get the longest K2-Horizon-MoVA context that your Mac can hold.
 - To get the smallest model file at a given quality.
 - To do research on seeded weights.
 
@@ -33,9 +41,11 @@ model. Use NanoSeedLM for one of these purposes:
 
 - **Seeds instead of stored weights.** The model file keeps each block of 8 weights as a 16-bit seed and a few small
   numbers. The GPU makes the weights again from the seed inside each matrix multiply.
-- **A smaller KV cache.** The MLA models keep less than half the KV cache of the original model. With the 8-bit
-  cache, the full 512K-token context fits on a 128 GB Mac, and much memory stays free.
-- **No patches in oMLX.** Each model repository includes its own loader. In oMLX, turn on **Trust Remote Code** for
+- **A smaller KV cache.** The K2-Horizon-MoVA MLA models keep less than half the KV cache of the original model. With
+  the 8-bit cache, the full 512K-token context fits on a 128 GB Mac, and much memory stays free.
+- **Experts in host memory.** The CUDA engine can keep the routed experts in RAM. A VRAM cache holds the recently used
+  experts. Qwen3.8-Flash-Next runs on a GPU with 16 GB of VRAM.
+- **No patches in oMLX or mlx-vlm.** Each model repository includes its own loader. Select **Trust Remote Code** for
   the model. The loader supplies the seed kernels and the MLA attention.
 - **The same engine on Metal and CUDA.** The two engines compile the same C sources and run the same tests. Each GPU
   kernel must match a C reference. The two engines give the same quality on the same model.
@@ -54,15 +64,15 @@ in [the documentation](docs/index.md).
 
 ## Get started
 
-### In oMLX (Mac)
+### In oMLX (Mac, K2-Horizon)
 
 1. Download a model, for example
    [K2-Horizon-MoVA-36B-A4B-MLA-NanoSeedLM-P4](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-NanoSeedLM-P4).
-2. In oMLX, turn on **Trust Remote Code** for the model.
+2. In oMLX, select **Trust Remote Code** for the model.
 
 For long contexts, read [The MLX loader](docs/guides/mlx.md).
 
-### With the engine (Mac)
+### With the engine (Mac, K2-Horizon)
 
 You need Apple Silicon and the Xcode command-line tools.
 
@@ -75,10 +85,27 @@ out/bin/nslm-serve --model MODEL_DIR --port 8080
 `nslm-serve` is an OpenAI-compatible server. It supports streaming, tool calls and continuous batching. Read
 [Run and serve](docs/guides/run-and-serve.md).
 
+### In mlx-vlm (Mac, Qwen3.8-Flash-Next)
+
+You need mlx-vlm 0.7.12 or later. The model card tells how to keep the PLE table on the SSD. Read
+[The MLX loader](docs/guides/mlx.md).
+
+```bash
+python -m mlx_vlm.generate --model txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4 --trust-remote-code --prompt "Why do tide pools matter?"
+```
+
 ### With the engine (Windows or Linux)
 
-You need an NVIDIA GPU of the Ampere generation or newer, with 12 GB or more of VRAM. Read
-[Build and test](docs/guides/build.md) and [NVIDIA GPUs](docs/guides/cuda.md).
+You need an NVIDIA GPU of the Ampere generation or newer. K2-Horizon-MoVA needs 12 GB or more of VRAM.
+Qwen3.8-Flash-Next runs on a 16 GB GPU. Its routed experts stay in RAM, or the engine reads them from the model files
+(`--stream-experts`). Read [Build and test](docs/guides/build.md) and [NVIDIA GPUs](docs/guides/cuda.md).
+
+```bash
+build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --expert-cache-gb 8 --prompt "Why do tide pools matter?"
+```
+
+`nslm-chat` and `nslm-serve` do not run Qwen3.8-Flash-Next yet. Read
+[Run and serve](docs/guides/run-and-serve.md#qwen38-flash-next-on-cuda).
 
 ## Models
 
@@ -92,8 +119,6 @@ You need an NVIDIA GPU of the Ampere generation or newer, with 12 GB or more of 
 | [K2-Horizon-0.9B-NSLM-seeds-4bpw](https://huggingface.co/txgsync/K2-Horizon-0.9B-NSLM-seeds-4bpw) | GQA | Seeds | 0.5 GB |
 | [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4) | Original (DeltaNet and attention) | Seed experts, the rest 4-bit | 105.7 GB |
 | [Qwen3.8-Flash-Next-NanoSeedLM-P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3) | Original (DeltaNet and attention) | Seed experts, the rest 4-bit | 98.2 GB |
-
-[The model list](docs/reference/models.md) tells which runtimes load each model.
 
 ## How it works
 
