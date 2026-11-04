@@ -59,7 +59,7 @@ On HF Jobs, `tools/hf_qwen4_pack.sh` packs on a CPU node, from and to mounted bu
 ```bash
 hf jobs run --detach --flavor cpu-xl --timeout 2h -v ./src:/src -v hf://buckets/USER/BUCKET:/b \
     -e SRC=/src -e BASE=mlx-community/Qwen3.8-Flash-Next-4bit-mtp@825df623302aeebc434f44ca9122827b04f9a0f1 \
-    -e BLK=/b/p4/experts-p4 -e P=4 -e OUT=/b/pack-p4 python:3.12 bash /src/tools/hf_qwen4_pack.sh
+    -e BLK=/b/p4/experts-p4 -e TIER=4 -e OUT=/b/pack-p4 python:3.12 bash /src/tools/hf_qwen4_pack.sh
 ```
 
 ## MLA projections
