@@ -53,7 +53,9 @@ if [ -n "${IMATRIX:-}" ]; then CALIB_ARGS="--imatrix $IMATRIX --scope gud"; else
 if [ -d "${XTX:-}" ]; then mkdir -p /tmp/xtx && cp -r "$XTX"/. /tmp/xtx/ && XTX=/tmp/xtx; fi   # mount can come back short
 rm -rf /work && cp -r "$SRC" /work
 cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
-cmake --build /work/build -j "$(nproc)" --target nslm-moe nslm-dense nslm-mova-mlacapture 2>&1 | grep -E "error" || true
+TARGETS=""   # only what JOBS needs (the MLA capture builds the whole CUDA engine)
+for j in $JOBS; do case $j in moe*) TARGETS+=" nslm-moe" ;; dense*) TARGETS+=" nslm-dense" ;; mla*) TARGETS+=" nslm-moe nslm-mova-mlacapture" ;; esac; done
+cmake --build /work/build -j "$(nproc)" --target $TARGETS 2>&1 | grep -E "error" || true
 BIN=/work/build/bin
 nvidia-smi --query-gpu=index,name,memory.total --format=csv | tee "$LOG/gpus.csv"
 
