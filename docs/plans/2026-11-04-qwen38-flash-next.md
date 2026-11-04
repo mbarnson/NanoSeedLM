@@ -5,7 +5,7 @@
 of DDR4, one pack must decode faster than a published quantization of similar quality. A second target is a Mac with
 128 GB of unified memory. The user chooses the precision of the PLE table to fit the free disk space.
 
-**Status.** Draft. No gate is measured yet. S1 items 1 to 3 are done. A first probe for H3 is done:
+**Status.** Draft. No gate is measured yet. S1 items 1 to 3 and S2's speed measurement are done. S3 runs. A first probe for H3 is done:
 [Hadamard rotation and P = 4 seeds](../results/2026-11-04-qwen38-rotation-probe.md). Each gate gets a results page
 when we measure it.
 
@@ -335,17 +335,18 @@ The seed search uses FP32 and integer arithmetic, not tensor cores. So `a100-lar
 each dollar.
 
 The search over the routed experts of K2-Horizon-MoVA (26.5 B weights) took 3.4 h on an M4 Max. Qwen3.8 has 4.6x as
-many expert weights: about 15 h for each tier on an M4 Max. Assume that the CUDA search has the same efficiency per
-FLOP. Then a tier takes about 5 h on the RTX 4080, 3 h on `l40sx1` and 2 h on `rtx-pro-6000`. Step S2 measures this.
+many expert weights.
 
-A budget for $19 of credits:
+Measured in step S2 (2026-11-04, `rtx-pro-6000`, layer 20, P = 4, 2 workers): 334 s for one layer. `gate_proj` and
+`up_proj` took 233 s each, side by side, and `down_proj` took 100 s. All 48 layers take about 4.5 GPU-hours for each tier.
+`l40sx1` was not available, so S3 runs on `rtx-pro-6000x4`.
 
-| Item | Estimate |
+| Item | Cost |
 |---|---|
-| S2, one layer | $0.20 |
-| S3, P4 | $5 |
-| S3, P3 | $5 |
-| A reserve for a 3-bit probe or a P8 tier | $8 |
+| S2, one layer | About $0.45 (measured) |
+| S3, P4, on `rtx-pro-6000x4` | About $14 (estimate from S2) |
+| S3, P3, on `rtx-pro-6000x4` | About $14 (estimate from S2) |
+| Packing, on a CPU flavor, for each tier | About $1 (estimate) |
 
 A BF16 reference or a GPTQ capture costs about $20 for each hour. They need more credits.
 

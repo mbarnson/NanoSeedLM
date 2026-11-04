@@ -33,7 +33,7 @@ from mlx_lm.models.switch_layers import SwitchGLU
 _HERE = os.path.dirname(os.path.abspath(__file__))   # nanoseedlm_seeds.py ships beside this loader
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from nanoseedlm_seeds import SeedEmbedding, SeedHeads, SeedLinear, SeedSwitchGLU, SeedSwitchLinear, _kernels, _module, decode  # noqa: E402
+from nanoseedlm_seeds import SeedEmbedding, SeedHeads, SeedLinear, SeedSwitchGLU, SeedSwitchLinear, _kernels, _module, decode, seed_p  # noqa: E402
 
 try:
     from mlx_lm.models import k2_horizon as _k2
@@ -1018,9 +1018,7 @@ class Model(_k2.Model):
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         seeded = sorted({k[: -len(".seeds")] for k in weights if k.endswith(".seeds")})
         for p in seeded:
-            if p + ".nibbles" in weights:   # SEED4 (P = 3): the nibble words carry the exponent codes
-                weights[p + ".coefs"] = weights.pop(p + ".nibbles").view(mx.int16)
-                weights[p + ".codes"] = mx.zeros((1,), mx.uint8)
+            seed_p(weights, p)   # SEED4 (P = 3): the nibble words carry the exponent codes
             if p + ".codes" not in weights:
                 raise ValueError(f"{p}: only SeedLM P=3 / P=4 / P=8 tensors load in MLX")
             weights[p + ".weight"] = mx.zeros((0,))   # the stack exists: K2's sanitize must not rebuild it
@@ -1046,7 +1044,7 @@ class Model(_k2.Model):
         for p in seeded:
             weights.pop(p + ".weight")
             e, n, kb = weights[p + ".seeds"].shape
-            pp = {mx.int16: 3, mx.uint16: 4, mx.uint32: 8}[weights[p + ".coefs"].dtype]
+            pp = seed_p(weights, p)
             parent, _, attr = p.rpartition(".")
             if parent and isinstance(_module(self, parent), MLA):
                 setattr(_module(self, parent), attr, SeedLinear(kb * 8, n, pp) if e == 1 else SeedHeads(e, kb * 8, n, pp))
