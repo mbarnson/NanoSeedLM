@@ -157,6 +157,19 @@ int kt_q4_norm1p(const float* x, int len, int g, const float* w, float eps, floa
 // qwen4_hc_add of branch into H with the gated inj
 int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up, float* mixed, float* inj, float* H,
              const float* branch, int T);
+// qwen4_head_norm_rope on each row t of x (row stride rs) at position pos0 + t, in place
+int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T);
+int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
+// qwen4_ple_gate into gated, then qwen4_ple_conv of cin (hist and H updated), T tokens
+int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, const float* w, const float* cin,
+              float* hist, float* H, int T);
+// QSA: nb block keys from raw[nb * ix_ratio][ix_dim] into blk, then qwen4_qsa_select for T rows (iq at row stride rs,
+// done[t] blocks) into sel[t][budget / ratio]
+int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float* blk, const float* iq, int rs, const int32_t* done,
+              int32_t* sel, int T);
+// qwen4_attend for rows at positions pos0 + t over caches of npos positions
+int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
+                 const int32_t* nsel, float* o, int T);
 
 #ifdef __cplusplus
 }

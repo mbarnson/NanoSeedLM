@@ -70,7 +70,7 @@ typedef struct {
     int32_t nv, fmt;
 } KvView;
 
-// x[t][:] = the embedding row of ids[t] (BF16 or Q8)
+// x[t][:] = the embedding row of ids[t] (BF16, Q8 or Q4)
 void kc_embed(cudaStream_t s, int fmt, WSlice w, int d, const int32_t* ids, float* x, int T);
 // grouped RMSNorm (2 groups)
 void kc_gnorm(cudaStream_t s, int d, float eps, const float* x, const uint16_t* w, float* y, int T);

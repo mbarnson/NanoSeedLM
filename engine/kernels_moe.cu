@@ -600,6 +600,10 @@ __global__ void k_embed(int fmt, WSlice w, int d, const int32_t* ids, float* x) 
         const float q = (float) ((wq >> (8 * (c % 4))) & 255u);
         const size_t gi = (row * (size_t) d + c) >> gsh(w);
         v = bfr(bf(((const uint16_t*) w.p[1])[gi]) * q + bf(((const uint16_t*) w.p[2])[gi]));
+    } else if (fmt == MF_Q4) {
+        const uint32_t wq = ((const uint32_t*) w.p[0])[(row * (size_t) d + c) / 8];
+        const size_t gi = (row * (size_t) d + c) >> gsh(w);
+        v = bfr(bf(((const uint16_t*) w.p[1])[gi]) * (float) ((wq >> (4 * (c % 8))) & 15u) + bf(((const uint16_t*) w.p[2])[gi]));
     } else v = bf(((const uint16_t*) w.p[0])[row * (size_t) d + c]);
     x[(size_t) t * d + c] = v;
 }

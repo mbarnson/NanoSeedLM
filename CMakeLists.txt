@@ -87,7 +87,7 @@ foreach(t chat_template tool_calls)
 endforeach()
 
 # ---- the CUDA engine ------------------------------------------------------------------------------------------------
-add_library(nslm_engine STATIC engine/mova_cuda.c engine/kernels_moe.cu engine/kernels_qwen4.cu)
+add_library(nslm_engine STATIC engine/mova_cuda.c engine/qwen4_cuda.c engine/kernels_moe.cu engine/kernels_qwen4.cu)
 target_include_directories(nslm_engine PUBLIC engine nslm)
 target_link_libraries(nslm_engine PUBLIC nslm CUDA::cudart_static)
 set_target_properties(nslm_engine PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -110,7 +110,7 @@ else()   # Linux: ICU's headers and libraries (Ubuntu / Debian: libicu-dev), fou
 endif()
 
 foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-smoke nslm-mova-kbench
-          nslm-mova-refcheck nslm-mova-routes nslm-mova-mlacapture)
+          nslm-mova-refcheck nslm-mova-routes nslm-mova-mlacapture nslm-qwen4-gen)
   add_executable(${t} harness/${t}.c)
   target_link_libraries(${t} nslm_engine nslm_harness)
 endforeach()
@@ -169,6 +169,10 @@ add_executable(test_qwen4_kernels tests/test_qwen4_kernels.c tests/kernel_backen
 target_link_libraries(test_qwen4_kernels nslm_engine)
 add_test(NAME test_qwen4_kernels COMMAND test_qwen4_kernels WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen4_kernels PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_qwen4_engine tests/test_qwen4_engine.c)   # the Qwen3.8 CUDA engine against mlx-vlm on the tiny model
+target_link_libraries(test_qwen4_engine nslm_engine)
+add_test(NAME test_qwen4_engine COMMAND test_qwen4_engine WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen4_engine PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_tokenizer tests/test_tokenizer.c)
 target_link_libraries(test_tokenizer nslm_harness)
 add_test(NAME test_tokenizer COMMAND test_tokenizer WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

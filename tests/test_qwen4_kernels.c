@@ -121,6 +121,100 @@ static void q4g32_case(int R, int K) {
     free(q); free(sc); free(bi);
 }
 
+static int cmp_i32(const void* a, const void* b) { return *(const int32_t*) a - *(const int32_t*) b; }
+static Qwen4Cfg big_cfg(void) {   // the Qwen3.8-Flash-Next sizes the kernels below need
+    Qwen4Cfg c;
+    memset(&c, 0, sizeof c);
+    c.d = 2560; c.hc = 4; c.eps = 1e-6f; c.rot_dim = 64; c.rope_theta = 10000000.0f; c.n_head = 24; c.n_kv = 2; c.head_dim = 256;
+    c.ix_heads = 4; c.ix_dim = 128; c.ix_ratio = 4; c.ix_budget = 32; c.n_exp = 512; c.top_k = 10; c.ple_conv = 4; c.ngram = 3;
+    return c;
+}
+
+static void norm_rope_route_case(void) {
+    const Qwen4Cfg c = big_cfg();
+    const int T = 3, rs = c.n_head * 2 * c.head_dim;
+    float *x = rnd((size_t) rs * T, -2, 2), *w = rnd((size_t) c.head_dim, -0.3f, 0.3f), *x_k = dup(x, (size_t) rs * T);
+    for (int t = 0; t < T; ++t) qwen4_head_norm_rope(&c, x + (size_t) rs * t, c.n_head, 2 * c.head_dim, c.head_dim, w, 70000 + t);
+    int rc = kt_q4_head_norm_rope(&c, x_k, rs, c.n_head, 2 * c.head_dim, c.head_dim, w, 70000, T);
+    if (rc == 1) printf("  head norm + RoPE: not on %s\n", kt_name());
+    else {
+        printf("  head norm + RoPE, 24 heads of 256 (rot 64) at 70000: %.1e\n", rel(x_k, x, (size_t) rs * T));
+        CHECK(rc == 0 && rel(x_k, x, (size_t) rs * T) < 1e-5, "head norm + RoPE differs");
+    }
+    float* lg = rnd((size_t) c.n_exp * T, -4, 4);
+    lg[7] = lg[300] = 9.0f;   // a tie: the higher expert first
+    int32_t ind[3 * 10], ind_k[3 * 10];
+    float wt[3 * 10], wt_k[3 * 10];
+    for (int t = 0; t < T; ++t) qwen4_route(&c, lg + (size_t) c.n_exp * t, ind + c.top_k * t, wt + c.top_k * t);
+    rc = kt_q4_route(&c, lg, ind_k, wt_k, T);
+    if (rc == 1) printf("  router: not on %s\n", kt_name());
+    else {
+        CHECK(rc == 0 && !memcmp(ind, ind_k, sizeof ind) && ind[0] == 300, "router experts differ");
+        printf("  router 512 experts, top 10: experts %s, weights %.1e\n", memcmp(ind, ind_k, sizeof ind) ? "differ" : "equal",
+               rel(wt_k, wt, (size_t) c.top_k * T));
+        CHECK(rel(wt_k, wt, (size_t) c.top_k * T) < 1e-5, "router weights differ");
+    }
+    free(x); free(w); free(x_k); free(lg);
+}
+
+static void ple_case(void) {
+    const Qwen4Cfg c = big_cfg();
+    const int T = 5;
+    const size_t HD = (size_t) c.hc * c.d, nh = qwen4_ple_hist_len(&c);
+    float *keys = rnd(HD * T, -1, 1), *qs = rnd(HD * T, -1, 1), *vals = rnd((size_t) c.d * T, -1, 1), *w = rnd(HD * c.ple_conv, -0.5f, 0.5f);
+    float *cin = rnd(HD * T, -1, 1), *hist = rnd(nh, -1, 1), *H = rnd(HD * T, -1, 1), *g = rnd(HD * T, 0, 0);
+    float *hist_k = dup(hist, nh), *H_k = dup(H, HD * T), *g_k = rnd(HD * T, 0, 0);
+    for (int t = 0; t < T; ++t) {
+        qwen4_ple_gate(&c, keys + HD * t, qs + HD * t, vals + (size_t) c.d * t, g + HD * t);
+        qwen4_ple_conv(&c, w, cin + HD * t, g + HD * t, hist, H + HD * t);
+    }
+    const int rc = kt_q4_ple(&c, keys, qs, vals, g_k, w, cin, hist_k, H_k, T);
+    if (rc == 1) printf("  PLE gate + conv: not on %s\n", kt_name());
+    else {
+        const double e[3] = {rel(g_k, g, HD * T), rel(hist_k, hist, nh), rel(H_k, H, HD * T)};
+        printf("  PLE gate + conv, %d tokens: gate %.1e, history %.1e, H %.1e\n", T, e[0], e[1], e[2]);
+        CHECK(rc == 0 && e[0] < 1e-5 && e[1] == 0 && e[2] < 1e-5, "PLE gate + conv differs");
+    }
+    free(keys); free(qs); free(vals); free(w); free(cin); free(hist); free(H); free(g); free(hist_k); free(H_k); free(g_k);
+}
+
+static void qsa_attend_case(void) {
+    const Qwen4Cfg c = big_cfg();
+    const int nb = 40, D = c.ix_dim, k = c.ix_budget / c.ix_ratio, T = 3, rs = (c.ix_heads + 1) * D;
+    float *raw = rnd((size_t) nb * c.ix_ratio * D, -1, 1), *w = rnd((size_t) D, -0.3f, 0.3f), *blk = rnd((size_t) nb * D, 0, 0);
+    float *blk_k = rnd((size_t) nb * D, 0, 0), *iq = rnd((size_t) rs * T, -1, 1);
+    for (int j = 0; j < nb; ++j) qwen4_qsa_block(&c, raw + (size_t) j * c.ix_ratio * D, w, j, blk + (size_t) j * D);
+    const int32_t done[3] = {40, 20, 9};
+    int32_t sel[3 * 8], sel_k[3 * 8];
+    int ns[3];
+    for (int t = 0; t < T; ++t) ns[t] = qwen4_qsa_select(&c, iq + (size_t) rs * t, blk, done[t], sel + k * t);
+    int rc = kt_q4_qsa(&c, raw, w, nb, blk_k, iq, rs, done, sel_k, T);
+    if (rc == 1) printf("  QSA blocks + select: not on %s\n", kt_name());
+    else {
+        int same = 1;
+        for (int t = 0; t < T; ++t) {
+            qsort(sel + k * t, (size_t) k, 4, cmp_i32);
+            qsort(sel_k + k * t, (size_t) k, 4, cmp_i32);
+            same &= ns[t] == k && !memcmp(sel + k * t, sel_k + k * t, 4 * (size_t) k);
+        }
+        printf("  QSA 40 block keys: %.1e; top 8 of 40 / 20 / 9 blocks: %s\n", rel(blk_k, blk, (size_t) nb * D), same ? "equal" : "differ");
+        CHECK(rc == 0 && rel(blk_k, blk, (size_t) nb * D) < 1e-5 && same, "QSA differs");
+    }
+    const int npos = 100, pos0 = 97, no = c.n_head * c.head_dim;
+    const size_t kv = (size_t) npos * c.n_kv * c.head_dim;
+    float *q = rnd((size_t) 2 * no * T, -1, 1), *K = rnd(kv, -1, 1), *V = rnd(kv, -1, 1), *o = rnd((size_t) no * T, 0, 0), *o_k = rnd((size_t) no * T, 0, 0);
+    int32_t asel[3 * 8], ansel[3] = {k, 0, k};
+    for (int i = 0; i < 3 * k; ++i) asel[i] = (i * 7 + i / k) % 24;   // distinct complete blocks of rows 0 and 2
+    for (int t = 0; t < T; ++t) qwen4_attend(&c, q + (size_t) 2 * no * t, K, V, pos0 + t, asel + k * t, ansel[t], o + (size_t) no * t);
+    rc = kt_q4_attend(&c, q, K, V, npos, pos0, asel, ansel, o_k, T);
+    if (rc == 1) printf("  attention: not on %s\n", kt_name());
+    else {
+        printf("  attention 24 heads of 256, 2 KV heads, sparse / dense / sparse rows: %.1e\n", rel(o_k, o, (size_t) no * T));
+        CHECK(rc == 0 && rel(o_k, o, (size_t) no * T) < 1e-5, "attention differs");
+    }
+    free(raw); free(w); free(blk); free(blk_k); free(iq); free(q); free(K); free(V); free(o); free(o_k);
+}
+
 int main(void) {
     char err[256];
     if (kt_open(err, sizeof err)) { printf("SKIP: %s\n", err); return 77; }
@@ -131,6 +225,9 @@ int main(void) {
     hc_case(4, 2560, 320, 3);        // Qwen3.8-Flash-Next
     hc_case(4, 64, 32, 5);
     q4g32_case(96, 2560);
+    norm_rope_route_case();
+    ple_case();
+    qsa_attend_case();
     kt_close();
     printf("test_qwen4_kernels: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

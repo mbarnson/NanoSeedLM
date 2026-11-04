@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # tools/hf_cuda_test.sh - builds and runs CUDA test targets on an HF Jobs GPU node (image nvidia/cuda:*-devel).
 #
-#   SRC=/src [TARGETS="test_qwen4_kernels test_qwen4_ref test_mova_kernels"] bash tools/hf_cuda_test.sh
+#   SRC=/src [TARGETS="test_qwen4_kernels test_qwen4_engine test_qwen4_ref test_mova_kernels"] bash tools/hf_cuda_test.sh
 set -euo pipefail
-TARGETS=${TARGETS:-"test_qwen4_kernels test_qwen4_ref test_mova_kernels"}
+TARGETS=${TARGETS:-"test_qwen4_kernels test_qwen4_engine test_qwen4_ref test_mova_kernels"}
 export DEBIAN_FRONTEND=noninteractive
 command -v cmake >/dev/null || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq cmake libicu-dev >/dev/null 2>&1; }
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader

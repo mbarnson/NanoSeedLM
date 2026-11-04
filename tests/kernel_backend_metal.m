@@ -754,3 +754,27 @@ int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up,
     (void) c; (void) lo; (void) normed; (void) up; (void) mixed; (void) inj; (void) H; (void) branch; (void) T;
     return 1;
 }
+int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T) {
+    (void) c; (void) x; (void) rs; (void) nh; (void) hs; (void) hd; (void) w; (void) pos0; (void) T;
+    return 1;
+}
+int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T) {
+    (void) c; (void) logits; (void) ind; (void) wt; (void) T;
+    return 1;
+}
+int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, const float* w, const float* cin,
+              float* hist, float* H, int T) {
+    (void) c; (void) keys; (void) qs; (void) vals; (void) gated; (void) w; (void) cin; (void) hist; (void) H; (void) T;
+    return 1;
+}
+int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float* blk, const float* iq, int rs, const int32_t* done,
+              int32_t* sel, int T) {
+    (void) c; (void) raw; (void) w; (void) nb; (void) blk; (void) iq; (void) rs; (void) done; (void) sel; (void) T;
+    return 1;
+}
+int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
+                 const int32_t* nsel, float* o, int T) {
+    (void) c; (void) q; (void) K; (void) V; (void) npos; (void) pos0; (void) sel; (void) nsel; (void) o; (void) T;
+    return 1;
+}
+

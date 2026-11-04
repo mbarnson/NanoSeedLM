@@ -1,0 +1,20 @@
+// engine/qwen4_eng.h - the Qwen3.8 (qwen4_exp) CUDA engine: an MLX model folder on the GPU, tokens in, logits out.
+// Routed experts in mapped host memory (or VRAM), the rest in VRAM; prompts run in rows of up to Q4E_MAX_ROWS tokens.
+#pragma once
+#include <stdint.h>
+
+#define Q4E_MAX_ROWS 8   // = MV_MAXT (engine/kernels_moe.metal)
+
+#include "qwen4_cfg.h"
+
+typedef struct Q4Eng Q4Eng;
+
+// vram_experts: the routed experts in VRAM too (a GPU with room for the whole pack but the PLE table)
+Q4Eng* q4e_open(const char* model_dir, int max_pos, int vram_experts, char* err, int errlen);
+void q4e_close(Q4Eng* e);
+const Qwen4Cfg* q4e_cfg(const Q4Eng* e);
+// Appends ids[0..n-1] to the context; the logits of each row go to logits[n][vocab] (NULL: none).  0, or -1 (q4e_error).
+int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits);
+void q4e_reset(Q4Eng* e);   // an empty context
+int q4e_pos(const Q4Eng* e);
+const char* q4e_error(const Q4Eng* e);
