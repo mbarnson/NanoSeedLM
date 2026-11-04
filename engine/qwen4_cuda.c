@@ -107,6 +107,7 @@ static void load_w(Q4Eng* e, W* w, int host, const char* fmt, ...) {
     NAME(name, fmt);
     const NsTensor* t = ns_find(&e->nm, name);
     if (!t || t->enc == NS_SEED6P8) { fail(e, "%s: %s", name, t ? "P = 8 seeds not supported" : "missing"); return; }
+    if ((t->enc == NS_Q4 || t->enc == NS_Q8) && t->group != 32 && t->group != 64) { fail(e, "%s: affine group %d not supported", name, t->group); return; }
     const int seed = t->enc == NS_SEED4 || t->enc == NS_SEED4P4;
     const uint8_t* p[4] = {NULL, NULL, NULL, NULL};
     for (int s = 0; s < 4; ++s)
@@ -210,6 +211,7 @@ static void build_cache(Q4Eng* e, double gb) {
     const Qwen4Cfg* c = &e->c;
     CachePool* p = &e->pool;
     const int E = c->n_exp, units = c->n_layer * E;
+    if (E > CACHE_MAX_PER_LAYER) { fail(e, "expert cache: %d experts per layer, at most %d", E, CACHE_MAX_PER_LAYER); return; }
     memset(p, 0, sizeof *p);
     p->per_layer = E;
     p->ntens = 3;
@@ -237,6 +239,7 @@ static void build_cache(Q4Eng* e, double gb) {
         for (int i = 0; i < 3; ++i) {
             const NsTensor* t = e->et[l][i];
             if (!t || t->enc != e->et[0][i]->enc || t->s[0].len != e->et[0][i]->s[0].len) { fail(e, "layer %d: experts differ from layer 0's", l); free(tab); return; }
+            if ((t->enc == NS_Q4 || t->enc == NS_Q8) && t->group != 32 && t->group != 64) { fail(e, "%s: affine group %d not supported", t->name, t->group); free(tab); return; }
             for (int x = 0; x < E; ++x) {
                 WSlice* w = &tab[((size_t) l * 3 + i) * E + x];
                 for (int s = 0; s < 4; ++s)

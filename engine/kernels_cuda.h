@@ -49,6 +49,7 @@ typedef struct {
 // rows x k selections inds[] of sparse layer sl.  flags: CACHE_PROTECT_PREV (never replace the units of the pool's
 // previous admit: their layer may still be computing beside a prefetch).
 enum { CACHE_PROTECT_PREV = 2 };
+#define CACHE_MAX_PER_LAYER 1024   // k_cache_admit's experts per layer (its thread count); callers check it
 void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* inds, int count, int flags);
 // blocks: the copy's grid (fewer leave SMs to kernels running beside it on another stream)
 void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks);

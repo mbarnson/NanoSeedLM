@@ -311,6 +311,7 @@ static int build_pool(Eng* e, CachePool* p, MW* const* ws, int ntens, int per_la
     const MovaCfg* c = &e->c;
     const int nsl = c->n_layer - c->first_sparse, units = nsl * per_layer;
     memset(p, 0, sizeof *p);
+    if (per_layer > CACHE_MAX_PER_LAYER) { snprintf(err, (size_t) errlen, "expert cache: %d experts per layer, at most %d", per_layer, CACHE_MAX_PER_LAYER); return -1; }
     p->per_layer = per_layer;
     p->ntens = ntens;
     uint64_t cur = 0;

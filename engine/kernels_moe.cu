@@ -1285,7 +1285,7 @@ __global__ void k_sumsq(const float* X, int n, int T, int xs, float* out) {
 __global__ void __launch_bounds__(MMT_THREADS) k_heads_mm(HmvArgs h, MmArgs a, int fmt, WSlice W, const float* X, const float* g,
                                                           float* Y) {
     const size_t n = (size_t) h.O * h.I * (size_t) blockIdx.z;   // values before this head
-    WSlice w;
+    WSlice w;   // MLA heads are group 64 (mova_cuda.c refuses others), so w.gs stays 0
     memset(&w, 0, sizeof w);
     w.p[0] = (const uint8_t*) W.p[0] + (fmt == MF_BF16 ? 2 * n : fmt == MF_Q8 ? n : n / 2);
     if (fmt != MF_BF16) { w.p[1] = (const uint16_t*) W.p[1] + n / 64; w.p[2] = (const uint16_t*) W.p[2] + n / 64; }
@@ -1929,7 +1929,7 @@ __global__ void __launch_bounds__(32 * ATTF_G * FA_RG) k_attn_prefill_tc(AttnArg
 }
 
 // ---- expert cache ------------------------------------------------------------------------------------------------------
-#define ADMIT_THREADS 1024
+#define ADMIT_THREADS CACHE_MAX_PER_LAYER
 __global__ void __launch_bounds__(ADMIT_THREADS) k_cache_admit(CachePool p, int sl, const int32_t* inds, int count, int flags) {
     const int prev = flags & CACHE_PROTECT_PREV ? (int) p.tick[0] : -1;
     __shared__ int need[ADMIT_THREADS];   // per_layer <= ADMIT_THREADS experts (qwen4: 512)

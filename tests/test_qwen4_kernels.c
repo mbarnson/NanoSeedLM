@@ -17,7 +17,7 @@ static float* rnd(size_t n, float lo, float hi) {
     for (size_t i = 0; i < n; ++i) v[i] = frand(lo, hi);
     return v;
 }
-static float* dup(const float* v, size_t n) { float* d = (float*) malloc(sizeof(float) * (n ? n : 1)); memcpy(d, v, sizeof(float) * n); return d; }
+static float* fdup(const float* v, size_t n) { float* d = (float*) malloc(sizeof(float) * (n ? n : 1)); memcpy(d, v, sizeof(float) * n); return d; }
 // max |a - b| over the largest |b|
 static double rel(const float* a, const float* b, size_t n) {
     double d = 0, m = 1e-30;
@@ -35,7 +35,7 @@ static void gdn_case(int hk, int hv, int dk, int dv, int T) {
     const Qwen4GdnW w = {cw, al, dt, nw};
     float *qkv = rnd(cd * T, -1, 1), *z = rnd(vd * T, -2, 2), *a = rnd((size_t) hv * T, -2, 2), *b = rnd((size_t) hv * T, -2, 2);
     float *conv = rnd(nc, -1, 1), *S = rnd(ns, -0.5f, 0.5f);
-    float *conv_k = dup(conv, nc), *S_k = dup(S, ns), *y = rnd(vd * T, 0, 0), *y_k = rnd(vd * T, 0, 0);
+    float *conv_k = fdup(conv, nc), *S_k = fdup(S, ns), *y = rnd(vd * T, 0, 0), *y_k = rnd(vd * T, 0, 0);
     for (int t = 0; t < T; ++t) qwen4_gdn_token(&c, &w, qkv + cd * t, z + vd * t, a + (size_t) hv * t, b + (size_t) hv * t, conv, S, y + vd * t);
     const int rc = kt_q4_gdn(&c, &w, qkv, z, a, b, conv_k, S_k, y_k, T);
     if (rc == 1) printf("  gdn: not on %s\n", kt_name());
@@ -64,7 +64,7 @@ static void hc_case(int hc, int d, int rank, int T) {
     }
     float *lo = rnd((size_t) rank * T, -4, 4), *up = rnd(HD * T, -4, 4), *inj = rnd((size_t) hc * T, -4, 4), *H = rnd(HD * T, -1, 1);
     float *br = rnd((size_t) d * T, -1, 1), *mix = rnd((size_t) d * T, 0, 0);
-    float *lo_k = dup(lo, (size_t) rank * T), *inj_k = dup(inj, (size_t) hc * T), *H_k = dup(H, HD * T), *mix_k = dup(mix, (size_t) d * T);
+    float *lo_k = fdup(lo, (size_t) rank * T), *inj_k = fdup(inj, (size_t) hc * T), *H_k = fdup(H, HD * T), *mix_k = fdup(mix, (size_t) d * T);
     for (int t = 0; t < T; ++t) {
         qwen4_hc_act(&c, lo + (size_t) rank * t);
         qwen4_hc_mix(&c, y + HD * t, up + HD * t, mix + (size_t) d * t);
@@ -133,7 +133,7 @@ static Qwen4Cfg big_cfg(void) {   // the Qwen3.8-Flash-Next sizes the kernels be
 static void norm_rope_route_case(void) {
     const Qwen4Cfg c = big_cfg();
     const int T = 3, rs = c.n_head * 2 * c.head_dim;
-    float *x = rnd((size_t) rs * T, -2, 2), *w = rnd((size_t) c.head_dim, -0.3f, 0.3f), *x_k = dup(x, (size_t) rs * T);
+    float *x = rnd((size_t) rs * T, -2, 2), *w = rnd((size_t) c.head_dim, -0.3f, 0.3f), *x_k = fdup(x, (size_t) rs * T);
     for (int t = 0; t < T; ++t) qwen4_head_norm_rope(&c, x + (size_t) rs * t, c.n_head, 2 * c.head_dim, c.head_dim, w, 70000 + t);
     int rc = kt_q4_head_norm_rope(&c, x_k, rs, c.n_head, 2 * c.head_dim, c.head_dim, w, 70000, T);
     if (rc == 1) printf("  head norm + RoPE: not on %s\n", kt_name());
@@ -163,7 +163,7 @@ static void ple_case(void) {
     const size_t HD = (size_t) c.hc * c.d, nh = qwen4_ple_hist_len(&c);
     float *keys = rnd(HD * T, -1, 1), *qs = rnd(HD * T, -1, 1), *vals = rnd((size_t) c.d * T, -1, 1), *w = rnd(HD * c.ple_conv, -0.5f, 0.5f);
     float *cin = rnd(HD * T, -1, 1), *hist = rnd(nh, -1, 1), *H = rnd(HD * T, -1, 1), *g = rnd(HD * T, 0, 0);
-    float *hist_k = dup(hist, nh), *H_k = dup(H, HD * T), *g_k = rnd(HD * T, 0, 0);
+    float *hist_k = fdup(hist, nh), *H_k = fdup(H, HD * T), *g_k = rnd(HD * T, 0, 0);
     for (int t = 0; t < T; ++t) {
         qwen4_ple_gate(&c, keys + HD * t, qs + HD * t, vals + (size_t) c.d * t, g + HD * t);
         qwen4_ple_conv(&c, w, cin + HD * t, g + HD * t, hist, H + HD * t);
