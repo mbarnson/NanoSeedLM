@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "ple.h"
 
@@ -47,7 +48,9 @@ int main(void) {
     const void* data[4] = {bf, q8, q5, iq};
     const size_t bytes[4] = {sizeof bf, sizeof q8, sizeof q5, sizeof iq};
     const char* path = "out/test_ple.gguf";
+    mkdir("out", 0755);   // a fresh checkout has no out/
     FILE* f = fopen(path, "wb");
+    if (!f) { printf("FAIL: cannot write %s\n", path); return 1; }
     put(f, "GGUF", 4); put_u32(f, 3); put_u64(f, 4); put_u64(f, 0);
     uint64_t off = 0;
     for (int k = 0; k < 4; ++k) {

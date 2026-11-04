@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "gguf.h"
 
@@ -17,6 +18,7 @@ static void put_str(FILE* f, const char* s) { put_u64(f, strlen(s)); put(f, s, s
 // A GGUF v3 file shaped like a llama.cpp imatrix: 2 experts x 3 inputs, alignment 64.
 static long write_file(const char* path) {
     FILE* f = fopen(path, "wb");
+    if (!f) { printf("FAIL: cannot write %s\n", path); exit(1); }
     put(f, "GGUF", 4); put_u32(f, 3); put_u64(f, 2); put_u64(f, 4);
     put_str(f, "general.type"); put_u32(f, 8); put_str(f, "imatrix");
     put_str(f, "imatrix.datasets"); put_u32(f, 9); put_u32(f, 8); put_u64(f, 2); put_str(f, "a.txt"); put_str(f, "b.txt");
@@ -35,6 +37,7 @@ static long write_file(const char* path) {
 }
 
 int main(void) {
+    mkdir("out", 0755);   // a fresh checkout has no out/
     const char* path = "out/test_gguf.gguf";
     const long size = write_file(path);
     Gguf g;
@@ -54,6 +57,7 @@ int main(void) {
     const long cut[2] = {size - 4, 40};   // the last tensor cut short, then the header cut off
     for (int i = 0; i < 2; ++i) {
         FILE* in = fopen(path, "rb"), *out = fopen("out/test_gguf_cut.gguf", "wb");
+        if (!in || !out) { printf("FAIL: cannot copy %s\n", path); return 1; }
         for (long k = 0; k < cut[i]; ++k) fputc(fgetc(in), out);
         fclose(in);
         fclose(out);

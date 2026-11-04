@@ -97,6 +97,7 @@ int main(void) {
 
     // ---- the MLX loader ships with nanoseedlm_seeds.py ----
     {
+        mkdir("out", 0755);   // a fresh checkout has no out/
         mkdir("out/test_moe_loader", 0755);
         mkdir("out/test_moe_pack", 0755);
         remove("out/test_moe_loader/nanoseedlm_seeds.py");   // a clean start on reruns
