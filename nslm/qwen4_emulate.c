@@ -23,7 +23,8 @@ int main(int argc, char** argv) {
     char err[512];
     if (ns_open(&m, dir, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
     int want = 0, done = 0;
-    for (int i = 0; i < m.n; ++i) want += strstr(m.t[i].name, ".mlp.switch_mlp.") != NULL;
+    for (int i = 0; i < m.n; ++i)   // the main layers: the GGUF keeps the MTP layer in another file
+        want += !strncmp(m.t[i].name, "language_model.model.layers.", 28) && strstr(m.t[i].name, ".mlp.switch_mlp.");
     for (int f = 0; f < nf; ++f) {
         const time_t t0 = time(NULL);
         int n = 0;
