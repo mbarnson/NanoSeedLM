@@ -84,7 +84,8 @@ struct Q4Eng {
     int no_split;              // Q4E_NO_SPLIT=1: k_mv for the few-row projections too (A / B)
     int no_attg;               // Q4E_NO_ATTG=1: prompt rows through k_q4_attend too (A / B)
     int no_splitk;             // Q4E_NO_SPLITK=1: long decode rows through k_q4_attend too (A / B)
-    int smin, skeys;           // decode rows of smin keys or more in k_q4_attend_g's splits of skeys (Q4E_SPLIT_MIN, _KEYS)
+    int smin, skeys, smax;     // decode rows of smin keys or more in k_q4_attend_g's splits of skeys, at most smax splits
+                               // (Q4E_SPLIT_MIN, _KEYS, _MAX)
     int no_mm64;               // Q4E_NO_MM64=1: dense prompt rows through k_mm, not k_mm64 (A / B)
     // The MTP head (Q4EOpts.mtp). Hin: its input streams, row 0 the last main row's (the next head row's input), row
     // 1 + t main row t's of this forward; Hm: its streams; dtok: q4e_draft's bonus and drafts. lrow: the last row's logits
@@ -598,10 +599,10 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
     for (int t = 0; t < T; ++t) {
         const int pos = pos0 + t, done = (pos + 1) / R, ns = done > e->kq ? e->kq : 0, tail = ns ? (pos + 1) / R * R : 0;
         const int n = ns * R + pos + 1 - tail, z = (n + e->skeys - 1) / e->skeys;
-        if (n >= e->smin) { ++nlong; if (z > zmax) zmax = z < ATG_MAX_SPLIT ? z : ATG_MAX_SPLIT; }
+        if (n >= e->smin) { ++nlong; if (z > zmax) zmax = z < e->smax ? z : e->smax; }
     }
     const int split = T <= MV_MAXT && canG && nlong && !e->no_splitk, grouped = (T > MV_MAXT && canG && !e->no_attg) || split;
-    const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, pos0, 1.0f / sqrtf((float) hd), split ? zmax : 1, split ? e->smin : 0, e->skeys, {0, 0}};
+    const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, pos0, 1.0f / sqrtf((float) hd), split ? zmax : 1, split ? e->smin : 0, e->skeys, e->smax, 0};
     for (int pass = 0; pass < 1 + (split && nlong < T); ++pass) {   // split rows: then k_q4_attend for the short rows
         const int g = grouped && !pass;
         [e->enc setComputePipelineState:pipe4(e, g ? "k_q4_attend_g" : "k_q4_attend")];
@@ -942,9 +943,13 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->no_splitk = getenv("Q4E_NO_SPLITK") != NULL;
     e->no_mm64 = getenv("Q4E_NO_MM64") != NULL;
     e->smin = getenv("Q4E_SPLIT_MIN") ? atoi(getenv("Q4E_SPLIT_MIN")) : 1;   // every decode row: k_q4_attend_g (70 -> 16 us at 100 keys)
-    e->skeys = getenv("Q4E_SPLIT_KEYS") ? atoi(getenv("Q4E_SPLIT_KEYS")) : 128;
+    // splits of 32 keys, at most 16: one split walks its tiles serially (a 100-key row: 86 us in one, 39 in four), and
+    // at long context 16 splits of 128 keys beat 32 of 64
+    e->skeys = getenv("Q4E_SPLIT_KEYS") ? atoi(getenv("Q4E_SPLIT_KEYS")) : 32;
+    e->smax = getenv("Q4E_SPLIT_MAX") ? atoi(getenv("Q4E_SPLIT_MAX")) : 16;
     if (e->smin < 1) e->smin = 1;
     if (e->skeys < 1) e->skeys = 1;
+    if (e->smax < 1 || e->smax > ATG_MAX_SPLIT) e->smax = ATG_MAX_SPLIT;
     if (@available(macOS 15.0, *)) {   // the weights and buffers resident on the GPU
         MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
         e->residency = e->err[0] ? nil : [e->dev newResidencySetWithDescriptor:rd error:nil];

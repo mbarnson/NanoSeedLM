@@ -946,7 +946,7 @@ int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float*
     memcpy(qb.contents, q, 4 * no * 2);   // + 16 heads of slack: k_q4_attend_g reads its padding heads
     const int ns = nsplit > 1 ? nsplit : 1;
     id<MTLBuffer> pb = buf(NULL, 4 * (size_t) T * c->n_head * ns * (c->head_dim + 2));
-    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), ns, 0, 1, {0, 0}};
+    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), ns, 0, 1, 0, 0};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob, pb]);
             if (grouped) [e dispatchThreadgroups:MTLSizeMake((NSUInteger) c->n_kv, (NSUInteger) T, (NSUInteger) ns) threadsPerThreadgroup:TGS(64 * ATG_NQ, 1)];

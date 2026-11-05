@@ -19,8 +19,8 @@ typedef struct { int D, R, pad[2]; } Q4QsaMeanArgs;                   // block k
 typedef struct { int nh, D, rs, maxdone, k, pad[3]; } Q4QsaArgs;      // scores and top k
 // hd a multiple of 32, <= 256. nsplit: k_q4_attend_g's key splits (its grid's depth). smin > 0: decode rows by their own
 // keys n, so that a row's sums do not depend on the other rows of its forward: rows with n >= smin in k_q4_attend_g, in
-// min(ATG_MAX_SPLIT, ceil(n / skeys)) splits (merged by k_q4_attend_comb), the others in k_q4_attend
-typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit, smin, skeys, pad[2]; } Q4AttArgs;
+// min(smax, ceil(n / skeys)) splits (smax 0: ATG_MAX_SPLIT; merged by k_q4_attend_comb), the others in k_q4_attend
+typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit, smin, skeys, smax, pad; } Q4AttArgs;
 #define ATG_MAX_SPLIT 32
 typedef struct { int w, ss, pos0, pad; } Q4StoreArgs;                 // cache rows: width, source row stride, first position
 typedef struct { int d, k, pad[2]; } Q4CombineArgs;                   // MoE combine: hidden size, top k
@@ -454,7 +454,7 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
     const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
     // split tg.z of nsp: keys [kb, ke), whole tiles of ATG_K (decode rows: the splits' partials go to part, then
     // k_q4_attend_comb merges them; one split writes the output itself)
-    const int nsp = a.smin ? min(ATG_MAX_SPLIT, (n + a.skeys - 1) / a.skeys) : a.nsplit > 1 ? a.nsplit : 1;
+    const int nsp = a.smin ? min(a.smax > 0 ? a.smax : ATG_MAX_SPLIT, (n + a.skeys - 1) / a.skeys) : a.nsplit > 1 ? a.nsplit : 1;
     if ((a.smin && n < a.smin) || (int) tg.z >= nsp) return;   // k_q4_attend's row, or a split past this row's
     const int per = ((n + nsp - 1) / nsp + ATG_K - 1) / ATG_K * ATG_K;
     const int kb = (int) tg.z * per, ke = min(n, kb + per);
@@ -554,7 +554,7 @@ kernel void k_q4_attend_comb(constant Q4AttArgs& a [[buffer(0)]], device const f
     int nsp = a.nsplit;
     if (a.smin) {   // this row's splits; none (k_q4_attend's row) or one (written by k_q4_attend_g): nothing to merge
         const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
-        nsp = n < a.smin ? 0 : min(ATG_MAX_SPLIT, (n + a.skeys - 1) / a.skeys);
+        nsp = n < a.smin ? 0 : min(a.smax > 0 ? a.smax : ATG_MAX_SPLIT, (n + a.skeys - 1) / a.skeys);
         if (nsp < 2) return;
     }
     const ulong head = (ulong) t * a.nh + h;
