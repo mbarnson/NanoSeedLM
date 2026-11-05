@@ -5,7 +5,8 @@ Each PC has a 12 GB GPU and keeps the BF16 PLE table on NVMe. Each pack must mat
 V3.1 pack of its RAM class in one harness. It must also decode faster than that pack on the same PC. Seeds encode every routed expert.
 Seeds also encode other weights where a gate shows no loss.
 
-**Status.** Draft. Matt approved the plan on 2026-11-04. No step is done. The parent plan is
+**Status.** In progress. Matt approved the plan on 2026-11-04. T2 is done, and gate G6 fails
+([seed probe](../results/2026-11-04-qwen38-seed-probe.md)). T64 takes the fallback of G6. The parent plan is
 [SeedLM packs for Qwen3.8-Flash-Next](2026-11-04-qwen38-flash-next.md).
 
 ## Key numbers
@@ -102,6 +103,9 @@ RAM (parent plan S6). So fewer expert bytes cross PCIe.
 
 **Gate G6.** On layer 20, the weighted error of S3 is at most the weighted error of IQ3_XXS. If G6 fails, T64 uses P3
 for the hot experts and streams the rest from the page cache.
+
+**Result.** G6 fails. On layer 20, S3 has a weighted error of 0.213 and IQ3_XXS has 0.184. The C reference measured
+it on the CPU. The GPU search of S3 is not written. Unsloth gives `down_proj` 4.5 to 6 bits in all four packs.
 
 ### T3. Full searches
 

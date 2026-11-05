@@ -43,7 +43,7 @@ Work that is not done yet, with its gates and hypotheses.
 - [2026-11-04: SeedLM packs for Qwen3.8-Flash-Next](plans/2026-11-04-qwen38-flash-next.md): steps, gates, costs and
   the PLE table choice, for a PC with a 16 GB GPU.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
-  64, 96 and 128 GB of RAM with a 12 GB GPU and the BF16 PLE table, against Unsloth V3.1.
+  64, 96 and 128 GB of RAM and a 12 GB GPU. Each must match an Unsloth V3.1 pack.
 
 ## Results
 
@@ -84,6 +84,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   P3 46.1, affine 42.4, P4 40.0 tokens per second on one GPU.
 - [2026-11-04: Layer-major prompt passes for Qwen3.8-Flash-Next](results/2026-11-04-qwen38-prompt-passes.md): 549 to
   977 tokens per second on a 15,922-token prompt.
+- [2026-11-04: Seed layouts against Unsloth's tensors on one layer](results/2026-11-04-qwen38-seed-probe.md): 3-bit
+  seeds have 16% more weighted error than IQ3_XXS. Gate G6 fails.
 
 ## For contributors and agents
 
