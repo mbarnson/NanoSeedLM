@@ -1,5 +1,6 @@
 // harness/nslm-qwen4-kld.c - KL divergence of a qwen4 model against a reference on one text, through the CUDA engine.
 //   nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens 1024] [--expert-cache-gb N [--stream-experts]] [--vram-experts]
+//                  [--decode N]: the model's last N rows one at a time (the decode kernels), their own KL line too
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,15 +12,16 @@
 
 static int cmp_f(const void* a, const void* b) { const float x = *(const float*) a, y = *(const float*) b; return x < y ? -1 : x > y; }
 
-// Log-probabilities of rows [0, n) of ids under the model at dir into lp[n][vocab]; 0 or -1
-static int run(const char* dir, const Q4EOpts* o, const int32_t* ids, int n, float* lp, int vocab) {
+// Log-probabilities of rows [0, n) of ids under the model at dir into lp[n][vocab], the last dec rows one a forward; 0 or -1
+static int run(const char* dir, const Q4EOpts* o, const int32_t* ids, int n, int dec, float* lp, int vocab) {
     char err[512];
     const double t0 = now_s();
     Q4Eng* e = q4e_open(dir, o, err, sizeof err);
     if (!e) { fprintf(stderr, "%s: %s\n", dir, err); return -1; }
     if (q4e_cfg(e)->vocab != vocab) { fprintf(stderr, "%s: vocab %d, not %d\n", dir, q4e_cfg(e)->vocab, vocab); q4e_close(e); return -1; }
     const double t1 = now_s();
-    const int rc = q4e_forward(e, ids, n, lp);
+    int rc = q4e_forward(e, ids, n - dec, lp);
+    for (int t = n - dec; !rc && t < n; ++t) rc = q4e_forward(e, ids + t, 1, lp + (size_t) t * vocab);
     if (rc) fprintf(stderr, "%s: %s\n", dir, q4e_error(e));
     fprintf(stderr, "%s: loaded in %.1f s, %d rows in %.1f s\n", dir, t1 - t0, n, now_s() - t1);
     q4e_close(e);
@@ -37,19 +39,20 @@ static int run(const char* dir, const Q4EOpts* o, const int32_t* ids, int n, flo
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     const char *ref = NULL, *model = NULL, *text = NULL;
-    int ntok = 1024;
-    Q4EOpts o = {0, 0, NULL, 0, 0};
+    int ntok = 1024, dec = 0;
+    Q4EOpts o = {0, 0, NULL, 0, 0, 0};
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = argv[++i];
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--text") && i + 1 < argc) text = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) ntok = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--decode") && i + 1 < argc) dec = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--expert-cache-gb") && i + 1 < argc) o.cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--vram-experts")) o.vram_experts = 1;
         else if (!strcmp(argv[i], "--stream-experts")) o.stream_experts = 1;
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N]\n"); return 2; }
+    if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N] [--decode N]\n"); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", ref);
     Tok* tok = tok_open(path, err, sizeof err);
@@ -66,9 +69,10 @@ int main(int argc, char** argv) {
     const size_t V = (size_t) c.vocab;
     float* lr = (float*) malloc(sizeof(float) * (size_t) n * V);
     float* lm = (float*) malloc(sizeof(float) * (size_t) n * V);
-    if (!lr || !lm || run(ref, &o, ids, n, lr, c.vocab) || run(model, &o, ids, n, lm, c.vocab)) return 1;
+    if (dec < 0 || dec >= n) dec = 0;
+    if (!lr || !lm || run(ref, &o, ids, n, 0, lr, c.vocab) || run(model, &o, ids, n, dec, lm, c.vocab)) return 1;
     float* kl = (float*) malloc(sizeof(float) * (size_t) n);
-    double skl = 0, nll_r = 0, nll_m = 0;
+    double skl = 0, dkl = 0, nll_r = 0, nll_m = 0;
     int agree = 0;
     for (int t = 0; t < n; ++t) {
         const float* a = lr + (size_t) t * V;
@@ -82,9 +86,11 @@ int main(int argc, char** argv) {
         }
         kl[t] = (float) k;
         skl += k;
+        if (t >= n - dec) dkl += k;
         agree += ia == ib;
         if (t + 1 < n) { nll_r -= a[ids[t + 1]]; nll_m -= b[ids[t + 1]]; }
     }
+    if (dec) printf("the last %d rows, one a forward: KL(ref || model) mean %.5f\n", dec, dkl / dec);
     qsort(kl, (size_t) n, sizeof(float), cmp_f);
     printf("%d tokens: KL(ref || model) mean %.5f, median %.5f, 99th percentile %.5f; top-1 agreement %.2f%%; "
            "perplexity ref %.3f, model %.3f\n", n, skl / n, kl[n / 2], kl[(int) (0.99 * (n - 1))], 100.0 * agree / n,
