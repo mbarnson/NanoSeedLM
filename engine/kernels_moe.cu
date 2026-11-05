@@ -50,6 +50,10 @@ static __device__ __forceinline__ float s4f(uint32_t w, int sh) {   // signed 4-
 // ---- seed blocks ------------------------------------------------------------------------------------------------------
 // SEED4 (P = 3, 24 states) and SEED4P4 (P = 4, 32 states).  State k of seed s = bits k .. k + 15 of the stream
 // s | G[s] << 16 (G: lfsr_stream24 / lfsr_stream32), as v_k = 1 + V_k / 2^16 (exact: the state under the exponent of 1).
+// The stream tables are linear over GF(2): G[s] = G[s & 0xFF] ^ G[s & 0xFF00] for every seed (both tables; checked on
+// all 65,536).  Two reads of 512 fixed entries (about 33 KB of lines, L1-resident) instead of one random read of 256 KB:
+// P3 decode on an RTX 4080 +6.5%, the same tokens.
+#define GLD(G, s) (__ldg((G) + ((s) & 0xFFu)) ^ __ldg((G) + ((s) & 0xFF00u)))
 static __device__ __forceinline__ float st1(uint64_t st, int k) {
     return __uint_as_float(0x3F800000u | (((uint32_t) (st >> k) & 0xFFFFu) << 7));
 }
@@ -137,7 +141,7 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
             for (int jq = lane; jq < nbk / 2; jq += 32) {
                 const uint32_t ss = s2[jq], cc = c2[jq], eb2 = EN[(kb + 2 * jq) >> 1];
                 const uint32_t sa = ss & 0xFFFFu, sb = ss >> 16;
-                const uint32_t ga = __ldg(G + sa), gb = __ldg(G + sb);
+                const uint32_t ga = GLD(G, sa), gb = GLD(G, sb);
                 const float4* xr = (const float4*) (xb + (size_t) (2 * jq) * 8);
                 const float4 x0 = xr[0], x1 = xr[1], x2 = xr[2], x3 = xr[3];
                 acc += seed4_dot(sa, ga, cc & 0xFFFFu, w->eb + (int) (eb2 & 15u), x0, x1, -1.5f * sum8(x0, x1));
@@ -149,7 +153,7 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
             const uint32_t s = seeds[j];
             const float4* xr = (const float4*) (xb + (size_t) j * 8);
             const float4 x0 = xr[0], x1 = xr[1];
-            acc += seed4_dot(s, __ldg(G + s), coefs[j], w->eb + seed4_ecode(EN, kb + (uint32_t) j), x0, x1, -1.5f * sum8(x0, x1));
+            acc += seed4_dot(s, GLD(G, s), coefs[j], w->eb + seed4_ecode(EN, kb + (uint32_t) j), x0, x1, -1.5f * sum8(x0, x1));
         }
         return acc * (1.0f / 32767.0f);
     }
@@ -160,7 +164,7 @@ static __device__ __forceinline__ float mv_lane(int fmt, const WSlice* w, const 
             const uint32_t s = seeds[j];
             const float4* xr = (const float4*) (xb + (size_t) j * 8);
             const float4 x0 = xr[0], x1 = xr[1];
-            acc += seed3_dot(s, __ldg(G + s), nibs[j], w->eb, x0, x1, -1.5f * sum8(x0, x1));
+            acc += seed3_dot(s, GLD(G, s), nibs[j], w->eb, x0, x1, -1.5f * sum8(x0, x1));
         }
         return acc * (1.0f / 32767.0f);
     }
@@ -242,7 +246,7 @@ static __device__ __forceinline__ void mv_body(int fmt, MvArgs a, WSlice wd, con
         for (int jq = lane; jq < nbk / 2; jq += 32) {
             const uint32_t ss = s2[jq], cc = c2[jq], eb2 = EN[(kb + 2 * jq) >> 1];
             const uint32_t sa = ss & 0xFFFFu, sb = ss >> 16;
-            const uint32_t ga = __ldg(G + sa), gb = __ldg(G + sb);
+            const uint32_t ga = GLD(G, sa), gb = GLD(G, sb);
             const int ea = w.eb + (int) (eb2 & 15u), eb = w.eb + (int) ((eb2 >> 4) & 15u);
 #pragma unroll
             for (int t = 0; t < MV_MAXT; ++t) {
@@ -274,7 +278,7 @@ static __device__ __forceinline__ void mv_body(int fmt, MvArgs a, WSlice wd, con
         const uint16_t* cws = (const uint16_t*) w.p[1] + (size_t) r * nbk;
         const uint8_t* EN = (const uint8_t*) w.p[3];
         for (int j = lane; j < nbk; j += 32) {
-            const uint32_t s = seeds[j], g = __ldg(G + s), cw = cws[j];
+            const uint32_t s = seeds[j], g = GLD(G, s), cw = cws[j];
             const int e = fmt == MF_SEED4P4 ? w.eb + seed4_ecode(EN, (uint32_t) r * (uint32_t) nbk + (uint32_t) j) : w.eb;
 #pragma unroll
             for (int t = 0; t < MV_MAXT; ++t) {
@@ -356,7 +360,7 @@ static __device__ __forceinline__ void tile_weights(int fmt, const WSlice* w, co
     if (fmt == MF_SEED4P4) {
         const uint32_t k = (uint32_t) r * (uint32_t) nbk + (uint32_t) j;
         const uint32_t s = ((const uint16_t*) w->p[0])[k], cw = ((const uint16_t*) w->p[1])[k];
-        const uint64_t st = (uint64_t) s | ((uint64_t) __ldg(G + s) << 16);
+        const uint64_t st = (uint64_t) s | ((uint64_t) GLD(G, s) << 16);
         const int ci = (int) cw;
         const float q0 = (float) ((ci << 28) >> 28), q1 = (float) ((ci << 24) >> 28), q2 = (float) ((ci << 20) >> 28),
                     q3 = (float) ((ci << 16) >> 28);
@@ -371,7 +375,7 @@ static __device__ __forceinline__ void tile_weights(int fmt, const WSlice* w, co
         const uint32_t k = (uint32_t) r * (uint32_t) nbk + (uint32_t) j;
         const uint32_t s = ((const uint16_t*) w->p[0])[k];
         const int nb = (int) ((const uint16_t*) w->p[1])[k];
-        const uint64_t st = (uint64_t) s | ((uint64_t) __ldg(G + s) << 16);
+        const uint64_t st = (uint64_t) s | ((uint64_t) GLD(G, s) << 16);
         const float q0 = (float) ((nb << 24) >> 28), q1 = (float) ((nb << 20) >> 28), q2 = (float) ((nb << 16) >> 28);
         const float sc = __uint_as_float((uint32_t) (w->eb + (nb & 15) + 127) << 23) * (1.0f / 32767.0f);
 #pragma unroll

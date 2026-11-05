@@ -83,6 +83,13 @@ int main(void) {
         printf("decode exactness: ok (%d of 2000000 bf16 roundings differ from exact-real RNE by double rounding)\n", ties);
         assert(ties < 2000);
     }
+    // the stream tables are linear over GF(2): G[s] = G[s & 0xFF] ^ G[s & 0xFF00] (the CUDA seed kernels' GLD reads)
+    for (uint32_t s = 0; s < 65536; ++s) {
+        const uint16_t lo = (uint16_t) (s & 0xFFu), hi = (uint16_t) (s & 0xFF00u);
+        if (lfsr_stream24((uint16_t) s) != (lfsr_stream24(lo) ^ lfsr_stream24(hi)) ||
+            lfsr_stream32((uint16_t) s) != (lfsr_stream32(lo) ^ lfsr_stream32(hi))) { printf("stream table not linear at seed %u\n", s); return 1; }
+    }
+    printf("stream tables linear: ok\n");
     printf("test_lfsr: PASS\n");
     return 0;
 }
