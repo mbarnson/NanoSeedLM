@@ -158,7 +158,7 @@ static double wref(const Weights* m, int fmt, int mv, int s, int r, int c) {
 }
 
 // ---- matvec: every format, dense T = 1..8 and gather ---------------------------------------------------------------
-static void test_mv(int K) {   // K = 256 and 512: the matvec's one- and two-blocks-per-lane seed paths
+static void test_mv(int K) {   // K = 256 and 512: the matvec's one- and two-blocks-per-lane seed paths; 4096: Q4's split rows
     const int R = 24, S = 3;
     unsigned sd = 1;
     float* x = malloc(4 * (size_t) MV_MAXT * K), *xg = malloc(4 * (size_t) 16 * K);
@@ -170,11 +170,17 @@ static void test_mv(int K) {   // K = 256 and 512: the matvec's one- and two-blo
         const KtWeight kw = kt_weight(&m, fmt);
         const double f32b = (fmt == MF_SEED6P8 ? 128 : fmt == MF_SEED4 || fmt == MF_SEED4P4 ? 64 : 48) * 1.2e-7;   // f32 accumulation, per |w x|
         double worst = 0;
+        float y1[24];   // token 0 alone: every T gives its rows bit for bit (batched decode equals decoding alone)
         for (int T = 1; T <= MV_MAXT; ++T) {   // dense on slice 0; also the residual add for T = 3
             const int add = T == 3;
             float y0[MV_MAXT * 24], y[MV_MAXT * 24];
             for (int i = 0; i < MV_MAXT * R; ++i) y[i] = y0[i] = bfr(frand(&sd));
             if (kt_mv(&kw, T, add, x, y)) { ++fails; break; }
+            if (T == 1) memcpy(y1, y, sizeof y1);
+            else if (!add && memcmp(y1, y, sizeof y1)) {
+                ++fails;
+                printf("FAIL mv %s dense T=%d: token 0 differs from T=1\n", kNames[fmt], T);
+            }
             for (int t = 0; t < T; ++t)
                 for (int r = 0; r < R; ++r) {
                     double acc = 0, mag = 0;
@@ -1355,6 +1361,7 @@ int main(void) {
     printf("kernels: %s\n", kt_name());
     test_mv(256);
     test_mv(512);
+    test_mv(4096);
     test_misc();
     test_mm();
     test_attn_prefill(0);

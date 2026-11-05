@@ -587,6 +587,58 @@ typedef void (*MmKernel)(MmArgs, WSlice, const WSlice*, const float*, float*, co
                          const uint32_t*);
 static const MvKernel MV_K[5] = {k_mv_bf16, k_mv_seed4, k_mv_q8, k_mv_q4, k_mv_seed4p4};
 static const MvKernel MV1_K[5] = {k_mv1_bf16, k_mv1_seed4, k_mv1_q8, k_mv1_q4, k_mv1_seed4p4};   // T = 1
+
+// Dense Q4, few rows and long rows (Qwen3.8's HC down projection, 324 x 10,240): one warp per row fills too few SMs, so
+// MVSK_SPLIT warps share a row, each over its share of mv_lane's 64-block steps, and add their warp sums in warp order.
+// Every T takes this kernel for such a weight, so a row's result does not depend on how many rows share the forward.
+#define MVSK_SPLIT 4
+#define MVSK_ROWS (MV_ROWS / MVSK_SPLIT)
+__global__ void __launch_bounds__(32 * MV_ROWS) k_mv_q4sk(MvArgs a, WSlice w, const float* x, float* y, int nt) {
+    __shared__ float part[MVSK_ROWS][MVSK_SPLIT][MV_MAXT];
+    const int lane = threadIdx.x & 31, wi = threadIdx.x >> 5, rl = wi / MVSK_SPLIT, sp = wi % MVSK_SPLIT;
+    const int r = (int) blockIdx.x * MVSK_ROWS + rl, nbk = a.K / 8, steps = (nbk + 63) / 64;
+    float acc[MV_MAXT];
+#pragma unroll
+    for (int t = 0; t < MV_MAXT; ++t) acc[t] = 0;
+    if (r < a.R) {
+        const uint16_t* S = (const uint16_t*) w.p[1];
+        const uint16_t* B = (const uint16_t*) w.p[2];
+        const uint32_t* qr = (const uint32_t*) w.p[0] + ((size_t) r * a.K) / 8;
+        const int i1 = steps * (sp + 1) / MVSK_SPLIT;
+        for (int i = steps * sp / MVSK_SPLIT; i < i1; ++i) {
+            const int j0 = lane * 2 + 64 * i;
+            if (j0 >= nbk) break;
+            const size_t gi = ((size_t) r * a.K + (size_t) j0 * 8) >> gsh(w);
+            const float s = bf(S[gi]), b = bf(B[gi]);
+            const uint2 qq = *(const uint2*) (qr + j0);
+            const uint32_t qw[2] = {qq.x, qq.y};
+            for (int k = 0; k < 2; ++k) {
+                const float4 q0 = make_float4(u4f(qw[k], 0), u4f(qw[k], 4), u4f(qw[k], 8), u4f(qw[k], 12));
+                const float4 q1 = make_float4(u4f(qw[k], 16), u4f(qw[k], 20), u4f(qw[k], 24), u4f(qw[k], 28));
+#pragma unroll
+                for (int t = 0; t < MV_MAXT; ++t) {
+                    if (t >= nt) break;
+                    const float4* xr = (const float4*) (x + (size_t) t * a.xs + (size_t) (j0 + k) * 8);
+                    const float4 x0 = xr[0], x1 = xr[1];
+                    acc[t] += s * (dot4(q0, x0) + dot4(q1, x1)) + b * sum8(x0, x1);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MV_MAXT; ++t) {
+        if (t >= nt) break;
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) part[rl][sp][t] = s;
+    }
+    __syncthreads();
+    if (r >= a.R || sp != 0 || lane >= nt) return;
+    float s = 0;
+#pragma unroll
+    for (int k = 0; k < MVSK_SPLIT; ++k) s += part[rl][k][lane];
+    store_y(y + (size_t) lane * a.ys + r, s, a.add);
+}
+static int mv_q4sk(int fmt, int K, int R) { return fmt == MF_Q4 && K >= 4096 && R <= 2048; }
 static const MvGuKernel MVGU_K[5] = {k_mv_gu_bf16, k_mv_gu_seed4, k_mv_gu_q8, k_mv_gu_q4, k_mv_gu_seed4p4};
 static const MmKernel MM_K[5] = {k_mm_bf16, k_mm_seed4, k_mm_q8, k_mm_q4, k_mm_seed4p4};
 template <int F>   // the seed formats with exact (three-term) weights
@@ -2091,6 +2143,10 @@ void kc_gnorm(cudaStream_t s, int d, float eps, const float* x, const uint16_t* 
 void kc_mv(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int xs, float* y, int ys, int T, int add,
            const uint32_t* G) {
     MvArgs a = {K, R, T, 1, xs, ys, 0, add};
+    if (mv_q4sk(fmt, K, R)) {
+        k_mv_q4sk<<<(unsigned) (R + MVSK_ROWS - 1) / MVSK_ROWS, 32 * MV_ROWS, 0, s>>>(a, w, x, y, T);
+        return;
+    }
     (T == 1 ? MV1_K : MV_K)[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, 1), 32 * MV_ROWS, 0, s>>>(a, w, NULL, x, y, NULL, G, T);
 }
 void kc_mv_sel(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
