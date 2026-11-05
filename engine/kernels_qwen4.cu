@@ -423,11 +423,55 @@ __global__ void __launch_bounds__(256) k_q4_attend(AttArgs a, const float* q, co
         o[((size_t) t * a.nh + h) * a.hd + i] = v / L * sigm(qh[a.hd + i]);
     }
 }
+// Prompt rows: block (KV group, row), a warp per query head of the group. The row's keys come in tiles of AT_KT; each
+// key's K and V is read once into shared memory for all heads of the group (one online softmax per head, in key order)
+#define AT_KT 16
+__global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel, const int32_t* nsel,
+                              const int32_t* dpos, float* o) {
+    extern __shared__ float kvs[];   // K [AT_KT][hd], then V [AT_KT][hd]
+    __shared__ int keys[AT_KT];
+    const int g = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, dl = a.hd / 32, h = g * (a.nh / a.nkv) + w;
+    const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    const float* qh = q + ((size_t) t * a.nh + h) * 2 * a.hd;
+    float* Vs = kvs + AT_KT * a.hd;
+    float qv[8], acc[8], m = -INFINITY, l = 0;
+    for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
+    for (int k0 = 0; k0 < n; k0 += AT_KT) {
+        const int nk = min(AT_KT, n - k0);
+        __syncthreads();   // the previous tile is read
+        if (threadIdx.x < nk) {
+            const int k = k0 + threadIdx.x;
+            keys[threadIdx.x] = k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+        }
+        __syncthreads();
+        for (int x = threadIdx.x; x < nk * a.hd; x += blockDim.x) {
+            const size_t at = ((size_t) keys[x / a.hd] * a.nkv + g) * a.hd + x % a.hd;
+            kvs[x] = K[at];
+            Vs[x] = V[at];
+        }
+        __syncthreads();
+        for (int kk = 0; kk < nk; ++kk) {
+            float d = 0;
+            for (int i = 0; i < dl; ++i) d += qv[i] * kvs[kk * a.hd + lane + 32 * i];
+            d = warp_sum(d) * a.scale;
+            const float mn = fmaxf(m, d), cf = expf(m - mn), p = expf(d - mn);
+            for (int i = 0; i < dl; ++i) acc[i] = acc[i] * cf + p * Vs[kk * a.hd + lane + 32 * i];
+            l = l * cf + p;
+            m = mn;
+        }
+    }
+    for (int i = 0; i < dl; ++i) o[((size_t) t * a.nh + h) * a.hd + lane + 32 * i] = acc[i] / l * sigm(qh[a.hd + lane + 32 * i]);
+}
+
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T) {
-    if (c->head_dim % 32 || c->head_dim > 256) return -1;
+    if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv) return -1;
     const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, 1.0f / sqrtf((float) c->head_dim)};
-    k_q4_attend<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, K, V, sel, nsel, dpos, o);
+    const int G = c->n_head / c->n_kv;
+    if (T > 8 && G <= 32)   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
+        k_q4_attend_g<<<dim3((unsigned) c->n_kv, (unsigned) T), 32 * (unsigned) G, sizeof(float) * 2 * AT_KT * (size_t) c->head_dim, s>>>(
+            a, q, K, V, sel, nsel, dpos, o);
+    else k_q4_attend<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, K, V, sel, nsel, dpos, o);
     return 0;
 }
 

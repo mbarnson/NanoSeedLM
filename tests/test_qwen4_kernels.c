@@ -200,19 +200,24 @@ static void qsa_attend_case(void) {
         printf("  QSA 40 block keys: %.1e; top 8 of 40 / 20 / 9 blocks: %s\n", rel(blk_k, blk, (size_t) nb * D), same ? "equal" : "differ");
         CHECK(rc == 0 && rel(blk_k, blk, (size_t) nb * D) < 1e-5 && same, "QSA differs");
     }
-    const int npos = 100, pos0 = 97, no = c.n_head * c.head_dim;
-    const size_t kv = (size_t) npos * c.n_kv * c.head_dim;
-    float *q = rnd((size_t) 2 * no * T, -1, 1), *K = rnd(kv, -1, 1), *V = rnd(kv, -1, 1), *o = rnd((size_t) no * T, 0, 0), *o_k = rnd((size_t) no * T, 0, 0);
-    int32_t asel[3 * 8], ansel[3] = {k, 0, k};
-    for (int i = 0; i < 3 * k; ++i) asel[i] = (i * 7 + i / k) % 24;   // distinct complete blocks of rows 0 and 2
-    for (int t = 0; t < T; ++t) qwen4_attend(&c, q + (size_t) 2 * no * t, K, V, pos0 + t, asel + k * t, ansel[t], o + (size_t) no * t);
-    rc = kt_q4_attend(&c, q, K, V, npos, pos0, asel, ansel, o_k, T);
-    if (rc == 1) printf("  attention: not on %s\n", kt_name());
-    else {
-        printf("  attention 24 heads of 256, 2 KV heads, sparse / dense / sparse rows: %.1e\n", rel(o_k, o, (size_t) no * T));
-        CHECK(rc == 0 && rel(o_k, o, (size_t) no * T) < 1e-5, "attention differs");
+    free(raw); free(w); free(blk); free(blk_k); free(iq);
+    for (int AT = 3; AT <= 12; AT += 9) {   // decode rows, and prompt rows (more than 8: a block per KV group)
+        const int npos = 112, pos0 = 97, no = c.n_head * c.head_dim;
+        const size_t kv = (size_t) npos * c.n_kv * c.head_dim;
+        float *q = rnd((size_t) 2 * no * AT, -1, 1), *K = rnd(kv, -1, 1), *V = rnd(kv, -1, 1), *o = rnd((size_t) no * AT, 0, 0);
+        float *o_k = rnd((size_t) no * AT, 0, 0);
+        int32_t asel[12 * 8], ansel[12];
+        for (int t = 0; t < AT; ++t) ansel[t] = t % 2 ? 0 : k;   // sparse and dense rows in turn
+        for (int i = 0; i < AT * k; ++i) asel[i] = (i * 7 + i / k) % 24;   // distinct complete blocks of the sparse rows
+        for (int t = 0; t < AT; ++t) qwen4_attend(&c, q + (size_t) 2 * no * t, K, V, pos0 + t, asel + k * t, ansel[t], o + (size_t) no * t);
+        rc = kt_q4_attend(&c, q, K, V, npos, pos0, asel, ansel, o_k, AT);
+        if (rc == 1) printf("  attention: not on %s\n", kt_name());
+        else {
+            printf("  attention 24 heads of 256, 2 KV heads, %d sparse and dense rows: %.1e\n", AT, rel(o_k, o, (size_t) no * AT));
+            CHECK(rc == 0 && rel(o_k, o, (size_t) no * AT) < 1e-5, "attention differs at %d rows", AT);
+        }
+        free(q); free(K); free(V); free(o); free(o_k);
     }
-    free(raw); free(w); free(blk); free(blk_k); free(iq); free(q); free(K); free(V); free(o); free(o_k);
 }
 
 int main(void) {
