@@ -15,6 +15,7 @@ except ImportError:   # mlx-vlm without mlx-lm
 # (token, expert) pairs at or below this use the fused mat-vec; above it, the pairs are sorted by expert and go
 # through the seeded tile GEMM (weight tiles rebuilt in threadgroup memory; no BF16 expert tensor).
 MATVEC_MAX_PAIRS = 64
+MATVEC_MAX_ROWS = 32   # dense projections (SeedLinear, SeedHeads): prompt rows above this take the GEMM
 # GEMM tile: BM weight rows x BN pairs, BK inputs per step.
 BM, BN, BK = 64, 64, 16
 
@@ -428,7 +429,7 @@ class SeedLinear(nn.Module):
         xs = x.reshape(-1, self.input_dims)
         idx = mx.zeros((xs.shape[0],), mx.uint32)
         parts = (self.seeds, self.coefs, self.codes, self.exp_bias)
-        y = gather_matvec(xs, idx, *parts) if xs.shape[0] <= MATVEC_MAX_PAIRS else gather_gemm(xs, idx, *parts)
+        y = gather_matvec(xs, idx, *parts) if xs.shape[0] <= MATVEC_MAX_ROWS else gather_gemm(xs, idx, *parts)
         return y.reshape(x.shape[:-1] + (self.output_dims,))
 
 
@@ -457,7 +458,7 @@ class SeedHeads(nn.Module):
         xs = x.transpose(1, 0, 2, 3).reshape(-1, k)
         idx = mx.repeat(mx.arange(a, dtype=mx.uint32), b * l)
         parts = (self.seeds, self.coefs, self.codes, self.exp_bias)
-        y = gather_matvec(xs, idx, *parts) if xs.shape[0] <= MATVEC_MAX_PAIRS else gather_gemm(xs, idx, *parts)
+        y = gather_matvec(xs, idx, *parts) if xs.shape[0] <= MATVEC_MAX_ROWS else gather_gemm(xs, idx, *parts)
         return y.reshape(a, b, l, self.output_dims).transpose(1, 0, 2, 3)
 
 
