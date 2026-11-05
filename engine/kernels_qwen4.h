@@ -50,6 +50,9 @@ void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int 
 // qwen4_route of logits[T][n_exp] into ind, wt [T][top_k] (top_k <= 32, n_exp <= 1024); _ld: logits rows ld apart
 void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
 void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
+// Q4EOpts.tail_skip on ind, wt [T][k]: a pair of rank >= R whose expert misses (slot[x] < 0), and that no row routes at a
+// rank below R, takes its row's first expert and weight 0 (so nothing is copied for it)
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R);
 // out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t * sgld]) sh[t]
 void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T);
 // qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated). _keep: also hist after each row t < T - 1 at

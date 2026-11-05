@@ -53,7 +53,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     }
     const char* mb = getenv("NSLM_EXPERT_VRAM_MB");   // else the expert cache takes the free VRAM
     Q4EOpts qo = {(int) (o->kv_tokens > 0 ? o->kv_tokens : 4096), env_int("Q4E_VRAM_EXPERTS"), getenv("Q4E_PLE_GGUF"),
-                  mb ? atof(mb) * 1048576.0 / 1e9 : -1, env_int("Q4E_STREAM_EXPERTS"), env_int("Q4E_ROWS"), 0};   // no MTP head
+                  mb ? atof(mb) * 1048576.0 / 1e9 : -1, env_int("Q4E_STREAM_EXPERTS"), env_int("Q4E_ROWS"), 0, 0};   // no MTP head, no tail skip
     Q4Api* e = (Q4Api*) calloc(1, sizeof *e);
     if (!e || !(e->q = q4e_open(o->model_dir, &qo, err, errlen))) { free(e); return NULL; }
     const Qwen4Cfg* c = q4e_cfg(e->q);

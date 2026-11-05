@@ -39,7 +39,8 @@ int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     const char *ref = NULL, *model = NULL, *text = NULL;
     int ntok = 1024, dec = 0;
-    Q4EOpts o = {0, 0, NULL, 0, 0, 0};
+    Q4EOpts o = {0, 0, NULL, 0, 0, 0, 0, 0};
+    int tail = 0;   // --tail-skip: the model's run only
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = argv[++i];
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -49,9 +50,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--expert-cache-gb") && i + 1 < argc) o.cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--vram-experts")) o.vram_experts = 1;
         else if (!strcmp(argv[i], "--stream-experts")) o.stream_experts = 1;
+        else if (!strcmp(argv[i], "--tail-skip") && i + 1 < argc) tail = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N] [--decode N]\n"); return 2; }
+    if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N] [--decode N] [--tail-skip R]\n"); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", ref);
     Tok* tok = tok_open(path, err, sizeof err);
@@ -69,7 +71,9 @@ int main(int argc, char** argv) {
     float* lr = (float*) malloc(sizeof(float) * (size_t) n * V);
     float* lm = (float*) malloc(sizeof(float) * (size_t) n * V);
     if (dec < 0 || dec >= n) dec = 0;
-    if (!lr || !lm || run(ref, &o, ids, n, 0, lr, c.vocab) || run(model, &o, ids, n, dec, lm, c.vocab)) return 1;
+    Q4EOpts om = o;
+    om.tail_skip = tail;
+    if (!lr || !lm || run(ref, &o, ids, n, 0, lr, c.vocab) || run(model, &om, ids, n, dec, lm, c.vocab)) return 1;
     float* kl = (float*) malloc(sizeof(float) * (size_t) n);
     double skl = 0, dkl = 0, nll_r = 0, nll_m = 0;
     int agree = 0;

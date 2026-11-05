@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     const char *model = NULL, *prompt = NULL, *ple = NULL, *effort = NULL;
     int max_tokens = 128, ctx = 4096, raw = 0, vram = 0, no_think = 0;
     double cache_gb = 0;
-    int stream = 0, rows = 0, drafts = 0;
+    int stream = 0, rows = 0, drafts = 0, tail = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
@@ -31,10 +31,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--stream-experts")) stream = 1;
         else if (!strcmp(argv[i], "--prompt-rows") && i + 1 < argc) rows = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--drafts") && i + 1 < argc) drafts = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tail-skip") && i + 1 < argc) tail = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw | --effort xhigh|medium|low\n"
-                                         "  | --no-think] [--vram-experts] [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N] [--drafts 1-3]\n"); return 2; }
+                                         "  | --no-think] [--vram-experts] [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N] [--drafts 1-3]\n"
+                                         "  [--tail-skip R]\n"); return 2; }
     if (drafts < 0 || drafts > Q4E_MAX_DRAFTS) { fprintf(stderr, "--drafts: 0 to %d\n", Q4E_MAX_DRAFTS); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", model);
@@ -53,7 +55,7 @@ int main(int argc, char** argv) {
     const int n = tok_encode(tok, text, 0, ids, ctx);
     if (n < 1 || n + max_tokens > ctx) { fprintf(stderr, "prompt of %d tokens does not fit --ctx %d\n", n, ctx); return 1; }
     double t0 = now_s();
-    const Q4EOpts o = {ctx, vram, ple, cache_gb, stream, rows, drafts};
+    const Q4EOpts o = {ctx, vram, ple, cache_gb, stream, rows, drafts, tail};
     Q4Eng* e = q4e_open(model, &o, err, sizeof err);
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
     const Qwen4Cfg* c = q4e_cfg(e);

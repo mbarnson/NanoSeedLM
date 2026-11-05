@@ -405,6 +405,17 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
     kq4_route_ld(s, c, logits, c->n_exp, ind, wt, T);
 }
 
+__global__ void k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= P || p % k < R || slot[ind[p]] >= 0) return;
+    for (int q = 0; q < P; ++q) if (q % k < R && ind[q] == ind[p]) return;   // a higher rank brings it anyway
+    ind[p] = ind[p - p % k];
+    wt[p] = 0.0f;
+}
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R) {
+    if (R > 0 && R < k) k_q4_tail_skip<<<(unsigned) (T * k + 127) / 128, 128, 0, s>>>(ind, wt, slot, T * k, k, R);
+}
+
 __global__ void k_q4_moe_combine(int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= d) return;

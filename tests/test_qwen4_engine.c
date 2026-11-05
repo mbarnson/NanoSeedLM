@@ -10,6 +10,7 @@
 
 #include "format.h"
 #include "kernels_cuda.h"
+#include "kernels_qwen4.h"
 #include "qwen4_eng.h"
 #include "qwen4_ref.h"
 
@@ -54,11 +55,41 @@ static void bucket_check(int n, int rows, int k) {
     free(inds); free(perm); free(tiles);
 }
 
+// kq4_tail_skip on rows x k picks over n experts, half of them missing from the cache, against the rule on the host
+static void tail_skip_check(int rows, int k, int n, int R) {
+    const int P = rows * k;
+    int32_t* ind = (int32_t*) malloc(4 * (size_t) P), *slot = (int32_t*) malloc(4 * (size_t) n), *got = (int32_t*) malloc(4 * (size_t) P);
+    float* wt = (float*) malloc(4 * (size_t) P), *gw = (float*) malloc(4 * (size_t) P);
+    uint32_t x = 777;
+    for (int i = 0; i < n; ++i) { x = x * 1664525u + 1013904223u; slot[i] = (x >> 9) & 1 ? (int) i : -1; }
+    for (int i = 0; i < P; ++i) { x = x * 1664525u + 1013904223u; ind[i] = (int) ((x >> 8) % (uint32_t) n); wt[i] = 0.5f + (float) (i % k); }
+    int32_t *di, *ds;
+    float* dw;
+    cudaMalloc((void**) &di, 4 * (size_t) P); cudaMalloc((void**) &ds, 4 * (size_t) n); cudaMalloc((void**) &dw, 4 * (size_t) P);
+    cudaMemcpy(di, ind, 4 * (size_t) P, cudaMemcpyHostToDevice); cudaMemcpy(ds, slot, 4 * (size_t) n, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw, wt, 4 * (size_t) P, cudaMemcpyHostToDevice);
+    kq4_tail_skip(0, di, dw, ds, rows, k, R);
+    cudaMemcpy(got, di, 4 * (size_t) P, cudaMemcpyDeviceToHost); cudaMemcpy(gw, dw, 4 * (size_t) P, cudaMemcpyDeviceToHost);
+    int bad = 0, skipped = 0;
+    for (int p = 0; p < P; ++p) {
+        int skip = p % k >= R && slot[ind[p]] < 0;
+        for (int q = 0; skip && q < P; ++q) skip = !(q % k < R && ind[q] == ind[p]);
+        skipped += skip;
+        bad += skip ? got[p] != ind[p - p % k] || gw[p] != 0.0f : got[p] != ind[p] || gw[p] != wt[p];
+    }
+    printf("kq4_tail_skip, %d rows of %d over %d experts from rank %d: %d of %d pairs skipped\n", rows, k, n, R, skipped, P);
+    CHECK(cudaGetLastError() == cudaSuccess && bad == 0 && skipped > 0, "kq4_tail_skip: %d pairs wrong", bad);
+    cudaFree(di); cudaFree(ds); cudaFree(dw);
+    free(ind); free(slot); free(got); free(wt); free(gw);
+}
+
 int main(void) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { printf("SKIP: no CUDA device\n"); return 77; }
     bucket_check(512, 128, 10);   // qwen4: 512 experts, top 10, a prompt chunk of 128 rows
     bucket_check(128, 64, 8);     // MoVA
+    tail_skip_check(4, 10, 64, 7);   // a verify step of 4 rows, top 10
+    tail_skip_check(1, 10, 512, 7);  // one decode row of Qwen3.8-Flash-Next
     char err[512] = "";
     StFile st;
     if (st_open_file(&st, "tests/data/qwen4_tiny_golden.safetensors", err, sizeof err)) { printf("FAIL: %s\n", err); return 1; }
@@ -272,6 +303,29 @@ int main(void) {
             q4e_close(e);
         }
         set_env("Q4E_NO_PREFETCH", NULL);
+        {   // decode rows with the tail skip: fewer misses, finite logits, the same logits from run to run
+            uint64_t m[3] = {0, 0, 0}, h;
+            int bad = 0, same = 1;
+            float* first = (float*) malloc(sizeof(float) * (size_t) V);
+            for (int run = 0; run < 3 && slots < units; ++run) {
+                Q4EOpts ot = oc3;
+                ot.tail_skip = run ? 1 : 0;   // the tiny model routes 3 of 8 experts
+                if (!(e = q4e_open("tests/data/qwen4_tiny", &ot, err, sizeof err))) { CHECK(0, "open: %s", err); break; }
+                int rc = q4e_forward(e, lid, 32, NULL);
+                for (int t = 32; !rc && t < 64; ++t) rc = q4e_forward(e, lid + t, 1, rows3);
+                CHECK(rc == 0, "decode with the tail skip at %d: %s", ot.tail_skip, q4e_error(e));
+                q4e_cache_stats(e, &h, &m[run], &slots);
+                for (int v = 0; v < V; ++v) bad += !isfinite(rows3[v]);
+                if (run == 1) memcpy(first, rows3, sizeof(float) * (size_t) V);
+                if (run == 2) same = !memcmp(first, rows3, sizeof(float) * (size_t) V);
+                q4e_close(e);
+            }
+            printf("32 decode rows with %d slots: %llu misses, %llu with the tail skip from rank 1\n", slots, (unsigned long long) m[0],
+                   (unsigned long long) m[1]);
+            CHECK(bad == 0 && same && m[1] < m[0] && m[1] == m[2], "the tail skip: %d non-finite logits, same %d, misses %llu / %llu / %llu",
+                  bad, same, (unsigned long long) m[0], (unsigned long long) m[1], (unsigned long long) m[2]);
+            free(first);
+        }
         free(lid); free(pass); free(rows3);
     }
     free(got);
