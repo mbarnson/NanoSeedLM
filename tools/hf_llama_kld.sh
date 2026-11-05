@@ -3,11 +3,11 @@
 # table (RAM-tier plan T1), on an HF Jobs node with 1 TB of RAM and 384 GB of VRAM (rtx-pro-6000x4).
 #
 #   SRC=/b/src OUT=/b/kld [PACKS="Q8_0 P3 P4 UD-IQ3_XXS UD-Q3_K_XL UD-IQ4_XS UD-Q4_K_XL"] [CHUNKS=64] [MAPS=/b/maps] \
-#     bash tools/hf_llama_kld.sh
+#     [S3BANK=/b/s3/experts-s3] bash tools/hf_llama_kld.sh
 #
-# A pack is an Unsloth folder, P3 / P4 (the Q8_0 shards with that seed pack's experts, nslm-qwen4-emulate), or H-NAME:
-# experts from P3 and P4 by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py).  The reference logits: BF16 on the
-# first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
+# A pack is an Unsloth folder, a seed tier (P3, P4, S3: the Q8_0 shards with those experts, nslm-qwen4-emulate), or
+# LOW+HIGH@NAME: experts from two tiers by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py), e.g. S3+P3@down.  The
+# reference logits: BF16 on the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
 set -uo pipefail
 UREPO=unsloth/Qwen3.8-Flash-Next-GGUF
 UREV=${UREV:-d96201194f103c906994f283f504209dc8d2a10c}
@@ -21,8 +21,12 @@ pip install -q --break-system-packages "huggingface_hub[hf_xet]" pyarrow >/dev/n
 mkdir -p "$OUT" /m /w
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader; uptime; free -g | head -2; df -h / | tail -1
 
-seed() {   # seed P3|P4: that seed pack in /m/seed-P3 or /m/seed-P4, kept for the next packs
-    [ -d "/m/seed-$1" ] || hf download "${SEED[$1]%@*}" --revision "${SEED[$1]#*@}" --local-dir "/m/seed-$1" --max-workers 32 >/dev/null
+seed() {   # seed P3|P4|S3: that tier in /m/seed-TIER, kept for the next packs (S3: a seed bank from the bucket)
+    [ -d "/m/seed-$1" ] && return
+    local t0; t0=$(date +%s)
+    if [ "$1" = S3 ]; then mkdir -p /m/seed-S3 && cp "${S3BANK:-/b/s3/experts-s3}"/*.blks /m/seed-S3/
+    else hf download "${SEED[$1]%@*}" --revision "${SEED[$1]#*@}" --local-dir "/m/seed-$1" --max-workers 32 >/dev/null; fi
+    echo "== $1: fetched in $(( $(date +%s) - t0 )) s, $(du -sh "/m/seed-$1" | cut -f1)"
 }
 get() {   # get FOLDER [EXCLUDED SHARD]: one Unsloth folder into /m
     local t0; t0=$(date +%s)
@@ -66,9 +70,11 @@ for pk in $PACKS; do
     case $pk in
         Q8_0) [ -d /m/Q8_0 ] || get Q8_0 -00003-of-00006; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf
             stamp "$PLE" 3 6; dir=/m/Q8_0 ;;
-        P3|P4|H-*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
+        P3|P4|S3|*+*@*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
             t1=$(date +%s)
-            if [[ $pk == H-* ]]; then seed P3; seed P4; args=(--pack /m/seed-P3 --pack /m/seed-P4 --map "$MAPS/${pk#H-}.bin")
+            if [[ $pk == *@* ]]; then
+                lo=${pk%%+*} hi=${pk#*+}; hi=${hi%@*}
+                seed "$lo"; seed "$hi"; args=(--pack "/m/seed-$lo" --pack "/m/seed-$hi" --map "$MAPS/${pk#*@}.bin")
             else seed "$pk"; args=(--pack "/m/seed-$pk"); fi
             if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack"; then
                 echo "== $pk: emulate failed"; continue
@@ -79,7 +85,7 @@ for pk in $PACKS; do
         *) echo "unknown pack $pk"; continue ;;
     esac
     echo "== $pk"
-    ppl "$dir" "$OUT/$pk.log" --kl-divergence-base /w/ref.kld --kl-divergence
+    ppl "$dir" "$OUT/${pk//[+@]/_}.log" --kl-divergence-base /w/ref.kld --kl-divergence
     [[ $pk == UD-* ]] && rm -rf "/m/$pk"
 done
 uptime
