@@ -317,3 +317,11 @@ memory, so one graph serves every position. On an RTX PRO 6000 with an 8 GB cach
 against 42.1 without graphs. The text is the same. `NSLM_NO_GRAPH=1` turns the graphs off. Read
 [CUDA graphs for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cuda-graphs.md).
 
+## [2026-11-04] result | Expert cache policies for Qwen3.8-Flash-Next decode, from a routing trace
+
+A routing trace of 1,024 decode tokens of P3 (`Q4E_ROUTES`) went through `tools/qwen4_cache_sim.py`. At 3,255 slots
+(8 GB), the engine's LRU serves 74.6% of the expert uses, LFU 67.4% and a static hot set at most 62.8%. Belady's
+optimum serves 87.6%. So the plan's hot set (S8, V3) does not help, and only a prediction of future routes can reduce
+the misses much. Read
+[Expert cache policies for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cache-policies.md).
+

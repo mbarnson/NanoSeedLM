@@ -24,6 +24,7 @@
 | `NSLM_NO_GRAPH=1` | off | Do not use CUDA graphs for decode (K2-Horizon-MoVA and Qwen3.8-Flash-Next) |
 | `NSLM_NO_PREDICT=1` | off | Do not predict the experts of the next layer during decode (K2-Horizon-MoVA) |
 | `Q4E_PROFILE=1` | off | Qwen3.8-Flash-Next: write the GPU time of each forward stage at exit |
+| `Q4E_ROUTES=FILE` | off | Qwen3.8-Flash-Next: write the routed experts of each forward, for `tools/qwen4_cache_sim.py` |
 | `NSLM_SEED_GEMM_F32=1` | off | Keep seed weights in f32 in the prompt GEMM. This changed neither KLD nor NLL, and it costs about 30% of prompt speed at 4K |
 | `NSLM_PREFILL_RANGE` | 8192, or 32768 when the KV cache is partly in host memory | Prompt rows that the engine computes layer by layer at a time. Each range copies the earlier host rows again |
 | `NSLM_MLA_DEC_KEYS` | 8192 (128 MiB of VRAM) | MLA keys that the engine decompresses at a time for prompt rows. 0 attends prompts absorbed, as decode does |

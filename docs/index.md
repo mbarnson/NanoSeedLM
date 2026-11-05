@@ -74,6 +74,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   151 to 541 tokens per second on a 3,703-token prompt. The prediction made decode 4% slower.
 - [2026-11-04: CUDA graphs for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cuda-graphs.md): P3 decode 10.6%
   faster on an RTX PRO 6000, with the same text.
+- [2026-11-04: Expert cache policies for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cache-policies.md): LRU
+  beats LFU and a hot set. The optimum would halve the misses.
 
 ## For contributors and agents
 
