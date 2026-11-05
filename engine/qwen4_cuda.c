@@ -42,6 +42,9 @@ typedef struct {
     float *kconv, *kS, *khist;   // q4e_forward_keep: the state after each row but the last (MTP)
 } Layer;
 
+typedef struct { Q4Eng* e; int i0, i1, prefetch, bad; } PleJob;   // items: rows (prefetch), else (row, head); bad: 1 + layer
+static void* ple_pool(void* arg);   // a worker of the PLE pool
+
 struct Q4Eng {
     Qwen4Cfg c;
     NsModel nm;
@@ -81,7 +84,12 @@ struct Q4Eng {
     int32_t *hin, *din;
     float* hlog;
     int nb, nple, cap, no_graph;   // QSA block slots; PLE layers; capturing a graph; NSLM_NO_GRAPH
-    int ple_threads;               // Q4E_PLE_THREADS: threads for the PLE rows of 64 rows or more
+    int ple_threads;               // Q4E_PLE_THREADS: threads for the PLE rows, a pool of ple_threads - 1 workers and the caller
+    pthread_t pth[16];             // the pool: a ple_run bumps pgen, workers w < pnw run pj[w], the caller pj[0], pndone counts
+    pthread_mutex_t pmu;
+    pthread_cond_t pgo, pdone;
+    int pgen, pnw, pndone, pquit, nth;
+    PleJob pj[16];
     double host_ms[2];             // Q4E_PROFILE: host time of the PLE prefetch and the PLE rows
     cudaGraphExec_t graph[4][MV_MAXT + 1];   // [with logits + 2 keep][rows]
     // The MTP head (Q4EOpts.mtp): it runs one row behind each forward. Hm: its streams; Hall[-1]: the last main row's
@@ -537,6 +545,13 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->ple_threads = getenv("Q4E_PLE_THREADS") ? atoi(getenv("Q4E_PLE_THREADS")) : ncpu > 16 ? 16 : ncpu > 1 ? (int) ncpu : 1;
     if (e->ple_threads < 1) e->ple_threads = 1;
     if (e->ple_threads > 16) e->ple_threads = 16;
+    pthread_mutex_init(&e->pmu, NULL);
+    pthread_cond_init(&e->pgo, NULL);
+    pthread_cond_init(&e->pdone, NULL);
+    for (e->pj[0].e = e; e->nth < e->ple_threads - 1; ++e->nth) {
+        e->pj[e->nth + 1].e = e;
+        if (pthread_create(&e->pth[e->nth], NULL, ple_pool, &e->pj[e->nth + 1])) break;
+    }
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
     if (getenv("Q4E_ROUTES") && !(e->routes = fopen(getenv("Q4E_ROUTES"), "wb"))) fail(e, "cannot write %s", getenv("Q4E_ROUTES"));
     if (e->routes) {
@@ -554,6 +569,16 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 void q4e_close(Q4Eng* e) {
     if (!e) return;
     cudaDeviceSynchronize();
+    if (e->ple_threads) {   // the PLE pool (started once ple_threads is set)
+        pthread_mutex_lock(&e->pmu);
+        e->pquit = 1;
+        pthread_cond_broadcast(&e->pgo);
+        pthread_mutex_unlock(&e->pmu);
+        for (int w = 0; w < e->nth; ++w) pthread_join(e->pth[w], NULL);
+        pthread_mutex_destroy(&e->pmu);
+        pthread_cond_destroy(&e->pgo);
+        pthread_cond_destroy(&e->pdone);
+    }
     if (e->prof) {
         double total = 0;
         for (int i = 0; i < ST_N; ++i) total += e->stage_ms[i];
@@ -637,36 +662,63 @@ static double host_ms(void) {
     return 1e3 * (double) ts.tv_sec + 1e-6 * (double) ts.tv_nsec;
 }
 
-typedef struct { Q4Eng* e; int t0, t1, prefetch, bad; } PleJob;   // bad: 1 + the failing layer
 static void* ple_worker(void* arg) {
     PleJob* j = (PleJob*) arg;
     Q4Eng* e = j->e;
     const Qwen4Cfg* c = &e->c;
+    const int H = j->prefetch ? 1 : e->ng[0].heads;
     for (int l = 0; l < c->n_layer && !j->bad; ++l)
-        for (int t = j->t0; c->ple[l] >= 0 && t < j->t1; ++t) {
+        for (int i = j->i0; c->ple[l] >= 0 && i < j->i1; ++i) {
+            const int t = i / H;
             if (j->prefetch) qwen4_ple_prefetch(&e->nm, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t);
-            else if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
-                                     e->emb_h + ((size_t) c->ple[l] * e->xr + t) * c->ple_dim)) { j->bad = l + 1; break; }
+            else if (qwen4_ple_head(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t, i % H,
+                                    e->emb_h + ((size_t) c->ple[l] * e->xr + t) * c->ple_dim)) { j->bad = l + 1; break; }
         }
     return NULL;
 }
 
-// The PLE rows [pos, pos + T) of each PLE layer: their pages asked of the OS (prefetch), or into emb_h. Host work,
-// before the rows' device work; calls of 64 rows or more split the rows over ple_threads threads.
-static int ple_run(Q4Eng* e, int T, int prefetch) {
-    PleJob j[16];
-    pthread_t th[16];
-    const int nw = T < 64 ? 1 : e->ple_threads;
-    const double t0 = e->prof ? host_ms() : 0;
-    for (int w = 0; w < nw; ++w) {
-        j[w] = (PleJob) {e, (int) ((int64_t) T * w / nw), (int) ((int64_t) T * (w + 1) / nw), prefetch, 0};
-        if (nw > 1) pthread_create(&th[w], NULL, ple_worker, &j[w]);
+static void* ple_pool(void* arg) {   // worker w of the pool
+    Q4Eng* e = ((PleJob*) arg)->e;
+    const int w = (int) ((PleJob*) arg - e->pj);
+    int gen = 0;
+    pthread_mutex_lock(&e->pmu);
+    for (;;) {
+        while (e->pgen == gen && !e->pquit) pthread_cond_wait(&e->pgo, &e->pmu);
+        if (e->pquit) break;
+        gen = e->pgen;
+        if (w >= e->pnw) continue;
+        pthread_mutex_unlock(&e->pmu);
+        ple_worker(&e->pj[w]);
+        pthread_mutex_lock(&e->pmu);
+        if (++e->pndone == e->pnw - 1) pthread_cond_signal(&e->pdone);
     }
-    if (nw == 1) ple_worker(&j[0]);
-    for (int w = 0; nw > 1 && w < nw; ++w) pthread_join(th[w], NULL);
+    pthread_mutex_unlock(&e->pmu);
+    return NULL;
+}
+
+// The PLE rows [pos, pos + T) of each PLE layer: their pages asked of the OS (prefetch), or into emb_h. Host work,
+// before the rows' device work, on the pool; decode rows split by head, so their page reads overlap.
+static int ple_run(Q4Eng* e, int T, int prefetch) {
+    const int n = prefetch ? T : T * e->ng[0].heads, nw = n < e->nth + 1 ? n : e->nth + 1;
+    const double t0 = e->prof ? host_ms() : 0;
+    for (int w = 0; w < nw; ++w) e->pj[w] = (PleJob) {e, (int) ((int64_t) n * w / nw), (int) ((int64_t) n * (w + 1) / nw), prefetch, 0};
+    if (nw > 1) {
+        pthread_mutex_lock(&e->pmu);
+        e->pnw = nw;
+        e->pndone = 0;
+        ++e->pgen;
+        pthread_cond_broadcast(&e->pgo);
+        pthread_mutex_unlock(&e->pmu);
+    }
+    if (nw > 0) ple_worker(&e->pj[0]);
+    if (nw > 1) {
+        pthread_mutex_lock(&e->pmu);
+        while (e->pndone < nw - 1) pthread_cond_wait(&e->pdone, &e->pmu);
+        pthread_mutex_unlock(&e->pmu);
+    }
     if (e->prof) e->host_ms[prefetch ? 0 : 1] += host_ms() - t0;
     for (int w = 0; w < nw; ++w)
-        if (j[w].bad) return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", j[w].bad - 1);
+        if (e->pj[w].bad) return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", e->pj[w].bad - 1);
     return 0;
 }
 static int ple_rows(Q4Eng* e, int T) { return ple_run(e, T, 0); }
@@ -942,7 +994,7 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     if (e->pos + n > e->max_pos) return fail(e, "the context is full (%d positions)", e->max_pos);
     for (int i = 0; i < n; ++i) if (ids[i] < 0 || ids[i] >= e->embed.rows) return fail(e, "token %d out of range", ids[i]);
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
-    ple_run(e, n, 1);   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
+    if (n > MV_MAXT) ple_run(e, n, 1);   // a prompt's PLE rows at once: the OS reads them in parallel (decode: by head)
     if (!logits && n > e->mt && !e->routes) {   // a long prompt: layer-major passes (Q4E_ROUTES traces chunk by chunk)
         for (int i = 0; i < n; i += e->xr) if (forward_pass(e, ids + i, n - i < e->xr ? n - i : e->xr)) return -1;
         return 0;

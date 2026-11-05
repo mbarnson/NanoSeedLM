@@ -42,6 +42,9 @@ void qwen4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt
 // folder's table shards of `layer`; -1 when a row is missing
 int qwen4_ple_embed(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,
                     const int32_t* ids, int t, float* emb);
+// Head h of qwen4_ple_embed alone: emb[h * ple_dim / heads ..] (an engine's threads read the heads in parallel)
+int qwen4_ple_head(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,
+                   const int32_t* ids, int t, int h, float* emb);
 // Start reading the PLE rows of token t from the files (a prompt's rows then load in parallel); the rows found
 int qwen4_ple_prefetch(const NsModel* m, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer, const int32_t* ids, int t);
 // gated[s] = sigmoid(signed sqrt(keys_s . qs_s / sqrt(d))) vals, for each stream s of the normed keys and queries

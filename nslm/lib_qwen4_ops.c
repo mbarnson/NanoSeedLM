@@ -134,21 +134,23 @@ static const NsTensor* ple_shard(const NsModel* m, const Qwen4Cfg* c, const Qwen
     return s;
 }
 
-int qwen4_ple_embed(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,
-                    const int32_t* ids, int t, float* emb) {
+int qwen4_ple_head(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,
+                   const int32_t* ids, int t, int h, float* emb) {
     const int wd = c->ple_dim / g->heads;
     int64_t rows[QWEN4_MAX_PLE_HEADS];
+    int local;
     qwen4_ngram_rows(c, g, ids, t, rows);
-    for (int h = 0; h < g->heads; ++h) {
-        if (table) {
-            if (table->width != wd || ple_row(table, rows[h], emb + (size_t) h * wd)) return -1;
-            continue;
-        }
-        int local;
-        const NsTensor* s = ple_shard(m, c, g, layer, rows[h], &local);
-        if (!s || s->cols != wd) return -1;
-        ns_row_f32(rw, s, 0, local, 0, emb + (size_t) h * wd);
-    }
+    emb += (size_t) h * wd;
+    if (table) return table->width != wd || ple_row(table, rows[h], emb) ? -1 : 0;
+    const NsTensor* s = ple_shard(m, c, g, layer, rows[h], &local);
+    if (!s || s->cols != wd) return -1;
+    ns_row_f32(rw, s, 0, local, 0, emb);
+    return 0;
+}
+
+int qwen4_ple_embed(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,
+                    const int32_t* ids, int t, float* emb) {
+    for (int h = 0; h < g->heads; ++h) if (qwen4_ple_head(m, rw, table, c, g, layer, ids, t, h, emb)) return -1;
     return 0;
 }
 
