@@ -666,7 +666,8 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
     kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
     mark(e, ST_QSA);
-    if (kq4_attend_part(e->s, c, e->qp, ld, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, e->part, T)) return fail(e, "head_dim %d not supported", hd);
+    if (kq4_attend_part(e->s, c, e->qp, ld, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, e->part, T))
+        return fail(e, "attention of head_dim %d, %d heads a KV head: not supported", hd, c->n_head / c->n_kv);
     mark(e, ST_ATTN);
     mv(e, &L->o, e->o, e->br, T);
     mark(e, ST_PROJ);

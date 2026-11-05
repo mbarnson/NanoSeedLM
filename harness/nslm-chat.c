@@ -1,16 +1,6 @@
-// harness/nslm-chat.c - single-turn chat with K2-Horizon-MoVA or Qwen3.8-Flash-Next through the engine, streaming the
-// reply to stdout.
-//
-//   nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N] [--system TEXT]
-//             [--effort E] [--no-think] [--kv bf16|q8|fp8|fp4] [--ctx N] [--print-ids] ("prompt text" | --prompt-file FILE)
-//
-// The prompt is the model's chat template (harness/chat_model.h) rendered for an optional system message and one user
-// message, with the generation prompt.  --effort: K2 high (default), medium or low; Qwen xhigh (default), medium or
-// low; --no-think: Qwen without thinking.  temp 0 = greedy (arg max, ties to the lowest id); temp > 0 = the MLX
-// reference sampler's pick(): p ~ exp((l - l_max) / T) in double, splitmix64 seeded with --seed, u = (z >> 11) 2^-53 *
-// sum, the first index whose cumulative sum exceeds u.  Stops at the model's end-of-text or end-of-turn token.  Timing
-// goes to stderr.  --kv q8 / fp8 / fp4: smaller KV caches (long contexts); --ctx: the KV capacity (default: the prompt
-// and the reply).
+// harness/nslm-chat.c - one chat turn with K2-Horizon-MoVA or Qwen3.8-Flash-Next, streamed to stdout (usage() lists options).
+// temp > 0 is the MLX sampler: p ~ exp((l - l_max) / T) in f64, u = (splitmix64 seeded with --seed >> 11) 2^-53 sum, the
+// first index whose cumulative sum exceeds u. temp 0: the arg max, ties to the lowest id.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +22,8 @@ static uint64_t splitmix(uint64_t* s) {
 
 static int usage(void) {
     fprintf(stderr, "usage: nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N] [--system TEXT]\n"
-                    "                 [--effort E] [--no-think] [--kv bf16|q8|fp8|fp4] [--ctx N] [--print-ids]\n"
+                    "                 [--effort high|medium|low (K2), xhigh|medium|low (Qwen)] [--no-think (Qwen)]\n"
+                    "                 [--kv bf16|q8|fp8|fp4] [--ctx N] [--print-ids]\n"
                     "                 (\"prompt text\" | --prompt-file FILE)\n");
     return 2;
 }

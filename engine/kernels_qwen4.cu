@@ -573,39 +573,6 @@ typedef struct {
 
 // Block (head, row), 8 warps: each warp takes every 8th visible key with an online softmax (lanes hold hd / 32 dims of q
 // and of the output), then the warps merge; the output is gated by sigmoid of the query's gate half
-__global__ void __launch_bounds__(256) k_q4_attend(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
-                                                   const int32_t* nsel, const int32_t* dpos, float* o) {
-    __shared__ float sm[8], sl[8], sacc[8][256];
-    const int h = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, dl = a.hd / 32, g = h / (a.nh / a.nkv);
-    const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
-    const float* qh = q + (size_t) t * a.qld + (size_t) h * 2 * a.hd;
-    float qv[8], acc[8], m = -INFINITY, l = 0;
-    for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
-    for (int k = w; k < n; k += 8) {
-        const int key = k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
-        const float* kk = K + ((size_t) key * a.nkv + g) * a.hd;
-        float d = 0;
-        for (int i = 0; i < dl; ++i) d += qv[i] * kk[lane + 32 * i];
-        d = warp_sum(d) * a.scale;
-        const float mn = fmaxf(m, d), cf = expf(m - mn), p = expf(d - mn);
-        const float* vv = V + ((size_t) key * a.nkv + g) * a.hd;
-        for (int i = 0; i < dl; ++i) acc[i] = acc[i] * cf + p * vv[lane + 32 * i];
-        l = l * cf + p;
-        m = mn;
-    }
-    if (lane == 0) { sm[w] = m; sl[w] = l; }
-    for (int i = 0; i < dl; ++i) sacc[w][lane + 32 * i] = acc[i];
-    __syncthreads();
-    float M = -INFINITY;
-    for (int x = 0; x < 8; ++x) M = fmaxf(M, sm[x]);
-    float L = 0;
-    for (int x = 0; x < 8; ++x) L += sm[x] == -INFINITY ? 0.0f : sl[x] * expf(sm[x] - M);
-    for (int i = threadIdx.x; i < a.hd; i += blockDim.x) {
-        float v = 0;
-        for (int x = 0; x < 8; ++x) if (sm[x] != -INFINITY) v += sacc[x][i] * expf(sm[x] - M);
-        o[((size_t) t * a.nh + h) * a.hd + i] = v / L * sigm(qh[a.hd + i]);
-    }
-}
 // Prompt rows: block (KV group, row), a warp per query head of the group. The row's keys come in tiles of AT_KT; each
 // key's K and V is read once into shared memory for all heads of the group. Each head takes one online-softmax step a tile
 #define AT_KT 16
@@ -917,18 +884,17 @@ int kq4_attend_ld(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, co
 }
 int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
                     const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, float* part, int T) {
-    if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv) return -1;
+    if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv || c->n_head / c->n_kv > 32) return -1;
     const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, qld, 1.0f / sqrtf((float) c->head_dim)};
     const int G = c->n_head / c->n_kv;
-    if (T <= 8 && G <= 32) {   // decode rows: keys split over AD_S blocks a KV group, then the splits combined
+    if (T <= 8) {   // decode rows: keys split over AD_S blocks a KV group, then the splits combined
         k_q4_attend_d<<<dim3((unsigned) c->n_kv, AD_S, (unsigned) T), 32 * (unsigned) G, 0, s>>>(a, q, K, V, sel, nsel, dpos, part);
         k_q4_attend_dc<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, part, o);
-    } else if (T > 8 && attend_tc(c))   // prompt rows on tensor cores
+    } else if (attend_tc(c))   // prompt rows on tensor cores
         k_q4_attend_tc<<<dim3((unsigned) c->n_kv, (unsigned) T), 128, tc_smem(c->head_dim), s>>>(a, q, K, V, sel, nsel, dpos, o);
-    else if (T > 8 && G <= 32)   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
+    else   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
         k_q4_attend_g<<<dim3((unsigned) c->n_kv, (unsigned) T), 32 * (unsigned) G, sizeof(float) * 2 * AT_KT * (size_t) c->head_dim, s>>>(
             a, q, K, V, sel, nsel, dpos, o);
-    else k_q4_attend<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, K, V, sel, nsel, dpos, o);
     return 0;
 }
 

@@ -1,6 +1,5 @@
 // harness/nslm-qwen4-kld.c - KL divergence of a qwen4 model against a reference on one text, through the CUDA engine.
-//   nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens 1024] [--expert-cache-gb N [--stream-experts]] [--vram-experts]
-//                  [--decode N]: the model's last N rows one at a time (the decode kernels), their own KL line too
+//   nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens 1024] [--expert-cache-gb N [--stream-experts]] [--vram-experts] [--decode N]
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
