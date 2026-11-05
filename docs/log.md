@@ -598,3 +598,20 @@ read two 256-entry halves from threadgroup memory, not a 256 KB table: +2% decod
 
 A simdgroup-MMA matvec (8 rows x 8 tokens a simdgroup) was tried first. It is T-invariant by construction and flat
 from 1 to 8 tokens, but 1.4 to 1.5 times slower than k_mv at one token, so plain decode would lose.
+
+## [2026-11-05] kernel | Metal decode: the DeltaNet step and short-context attention
+
+`c24a34a`, `44d0dab`, `2374087`: P3 decode on the M4 Max goes from 41.3 to 43.3 tokens/s without drafts, and from 56.2
+to 59.6 with 2 drafts (code prompt, two runs each). After a 20,131-token prompt it goes from 34.6 to 35.6. `Q4E_PROFILE=3`
+times each decode dispatch by kernel. It showed two latency-bound kernels at one token:
+
+- The DeltaNet step held each value row's state in 2 lanes. With 4 lanes a row it runs twice the threads: 43 -> 24 us
+  a layer.
+- `k_q4_attend` took 70 us a layer at about 100 keys. `k_q4_attend_g` with its key splits takes 16, so every decode row
+  now uses it, not only rows of 512 keys or more. The merge kernel runs only when a row has more than one split.
+
+Both change the order of some sums, so the text changes at the rounding level. The kernel tests stay within 4e-7 of
+the C reference. MTP verify rows still equal decode rows bit for bit, so drafts do not change the text.
+
+Tried and dropped: the router top-k in one simdgroup (13.5 -> 18.5 us a call, 46 with a sorting network). The
+distinct-expert pass for verify rows was slower (51.5 against 56.9 tokens/s at 2 drafts), with the same text.
