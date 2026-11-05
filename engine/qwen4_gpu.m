@@ -76,7 +76,8 @@ struct Q4Eng {
     id<MTLCommandBuffer> cb;   // the forward being encoded
     id<MTLComputeCommandEncoder> enc;
     int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage; 2: decode rows only;
-                               // 3: decode rows, a command buffer per dispatch, its GPU time added to the kernel (and specialisation)
+                               // 3: decode rows, a command buffer per dispatch, its GPU time added to the kernel (and specialisation);
+                               // 4: the same for prompt rows only
     NSString* kname;           // Q4E_PROFILE=3: the pipeline of the next dispatch
     NSMutableDictionary<NSString*, NSNumber*>* kms, *kcalls;
     int prof_skip;             // this forward's rows are not counted (Q4E_PROFILE=2 and T > MV_MAXT)
@@ -84,6 +85,7 @@ struct Q4Eng {
     int no_attg;               // Q4E_NO_ATTG=1: prompt rows through k_q4_attend too (A / B)
     int no_splitk;             // Q4E_NO_SPLITK=1: long decode rows through k_q4_attend too (A / B)
     int smin, skeys;           // decode rows of smin keys or more in k_q4_attend_g's splits of skeys (Q4E_SPLIT_MIN, _KEYS)
+    int no_mm64;               // Q4E_NO_MM64=1: dense prompt rows through k_mm, not k_mm64 (A / B)
     // The MTP head (Q4EOpts.mtp). Hin: its input streams, row 0 the last main row's (the next head row's input), row
     // 1 + t main row t's of this forward; Hm: its streams; dtok: q4e_draft's bonus and drafts. lrow: the last row's logits
     // in logits (-1: none); keep: a q4e_forward_keep of nkeep rows
@@ -125,7 +127,7 @@ static id<MTLBuffer> dbuf(Q4Eng* e, const void* p, size_t n) {   // a shared buf
 static id<MTLComputePipelineState> pipe_g(Q4Eng* e, const char* name, int fmt, int T, int gs) {
     NSString* key = [NSString stringWithFormat:@"%s|%d|%d|%d", name, fmt, T, gs];
     id<MTLComputePipelineState> p = e->pipes[key];
-    if (e->prof == 3) e->kname = key;
+    if (e->prof >= 3) e->kname = key;
     if (p) return p;
     const int q4 = !strncmp(name, "k_q4_", 5);
     NSError* err = nil;
@@ -139,7 +141,7 @@ static id<MTLComputePipelineState> pipe_g(Q4Eng* e, const char* name, int fmt, i
         if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
         fn = [e->lib newFunctionWithName:[NSString stringWithUTF8String:name] constantValues:cv error:&err];
     }
-    if (e->prof == 3) e->kname = key;
+    if (e->prof >= 3) e->kname = key;
     p = fn ? [e->dev newComputePipelineStateWithFunction:fn error:&err] : nil;
     if (!p) { fprintf(stderr, "qwen4 engine: kernel %s: %s\n", name, err ? err.localizedDescription.UTF8String : "not found"); abort(); }
     e->pipes[key] = p;
@@ -163,7 +165,7 @@ static int cmd_wait(Q4Eng* e) {
 }
 // Q4E_PROFILE: the work encoded since the last mark is stage's (its command buffer's GPU time)
 static void mark(Q4Eng* e, int stage) {
-    if (!e->prof || e->prof == 3 || !e->cb) return;
+    if (!e->prof || e->prof >= 3 || !e->cb) return;
     id<MTLCommandBuffer> cb = e->cb;
     if (cmd_wait(e)) return;
     if (!e->prof_skip) e->stage_ms[stage] += 1e3 * (cb.GPUEndTime - cb.GPUStartTime);
@@ -173,7 +175,7 @@ static void B(Q4Eng* e, int i, id<MTLBuffer> b, uint64_t off) { [e->enc setBuffe
 static void A_(Q4Eng* e, const void* p, size_t n) { [e->enc setBytes:p length:n atIndex:0]; }
 // Q4E_PROFILE=3: the dispatch just encoded runs alone; its GPU time goes to its pipeline's line
 static void kprof(Q4Eng* e) {
-    if (e->prof != 3 || e->prof_skip || !e->cb) return;
+    if (e->prof < 3 || e->prof_skip || !e->cb) return;
     id<MTLCommandBuffer> cb = e->cb;
     if (cmd_wait(e)) return;
     NSString* k = e->kname ? e->kname : @"?";
@@ -331,7 +333,9 @@ static void mv_o(Q4Eng* e, const MW* w, id<MTLBuffer> X, uint64_t xo, int xs, id
         return;
     }
     const MmArgs a = {w->cols, w->rows, T, xs, ys, 1, 0, 0};
-    [e->enc setComputePipelineState:pipe_g(e, "k_mm", w->fmt, 1, w->gs)];
+    // k_mm64's 64 x 64 tiles: the same y, about 24% faster (its float4 input loads want 16-byte rows and offsets)
+    const int m64 = !e->no_mm64 && xs % 4 == 0 && xo % 16 == 0 && w->cols % MM_BK == 0;
+    [e->enc setComputePipelineState:pipe_g(e, m64 ? "k_mm64" : "k_mm", w->fmt, 1, w->gs)];
     A_(e, &a, sizeof a);
     bind_w(e, w, 1);
     B(e, 4, X, xo);
@@ -341,7 +345,8 @@ static void mv_o(Q4Eng* e, const MW* w, id<MTLBuffer> X, uint64_t xo, int xs, id
     B(e, 8, e->tok, 0);
     bind_codes(e, w, 9);
     B(e, 10, Y, yo);   // the gate's (unused)
-    tgs(e, (uint64_t) (w->rows + MM_BM - 1) / MM_BM, (uint64_t) (T + MM_BN - 1) / MM_BN, 128);
+    if (m64) tgs(e, (uint64_t) (w->rows + MM2_BM - 1) / MM2_BM, (uint64_t) (T + MM2_BN - 1) / MM2_BN, 128);
+    else tgs(e, (uint64_t) (w->rows + MM_BM - 1) / MM_BM, (uint64_t) (T + MM_BN - 1) / MM_BN, 128);
 }
 static void mv(Q4Eng* e, const MW* w, id<MTLBuffer> X, id<MTLBuffer> Y, int T) { mv_o(e, w, X, 0, w->cols, Y, 0, w->rows, T); }
 
@@ -932,6 +937,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
     e->no_attg = getenv("Q4E_NO_ATTG") != NULL;
     e->no_splitk = getenv("Q4E_NO_SPLITK") != NULL;
+    e->no_mm64 = getenv("Q4E_NO_MM64") != NULL;
     e->smin = getenv("Q4E_SPLIT_MIN") ? atoi(getenv("Q4E_SPLIT_MIN")) : 1;   // every decode row: k_q4_attend_g (70 -> 16 us at 100 keys)
     e->skeys = getenv("Q4E_SPLIT_KEYS") ? atoi(getenv("Q4E_SPLIT_KEYS")) : 128;
     if (e->smin < 1) e->smin = 1;
@@ -952,10 +958,11 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 
 void q4e_close(Q4Eng* e) {
     if (!e) return;
-    if (e->prof == 3) {
+    if (e->prof >= 3) {
         double total = 0;
         for (NSString* k in e->kms) total += e->kms[k].doubleValue;
-        fprintf(stderr, "Q4E_PROFILE=3: %.0f ms of decode GPU time (a command buffer per dispatch; kernel|format|T|group)\n", total);
+        fprintf(stderr, "Q4E_PROFILE=%d: %.0f ms of %s GPU time (a command buffer per dispatch; kernel|format|T|group)\n", e->prof, total,
+                e->prof == 4 ? "prompt" : "decode");
         NSArray* keys = [e->kms keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber* a, NSNumber* b) { return [b compare:a]; }];
         for (NSString* k in keys)
             fprintf(stderr, "  %-32s %8d calls %9.1f ms %7.2f us a call %5.1f%%\n", k.UTF8String, e->kcalls[k].intValue, e->kms[k].doubleValue,
@@ -1013,7 +1020,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         nsel[t] = done[t] > e->kq ? e->kq : 0;
     }
     if (ple_rows(e, T)) return -1;
-    e->prof_skip = e->prof >= 2 && T > MV_MAXT;
+    e->prof_skip = e->prof == 4 ? T <= MV_MAXT : e->prof >= 2 && T > MV_MAXT;
     cmd_begin(e);
     embed(e, T);
     mark(e, ST_EMBED);

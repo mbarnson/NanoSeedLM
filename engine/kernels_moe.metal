@@ -114,6 +114,8 @@ typedef struct {           // per-head maps: y[t][h][o] = W_h[o] . x[t * xs + h 
 #define MM_BM 32           // GEMM: weight rows per threadgroup
 #define MM_BN 32           // GEMM: tokens (or pairs) per threadgroup
 #define MM_BK 32
+#define MM2_BM 64          // k_mm64 (dense prompt rows): weight rows a threadgroup
+#define MM2_BN 64          // k_mm64: tokens a threadgroup
 typedef struct {
     int K, R;              // input width, rows per slice
     int T;                 // dense: tokens; grouped: unused
@@ -975,6 +977,63 @@ kernel void k_mm(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffe
         device float* yo = Y + (ulong) dst * a.ys + row;
         const float s = Ot[n * MM_BM + rr];
         *yo = a.add == 2 ? bfr(bfr(s) * softplus_ln2_bf(Gt[(ulong) dst * a.ys + row])) : a.add ? bfr(*yo + bfr(s)) : bfr(s);
+    }
+}
+
+// Dense prompt rows (k_mm with FC_T = 1, weights [R][K]) in 64-row x 64-column tiles: 4 simdgroups of 32 x 32 each
+// (16 accumulators: 16 multiplies for 8 fragment loads, against k_mm's 4 for 4). The weights dequantized as k_mm's
+// (tile_weights), and each output's products added in the same k order, so y is k_mm's.  Threadgroup memory: one
+// buffer for the weight and input tiles, then for the transposed store.
+kernel void k_mm64(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const ushort* S [[buffer(2)]],
+                   device const ushort* B [[buffer(3)]], device const float* X [[buffer(4)]], device float* Y [[buffer(5)]],
+                   device const int* perm [[buffer(6)]], device const uint* G [[buffer(7)]], device const MmTile* tiles [[buffer(8)]],
+                   device const uchar* EN [[buffer(9)]], device const float* Gt [[buffer(10)]],
+                   uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                   uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float buf[MM2_BM * MM2_BN];
+    threadgroup float* Wt = buf;                    // [row][k], MM2_BM x MM_BK
+    threadgroup float* Xt = buf + MM2_BM * MM_BK;   // [k][n], MM_BK x MM2_BN
+    const int r0 = (int) tg.x * MM2_BM, start = (int) tg.y * MM2_BN, count = min(MM2_BN, a.T - start);
+    const int ebias = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[0] : 0;
+    simdgroup_float8x8 acc[4][4];
+    _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
+    const int sr = (int) (sgi / 2) * 32, sn = (int) (sgi % 2) * 32;   // this simdgroup's 32 x 32 sub-tile
+    for (int k0 = 0; k0 < a.K; k0 += MM_BK) {
+        for (int h = 0; h < 2; ++h) {   // weights: 64 rows x 32 k = 256 blocks, two per thread
+            const int rr = (int) tid / 4 + 32 * h, jb = (int) tid % 4, row = r0 + rr;
+            if (row < a.R) tile_weights(FC_FMT, W, S, B, G, 0, (ulong) row, a.K, k0 / 8 + jb, ebias, Wt + rr * MM_BK + jb * 8, EN);
+            else for (int i = 0; i < 8; ++i) Wt[rr * MM_BK + jb * 8 + i] = 0;
+        }
+        {   // inputs: 64 columns x 32 k, 16 per thread
+            const int n = (int) tid / 2, kk = ((int) tid % 2) * 16;
+            if (n < count) {
+                device const float4* xr = (device const float4*) (X + (ulong) (start + n) * a.xs + k0 + kk);
+                for (int i = 0; i < 4; ++i) {
+                    const float4 v = xr[i];
+                    Xt[(kk + 4 * i) * MM2_BN + n] = v.x; Xt[(kk + 4 * i + 1) * MM2_BN + n] = v.y;
+                    Xt[(kk + 4 * i + 2) * MM2_BN + n] = v.z; Xt[(kk + 4 * i + 3) * MM2_BN + n] = v.w;
+                }
+            } else for (int i = 0; i < 16; ++i) Xt[(kk + i) * MM2_BN + n] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        _Pragma("clang loop unroll(full)") for (int kb = 0; kb < MM_BK; kb += 8) {
+            simdgroup_float8x8 wa[4], xb[4];
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) simdgroup_load(wa[i], Wt + (sr + 8 * i) * MM_BK + kb, MM_BK);
+            _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) simdgroup_load(xb[j], Xt + kb * MM2_BN + sn + 8 * j, MM2_BN);
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], wa[i], xb[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float* Ot = buf;   // [n][row]
+    _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i)
+        _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) simdgroup_store(acc[i][j], Ot + (sn + 8 * j) * MM2_BM + sr + 8 * i, MM2_BM, ulong2(0, 0), true);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int idx = (int) tid; idx < MM2_BN * MM2_BM; idx += 128) {
+        const int n = idx / MM2_BM, rr = idx % MM2_BM, row = r0 + rr;
+        if (n >= count || row >= a.R) continue;
+        device float* yo = Y + (ulong) (start + n) * a.ys + row;
+        const float s = Ot[n * MM2_BM + rr];
+        *yo = a.add == 2 ? bfr(bfr(s) * softplus_ln2_bf(Gt[(ulong) (start + n) * a.ys + row])) : a.add ? bfr(*yo + bfr(s)) : bfr(s);
     }
 }
 
