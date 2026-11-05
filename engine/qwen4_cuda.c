@@ -218,32 +218,31 @@ static void mv_on(Q4Eng* e, cudaStream_t s, const W* w, const float* x, int xs, 
 static void mvx(Q4Eng* e, const W* w, const float* x, int xs, float* y, int T) { mv_on(e, e->s, w, x, xs, y, T); }
 static void mv(Q4Eng* e, const W* w, const float* x, float* y, int T) { mvx(e, w, x, w->cols, y, T); }
 
-static void load_layer(Q4Eng* e, int l) {
+// Layer L named lp (attention if attn): main layer l, or the MTP head's layer (l < 0: no PLE, its experts in VRAM)
+static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
     const Qwen4Cfg* c = &e->c;
-    Layer* L = &e->L[l];
     const int HD = c->hc * c->d, cd = 2 * c->lin_hk * c->lin_dk + c->lin_hv * c->lin_dv;
-    const char* p = "language_model.model.layers";
     for (int b = 0; b < 2; ++b) {
         const char* hc = b ? "mlp_hyper_connection" : "attn_hyper_connection";
-        L->hc_norm[b] = load_v(e, HD, "%s.%d.%s.hc_norm.weight", p, l, hc);
+        L->hc_norm[b] = load_v(e, HD, "%s.%s.hc_norm.weight", lp, hc);
         char n[2][192];
-        snprintf(n[0], sizeof n[0], "%s.%d.%s.input_mix_weight_down.weight", p, l, hc);
-        snprintf(n[1], sizeof n[1], "%s.%d.%s.block_inject_weight.weight", p, l, hc);
+        snprintf(n[0], sizeof n[0], "%s.%s.input_mix_weight_down.weight", lp, hc);
+        snprintf(n[1], sizeof n[1], "%s.%s.block_inject_weight.weight", lp, hc);
         load_cat(e, &L->hc_di[b], (const char* const[]) {n[0], n[1]}, 2);
-        load_w(e, &L->hc_up[b], 0, "%s.%d.%s.input_mix_weight_up.weight", p, l, hc);
+        load_w(e, &L->hc_up[b], 0, "%s.%s.input_mix_weight_up.weight", lp, hc);
     }
-    if (c->attn[l]) {
+    if (attn) {
         const int nb = e->max_pos / c->ix_ratio + 1;
         const char* in[4] = {"q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"};
         char n[4][192];
-        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.%d.self_attn.%s.weight", p, l, in[i]);
+        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.self_attn.%s.weight", lp, in[i]);
         load_cat(e, &L->qkvi, (const char* const[]) {n[0], n[1], n[2], n[3]}, 4);
-        if (!e->err[0] && L->qkvi.rows != att_ld(c)) fail(e, "layer %d: attention projections of %d rows, not %d", l, L->qkvi.rows, att_ld(c));
-        load_w(e, &L->o, 0, "%s.%d.self_attn.o_proj.weight", p, l);
-        L->qn = load_v(e, c->head_dim, "%s.%d.self_attn.q_norm.weight", p, l);
-        L->kn = load_v(e, c->head_dim, "%s.%d.self_attn.k_norm.weight", p, l);
-        L->iqn = load_v(e, c->ix_dim, "%s.%d.self_attn.indexer.q_layernorm.weight", p, l);
-        L->ikn = load_v(e, c->ix_dim, "%s.%d.self_attn.indexer.k_layernorm.weight", p, l);
+        if (!e->err[0] && L->qkvi.rows != att_ld(c)) fail(e, "%s: attention projections of %d rows, not %d", lp, L->qkvi.rows, att_ld(c));
+        load_w(e, &L->o, 0, "%s.self_attn.o_proj.weight", lp);
+        L->qn = load_v(e, c->head_dim, "%s.self_attn.q_norm.weight", lp);
+        L->kn = load_v(e, c->head_dim, "%s.self_attn.k_norm.weight", lp);
+        L->iqn = load_v(e, c->ix_dim, "%s.self_attn.indexer.q_layernorm.weight", lp);
+        L->ikn = load_v(e, c->ix_dim, "%s.self_attn.indexer.k_layernorm.weight", lp);
         L->K = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->n_kv * c->head_dim);
         L->V = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->n_kv * c->head_dim);
         L->raw = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->ix_dim);
@@ -251,42 +250,43 @@ static void load_layer(Q4Eng* e, int l) {
     } else {
         const char* in[4] = {"qkv", "z", "b", "a"};
         char n[4][192];
-        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.%d.linear_attn.in_proj_%s.weight", p, l, in[i]);
+        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.linear_attn.in_proj_%s.weight", lp, in[i]);
         load_cat(e, &L->in, (const char* const[]) {n[0], n[1], n[2], n[3]}, 4);
-        if (!e->err[0] && L->in.rows != gdn_ld(c)) fail(e, "layer %d: DeltaNet in_proj of %d rows, not %d", l, L->in.rows, gdn_ld(c));
-        load_w(e, &L->out, 0, "%s.%d.linear_attn.out_proj.weight", p, l);
-        L->gw.conv_w = load_v(e, (int64_t) cd * c->lin_conv, "%s.%d.linear_attn.conv1d.weight", p, l);
-        L->gw.A_log = load_v(e, c->lin_hv, "%s.%d.linear_attn.A_log", p, l);
-        L->gw.dt_bias = load_v(e, c->lin_hv, "%s.%d.linear_attn.dt_bias", p, l);
-        L->gw.norm_w = load_v(e, c->lin_dv, "%s.%d.linear_attn.norm.weight", p, l);
+        if (!e->err[0] && L->in.rows != gdn_ld(c)) fail(e, "%s: DeltaNet in_proj of %d rows, not %d", lp, L->in.rows, gdn_ld(c));
+        load_w(e, &L->out, 0, "%s.linear_attn.out_proj.weight", lp);
+        L->gw.conv_w = load_v(e, (int64_t) cd * c->lin_conv, "%s.linear_attn.conv1d.weight", lp);
+        L->gw.A_log = load_v(e, c->lin_hv, "%s.linear_attn.A_log", lp);
+        L->gw.dt_bias = load_v(e, c->lin_hv, "%s.linear_attn.dt_bias", lp);
+        L->gw.norm_w = load_v(e, c->lin_dv, "%s.linear_attn.norm.weight", lp);
         L->conv = (float*) dmem(e, NULL, sizeof(float) * qwen4_gdn_conv_len(c));
         L->S = (float*) dmem(e, NULL, sizeof(float) * qwen4_gdn_state_len(c));
     }
     char gn[2][192];   // the router's rows, then the shared expert's gate row: one GEMM of x
-    snprintf(gn[0], sizeof gn[0], "%s.%d.mlp.gate.weight", p, l);
-    snprintf(gn[1], sizeof gn[1], "%s.%d.mlp.shared_expert_gate.weight", p, l);
+    snprintf(gn[0], sizeof gn[0], "%s.mlp.gate.weight", lp);
+    snprintf(gn[1], sizeof gn[1], "%s.mlp.shared_expert_gate.weight", lp);
     load_cat(e, &L->gate, (const char* const[]) {gn[0], gn[1]}, 2);
-    if (!e->err[0] && L->gate.rows != c->n_exp + 1) fail(e, "layer %d: router of %d rows, not %d + 1", l, L->gate.rows, c->n_exp);
-    load_w(e, &L->sh_g, 0, "%s.%d.mlp.shared_expert.gate_proj.weight", p, l);
-    load_w(e, &L->sh_u, 0, "%s.%d.mlp.shared_expert.up_proj.weight", p, l);
-    load_w(e, &L->sh_d, 0, "%s.%d.mlp.shared_expert.down_proj.weight", p, l);
+    if (!e->err[0] && L->gate.rows != c->n_exp + 1) fail(e, "%s: router of %d rows, not %d + 1", lp, L->gate.rows, c->n_exp);
+    load_w(e, &L->sh_g, 0, "%s.mlp.shared_expert.gate_proj.weight", lp);
+    load_w(e, &L->sh_u, 0, "%s.mlp.shared_expert.up_proj.weight", lp);
+    load_w(e, &L->sh_d, 0, "%s.mlp.shared_expert.down_proj.weight", lp);
     W* ex[3] = {&L->eg, &L->eu, &L->ed};
     const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
     for (int i = 0; i < 3; ++i) {
         char name[160];
-        snprintf(name, sizeof name, "%s.%d.mlp.switch_mlp.%s.weight", p, l, proj[i]);
-        const NsTensor* t = e->et[l][i] = ns_find(&e->nm, name);
-        if (!e->cache) load_w(e, ex[i], e->host_experts, "%s", name);
+        snprintf(name, sizeof name, "%s.mlp.switch_mlp.%s.weight", lp, proj[i]);
+        const NsTensor* t = ns_find(&e->nm, name);
+        if (l >= 0) e->et[l][i] = t;
+        if (!e->cache || l < 0) load_w(e, ex[i], e->host_experts && l >= 0, "%s", name);
         else if (!t || t->enc == NS_SEED6P8 || t->slices != c->n_exp) fail(e, "%s: missing, P = 8, or not %d experts", name, c->n_exp);
         else { memset(ex[i], 0, sizeof *ex[i]); ex[i]->fmt = t->enc; ex[i]->slices = t->slices; ex[i]->rows = t->rows; ex[i]->cols = t->cols; }
     }
-    if (c->ple[l] >= 0) {
-        load_w(e, &L->key, 0, "%s.%d.ple.key_proj.weight", p, l);
-        load_w(e, &L->val, 0, "%s.%d.ple.value_proj.weight", p, l);
-        L->nk = load_v(e, HD, "%s.%d.ple.norm_key.weight", p, l);
-        L->nq = load_v(e, HD, "%s.%d.ple.norm_query.weight", p, l);
-        L->nc = load_v(e, HD, "%s.%d.ple.norm_conv.weight", p, l);
-        L->pw = load_v(e, (int64_t) HD * c->ple_conv, "%s.%d.ple.conv1d.weight", p, l);
+    if (l >= 0 && c->ple[l] >= 0) {
+        load_w(e, &L->key, 0, "%s.ple.key_proj.weight", lp);
+        load_w(e, &L->val, 0, "%s.ple.value_proj.weight", lp);
+        L->nk = load_v(e, HD, "%s.ple.norm_key.weight", lp);
+        L->nq = load_v(e, HD, "%s.ple.norm_query.weight", lp);
+        L->nc = load_v(e, HD, "%s.ple.norm_conv.weight", lp);
+        L->pw = load_v(e, (int64_t) HD * c->ple_conv, "%s.ple.conv1d.weight", lp);
         L->hist = (float*) dmem(e, NULL, sizeof(float) * qwen4_ple_hist_len(c));
     }
 }
@@ -443,7 +443,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         if (c->ple[l] >= 0) qwen4_ngram_init(c, c->ple[l], &e->ng[c->ple[l]]);
         if (c->ple[l] >= 0 && e->table && (c->ple[l] > 0 || e->table->rows != e->ng[0].rows))
             fail(e, "the PLE GGUF has %lld rows, the model's table %lld (and one PLE layer)", (long long) e->table->rows, (long long) e->ng[0].rows);
-        load_layer(e, l);
+        char lp[48];
+        snprintf(lp, sizeof lp, "language_model.model.layers.%d", l);
+        load_layer(e, &e->L[l], lp, c->attn[l], l);
     }
     const size_t T = (size_t) e->mt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, kf = (size_t) c->top_k * c->ff_exp;

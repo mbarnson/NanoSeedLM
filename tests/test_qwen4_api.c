@@ -98,6 +98,13 @@ int main(void) {
     q4e_forward(q, ids + 9, 20, b);
     CHECK(same(a, b, 20 * V), "score differs from the engine's rows");
 
+    // MTP verify (plan gate MB): 4 decode rows in one forward give each row the logits of 4 one-row forwards, bit for bit
+    q4e_reset(q);
+    q4e_forward(q, ids, 20, NULL);
+    for (int j = 0; j < 4; ++j) q4e_forward(q, ids + 20 + j, 1, a + (size_t) j * V);
+    q4e_reset(q);
+    q4e_forward(q, ids, 20, NULL);
+    CHECK(q4e_forward(q, ids + 20, 4, b) == 0 && same(a, b, 4 * V), "4 decode rows in one forward differ from 4 one-row forwards");
     CHECK(eng_fork(e, 1, 0) == -1 && eng_kv_bytes(e) == 0 && eng_kv_read(e, 0, 0, 1, a) == -1, "one slot, no KV files");
     eng_close(e);
     q4e_close(q);
