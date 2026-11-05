@@ -228,3 +228,5 @@ int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) {
 }
 int pthread_cond_signal(pthread_cond_t* c) { WakeConditionVariable((PCONDITION_VARIABLE) &c->p); return 0; }
 int pthread_cond_broadcast(pthread_cond_t* c) { WakeAllConditionVariable((PCONDITION_VARIABLE) &c->p); return 0; }
+static BOOL CALLBACK once_cb(PINIT_ONCE o, PVOID fn, PVOID* ctx) { (void) o; (void) ctx; ((void (*)(void)) fn)(); return TRUE; }
+int pthread_once(pthread_once_t* o, void (*fn)(void)) { return InitOnceExecuteOnce((PINIT_ONCE) &o->p, once_cb, (PVOID) fn, NULL) ? 0 : 1; }

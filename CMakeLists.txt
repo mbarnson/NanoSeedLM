@@ -36,7 +36,7 @@ find_package(CUDAToolkit REQUIRED)
 if(MSVC)
   set(COMPAT_DIR ${CMAKE_SOURCE_DIR}/win/compat)
   # /fp:precise without /fp:contract: no FMA contraction in host code.  /utf-8: sources and string literals are UTF-8.
-  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8> $<$<COMPILE_LANGUAGE:C,CXX>:/fp:precise> $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8> $<$<COMPILE_LANGUAGE:C,CXX>:/fp:precise> $<$<AND:$<COMPILE_LANGUAGE:C>,$<C_COMPILER_ID:MSVC>>:/experimental:c11atomics>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/W3> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4244> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4267>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/wd4305> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4996> $<$<COMPILE_LANGUAGE:C,CXX>:/wd4146>
                       $<$<COMPILE_LANGUAGE:C,CXX>:/FI${COMPAT_DIR}/posix_compat.h>
@@ -54,13 +54,18 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
 
 # ---- the C99 library ------------------------------------------------------------------------------------------------
 file(GLOB NSLM_LIB_SRC ${CMAKE_SOURCE_DIR}/nslm/lib_*.c)
-# The CPU-ahead Metal backend needs Clang vectors and POSIX pthread_once.
-# CUDA does not call it; keep the MSVC/GCC library build on portable sources.
-if(MSVC OR NOT CMAKE_C_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
+# The CPU seed kernels (the CPU expert path, plan D4) need Clang vectors and pthread_once (win/compat has it): any Clang C
+# compiler, clang-cl on Windows too (-DCMAKE_C_COMPILER=clang-cl; nvcc keeps cl as its host compiler).  MSVC cl and GCC
+# build the portable stub.
+if(NOT CMAKE_C_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
   list(FILTER NSLM_LIB_SRC EXCLUDE REGEX "/lib_cpu_seed4\\.c$")
   list(APPEND NSLM_LIB_SRC ${CMAKE_SOURCE_DIR}/nslm/cpu_seed4_none.c)   # cpu_seed4_on() is 0: no CPU expert path
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-  set_source_files_properties(${CMAKE_SOURCE_DIR}/nslm/lib_cpu_seed4.c PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  if(MSVC)   # clang-cl: the driver flags through /clang:
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/nslm/lib_cpu_seed4.c PROPERTIES COMPILE_OPTIONS "/clang:-mavx2;/clang:-mfma")
+  else()
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/nslm/lib_cpu_seed4.c PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  endif()
 endif()
 add_library(nslm STATIC ${NSLM_LIB_SRC})
 target_include_directories(nslm PUBLIC nslm harness)
@@ -74,6 +79,11 @@ foreach(t affine emulate gguf kvq lfsr linalg model_st moe ple qwen4_ref search 
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
 set_tests_properties(test_affine PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_C_COMPILER_ID MATCHES "^(Clang|AppleClang)$")   # the CPU seed kernels exist only in Clang builds
+  add_executable(test_cpu_seed4 tests/test_cpu_seed4.c)
+  target_link_libraries(test_cpu_seed4 nslm)
+  add_test(NAME test_cpu_seed4 COMMAND test_cpu_seed4 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 # tests that read a model folder (config.json, ...): -DNSLM_MODEL_DIR=<a K2-Horizon-MoVA folder>
 set(NSLM_MODEL_DIR "" CACHE PATH "a NanoSeedLM model folder for the tests that need one")
 add_executable(test_mova_cfg tests/test_mova_cfg.c)
