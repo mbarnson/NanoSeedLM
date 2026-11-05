@@ -557,3 +557,22 @@ prefetch took 4.2 ms a token. A verify forward of 3 rows took 42 ms when the pre
 4080 is not measured yet. `35f17e0`: an explicit `--expert-cache-gb` did not look at `NSLM_VRAM_RESERVE_MB`. With
 cache 8, the display driver of the 4080 that drives the desktop failed, and the screen went black while the runs went
 on. Now the cache shrinks to keep the reserve. The reserve is 2560 MB on a GPU that drives a display, else 512 MB.
+
+## [2026-11-05] engine | MTP drafts on Metal
+
+`1464fb3`, `8344d76`, `383d17b`: plan step M4. The Metal engine has the MTP head, `q4e_draft`, `q4e_forward_keep` and
+`q4e_accept`, as CUDA's `ecd552f` and `7cfd557` do, so `nslm-qwen4-gen --drafts` works on macOS. The verify rows write the
+recurrent state after each row to snapshot buffers, and `q4e_accept` swaps the kept row's buffers in, so a failed
+draft copies nothing. On the M4 Max, P3, greedy, 256 tokens at most (tokens/s, two runs within 1%):
+
+| Prompt | No drafts | 1 draft | 2 drafts | 3 drafts |
+|---|---|---|---|---|
+| Code | 41.1 | 50.1 | 52.2 | 50.6 |
+| Chat | 42.0 | 47.4 | 43.8 | 39.7 |
+
+Gate MB holds: the text is byte-identical at every K, on both prompts and after a 20,131-token prompt (35.9 tokens/s
+without drafts, 38.4 with 2). It holds by construction. The matvecs now run without fast math, so a token's row sums in
+the same order for any row count. Each decode row's attention kernel and key splits now follow from its own keys, not
+from the longest row of its forward. A 4-row forward then gives the logits of four one-row forwards bit for bit, after
+20 to 2,400 tokens. Before the attention change, 4 rows that straddled 512 keys or a 128-key split boundary changed
+about 240,000 logits a row. mlx-vlm 0.7.12's own MTP reached 51.8 (code) and 43.1 (chat) at 2 drafts.
