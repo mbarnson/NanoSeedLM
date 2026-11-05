@@ -113,7 +113,7 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 | `--stream-experts` | With a cache: read the missing experts from the model files. Use it when RAM is smaller than the experts |
 | `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
 | `--ctx N` | Context positions (4096) |
-| `--prompt-rows N` | Prompt rows of one forward (4096, at most the context). Each row takes about 0.25 MB of VRAM |
+| `--prompt-rows N` | Prompt rows of one forward: 4096, or 16384 on GPUs of 64 GB or more, at most the context. A row takes about 0.25 MB of VRAM |
 | `--raw` | No chat template |
 
 ## See also

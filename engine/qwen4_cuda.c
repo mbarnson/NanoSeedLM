@@ -404,7 +404,10 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const Qwen4Cfg* c = &e->c;
     if (c->n_exp > BUCKET_MAX_EXPERTS) { snprintf(err, (size_t) errlen, "%d experts, at most %d", c->n_exp, BUCKET_MAX_EXPERTS); ns_close(&e->nm); free(e); return NULL; }
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
-    const int mt = o && o->rows > 0 ? o->rows : Q4E_MAX_ROWS, ctx = (e->max_pos + Q4E_LOGIT_ROWS - 1) / Q4E_LOGIT_ROWS * Q4E_LOGIT_ROWS;
+    size_t vfree = 0, vtotal = 0;
+    cudaMemGetInfo(&vfree, &vtotal);
+    const int mt = o && o->rows > 0 ? o->rows : vtotal >= ((size_t) 64 << 30) ? Q4E_BIG_ROWS : Q4E_MAX_ROWS;
+    const int ctx = (e->max_pos + Q4E_LOGIT_ROWS - 1) / Q4E_LOGIT_ROWS * Q4E_LOGIT_ROWS;
     e->mt = mt < Q4E_LOGIT_ROWS ? Q4E_LOGIT_ROWS : mt > Q4E_PASS_ROWS ? Q4E_PASS_ROWS : mt > ctx ? ctx : mt;
     e->xr = (e->max_pos + e->mt - 1) / e->mt * e->mt;
     if (e->xr > Q4E_PASS_ROWS) e->xr = Q4E_PASS_ROWS / e->mt * e->mt;
