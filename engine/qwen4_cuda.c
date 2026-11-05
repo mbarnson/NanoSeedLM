@@ -31,10 +31,10 @@ typedef struct {   // a weight: its format and shape, slice 0, and a device tabl
 typedef struct {
     W hc_di[2], hc_up[2];   // each mix: the down rows, then the hc inject rows (one GEMM of the same input); up
     float* hc_norm[2];
-    W qkv, z, b, a, out;                        // Gated DeltaNet
+    W in, out;   // Gated DeltaNet: in = the rows of in_proj qkv, z, b and a (one GEMM of x)
     Q4GdnDev gw;
     float *conv, *S;
-    W q, k, v, o, ix;                           // QSA attention
+    W qkvi, o;   // QSA attention: qkvi = the rows of q, k, v and the indexer's qk (one GEMM of x)
     float *qn, *kn, *iqn, *ikn, *K, *V, *raw, *blk;
     W gate, sg, sh_g, sh_u, sh_d, eg, eu, ed;   // MoE
     W key, val;                                 // PLE
@@ -70,8 +70,8 @@ struct Q4Eng {
     const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *Hall;   // the hidden streams of a pass, xr rows; H: the current chunk's
-    float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
-    float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
+    float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
+    float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb;
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
     // A chunk's input: its slot of hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
     // from din, so a CUDA graph of T decode rows serves every position.  emb_h (PLE rows) and hlog (logits) are pinned too.
@@ -165,28 +165,35 @@ static void load_w(Q4Eng* e, W* w, int host, const char* fmt, ...) {
     *w = (W) {t->enc, t->slices, t->rows, t->cols, tab[0], (const WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) t->slices)};
     free(tab);
 }
-// Two dense weights of the same input (BF16, Q8 or Q4, one encoding and width) as one in VRAM: the rows of a, then of b
-static void load_cat(Q4Eng* e, W* w, const char* na, const char* nb) {
-    const NsTensor* t[2] = {ns_find(&e->nm, na), ns_find(&e->nm, nb)};
-    if (!t[0] || !t[1]) { fail(e, "%s: missing", t[0] ? nb : na); return; }
-    if (t[0]->enc != t[1]->enc || (t[0]->enc != NS_BF16 && t[0]->enc != NS_Q4 && t[0]->enc != NS_Q8) || t[0]->cols != t[1]->cols ||
-        t[0]->group != t[1]->group || t[0]->slices != 1 || t[1]->slices != 1 || (t[0]->enc != NS_BF16 && t[0]->group != 32 && t[0]->group != 64)) {
-        fail(e, "%s and %s: not one dense encoding and width", na, nb);
-        return;
+// A row of the merged input projections: attention's q (and gate), k, v and indexer q heads and key; DeltaNet's qkv, z, b, a
+static int att_ld(const Qwen4Cfg* c) { return c->n_head * 2 * c->head_dim + 2 * c->n_kv * c->head_dim + (c->ix_heads + 1) * c->ix_dim; }
+static int gdn_ld(const Qwen4Cfg* c) { return 2 * c->lin_hk * c->lin_dk + 2 * c->lin_hv * c->lin_dv + 2 * c->lin_hv; }
+// Dense weights of the same input (BF16, Q8 or Q4, one encoding and width) as one in VRAM: their rows in order
+static void load_cat(Q4Eng* e, W* w, const char* const* names, int n) {
+    const NsTensor* t[4];
+    int rows = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!(t[i] = ns_find(&e->nm, names[i]))) { fail(e, "%s: missing", names[i]); return; }
+        if (t[i]->enc != t[0]->enc || (t[0]->enc != NS_BF16 && t[0]->enc != NS_Q4 && t[0]->enc != NS_Q8) || t[i]->cols != t[0]->cols ||
+            t[i]->group != t[0]->group || t[i]->slices != 1 || (t[0]->enc != NS_BF16 && t[0]->group != 32 && t[0]->group != 64)) {
+            fail(e, "%s and %s: not one dense encoding and width", names[0], names[i]);
+            return;
+        }
+        rows += t[i]->rows;
     }
     WSlice ws;
     memset(&ws, 0, sizeof ws);
     for (int s = 0; s < 4; ++s) {
-        const uint64_t la = t[0]->s[s].len, lb = t[1]->s[s].len;
-        uint8_t* h = la ? (uint8_t*) malloc(la + lb) : NULL;
+        uint64_t len = 0;
+        for (int i = 0; i < n; ++i) len += t[i]->s[s].len;
+        uint8_t* h = len ? (uint8_t*) malloc(len) : NULL;
         if (!h) continue;
-        memcpy(h, t[0]->s[s].p, la);
-        memcpy(h + la, t[1]->s[s].p, lb);
-        ws.p[s] = dmem(e, h, la + lb);
+        for (int i = 0, at = 0; i < n; at += (int) t[i++]->s[s].len) memcpy(h + at, t[i]->s[s].p, t[i]->s[s].len);
+        ws.p[s] = dmem(e, h, len);
         free(h);
     }
     if (t[0]->enc != NS_BF16) ws.gs = t[0]->group == 32 ? 5 : 6;
-    *w = (W) {t[0]->enc, 1, t[0]->rows + t[1]->rows, t[0]->cols, ws, (const WSlice*) dmem(e, &ws, sizeof ws)};
+    *w = (W) {t[0]->enc, 1, rows, t[0]->cols, ws, (const WSlice*) dmem(e, &ws, sizeof ws)};
 }
 // A BF16 vector of n values (any shape) as f32 in VRAM
 static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
@@ -217,19 +224,20 @@ static void load_layer(Q4Eng* e, int l) {
     for (int b = 0; b < 2; ++b) {
         const char* hc = b ? "mlp_hyper_connection" : "attn_hyper_connection";
         L->hc_norm[b] = load_v(e, HD, "%s.%d.%s.hc_norm.weight", p, l, hc);
-        char nd[192], ni[192];
-        snprintf(nd, sizeof nd, "%s.%d.%s.input_mix_weight_down.weight", p, l, hc);
-        snprintf(ni, sizeof ni, "%s.%d.%s.block_inject_weight.weight", p, l, hc);
-        load_cat(e, &L->hc_di[b], nd, ni);
+        char n[2][192];
+        snprintf(n[0], sizeof n[0], "%s.%d.%s.input_mix_weight_down.weight", p, l, hc);
+        snprintf(n[1], sizeof n[1], "%s.%d.%s.block_inject_weight.weight", p, l, hc);
+        load_cat(e, &L->hc_di[b], (const char* const[]) {n[0], n[1]}, 2);
         load_w(e, &L->hc_up[b], 0, "%s.%d.%s.input_mix_weight_up.weight", p, l, hc);
     }
     if (c->attn[l]) {
         const int nb = e->max_pos / c->ix_ratio + 1;
-        load_w(e, &L->q, 0, "%s.%d.self_attn.q_proj.weight", p, l);
-        load_w(e, &L->k, 0, "%s.%d.self_attn.k_proj.weight", p, l);
-        load_w(e, &L->v, 0, "%s.%d.self_attn.v_proj.weight", p, l);
+        const char* in[4] = {"q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"};
+        char n[4][192];
+        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.%d.self_attn.%s.weight", p, l, in[i]);
+        load_cat(e, &L->qkvi, (const char* const[]) {n[0], n[1], n[2], n[3]}, 4);
+        if (!e->err[0] && L->qkvi.rows != att_ld(c)) fail(e, "layer %d: attention projections of %d rows, not %d", l, L->qkvi.rows, att_ld(c));
         load_w(e, &L->o, 0, "%s.%d.self_attn.o_proj.weight", p, l);
-        load_w(e, &L->ix, 0, "%s.%d.self_attn.indexer.index_qk_proj.weight", p, l);
         L->qn = load_v(e, c->head_dim, "%s.%d.self_attn.q_norm.weight", p, l);
         L->kn = load_v(e, c->head_dim, "%s.%d.self_attn.k_norm.weight", p, l);
         L->iqn = load_v(e, c->ix_dim, "%s.%d.self_attn.indexer.q_layernorm.weight", p, l);
@@ -239,10 +247,11 @@ static void load_layer(Q4Eng* e, int l) {
         L->raw = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->ix_dim);
         L->blk = (float*) dmem(e, NULL, sizeof(float) * (size_t) nb * c->ix_dim);
     } else {
-        load_w(e, &L->qkv, 0, "%s.%d.linear_attn.in_proj_qkv.weight", p, l);
-        load_w(e, &L->z, 0, "%s.%d.linear_attn.in_proj_z.weight", p, l);
-        load_w(e, &L->b, 0, "%s.%d.linear_attn.in_proj_b.weight", p, l);
-        load_w(e, &L->a, 0, "%s.%d.linear_attn.in_proj_a.weight", p, l);
+        const char* in[4] = {"qkv", "z", "b", "a"};
+        char n[4][192];
+        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.%d.linear_attn.in_proj_%s.weight", p, l, in[i]);
+        load_cat(e, &L->in, (const char* const[]) {n[0], n[1], n[2], n[3]}, 4);
+        if (!e->err[0] && L->in.rows != gdn_ld(c)) fail(e, "layer %d: DeltaNet in_proj of %d rows, not %d", l, L->in.rows, gdn_ld(c));
         load_w(e, &L->out, 0, "%s.%d.linear_attn.out_proj.weight", p, l);
         L->gw.conv_w = load_v(e, (int64_t) cd * c->lin_conv, "%s.%d.linear_attn.conv1d.weight", p, l);
         L->gw.A_log = load_v(e, c->lin_hv, "%s.%d.linear_attn.A_log", p, l);
@@ -421,23 +430,22 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     if (e->cache && !e->err[0]) build_cache(e, o->cache_gb);
     const size_t T = (size_t) e->mt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
-    const size_t vd = (size_t) c->lin_hv * c->lin_dv, iw = (size_t) (c->ix_heads + 1) * c->ix_dim, kf = (size_t) c->top_k * c->ff_exp;
+    const size_t vd = (size_t) c->lin_hv * c->lin_dv, kf = (size_t) c->top_k * c->ff_exp;
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
 #define F(n) (float*) dmem(e, NULL, sizeof(float) * (n))
 #define I(n) (int32_t*) dmem(e, NULL, sizeof(int32_t) * (n))
     e->x = F(T * c->d); e->Hall = e->H = F((size_t) e->xr * HD); e->inj = F(T * c->hc); e->br = F(T * c->d);
     e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab);
     // Each stage's buffers live only inside the stage (x, br and inj carry between stages), so the stages share one region
-    const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared, kvw = (size_t) c->n_kv * c->head_dim;
+    const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
     const Buf mix[] = {{&e->normed, T * HD}, {&e->lo, T * (c->hc_rank + c->hc)}, {&e->up, T * HD}};
     const Buf pl[] = {{&e->emb, T * c->ple_dim}, {&e->keys, T * HD}, {&e->qs, T * HD}, {&e->vals, T * c->d}, {&e->gated, T * HD}};
-    const Buf att[] = {{&e->qp, T * c->n_head * 2 * c->head_dim}, {&e->kk, T * kvw}, {&e->vv, T * kvw},
-                       {&e->o, T * c->n_head * c->head_dim}, {&e->ixo, T * iw}, {&e->sc, T * nb}};
-    const Buf lin[] = {{&e->y, T * vd}, {&e->cv, T * cd}, {&e->qkvb, T * cd}, {&e->zb, T * vd}, {&e->bb, T * c->lin_hv}, {&e->ab, T * c->lin_hv}};
+    const Buf att[] = {{&e->qp, T * att_ld(c)}, {&e->o, T * c->n_head * c->head_dim}, {&e->sc, T * nb}};
+    const Buf lin[] = {{&e->y, T * vd}, {&e->cv, T * cd}, {&e->qkvb, T * gdn_ld(c)}};
     const Buf ffn[] = {{&e->lg, T * c->n_exp}, {&e->wt, T * c->top_k}, {&e->A, T * ka}, {&e->Gb, T * ka}, {&e->Ub, T * ka},
                        {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}, {&e->sgv, T}};
     const Buf* grp[] = {mix, pl, att, lin, ffn};
-    const int ng[] = {3, 5, 6, 6, 8};
+    const int ng[] = {3, 5, 3, 3, 8};
     size_t most = 0;
     for (int i = 0; i < 5; ++i) if (bufs_len(grp[i], ng[i]) > most) most = bufs_len(grp[i], ng[i]);
     float* work = F(most);
@@ -617,25 +625,24 @@ static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first
 
 static int attention(Q4Eng* e, Layer* L, int T) {
     const Qwen4Cfg* c = &e->c;
-    const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio, iw = (c->ix_heads + 1) * D;
-    mv(e, &L->q, e->x, e->qp, T);
-    mv(e, &L->k, e->x, e->kk, T);
-    mv(e, &L->v, e->x, e->vv, T);
-    mv(e, &L->ix, e->x, e->ixo, T);
+    const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio;
+    const int ld = att_ld(c);   // a row of qp: q, k, v, the indexer's q heads and key
+    float* kk = e->qp + (size_t) c->n_head * 2 * hd, *vv = kk + kvw, *ixo = vv + kvw;
+    mv(e, &L->qkvi, e->x, e->qp, T);
     mark(e, ST_PROJ);
-    kq4_head_norm_rope(e->s, c, e->qp, c->n_head * 2 * hd, c->n_head, 2 * hd, hd, L->qn, 0, e->din, T);
-    kq4_head_norm_rope(e->s, c, e->kk, kvw, c->n_kv, hd, hd, L->kn, 0, e->din, T);
-    kq4_store(e->s, L->K, kvw, e->kk, kvw, 0, e->din, T);
-    kq4_store(e->s, L->V, kvw, e->vv, kvw, 0, e->din, T);
-    kq4_store(e->s, L->raw, D, e->ixo + (size_t) c->ix_heads * D, iw, 0, e->din, T);
-    kq4_head_norm_rope(e->s, c, e->ixo, iw, c->ix_heads, D, D, L->iqn, 0, e->din, T);
+    kq4_head_norm_rope(e->s, c, e->qp, ld, c->n_head, 2 * hd, hd, L->qn, 0, e->din, T);
+    kq4_head_norm_rope(e->s, c, kk, ld, c->n_kv, hd, hd, L->kn, 0, e->din, T);
+    kq4_store(e->s, L->K, kvw, kk, ld, 0, e->din, T);
+    kq4_store(e->s, L->V, kvw, vv, ld, 0, e->din, T);
+    kq4_store(e->s, L->raw, D, ixo + (size_t) c->ix_heads * D, ld, 0, e->din, T);
+    kq4_head_norm_rope(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, 0, e->din, T);
     mark(e, ST_ROPE);
     kq4_qsa_blocks(e->s, c, L->raw, L->ikn, 0, e->din, T, L->blk);
     kq4_qsa_rows(e->s, c, 0, e->din, e->done, e->nsel, T);
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
-    kq4_qsa_select(e->s, c, e->ixo, iw, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
+    kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
     mark(e, ST_QSA);
-    if (kq4_attend(e->s, c, e->qp, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
+    if (kq4_attend_ld(e->s, c, e->qp, ld, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
     mark(e, ST_ATTN);
     mv(e, &L->o, e->o, e->br, T);
     mark(e, ST_PROJ);
@@ -643,12 +650,12 @@ static int attention(Q4Eng* e, Layer* L, int T) {
 }
 
 static int gdn(Q4Eng* e, Layer* L, int T) {
-    mv(e, &L->qkv, e->x, e->qkvb, T);
-    mv(e, &L->z, e->x, e->zb, T);
-    mv(e, &L->b, e->x, e->bb, T);
-    mv(e, &L->a, e->x, e->ab, T);
+    const Qwen4Cfg* c = &e->c;
+    const int cd = 2 * c->lin_hk * c->lin_dk + c->lin_hv * c->lin_dv;
+    const float* z = e->qkvb + cd, *b = z + (size_t) c->lin_hv * c->lin_dv, *a = b + c->lin_hv;   // the columns of a row of qkvb
+    mv(e, &L->in, e->x, e->qkvb, T);
     mark(e, ST_PROJ);
-    if (kq4_gdn(e->s, &e->c, L->gw, e->qkvb, e->zb, e->ab, e->bb, L->conv, L->S, e->cv, e->y, T)) return fail(e, "Gated DeltaNet head widths not supported");
+    if (kq4_gdn_ld(e->s, c, L->gw, e->qkvb, z, a, b, gdn_ld(c), L->conv, L->S, e->cv, e->y, T)) return fail(e, "Gated DeltaNet head widths not supported");
     mark(e, ST_GDN);
     mv(e, &L->out, e->y, e->br, T);
     mark(e, ST_PROJ);

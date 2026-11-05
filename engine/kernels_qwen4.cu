@@ -33,19 +33,19 @@ static __device__ __forceinline__ float warp_max(float v) {
 // ---- Gated DeltaNet ---------------------------------------------------------------------------------------------------
 
 // Thread (channel, token): cv = silu(causal conv of the last K inputs); inputs before the chunk come from conv.
-__global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, const float* conv, float* cv) {
+__global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, int ld, const float* conv, float* cv) {   // qkv rows ld apart
     const int ch = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (ch >= cd) return;
-    float acc = w[(size_t) ch * K + K - 1] * qkv[(size_t) t * cd + ch];
-    for (int k = 0, u = t - (K - 1); k < K - 1; ++k, ++u) acc += w[(size_t) ch * K + k] * (u >= 0 ? qkv[(size_t) u * cd + ch] : conv[(size_t) (K - 1 + u) * cd + ch]);
+    float acc = w[(size_t) ch * K + K - 1] * qkv[(size_t) t * ld + ch];
+    for (int k = 0, u = t - (K - 1); k < K - 1; ++k, ++u) acc += w[(size_t) ch * K + k] * (u >= 0 ? qkv[(size_t) u * ld + ch] : conv[(size_t) (K - 1 + u) * cd + ch]);
     cv[(size_t) t * cd + ch] = acc * sigm(acc);
 }
 // conv keeps the last K - 1 inputs
-__global__ void k_q4_gdn_conv_keep(int cd, int K, const float* qkv, float* conv, int T) {
+__global__ void k_q4_gdn_conv_keep(int cd, int K, const float* qkv, int ld, float* conv, int T) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= cd) return;
     float st[7];
-    for (int k = 0, u = T - (K - 1); k < K - 1; ++k, ++u) st[k] = u >= 0 ? qkv[(size_t) u * cd + ch] : conv[(size_t) (K - 1 + u) * cd + ch];
+    for (int k = 0, u = T - (K - 1); k < K - 1; ++k, ++u) st[k] = u >= 0 ? qkv[(size_t) u * ld + ch] : conv[(size_t) (K - 1 + u) * cd + ch];
     for (int k = 0; k < K - 1; ++k) conv[(size_t) k * cd + ch] = st[k];
 }
 
@@ -60,7 +60,7 @@ __global__ void k_q4_gdn_qknorm(int cd, int kd, float* cv) {
 }
 
 typedef struct {
-    int cd, kd, vd, hv, rep, dv;
+    int cd, kd, vd, hv, rep, dv, abld;   // abld: the rows of a and b are abld apart
 } GdnArgs;
 
 // Block = 32 value rows of head hv (grid hv x dv / 32). SPLIT threads hold one row's state column S[hv][.][i] in
@@ -87,8 +87,8 @@ static __device__ __forceinline__ void gdn_fetch(const GdnArgs& a, const float* 
     for (int x = threadIdx.x; x < nt * 8; x += blockDim.x)
         __pipeline_memcpy_async(&st->v[x / 8][x % 8], cv + (size_t) (t0 + x / 8) * a.cd + 2 * a.kd + (size_t) hv * a.dv + blockIdx.y * 32 + 4 * (x % 8), 16);
     if (threadIdx.x < nt) {
-        __pipeline_memcpy_async(&st->a[threadIdx.x], aa + (size_t) (t0 + threadIdx.x) * a.hv + hv, 4);
-        __pipeline_memcpy_async(&st->b[threadIdx.x], bb + (size_t) (t0 + threadIdx.x) * a.hv + hv, 4);
+        __pipeline_memcpy_async(&st->a[threadIdx.x], aa + (size_t) (t0 + threadIdx.x) * a.abld + hv, 4);
+        __pipeline_memcpy_async(&st->b[threadIdx.x], bb + (size_t) (t0 + threadIdx.x) * a.abld + hv, 4);
     }
     __pipeline_commit();
 }
@@ -141,21 +141,21 @@ __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const flo
 }
 
 // Block (head, token), thread = value row: RMSNorm over the head (plain weight), gated by sigmoid(z)
-__global__ void k_q4_gdn_norm(int hv, int dv, float eps, const float* norm_w, const float* z, float* y) {
+__global__ void k_q4_gdn_norm(int hv, int dv, float eps, const float* norm_w, const float* z, int zld, float* y) {   // z rows zld apart
     __shared__ float red[32];
     const size_t o = ((size_t) blockIdx.y * hv + blockIdx.x) * dv + threadIdx.x;
     const float v = y[o], r = rsqrtf(block_sum(v * v, red) / dv + eps);
-    y[o] = v * r * norm_w[threadIdx.x] * sigm(z[o]);
+    y[o] = v * r * norm_w[threadIdx.x] * sigm(z[(size_t) blockIdx.y * zld + (size_t) blockIdx.x * dv + threadIdx.x]);
 }
 
-int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b,
-            float* conv, float* S, float* cv, float* y, int T) {
+static int gdn_run(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, int qld, const float* z, int zld, const float* a,
+                   const float* b, int abld, float* conv, float* S, float* cv, float* y, int T) {
     const int kd = c->lin_hk * c->lin_dk, vd = c->lin_hv * c->lin_dv, cd = 2 * kd + vd;
     if (c->lin_conv < 1 || c->lin_conv > 8 || c->lin_dv % 32 || c->lin_dv > 1024) return -1;
-    k_q4_gdn_conv<<<dim3((unsigned) (cd + 255) / 256, (unsigned) T), 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, conv, cv);
-    k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, conv, T);
+    k_q4_gdn_conv<<<dim3((unsigned) (cd + 255) / 256, (unsigned) T), 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, qld, conv, cv);
+    k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, qld, conv, T);
     k_q4_gdn_qknorm<<<dim3((unsigned) T, (unsigned) c->lin_hk), (unsigned) c->lin_dk, 0, s>>>(cd, kd, cv);
-    const GdnArgs ga = {cd, kd, vd, c->lin_hv, c->lin_hv / c->lin_hk, c->lin_dv};
+    const GdnArgs ga = {cd, kd, vd, c->lin_hv, c->lin_hv / c->lin_hk, c->lin_dv, abld};
     const dim3 grid((unsigned) c->lin_hv, (unsigned) c->lin_dv / 32);
     switch (c->lin_dk) {
     case 32: k_q4_gdn_step<32, 1><<<grid, 32, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, y, T); break;
@@ -163,8 +163,17 @@ int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, con
     case 128: k_q4_gdn_step<128, 2><<<grid, 64, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, y, T); break;
     default: return -1;
     }
-    k_q4_gdn_norm<<<dim3((unsigned) c->lin_hv, (unsigned) T), (unsigned) c->lin_dv, 0, s>>>(c->lin_hv, c->lin_dv, c->eps, w.norm_w, z, y);
+    k_q4_gdn_norm<<<dim3((unsigned) c->lin_hv, (unsigned) T), (unsigned) c->lin_dv, 0, s>>>(c->lin_hv, c->lin_dv, c->eps, w.norm_w, z, zld, y);
     return 0;
+}
+int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b,
+            float* conv, float* S, float* cv, float* y, int T) {
+    const int vd = c->lin_hv * c->lin_dv;
+    return gdn_run(s, c, w, qkv, 2 * c->lin_hk * c->lin_dk + vd, z, vd, a, b, c->lin_hv, conv, S, cv, y, T);
+}
+int kq4_gdn_ld(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b, int ld,
+               float* conv, float* S, float* cv, float* y, int T) {
+    return gdn_run(s, c, w, qkv, ld, z, ld, a, b, ld, conv, S, cv, y, T);
 }
 
 // ---- RMSNorm (1 + w) and the hyper-connection pointwise steps --------------------------------------------------------
@@ -440,7 +449,7 @@ void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, 
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 typedef struct {
-    int nh, nkv, hd, R, topk, pos0;
+    int nh, nkv, hd, R, topk, pos0, qld;   // qld: the rows of q are qld apart
     float scale;
 } AttArgs;
 
@@ -451,7 +460,7 @@ __global__ void __launch_bounds__(256) k_q4_attend(AttArgs a, const float* q, co
     __shared__ float sm[8], sl[8], sacc[8][256];
     const int h = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, dl = a.hd / 32, g = h / (a.nh / a.nkv);
     const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
-    const float* qh = q + ((size_t) t * a.nh + h) * 2 * a.hd;
+    const float* qh = q + (size_t) t * a.qld + (size_t) h * 2 * a.hd;
     float qv[8], acc[8], m = -INFINITY, l = 0;
     for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
     for (int k = w; k < n; k += 8) {
@@ -488,7 +497,7 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
     __shared__ int keys[AT_KT];
     const int g = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, dl = a.hd / 32, h = g * (a.nh / a.nkv) + w;
     const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
-    const float* qh = q + ((size_t) t * a.nh + h) * 2 * a.hd;
+    const float* qh = q + (size_t) t * a.qld + (size_t) h * 2 * a.hd;
     float* Vs = kvs + AT_KT * a.hd;
     float qv[8], acc[8], m = -INFINITY, l = 0;
     for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
@@ -576,7 +585,7 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
     const int hd = a.hd, ld = hd + 8, G = a.nh / a.nkv, g = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, tid = threadIdx.x, ds = hd / 4;
     const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
     float* Ks = tcs, *Sp = Ks + TC_KT * ld, *Ps = Sp + 4 * 256;
-    const float* qg = q + ((size_t) t * a.nh + (size_t) g * G) * 2 * hd;   // head h of the group: qg + h * 2 hd
+    const float* qg = q + (size_t) t * a.qld + (size_t) g * G * 2 * hd;   // head h of the group: qg + h * 2 hd
     for (int x = tid; x < 16 * hd; x += blockDim.x) Ks[x / hd * ld + x % hd] = x / hd < G ? qg[(size_t) (x / hd) * 2 * hd + x % hd] : 0.0f;
     if (tid < 16) { mx[tid] = -INFINITY; sum[tid] = 0.0f; }
     __syncthreads();
@@ -676,8 +685,12 @@ void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks) {   // the promp
 
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T) {
+    return kq4_attend_ld(s, c, q, c->n_head * 2 * c->head_dim, K, V, pos0, dpos, sel, nsel, o, T);
+}
+int kq4_attend_ld(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
+                  const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, int T) {
     if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv) return -1;
-    const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, 1.0f / sqrtf((float) c->head_dim)};
+    const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, qld, 1.0f / sqrtf((float) c->head_dim)};
     const int G = c->n_head / c->n_kv;
     if (T > 8 && attend_tc(c))   // prompt rows on tensor cores
         k_q4_attend_tc<<<dim3((unsigned) c->n_kv, (unsigned) T), 128, tc_smem(c->head_dim), s>>>(a, q, K, V, sel, nsel, dpos, o);

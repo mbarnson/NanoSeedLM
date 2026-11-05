@@ -16,6 +16,9 @@ typedef struct {
 // 128, dv a multiple of 32 up to 1024 and the conv kernel at most 8.
 int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b,
             float* conv, float* S, float* cv, float* y, int T);
+// The same, with the rows of qkv, z, a and b ld floats apart (the columns of one GEMM's output)
+int kq4_gdn_ld(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b, int ld,
+               float* conv, float* S, float* cv, float* y, int T);
 // y[t] = qwen4_norm1p(x[t], len, g, w, eps) for t < T (y may be x)
 void kq4_norm1p(cudaStream_t s, const float* x, int len, int g, const float* w, float eps, float* y, int T);
 // the hyper-connection pointwise steps of qwen4_ops.h for T tokens: lo[T][rank], up and normed [T][hc * d], mixed [T][d],
@@ -55,6 +58,9 @@ void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, 
 // sel[t][budget / ratio]; o[t][n_head][head_dim].  -1 unless head_dim is a multiple of 32, at most 256.
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T);
+// The same, with the rows of q qld floats apart
+int kq4_attend_ld(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
+                  const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, int T);
 // Q4E_PROFILE: the prompt-row attention kernel's registers a thread and blocks an SM
 void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks);
 
