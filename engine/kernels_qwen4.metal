@@ -24,6 +24,10 @@ typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit, smin, 
 #define ATG_MAX_SPLIT 32
 typedef struct { int w, ss, pos0, pad; } Q4StoreArgs;                 // cache rows: width, source row stride, first position
 typedef struct { int d, k, pad[2]; } Q4CombineArgs;                   // MoE combine: hidden size, top k
+#ifndef GDN_SPLIT128
+#define GDN_SPLIT128 4   // k_q4_gdn_step, dk 128: adjacent lanes that share a value row's state (dk / GDN_SPLIT128 values each)
+#endif
+#define Q4_GDN_SPLIT(dk) ((dk) == 128 ? GDN_SPLIT128 : 1)   // threads 32 * Q4_GDN_SPLIT(dk) a threadgroup
 #ifndef ATG_NQ
 #define ATG_NQ 4   // k_q4_attend_g: simdgroups a head tile (the head dims in ATG_NQ parts); 2 ATG_NQ in all
 #endif
@@ -103,11 +107,11 @@ kernel void k_q4_gdn_step(GDN_STEP_ARGS) {
         threadgroup const float* qp = q + p * DJ;
         float kv = 0;
         for (int j = 0; j < DJ; ++j) kv += s[j] * kp[j];
-        if (SPLIT == 2) kv += simd_shuffle_xor(kv, (ushort) 1);
+        for (ushort o = 1; o < SPLIT; o <<= 1) kv += simd_shuffle_xor(kv, o);
         const float delta = (c[2 * a.kd + hv * a.dv + i] - g * kv * sk) * beta;
         float yq = 0;
         for (int j = 0; j < DJ; ++j) { s[j] = g * s[j] + delta * kp[j] * sk; yq += s[j] * qp[j]; }
-        if (SPLIT == 2) yq += simd_shuffle_xor(yq, (ushort) 1);
+        for (ushort o = 1; o < SPLIT; o <<= 1) yq += simd_shuffle_xor(yq, o);
         if (p == 0) y[(ulong) t * a.vd + (ulong) hv * a.dv + i] = yq * sq;
         if (a.keep && t + 1 < a.T) {
             device float* ks = (t == 0 ? k0 : t == 1 ? k1 : k2) + (St - S);
@@ -118,7 +122,7 @@ kernel void k_q4_gdn_step(GDN_STEP_ARGS) {
 }
 template [[host_name("k_q4_gdn_step_32")]] kernel void k_q4_gdn_step<32, 1>(GDN_STEP_ARGS);
 template [[host_name("k_q4_gdn_step_64")]] kernel void k_q4_gdn_step<64, 1>(GDN_STEP_ARGS);
-template [[host_name("k_q4_gdn_step_128")]] kernel void k_q4_gdn_step<128, 2>(GDN_STEP_ARGS);
+template [[host_name("k_q4_gdn_step_128")]] kernel void k_q4_gdn_step<128, GDN_SPLIT128>(GDN_STEP_ARGS);
 
 // Threadgroup (head, token), thread = value row (dv threads): RMSNorm over the head (plain weight), gated by sigmoid(z)
 kernel void k_q4_gdn_norm(constant Q4GNormArgs& a [[buffer(0)]], device const float* norm_w [[buffer(1)]], device const float* z [[buffer(2)]],

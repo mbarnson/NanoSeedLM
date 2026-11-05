@@ -792,7 +792,7 @@ int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const flo
     const Q4ConvArgs ca = {(int) cd, K, T, 0};
     const Q4GdnArgs ga = {(int) cd, c->lin_hk * dk, (int) vd, hv, hv / c->lin_hk, dv, T, 0};
     const Q4GNormArgs na = {hv, dv, c->eps, 0};
-    const int split = dk == 128 ? 2 : 1;
+    const int split = Q4_GDN_SPLIT(dk);
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, pc, &ca, sizeof ca, @[wb, qb, cb, cvb]);
             [e dispatchThreads:TGS(cd, 1) threadsPerThreadgroup:TGS(256, 1)];

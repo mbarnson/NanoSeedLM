@@ -651,7 +651,7 @@ static void gdn(Q4Eng* e, Layer* L, int T) {
     B(e, 6, L->S, 0);
     B(e, 7, e->y, 0);
     bind_keep(e, 8, L->kS, L->S);
-    tgs(e, (uint64_t) hv, (uint64_t) dv / 32, 32 * (dk == 128 ? 2 : 1));
+    tgs(e, (uint64_t) hv, (uint64_t) dv / 32, 32 * Q4_GDN_SPLIT(dk));
     const Q4GNormArgs na = {hv, dv, c->eps, 0};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_gdn_norm")];
     A_(e, &na, sizeof na);
