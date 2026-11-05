@@ -404,3 +404,10 @@ token. Read [the tier simulation](results/2026-11-04-qwen38-tier-sim.md).
 
 A draft for Matt's go: S3 or P3 for all experts, and P4 for the session's hot set, moved by the engine. Read
 [the adaptive tiers plan](plans/2026-11-04-qwen38-adaptive-tiers.md).
+
+## [2026-11-04] result | Long-prompt prefill of Qwen3.8-Flash-Next by stage, and four kernel changes
+
+`ac11534` to `d1cff61`: the PLE rows on 16 threads, attention a block for each KV group and row, DeltaNet q and k
+normalised once a token, and a softmax step a tile of keys. A 15,922-token prompt went from 1,026 to 1,234 tokens per
+second on an RTX PRO 6000. `39967ad` fixes `Q4E_PROFILE` for long prompts. Read
+[prefill by stage](results/2026-11-04-qwen38-prefill-stages.md).
