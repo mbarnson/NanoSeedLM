@@ -654,3 +654,11 @@ same text. The host PLE prefetch took 1,075 ms of a 256-token run, and now takes
 4,315 ms on `ecd552f` and take 403 ms now. So the MTP measurement on the 4080 gets a rerun. `3f570f3` also drops the
 experts' file pages after the pinned copy: the load peak fell from more than 111 GB to 59.7 GB. Read
 [PLE rows on a thread pool](results/2026-11-05-qwen38-4080-ple-pool.md).
+
+## [2026-11-05] result | MTP drafts on the RTX 4080, again: the same text, slower
+
+`3f570f3`, pc-cuda's RTX 4080, P3, the automatic cache. Greedy text with 0 to 3 drafts has the same md5 on both
+prompts. Code decodes at 37.6 tokens per second without drafts and 29.0 to 32.5 with drafts. Chat decodes at 38.9
+without drafts and 24.1 to 32.7 with drafts. The head takes about 1.9 GB of the cache, and each verify row pays the
+PCIe copies of its missed experts. Drafts stay off by default on CUDA. On the M4 Max they make code 31% to 37% faster.
+Read [MTP drafts on the RTX 4080, again](results/2026-11-05-qwen38-mtp-4080-rerun.md).
