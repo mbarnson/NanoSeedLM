@@ -160,48 +160,53 @@ static void cpu_tail_check(void) {
     const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
     snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_seeds", tmp);
     if (seed_fixture(dir, err, sizeof err)) { CHECK(0, "seed fixture: %s", err); return; }
+    enum { NR = 5, ND = 20 };   // decode steps
     int32_t ids[40];
-    float* lg[4] = {NULL, NULL, NULL, NULL};
-    uint64_t miss[4] = {0, 0, 0, 0};
-    for (int run = 0; run < 4; ++run) {   // the GPU, the CPU tail twice, the tail dropped
+    float* lg[NR] = {NULL};
+    uint64_t miss[NR] = {0};
+    int V = 0;
+    for (int run = 0; run < NR; ++run) {   // the GPU, the CPU tail twice, the tail dropped, the GPU with every expert in VRAM
         Q4EOpts o;
         memset(&o, 0, sizeof o);
         o.max_pos = 64;
-        o.cache_gb = 1e-5;   // a cache of one layer's experts: misses in every layer
+        o.cache_gb = run == 4 ? 0 : 1e-5;   // 1e-5: a cache of one layer's experts, misses in every layer
         o.cpu_tail = run == 1 || run == 2;   // the tiny model routes 3 of 8 experts
         o.tail_skip = run == 3;
         Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
         if (!e && run && strstr(err, "Clang")) { printf("cpu_tail: skipped (%s)\n", err); break; }
-        CHECK(e != NULL, "open the seed fixture (cpu_tail %d): %s", o.cpu_tail, err);
+        CHECK(e != NULL, "open the seed fixture (run %d): %s", run, err);
         if (!e) break;
-        const int V = q4e_cfg(e)->vocab;
+        V = q4e_cfg(e)->vocab;
         for (int i = 0; i < 40; ++i) ids[i] = (i * 37 + 11) % V;
-        lg[run] = (float*) malloc(sizeof(float) * (size_t) V);
+        lg[run] = (float*) malloc(sizeof(float) * (size_t) V * ND);
         int rc = q4e_forward(e, ids, 20, NULL);
-        for (int t = 20; !rc && t < 40; ++t) rc = q4e_forward(e, ids + t, 1, lg[run]);
-        CHECK(rc == 0, "decode with cpu_tail %d: %s", o.cpu_tail, q4e_error(e));
+        for (int t = 0; !rc && t < ND; ++t) rc = q4e_forward(e, ids + 20 + t, 1, lg[run] + (size_t) t * V);
+        CHECK(rc == 0, "decode (run %d): %s", run, q4e_error(e));
         uint64_t h;
         int slots;
         q4e_cache_stats(e, &h, &miss[run], &slots);
-        if (run == 3) {
-            double d = 0, dd = 0, m = 1e-30;
-            int bad = 0;
-            for (int v = 0; v < V; ++v) {
-                bad += !isfinite(lg[1][v]);
-                d = fmax(d, fabs((double) lg[1][v] - lg[0][v]));
-                dd = fmax(dd, fabs((double) lg[3][v] - lg[0][v]));
-                m = fmax(m, fabs((double) lg[0][v]));
-            }
-            const int same = !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V);
-            printf("cpu_tail on the seed fixture: logits within %.1e of the GPU's (the tail dropped: %.1e), %llu misses against %llu\n",
-                   d / m, dd / m, (unsigned long long) miss[1], (unsigned long long) miss[0]);
-            CHECK(!bad && d / m < 1e-4 && dd / m > 1e-2 && same && miss[1] < miss[0],
-                  "cpu_tail: logits %.1e from the GPU's (dropped %.1e), runs %s, misses %llu / %llu", d / m, dd / m,
-                  same ? "equal" : "differ", (unsigned long long) miss[1], (unsigned long long) miss[0]);
-        }
         q4e_close(e);
     }
-    for (int i = 0; i < 4; ++i) free(lg[i]);
+    if (lg[NR - 1]) {
+        double d[NR][2] = {{0}}, m = 1e-30;   // [run][first step, last step]: max |logit - the GPU's| / max |the GPU's|
+        int bad = 0;
+        for (int v = 0; v < V; ++v) m = fmax(m, fabs((double) lg[0][(size_t) (ND - 1) * V + v]));
+        for (int run = 1; run < NR; ++run)
+            for (int st = 0; st < 2; ++st)
+                for (int v = 0; v < V; ++v) {
+                    const size_t i = (size_t) (st ? ND - 1 : 0) * V + v;
+                    bad += !isfinite(lg[run][i]);
+                    d[run][st] = fmax(d[run][st], fabs((double) lg[run][i] - lg[0][i]) / m);
+                }
+        const int same = !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V * ND);
+        printf("cpu_tail on the seed fixture: logits %.1e / %.1e (first / last step) from the GPU's; the tail dropped %.1e / %.1e; "
+               "the GPU with all experts in VRAM %.1e / %.1e; %llu misses against %llu\n", d[1][0], d[1][1], d[3][0], d[3][1], d[4][0], d[4][1],
+               (unsigned long long) miss[1], (unsigned long long) miss[0]);
+        CHECK(!bad && d[1][1] < 1e-4 && d[3][1] > 1e-2 && same && miss[1] < miss[0],
+              "cpu_tail: logits %.1e from the GPU's (dropped %.1e), runs %s, misses %llu / %llu", d[1][1], d[3][1],
+              same ? "equal" : "differ", (unsigned long long) miss[1], (unsigned long long) miss[0]);
+    }
+    for (int i = 0; i < NR; ++i) free(lg[i]);
 }
 
 int main(void) {

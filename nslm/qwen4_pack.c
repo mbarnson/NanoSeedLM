@@ -96,16 +96,31 @@ static int write_config(Json* c, const char* out, const char* loader_name, const
     return fclose(f);
 }
 
+// The default loader: tools/ of the working directory, else of the repository that built this tool (out/bin, build/bin)
+static const char* find_loader(const char* exe, char* buf, size_t n) {
+    FILE* f = fopen("tools/nanoseedlm_qwen4.py", "rb");
+    if (f) { fclose(f); return "tools/nanoseedlm_qwen4.py"; }
+    const char* sl = strrchr(exe, '/'), *bs = strrchr(exe, '\\');
+    if (bs > sl) sl = bs;
+    snprintf(buf, n, "%.*s../../tools/nanoseedlm_qwen4.py", sl ? (int) (sl - exe + 1) : 0, exe);
+    return buf;
+}
+
 int main(int argc, char** argv) {
     const char* base = opt(argc, argv, "--base", NULL), *out = opt(argc, argv, "--out", NULL);
     const char* blk3 = opt(argc, argv, "--blk", NULL), *blk4 = opt(argc, argv, "--blk4", NULL), *blk = blk4 ? blk4 : blk3;
     const int P = blk4 ? 4 : 3;
-    const char* loader = opt(argc, argv, "--loader", "tools/nanoseedlm_qwen4.py");
+    char lbuf[2048];
+    const char* loader = opt(argc, argv, "--loader", NULL);
+    if (!loader) loader = find_loader(argv[0], lbuf, sizeof lbuf);
     const uint64_t shard = (uint64_t) (atof(opt(argc, argv, "--shard-gb", "4.5")) * 1e9);
     if (!base || !out || !blk3 == !blk4) {
         fprintf(stderr, "usage: nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR) --out DIR [--loader FILE] [--shard-gb 4.5]\n");
         return 2;
     }
+    FILE* lf = fopen(loader, "rb");   // before the pack's hours, not after
+    if (!lf) { fprintf(stderr, "%s: no loader (give --loader tools/nanoseedlm_qwen4.py)\n", loader); return 2; }
+    fclose(lf);
     Json* cfg = read_json(base, "config.json"), *idx = read_json(base, "model.safetensors.index.json");
     if (!cfg || !idx) return 2;
     int D = 0, F = 0, E = 0, L = 0;
