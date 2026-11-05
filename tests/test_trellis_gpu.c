@@ -1,7 +1,8 @@
 // tests/test_trellis_gpu.c - the trellis encoder on CUDA (nslm/trellis.cu) against the C reference (nslm_tq_encode_row):
 // the same words, scales and error, bit for bit, at L = 12 and 16, K = 2 to 4, gate/up (T = 256) and down (T = 320)
-// blocks, a short last block, with and without importance weights, and a zero row (scale 0).
+// blocks, a short last block, with and without importance weights, a zero row (scale 0), and two threads at once.
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,23 @@ static void one(NslmTqGpu* g, int rows, int cols, int T, int L, int K, int imat,
     free(w); free(h); free(gw); free(cw); free(gs); free(cs); free(ge);
 }
 
+// Two threads with their own handles, gate/up and down blocks at once (nslm-moe's workers): no launch may fail
+typedef struct { int T, cols, fails; } Par;
+static void* par_run(void* arg) {
+    Par* p = (Par*) arg;
+    char msg[256];
+    NslmTqGpu* g = nslm_tq_gpu_open(msg, sizeof msg);
+    float* w = calloc((size_t) 64 * p->cols, sizeof(float));
+    uint32_t* words = malloc(sizeof(uint32_t) * nslm_tq_row_words(p->cols, p->T, 12, 3) * 64);
+    uint16_t* sc = malloc(sizeof(uint16_t) * 64 * (size_t) (p->cols / p->T));
+    for (int i = 0; i < 64 * p->cols; ++i) w[i] = (float) ((i * 7919 % 2001) - 1000) * 2e-5f;
+    for (int it = 0; it < 200 && g; ++it) p->fails += nslm_tq_gpu_encode(g, w, NULL, 64, p->cols, p->T, 12, 3, words, sc, NULL, msg, sizeof msg) != 0;
+    if (!g) p->fails = 1;
+    nslm_tq_gpu_close(g);
+    free(w); free(words); free(sc);
+    return NULL;
+}
+
 int main(void) {
     char err[256];
     NslmTqGpu* g = nslm_tq_gpu_open(err, sizeof err);
@@ -68,6 +86,16 @@ int main(void) {
         uint32_t words[64];
         uint16_t sc[4];
         CHECK(nslm_tq_gpu_encode(g, w, NULL, 1, 16, 16, 6, 4, words, sc, NULL, err, sizeof err) != 0, "2 K > L accepted");
+    }
+    {
+        Par a = {256, 2560, 0}, b = {320, 640, 0};
+        pthread_t ta, tb;
+        pthread_create(&ta, NULL, par_run, &a);
+        pthread_create(&tb, NULL, par_run, &b);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        printf("two threads, T 256 and T 320, 200 calls each: %d and %d failed\n", a.fails, b.fails);
+        CHECK(!a.fails && !b.fails, "concurrent encodes failed");
     }
     nslm_tq_gpu_close(g);
     printf("test_trellis_gpu: %s\n", failures ? "FAIL" : "PASS");
