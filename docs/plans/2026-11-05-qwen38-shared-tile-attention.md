@@ -4,7 +4,8 @@
 At 15,922 tokens it takes 480 ms of 3.73 s (13%). Each block takes one row and one KV group, and loads its own
 selected keys. Neighbouring rows select most of the same blocks, so most of those loads repeat.
 
-**Status.** Planned. The work is in cloud's files only: `engine/kernels_qwen4.cu` and its kernel test.
+**Status.** Stopped at gate G2: the kernel was 1.7 times slower, and `c036709` reverts it
+([shared key tiles](../results/2026-11-05-qwen38-shared-tile-attention.md)). Gates G1 and G3 passed.
 
 ## Key numbers
 

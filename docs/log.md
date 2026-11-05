@@ -491,3 +491,9 @@ blocks give the same speed. Read [faster decode norms and RoPE](results/2026-11-
 passes. The shared expert runs on a second stream in decode (+2.5% at short prompts). The decode rows' KL against the
 prompt rows is the same (0.0271 and 0.0272). Read [long-context decode](results/2026-11-05-qwen38-long-context-decode.md).
 
+## [2026-11-05] result | Prompt attention over 4 rows' shared key tiles is slower
+
+`3ef4599`, reverted by `c036709`: a block of 4 prompt rows loaded each key tile of their union once, 2.7 times fewer
+loads. Attention went from 480 to 805 ms at 15,922 tokens, and from 895 to 1,600 at 29,120. The old kernel is not
+bound by its loads. Read [shared key tiles](results/2026-11-05-qwen38-shared-tile-attention.md).
+

@@ -49,7 +49,7 @@ Work that is not done yet, with its gates and hypotheses.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
   64, 96 and 128 GB of RAM and a 12 GB GPU. Each must match an Unsloth V3.1 pack.
 - [2026-11-05: Prompt attention that loads each key tile once for several rows](plans/2026-11-05-qwen38-shared-tile-attention.md):
-  4 neighbouring rows select about 1.5 times one row's blocks, so their K and V loads can fall 2.7 times.
+  stopped: 2.7 times fewer key loads, but 1.7 times slower.
 
 ## Results
 
@@ -118,6 +118,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   P3 decode 54.6 to 56.5 tokens per second (8 GB cache, RTX PRO 6000), the same text. More copy blocks do not help.
 - [2026-11-05: Long-context decode 34% faster](results/2026-11-05-qwen38-long-context-decode.md): after 15,975
   tokens, P3 decode 43.8 to 58.8 tokens per second (split-key attention, 8-bit QSA top-k). Decode-row KL unchanged.
+- [2026-11-05: Prompt attention over 4 rows' shared key tiles is slower](results/2026-11-05-qwen38-shared-tile-attention.md):
+  480 to 805 ms at 15,922 tokens with 2.7 times fewer key loads. Reverted.
 
 ## For contributors and agents
 
