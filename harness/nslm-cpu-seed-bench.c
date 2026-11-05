@@ -1,8 +1,9 @@
 // harness/nslm-cpu-seed-bench.c - CPU P = 4 seed mat-vec throughput (G weights / s) by thread count, on random
 // seed matrices shaped like MoVA's routed experts (gate / up: 768 x 2560, down: 2560 x 768) and its decode step; and
 // per token for 2 and 4 tokens at once (an MTP verify window), at P = 4 and P = 3.  Prints the load average.
+// qwen4: one layer of Qwen3.8-Flash-Next's decode instead (10 experts of 640 x 2560), and the time for its 48 layers.
 //
-//   nslm-cpu-seed-bench [threads,...] [reps]
+//   nslm-cpu-seed-bench [threads,...] [reps] [qwen4]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +20,10 @@ static double now(void) {
 int main(int argc, char** argv) {
     const char* tl = argc > 1 ? argv[1] : "1,2,4,8,12,16";
     const int reps = argc > 2 ? atoi(argv[2]) : 20;
-    // one decode step's routed experts: 8 experts x (gate + up + down) of 768 x 2560 = 47.2 M weights
-    const int rows = 8 * 3 * 768, kb = 2560 / 8;
+    // one decode step's routed experts: 8 experts x (gate + up + down) of 768 x 2560 = 47.2 M weights (qwen4: 10 of
+    // 640 x 2560 a layer, 49.2 M; 48 layers a token)
+    const int qwen4 = argc > 3 && !strcmp(argv[3], "qwen4"), layers = qwen4 ? 48 : 1;
+    const int rows = qwen4 ? 10 * 3 * 640 : 8 * 3 * 768, kb = 2560 / 8;
     const size_t n = (size_t) rows * kb;
     uint16_t* seeds = malloc(n * 2);
     uint16_t* coefs = malloc(n * 2);
@@ -68,7 +71,9 @@ int main(int argc, char** argv) {
             const double dt = now() - t0;
             if (dt < best) best = dt;
         }
-        printf("  tiled    %.2f ms per step, %.1f G weights/s\n", best * 1e3, n * 8 / best / 1e9);
+        printf("  tiled    %.2f ms per step, %.1f G weights/s", best * 1e3, n * 8 / best / 1e9);
+        if (layers > 1) printf(", %.1f ms for %d layers", best * 1e3 * layers, layers);
+        printf("\n");
         for (int pp = 4; pp >= 3; --pp)
             for (int nt = pp == 4 ? 2 : 1; nt <= 4; nt *= 2) {
                 best = 1e9;
