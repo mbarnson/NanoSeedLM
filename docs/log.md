@@ -540,3 +540,20 @@ prompt and on a chat prompt (gate MB). Code decodes at 29.7 tokens per second wi
 decodes at 29.2 without drafts and 22.7 to 28.7 with drafts. Gate MC fails, so drafts stay off by default. A step of T
 rows takes about 10 ms + 25 ms x T: each verify row pays its expert copies and its expert matvec again. Read
 [MTP drafts on the RTX 4080](results/2026-11-05-qwen38-mtp-4080.md).
+
+## [2026-11-05] result | The RTX 4080 PC: CPU seed rate and streamed experts
+
+`35f17e0`, pc-cuda's PC. On 16 threads, the Ryzen 7 5800X3D computes P3 seed experts at 20.7 G weights per second for
+one token. For each token of 4 tokens, it computes 51.8. A CPU share of the missed experts may save at most about 6 ms of 34 ms a
+token, so the CPU expert path stays on hold on this PC. Streamed experts decode P3 at 14.7 to 19.8 tokens per second
+with a warm page cache, about half of pinned. Read
+[the CPU seed rate and streamed experts](results/2026-11-05-qwen38-4080-cpu-and-streamed.md).
+
+## [2026-11-05] engine | PLE rows on a thread pool, and the expert cache keeps the VRAM reserve
+
+`d946eab`: decode read its 16 PLE rows on one thread after a WILLNEED prefetch. On the RTX 4080 under Windows, the
+prefetch took 4.2 ms a token. A verify forward of 3 rows took 42 ms when the prefetch did not hold the pages. Now each
+(row, head) is an item on a persistent pool of `Q4E_PLE_THREADS` threads, so the page reads overlap. The speed on the
+4080 is not measured yet. `35f17e0`: an explicit `--expert-cache-gb` did not look at `NSLM_VRAM_RESERVE_MB`. With
+cache 8, the display driver of the 4080 that drives the desktop failed, and the screen went black while the runs went
+on. Now the cache shrinks to keep the reserve. The reserve is 2560 MB on a GPU that drives a display, else 512 MB.

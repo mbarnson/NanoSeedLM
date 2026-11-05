@@ -122,6 +122,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   480 to 805 ms at 15,922 tokens with 2.7 times fewer key loads. Reverted.
 - [2026-11-05: MTP drafts on the RTX 4080: the same text, not faster](results/2026-11-05-qwen38-mtp-4080.md): P3 code
   29.7 tokens per second without drafts, 27.6 to 28.9 with 1 to 3. Each verify row pays its expert copies again.
+- [2026-11-05: The RTX 4080 PC: CPU seed rate and streamed experts](results/2026-11-05-qwen38-4080-cpu-and-streamed.md):
+  P3 on the 5800X3D at 20.7 G weights/s, so a CPU share saves at most about 6 of 34 ms a token. Streamed decode 14.7 to 19.8.
 
 ## For contributors and agents
 
