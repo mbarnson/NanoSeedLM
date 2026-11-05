@@ -342,6 +342,16 @@ void q4e_cache_stats(Q4Eng* e, uint64_t* hits, uint64_t* misses, int* slots) {
     *slots = e->cache ? e->pool.slots : 0;
 }
 
+typedef struct { float** p; size_t n; } Buf;   // a buffer of a stage's region: its pointer and floats
+static size_t bufs_len(const Buf* b, int n) {   // floats, each buffer on a 256-byte boundary
+    size_t len = 0;
+    for (int i = 0; i < n; ++i) len += (b[i].n + 63) & ~(size_t) 63;
+    return len;
+}
+static void bufs_set(const Buf* b, int n, float* w) {
+    for (int i = 0; i < n; ++i) { *b[i].p = w; w += (b[i].n + 63) & ~(size_t) 63; }
+}
+
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) {
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
@@ -381,14 +391,23 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
 #define F(n) (float*) dmem(e, NULL, sizeof(float) * (n))
 #define I(n) (int32_t*) dmem(e, NULL, sizeof(int32_t) * (n))
-    e->x = F(T * c->d); e->Hall = e->H = F((size_t) e->xr * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
-    e->br = F(T * c->d); e->qp = F(T * c->n_head * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);
-    e->vv = F(T * c->n_kv * c->head_dim); e->o = F(T * c->n_head * c->head_dim); e->ixo = F(T * iw); e->sc = F(T * nb);
-    e->emb = F(T * c->ple_dim); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d); e->gated = F(T * HD);
-    const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
-    e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * ka); e->Gb = F(T * ka); e->Ub = F(T * ka);
-    e->Dx = F(T * c->top_k * c->d); e->sh = F(T * c->d); e->sgv = F(T); e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab); e->y = F(T * vd);
-    e->cv = F(T * cd); e->qkvb = F(T * cd); e->zb = F(T * vd); e->bb = F(T * c->lin_hv); e->ab = F(T * c->lin_hv);
+    e->x = F(T * c->d); e->Hall = e->H = F((size_t) e->xr * HD); e->inj = F(T * c->hc); e->br = F(T * c->d);
+    e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab);
+    // Each stage's buffers live only inside the stage (x, br and inj carry between stages), so the stages share one region
+    const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared, kvw = (size_t) c->n_kv * c->head_dim;
+    const Buf mix[] = {{&e->normed, T * HD}, {&e->lo, T * c->hc_rank}, {&e->up, T * HD}};
+    const Buf pl[] = {{&e->emb, T * c->ple_dim}, {&e->keys, T * HD}, {&e->qs, T * HD}, {&e->vals, T * c->d}, {&e->gated, T * HD}};
+    const Buf att[] = {{&e->qp, T * c->n_head * 2 * c->head_dim}, {&e->kk, T * kvw}, {&e->vv, T * kvw},
+                       {&e->o, T * c->n_head * c->head_dim}, {&e->ixo, T * iw}, {&e->sc, T * nb}};
+    const Buf lin[] = {{&e->y, T * vd}, {&e->cv, T * cd}, {&e->qkvb, T * cd}, {&e->zb, T * vd}, {&e->bb, T * c->lin_hv}, {&e->ab, T * c->lin_hv}};
+    const Buf ffn[] = {{&e->lg, T * c->n_exp}, {&e->wt, T * c->top_k}, {&e->A, T * ka}, {&e->Gb, T * ka}, {&e->Ub, T * ka},
+                       {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}, {&e->sgv, T}};
+    const Buf* grp[] = {mix, pl, att, lin, ffn};
+    const int ng[] = {3, 5, 6, 6, 8};
+    size_t most = 0;
+    for (int i = 0; i < 5; ++i) if (bufs_len(grp[i], ng[i]) > most) most = bufs_len(grp[i], ng[i]);
+    float* work = F(most);
+    for (int i = 0; i < 5; ++i) bufs_set(grp[i], ng[i], work);
     e->din = I(T + 1); e->ind = I(T * c->top_k); e->sel = I(T * (c->ix_budget / c->ix_ratio)); e->done = I(T); e->nsel = I(T); e->zero = I(T);
     e->perm = I(T * c->top_k); e->ntiles = I(2 * (size_t) c->n_exp + 3);
     e->tiles = (MmTile*) dmem(e, NULL, sizeof(MmTile) * (T * c->top_k / MMT_BN + (size_t) c->n_exp));
