@@ -6,7 +6,9 @@
 #define Q4E_MAX_ROWS 4096    // default rows of one forward without logits (a chunk): about 0.25 MB of VRAM a row. More rows
                              // fill the GEMM tiles: each expert gets about rows * top_k / experts of them
 #define Q4E_LOGIT_ROWS 128   // rows of one forward with logits (the logits take vocab floats a row)
-#define Q4E_PREFETCH_ROWS 64 // prompts of more rows copy each layer's experts while the layer before computes
+#define Q4E_PREFETCH_PICKS 64 // forwards of this many router picks an expert or more copy each layer's experts while the
+                             // layer before computes (fewer: most of the copies are of unused experts, and too little
+                             // compute hides them; on an RTX PRO 6000 the prefetch pays from about 3,000 prompt rows)
 #define Q4E_PASS_ROWS 32768  // most prompt rows of one layer-major pass (the context, rounded up to chunks): each layer's
                              // missing experts cross PCIe once a pass
 

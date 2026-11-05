@@ -743,8 +743,9 @@ static void prefetch(Q4Eng* e, int l) {
     kc_cache_copy(e->cs, &e->pf, 8);
     cudaEventRecord(e->ev_ready[l], e->cs);
 }
-// At layer l's start (pre: a prompt of more than Q4E_PREFETCH_ROWS rows, which uses nearly every expert of each layer):
-// layer l's experts in VRAM, layer l + 1's on their way. The layers' own admits then find their experts resident.
+// At layer l's start (pre: a forward of T rows with Q4E_PREFETCH_PICKS router picks an expert, so nearly every expert
+// in use): layer l's experts in VRAM, layer l + 1's on their way. The layers' own admits then find their experts resident.
+static int prefetch_on(const Q4Eng* e, int T) { return e->pf_ok && (int64_t) T * e->c.top_k >= (int64_t) Q4E_PREFETCH_PICKS * e->c.n_exp; }
 static void layer_start(Q4Eng* e, int l, int pre) {
     if (!pre) return;
     if (l == 0) prefetch(e, 0);
@@ -756,7 +757,7 @@ static int enqueue(Q4Eng* e, int T, int want) {   // the rows of slot 0 through 
     rows_in(e, 0, T);
     embed(e, T);
     for (int l = 0; l < e->c.n_layer; ++l) {
-        layer_start(e, l, e->pf_ok && T > Q4E_PREFETCH_ROWS);
+        layer_start(e, l, prefetch_on(e, T));
         if (layer(e, l, T, 0)) return -1;
     }
     if (want) {   // prompt rows without logits skip the mixer and the head
@@ -779,7 +780,7 @@ static int forward_pass(Q4Eng* e, const int32_t* ids, int n) {
     }
     int rc = ple_rows(e, n);
     for (int l = -1; !rc && l < e->c.n_layer; ++l) {   // l = -1: the embedding
-        if (l >= 0) layer_start(e, l, e->pf_ok && n > Q4E_PREFETCH_ROWS);
+        if (l >= 0) layer_start(e, l, prefetch_on(e, n));
         for (int k = 0; !rc && k < nc; ++k) {
             const int T = n - k * e->mt < e->mt ? n - k * e->mt : e->mt;
             e->H = e->Hall + (size_t) k * e->mt * HD;
