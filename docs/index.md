@@ -44,6 +44,8 @@ Work that is not done yet, with its gates and hypotheses.
   the PLE table choice, for a PC with a 16 GB GPU.
 - [2026-11-04: MTP drafts in the CUDA engine](plans/2026-11-04-qwen38-mtp.md): draft. The model's MTP head drafts
   tokens, and one main forward verifies them (+31% on code on the M4 Max).
+- [2026-11-05: Trellis-coded experts at 2 to 3 bits](plans/2026-11-05-trellis-experts.md): a QTIP-style trellis code for
+  the experts, against Unsloth's quality curve. Gate TA passes at 3 bits.
 - [2026-11-05: Qwen3.8-Flash-Next decode on the RTX 4080 near Strata's speed](plans/2026-11-05-qwen38-decode-4080.md):
   draft. Cheaper decode rows: the MTP head in the cache, a matvec by expert, the tail skip, and the CPU for misses.
 - [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
@@ -142,6 +144,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   decodes P3 code at 69.6 tokens per second, against 47.8 without drafts, with the same text. Chat: +8.5% at 1 draft, -13% at 3.
 - [2026-11-05: The tail skip and the CPU tail on an RTX PRO 6000](results/2026-11-05-qwen38-tail-hf.md): the tail skip
   fails gate DL at R = 7 to 9. The CPU tail keeps the KL but halves decode there: one P3 expert is 1.6 ms of one core.
+- [2026-11-05: Trellis-coded experts: weight error](results/2026-11-05-trellis-probe.md): at 3.1 and 4.1 bits a trellis
+  has less weighted error than ggml's IQ3_S (3.44 bits) and IQ4_XS (4.25 bits). It saves about 0.4 to 0.5 bits a weight.
 
 ## For contributors and agents
 

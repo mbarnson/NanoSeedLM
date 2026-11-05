@@ -724,3 +724,10 @@ bit. Drafts stay off by default.
 `ba71ba8`: P3 decodes code at 69.6 tokens per second with 2 drafts, against 47.8 without drafts (+46%). A short chat
 answer is 8.5% faster with 1 draft, and 0.5% and 13% slower with 2 and 3. The text is the same at every K. Read
 [MTP drafts in nslm-chat on the M4 Max](results/2026-11-05-qwen38-mtp-chat-m4max.md).
+
+## [2026-11-05] result | Trellis-coded experts: weight error against ggml's types
+
+The probe used layer 20's experts, a bitshift trellis with QTIP's computed code, and an imatrix-weighted Viterbi search.
+At 3.11 bits the weighted error is 0.0158, against 0.0182 for IQ3_S at 3.44 bits. At 4.11 bits it has 0.0042, against 0.0057 for
+IQ4_XS at 4.25 bits. At 2.12 bits it equals IQ2_S at 2.56 bits. It saves about 0.4 to 0.5 bits a weight, and it is
+close to the bound for Gaussian weights. Read [Trellis-coded experts: weight error](results/2026-11-05-trellis-probe.md).
