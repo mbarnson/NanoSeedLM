@@ -609,7 +609,11 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
                 if (j < ds / 8) {
                     wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kb;
                     wmma::load_matrix_sync(kb, Ks + w * ds + 8 * j, ld);   // K^T: the tile [key][dim] read column-major
-                    mma3s(sacc, qh[j], ql[j], kb);
+                    if (pass) mma3s(sacc, qh[j], ql[j], kb);
+                    else {   // the row maxima only keep the exponentials in range (the sums normalise): one TF32 part
+                        for (int i = 0; i < kb.num_elements; ++i) kb.x[i] = wmma::__float_to_tf32(kb.x[i]);
+                        wmma::mma_sync(sacc, qh[j], kb, sacc);
+                    }
                 }
             wmma::store_matrix_sync(Sp + w * 256, sacc, 16, wmma::mem_row_major);
             __syncthreads();   // S is done with the K tile: V takes it, while the softmax runs
