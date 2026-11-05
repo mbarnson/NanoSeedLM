@@ -25,7 +25,8 @@ NSLM_HDRS := $(wildcard nslm/*.h)
 ENGINE    := engine/mova_gpu.m nslm/lib_model_st.c nslm/lib_json.c nslm/lib_mova_cfg.c nslm/lib_mova_ckpt.c nslm/lib_moe.c nslm/lib_format.c nslm/lib_sha256.c
 HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/chat_model.c harness/tool_calls.c harness/kv_disk.c
 HARN_HDRS := $(wildcard harness/*.h)
-ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h
+ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h \
+             engine/engine_mova.h engine/engine_qwen4.h engine/engine_api_fns.h engine/engine_unname.h engine/qwen4_eng.h
 
 METALLIBS := $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib $(RES)/search.metallib $(RES)/search4.metallib \
              $(RES)/searchp.metallib
@@ -62,15 +63,21 @@ $(RES)/searchp.metallib: nslm/searchp.metal nslm/searchp_gpu.h nslm/lfsr.h
 	$(METAL) -fno-fast-math -Inslm -c $< -o $(@D)/searchp.air && xcrun -sdk macosx metallib $(@D)/searchp.air -o $@
 
 # ---- objects: the engine (Metal), the shared harness and the C library ---------------------------------------------
-ENG_O     := $(OBJ)/mova_gpu.o
-$(ENG_O): engine/mova_gpu.m $(ENG_HDRS)
+# engine_api.h for every model (option A): engine/engine.c picks the MoVA engine (engine/mova_gpu.m, its eng_* named
+# mova_eng_* by engine_mova.h) or the qwen4 one (engine/qwen4_api.c over engine/qwen4_gpu.m, q4_eng_*) by config.json
+MOVA_O    := $(OBJ)/mova_gpu.o
+$(MOVA_O): engine/mova_gpu.m $(ENG_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
-# the qwen4 Metal engine (engine/qwen4_eng.h), for nslm-qwen4-gen and test_qwen4_metal
+# the qwen4 Metal engine (engine/qwen4_eng.h): alone for nslm-qwen4-gen and test_qwen4_metal, else under qwen4_api.c
 Q4E_O     := $(OBJ)/qwen4_gpu.o
 $(Q4E_O): engine/qwen4_gpu.m engine/qwen4_eng.h engine/kernels_moe.metal engine/kernels_qwen4.metal $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
+$(OBJ)/e_%.o: engine/%.c $(ENG_HDRS) $(NSLM_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+ENG_O     := $(MOVA_O) $(OBJ)/e_engine.o $(OBJ)/e_qwen4_api.o $(Q4E_O)
 HARN_O    := $(patsubst harness/%.c,$(OBJ)/h_%.o,$(HARNESS))
 $(OBJ)/h_%.o: harness/%.c $(HARN_HDRS) nslm/json.h
 	@mkdir -p $(@D)

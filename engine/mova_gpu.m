@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <time.h>
 
+#include "engine_mova.h"   // eng_* as mova_eng_*: engine/engine.c dispatches by model
 #include "engine_api.h"
 #include "kvq.h"
 #include "model_st.h"
