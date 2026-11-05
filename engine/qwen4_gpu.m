@@ -68,6 +68,7 @@ struct Q4Eng {
     id<MTLCommandBuffer> cb;   // the forward being encoded
     id<MTLComputeCommandEncoder> enc;
     int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage
+    int no_split;              // Q4E_NO_SPLIT=1: k_mv for the few-row projections too (A / B)
     double stage_ms[8];
     char err[256];
 };
@@ -269,6 +270,18 @@ static void bind_codes(Q4Eng* e, const MW* w, int index) {   // SEED4P4's expone
 
 // y[T][rows] = W x[T][cols] (row strides xs, ys; offsets xo, yo in bytes): the matvec for up to MV_MAXT rows, the GEMM above
 static void mv_o(Q4Eng* e, const MW* w, id<MTLBuffer> X, uint64_t xo, int xs, id<MTLBuffer> Y, uint64_t yo, int ys, int T) {
+    const int aff = w->fmt == MF_BF16 || w->fmt == MF_Q8 || w->fmt == MF_Q4;
+    if (T <= MV_MAXT && aff && !e->no_split && w->rows * 8 < w->cols && w->cols % 8 == 0 && xs % 4 == 0 && xo % 16 == 0) {
+        // few rows, long K (hyper-connection inject / down, DeltaNet a / b): a threadgroup per row (k_mv_split)
+        const MvArgs a = {w->cols, w->rows, T, 1, xs, ys, 0, 0};
+        [e->enc setComputePipelineState:pipe_g(e, "k_mv_split", w->fmt, T, w->gs)];
+        A_(e, &a, sizeof a);
+        bind_w(e, w, 1);
+        B(e, 4, X, xo);
+        B(e, 5, Y, yo);
+        tgs(e, (uint64_t) w->rows, 1, MVS_TG);
+        return;
+    }
     if (T <= MV_MAXT) {
         const MvArgs a = {w->cols, w->rows, T, 1, xs, ys, 0, 0};
         [e->enc setComputePipelineState:pipe_g(e, "k_mv", w->fmt, T, w->gs)];
@@ -720,6 +733,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
+    e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
     if (@available(macOS 15.0, *)) {   // the weights and buffers resident on the GPU
         MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
         e->residency = e->err[0] ? nil : [e->dev newResidencySetWithDescriptor:rd error:nil];

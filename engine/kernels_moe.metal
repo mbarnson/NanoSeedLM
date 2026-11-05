@@ -13,6 +13,7 @@ using namespace metal;
 enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6P8 = 5 };   // = NS_* (nslm/model_st.h)
 #define MV_MAXT 8          // dense matvec: tokens per weight-row load
 #define MV_ROWS 8          // simdgroups per matvec threadgroup
+#define MVS_TG 256         // k_mv_split: threads per output row
 #ifndef MV_NR_SEED
 #define MV_NR_SEED 1       // rows per simdgroup (sharing each x load), SEED4
 #endif
@@ -674,6 +675,39 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
     if (lane == 0) y[(ulong) p0 * a.ys + r] = bfr(silu_bf(bfr(g)) * bfr(u));
 }
 
+// ---- small-row matvec: one threadgroup of MVS_TG threads per output row, the row's 8-weight blocks split among all of
+// them, then a simdgroup and a threadgroup sum.  For the few-row, long-K projections that k_mv runs on few simdgroups
+// (qwen4: the hyper-connection inject 4 x 10,240 and down 320 x 10,240, DeltaNet a / b 48 x 2,560).  FC_T tokens
+// (<= MV_MAXT), BF16 / Q8 / Q4 (AFF_GS); y[t][r] = bf16(acc), or bf16(y + bf16(acc)) with a.add.
+kernel void k_mv_split(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const ushort* S [[buffer(2)]],
+                       device const ushort* B [[buffer(3)]], device const float* x [[buffer(4)]], device float* y [[buffer(5)]],
+                       uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[MVS_TG / 32][MV_MAXT];
+    const int nt = FC_T, nbk = a.K / 8;
+    float acc[MV_MAXT];
+    for (int t = 0; t < MV_MAXT; ++t) acc[t] = 0;
+    for (int j = (int) tid; j < nbk; j += MVS_TG) {
+        float w[8];
+        wblock(FC_FMT, W, S, B, (ulong) r, a.K, j, w);
+        for (int t = 0; t < nt; ++t) {
+            device const float4* xp = (device const float4*) (x + (ulong) t * a.xs + (ulong) j * 8);
+            const float4 x0 = xp[0], x1 = xp[1];
+            acc[t] += w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w;
+        }
+    }
+    for (int t = 0; t < nt; ++t) {
+        const float s = simd_sum(acc[t]);
+        if (lane == 0) part[sg][t] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int) tid < nt) {
+        float s = 0;
+        for (int g = 0; g < MVS_TG / 32; ++g) s += part[g][tid];
+        device float* yo = y + (ulong) tid * a.ys + r;
+        *yo = a.add ? bfr(*yo + bfr(s)) : bfr(s);
+    }
+}
 
 // ---- GEMM (prefill): Y[n][r] = sum_k W[r][k] X[n][k] for a 32-row x 32-token tile; f32 simdgroup matrices (exact
 // products of the BF16-valued weights and activations, f32 accumulation).  The weight tile is dequantized per format
