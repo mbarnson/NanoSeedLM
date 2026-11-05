@@ -1,7 +1,10 @@
 // tests/test_qwen4_metal.c - the qwen4 Metal engine (engine/qwen4_gpu.m) on tests/data/qwen4_tiny against mlx-vlm's
-// float32 logits, with test_qwen4_engine.c's limits: matvec rows (any split, within BF16 rounding), one GEMM row of 48, the
-// same logits twice (the QSA selection in block order), and a prompt of 199 rows in one forward or three, bit for bit.
-// Then tests/data/qwen4_tiny_attn (strong attention) against nslm/qwen4_ref.h, with test_qwen4_engine.c's bounds.
+// float32 logits, with test_qwen4_engine.c's limits: matvec rows (within BF16 rounding; any split of up to 8 rows, bit for
+// bit), one GEMM row of 48, the same logits twice (the QSA selection in block order), and a prompt of 199 rows in one
+// forward or three, bit for bit. Then tests/data/qwen4_tiny_attn (strong attention) against nslm/qwen4_ref.h, with
+// test_qwen4_engine.c's bounds, also with the decode rows in key splits. Bit for bit across row splits is what MTP's
+// verify forwards need: drafts then change no logits (plan gate MB, tests/test_qwen4_mtp.c).
+#define _DARWIN_C_SOURCE   // setenv
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +32,7 @@ int main(void) {
     const int n = (int) ei->shape[0], V = (int) el->shape[1];
     const int32_t* ids = (const int32_t*) st_data(&st, ei);
     const float* want = (const float*) st_data(&st, el);
-    const Q4EOpts o = {256, 0, NULL, 0, 0, 0};
+    const Q4EOpts o = {256, 0, NULL, 0, 0, 0, 0};
     Q4Eng* e = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
     if (!e) { printf("FAIL: open: %s\n", err); return 1; }
     float* got = (float*) malloc(sizeof(float) * (size_t) n * V);
@@ -72,9 +75,8 @@ int main(void) {
     CHECK(worst < 3e-2 * scale && argmax_diff <= n / 16, "logits differ from mlx-vlm beyond the BF16 matvec rounding");
     // the GEMM rounds every projection's inputs to BF16 too, on top of the BF16 outputs: twice the matvec bound
     CHECK(wbig < 6e-2 * scale && argmax_big <= n / 16, "GEMM-row logits differ from mlx-vlm beyond the BF16 rounding");
-    // Unlike CUDA's, Metal's k_mv sums one token's row (its per-lane path) in another order than several tokens' rows, so
-    // the BF16 rounding of a projection output can flip with the row count: the split moves logits by BF16 steps, no more
-    CHECK(same < 1e-2 * scale, "the row split changes the logits beyond BF16 rounding");
+    // the matvecs run without fast math, so one token's row sums in the same order for any row count
+    CHECK(same == 0, "the row split changes the logits (from row %d)", first);
     q4e_close(e);
     {   // qwen4_tiny_attn (tools/qwen4_tiny_attn.py): attention strong enough that zero keys move the C reference's
         // logits by about 1.7 of 1.7. The engine against the reference, in decode rows and in one prompt forward.
@@ -113,6 +115,35 @@ int main(void) {
                    " %d rows; argmax differs in %d, %d\n", wr, wg, sr, br, bg, n, ar, ag);
             CHECK(br <= n / 16 && ar <= n / 16, "strong-attention logits differ from the C reference beyond the BF16 matvec rounding");
             CHECK(bg <= n / 16 && ag <= n / 16, "strong-attention GEMM-row logits differ from the C reference beyond the BF16 rounding");
+            // The long-context decode path, forced: rows of 5 keys or more in k_q4_attend_g's splits of 10 keys, merged by
+            // k_q4_attend_comb. Against the reference, and rows of 1 against uneven rows. This model's lists of at most 20
+            // keys fall into the same 8-key tiles for any split count, so the rule that a row's kernel and split count
+            // are its own (not its forward's) is checked on P3 at 510 to 770 keys instead (docs/log.md, 2026-11-05)
+            setenv("Q4E_SPLIT_MIN", "5", 1);
+            setenv("Q4E_SPLIT_KEYS", "10", 1);
+            Q4Eng* es = q4e_open("tests/data/qwen4_tiny_attn", &o, err, sizeof err);
+            unsetenv("Q4E_SPLIT_MIN");
+            unsetenv("Q4E_SPLIT_KEYS");
+            CHECK(es != NULL, "open with splits: %s", err);
+            float* s8 = (float*) malloc(sizeof(float) * (size_t) n * V);
+            for (int i = 0, at = 0; es && i < 8; at += rows[i++]) CHECK(q4e_forward(es, ids + at, rows[i], s8 + (size_t) at * V) == 0, "split rows: %s", q4e_error(es));
+            if (es) q4e_reset(es);
+            for (int t = 0; es && t < n; ++t) CHECK(q4e_forward(es, ids + t, 1, s1 + (size_t) t * V) == 0, "split, one row: %s", q4e_error(es));
+            int bs = 0, nd = 0;
+            for (int t = 0; t < n; ++t) {
+                double er = 0;
+                for (int v = 0; v < V; ++v) {
+                    const size_t i = (size_t) t * V + v;
+                    er = fmax(er, fabs((double) s1[i] - ref[i]));
+                    nd += s1[i] != s8[i];
+                }
+                bs += er > 3e-2 * sr;
+            }
+            printf("strong attention in key splits: past the bound in %d of %d rows; rows of 1 vs uneven: %d logits differ\n", bs, n, nd);
+            CHECK(bs <= n / 16, "split-attention logits differ from the C reference beyond the BF16 matvec rounding");
+            CHECK(nd == 0, "split attention: a row's logits depend on the rows beside it");
+            free(s8);
+            q4e_close(es);
         } else CHECK(!r || !ea, "reference forward: %s", r ? qwen4_ref_error(r) : "");
         free(ref); free(sr8); free(s1);
         q4e_close(ea);

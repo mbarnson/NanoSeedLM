@@ -4,19 +4,24 @@
 #ifndef NSLM_KERNELS_QWEN4_METAL
 #define NSLM_KERNELS_QWEN4_METAL
 
-typedef struct { int cd, K, T, pad; } Q4ConvArgs;                    // GDN causal conv: channels, kernel, tokens
-typedef struct { int cd, kd, vd, hv, rep, dv, T, pad; } Q4GdnArgs;    // GDN step: conv_dim, hk * dk, hv * dv, ...
+typedef struct { int cd, K, T, keep; } Q4ConvArgs;                   // GDN causal conv: channels, kernel, tokens; keep: below
+typedef struct { int cd, kd, vd, hv, rep, dv, T, keep; } Q4GdnArgs;   // GDN step: conv_dim, hk * dk, hv * dv, ...
 typedef struct { int hv, dv; float eps; int pad; } Q4GNormArgs;       // GDN output norm
 typedef struct { int len, g; float eps; int pad; } Q4NormArgs;        // RMSNorm (1 + w) in groups of g
 typedef struct { int hc, d, n; float inv_hc; } Q4HcArgs;              // hyper-connection pointwise steps
 typedef struct { int rs, hs, hd, rot, pos0, pstep; float eps; int pad; } Q4RopeArgs;   // row t at pos0 + t * pstep
 typedef struct { int E, k, pad[2]; } Q4RouteArgs;                     // experts, top k (<= 32)
 typedef struct { int hc, d, pad[2]; } Q4PleGateArgs;
-typedef struct { int HD, K, dil, T; } Q4PleConvArgs;                  // (K - 1) * dil <= 32
+typedef struct { int HD, K, dil, T, keep, pad[3]; } Q4PleConvArgs;   // (K - 1) * dil <= 32
+// keep (a verify forward's rows, at most Q4E_KEEP_SLOTS + 1): the state after each row t < T - 1 also to snapshot buffer t
+#define Q4E_KEEP_SLOTS 3
 typedef struct { int D, R, pad[2]; } Q4QsaMeanArgs;                   // block keys: ix_dim, ix_ratio
 typedef struct { int nh, D, rs, maxdone, k, pad[3]; } Q4QsaArgs;      // scores and top k
-typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit; } Q4AttArgs;   // hd a multiple of 32, <= 256;
-                                                                                         // nsplit: k_q4_attend_g's key splits
+// hd a multiple of 32, <= 256. nsplit: k_q4_attend_g's key splits (its grid's depth). smin > 0: decode rows by their own
+// keys n, so that a row's sums do not depend on the other rows of its forward: rows with n >= smin in k_q4_attend_g, in
+// min(ATG_MAX_SPLIT, ceil(n / skeys)) splits (merged by k_q4_attend_comb), the others in k_q4_attend
+typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit, smin, skeys, pad[2]; } Q4AttArgs;
+#define ATG_MAX_SPLIT 32
 typedef struct { int w, ss, pos0, pad; } Q4StoreArgs;                 // cache rows: width, source row stride, first position
 typedef struct { int d, k, pad[2]; } Q4CombineArgs;                   // MoE combine: hidden size, top k
 #ifndef ATG_NQ
@@ -42,8 +47,10 @@ static inline float tg_sum(float v, threadgroup float* red, uint lane, uint sg, 
 // ---- Gated DeltaNet ---------------------------------------------------------------------------------------------------
 
 // One thread per channel, the T tokens in order: cv = silu(causal conv of the last K inputs); conv keeps the last K - 1.
+// keep: also the state after each row t < T - 1 at k0, k1, k2 (t)
 kernel void k_q4_gdn_conv(constant Q4ConvArgs& a [[buffer(0)]], device const float* w [[buffer(1)]], device const float* qkv [[buffer(2)]],
-                          device float* conv [[buffer(3)]], device float* cv [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+                          device float* conv [[buffer(3)]], device float* cv [[buffer(4)]], device float* k0 [[buffer(5)]],
+                          device float* k1 [[buffer(6)]], device float* k2 [[buffer(7)]], uint gid [[thread_position_in_grid]]) {
     const int ch = (int) gid, cd = a.cd, K = a.K;
     if (ch >= cd) return;
     float st[7], wk[8];
@@ -56,16 +63,22 @@ kernel void k_q4_gdn_conv(constant Q4ConvArgs& a [[buffer(0)]], device const flo
         cv[(ulong) t * cd + ch] = acc * sigm(acc);
         for (int k = 0; k + 1 < K - 1; ++k) st[k] = st[k + 1];
         if (K > 1) st[K - 2] = x;
+        if (a.keep && t + 1 < a.T) {
+            device float* ks = t == 0 ? k0 : t == 1 ? k1 : k2;
+            for (int k = 0; k < K - 1; ++k) ks[(ulong) k * cd + ch] = st[k];
+        }
     }
     for (int k = 0; k < K - 1; ++k) conv[(ulong) k * cd + ch] = st[k];
 }
 
 // Threadgroup = 32 value rows of head hv (grid hv x dv / 32); SPLIT threads (adjacent lanes) hold one row's state column
 // S[hv][.][i] over the T tokens, DK / SPLIT values each.  y gets the raw read S q; k_q4_gdn_norm normalises and gates it.
+// keep: also the state after each row t < T - 1 at k0, k1, k2 (t)
 #define GDN_STEP_ARGS                                                                                                      \
     constant Q4GdnArgs& a [[buffer(0)]], device const float* cv [[buffer(1)]], device const float* aa [[buffer(2)]],      \
         device const float* bb [[buffer(3)]], device const float* A_log [[buffer(4)]],                                    \
         device const float* dt_bias [[buffer(5)]], device float* S [[buffer(6)]], device float* y [[buffer(7)]],          \
+        device float* k0 [[buffer(8)]], device float* k1 [[buffer(9)]], device float* k2 [[buffer(10)]],                  \
         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 template <int DK, int SPLIT>
 kernel void k_q4_gdn_step(GDN_STEP_ARGS) {
@@ -96,6 +109,10 @@ kernel void k_q4_gdn_step(GDN_STEP_ARGS) {
         for (int j = 0; j < DJ; ++j) { s[j] = g * s[j] + delta * kp[j] * sk; yq += s[j] * qp[j]; }
         if (SPLIT == 2) yq += simd_shuffle_xor(yq, (ushort) 1);
         if (p == 0) y[(ulong) t * a.vd + (ulong) hv * a.dv + i] = yq * sq;
+        if (a.keep && t + 1 < a.T) {
+            device float* ks = (t == 0 ? k0 : t == 1 ? k1 : k2) + (St - S);
+            for (int j = 0; j < DJ; ++j) ks[(ulong) j * a.dv] = s[j];
+        }
     }
     for (int j = 0; j < DJ; ++j) St[(ulong) j * a.dv] = s[j];
 }
@@ -265,9 +282,10 @@ kernel void k_q4_ple_gate(constant Q4PleGateArgs& a [[buffer(0)]], device const 
 }
 
 // One thread per channel, tokens in order: H += gated + silu(causal conv, dilation dil); the last (K - 1) * dil inputs in
-// registers
+// registers. keep: also the history after each row t < T - 1 at k0, k1, k2 (t)
 kernel void k_q4_ple_conv(constant Q4PleConvArgs& a [[buffer(0)]], device const float* w [[buffer(1)]], device const float* cin [[buffer(2)]],
                           device const float* gated [[buffer(3)]], device float* hist [[buffer(4)]], device float* H [[buffer(5)]],
+                          device float* k0 [[buffer(6)]], device float* k1 [[buffer(7)]], device float* k2 [[buffer(8)]],
                           uint gid [[thread_position_in_grid]]) {
     const int ch = (int) gid, HD = a.HD, K = a.K;
     if (ch >= HD) return;
@@ -281,6 +299,10 @@ kernel void k_q4_ple_conv(constant Q4PleConvArgs& a [[buffer(0)]], device const 
         H[(ulong) t * HD + ch] += gated[(ulong) t * HD + ch] + acc * sigm(acc);
         for (int j = 0; j + 1 < L; ++j) st[j] = st[j + 1];
         if (L > 0) st[L - 1] = x;
+        if (a.keep && t + 1 < a.T) {
+            device float* ks = t == 0 ? k0 : t == 1 ? k1 : k2;
+            for (int j = 0; j < L; ++j) ks[(ulong) j * HD + ch] = st[j];
+        }
     }
     for (int j = 0; j < L; ++j) hist[(ulong) j * HD + ch] = st[j];
 }
@@ -361,6 +383,7 @@ kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float*
     threadgroup float sm[8], sl[8], sacc[8][256];
     const int h = (int) tg.x, t = (int) tg.y, w = (int) sg, dl = a.hd / 32, g = h / (a.nh / a.nkv);
     const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    if (a.smin && n >= a.smin) return;   // k_q4_attend_g's row
     device const float* qh = q + ((ulong) t * a.nh + h) * 2 * a.hd;
     float qv[8], acc[8], m = -INFINITY, l = 0;
     for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
@@ -410,7 +433,9 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
     const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
     // split tg.z of nsp: keys [kb, ke), whole tiles of ATG_K (decode rows: the splits' partials go to part, then
     // k_q4_attend_comb merges them; one split writes the output itself)
-    const int nsp = a.nsplit > 1 ? a.nsplit : 1, per = ((n + nsp - 1) / nsp + ATG_K - 1) / ATG_K * ATG_K;
+    const int nsp = a.smin ? min(ATG_MAX_SPLIT, (n + a.skeys - 1) / a.skeys) : a.nsplit > 1 ? a.nsplit : 1;
+    if ((a.smin && n < a.smin) || (int) tg.z >= nsp) return;   // k_q4_attend's row, or a split past this row's
+    const int per = ((n + nsp - 1) / nsp + ATG_K - 1) / ATG_K * ATG_K;
     const int kb = (int) tg.z * per, ke = min(n, kb + per);
     const bool active = ht * 8 < G;
     device const float* qb = q + ((ulong) t * a.nh + (ulong) g * G + ht * 8) * 2 * hd;   // 8 heads, stride 2 hd
@@ -492,20 +517,27 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
             for (int i = j0 * 8 + (int) lane; i < (j0 + nj) * 8; i += 32)
                 o[head * hd + i] = sO[h * hd + i] / sL[ht][h] * sigm(qb[(ulong) h * 2 * hd + hd + i]);
         } else {   // this split's partial: O unnormalised, then its max and sum (m = -inf: no keys)
-            device float* pb = part + (head * nsp + tg.z) * (hd + 2);
+            device float* pb = part + (head * a.nsplit + tg.z) * (hd + 2);
             for (int i = j0 * 8 + (int) lane; i < (j0 + nj) * 8; i += 32) pb[i] = sO[h * hd + i];
             if (dh == 0 && lane == 0) { pb[hd] = sM[ht][h]; pb[hd + 1] = sL[ht][h]; }
         }
     }
 }
 
-// k_q4_attend_g's nsplit partials of decode rows merged: threadgroup (head h, row t), 256 threads; the output / L, gated by
-// sigmoid of the query's gate half
+// k_q4_attend_g's partials of decode rows merged (its nsplit, or with smin each row's own count): threadgroup (head h,
+// row t), 256 threads; the output / L, gated by sigmoid of the query's gate half
 kernel void k_q4_attend_comb(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* part [[buffer(2)]],
-                             device float* o [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    const int h = (int) tg.x, t = (int) tg.y, hd = a.hd, nsp = a.nsplit, st = hd + 2;
+                             device float* o [[buffer(3)]], device const int* nsel [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const int h = (int) tg.x, t = (int) tg.y, hd = a.hd, st = hd + 2;
+    int nsp = a.nsplit;
+    if (a.smin) {   // this row's splits; none (k_q4_attend's row) or one (written by k_q4_attend_g): nothing to merge
+        const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+        nsp = n < a.smin ? 0 : min(ATG_MAX_SPLIT, (n + a.skeys - 1) / a.skeys);
+        if (nsp < 2) return;
+    }
     const ulong head = (ulong) t * a.nh + h;
-    device const float* pb = part + head * nsp * st;
+    device const float* pb = part + head * a.nsplit * st;
     float M = -INFINITY;
     for (int s = 0; s < nsp; ++s) M = max(M, pb[s * st + hd]);
     float L = 0.0f;

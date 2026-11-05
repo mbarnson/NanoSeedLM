@@ -885,7 +885,7 @@ int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float
     id<MTLBuffer> kb = buf(keys, 4 * HD * T), qb = buf(qs, 4 * HD * T), vb = buf(vals, 4 * (size_t) c->d * T), gb = buf(NULL, 4 * HD * T),
                   wb = buf(w, 4 * HD * c->ple_conv), cb = buf(cin, 4 * HD * T), hb = buf(hist, 4 * nh), Hb = buf(H, 4 * HD * T);
     const Q4PleGateArgs ga = {c->hc, c->d, {0, 0}};
-    const Q4PleConvArgs ca = {(int) HD, c->ple_conv, c->ngram, T};
+    const Q4PleConvArgs ca = {(int) HD, c->ple_conv, c->ngram, T, 0, {0, 0, 0}};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, pg, &ga, sizeof ga, @[kb, qb, vb, gb]);
             [e dispatchThreadgroups:TGS(c->hc, T) threadsPerThreadgroup:TGS(256, 1)];
@@ -946,14 +946,14 @@ int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float*
     memcpy(qb.contents, q, 4 * no * 2);   // + 16 heads of slack: k_q4_attend_g reads its padding heads
     const int ns = nsplit > 1 ? nsplit : 1;
     id<MTLBuffer> pb = buf(NULL, 4 * (size_t) T * c->n_head * ns * (c->head_dim + 2));
-    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), ns};
+    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), ns, 0, 1, {0, 0}};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob, pb]);
             if (grouped) [e dispatchThreadgroups:MTLSizeMake((NSUInteger) c->n_kv, (NSUInteger) T, (NSUInteger) ns) threadsPerThreadgroup:TGS(64 * ATG_NQ, 1)];
             else [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
             if (ns > 1) {
                 [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                enc4(e, pc, &aa, sizeof aa, @[qb, pb, ob]);
+                enc4(e, pc, &aa, sizeof aa, @[qb, pb, ob, nb]);
                 [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
             }
         }))
