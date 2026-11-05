@@ -393,3 +393,14 @@ bits, a random third, every `down_proj` and the chat and code hot third in P4 al
 `e8426e0`, `047ad9f`: `nslm-moe --codec s3` searched all experts at C = 12, P = 4 on CUDA (12.9 GPU-hours). S3 alone
 has a KLD of 0.142 against BF16, and UD-IQ3_XXS has 0.0735. A random third in P3 gives 0.116 at 3.35 bits. The text's
 own hot third in P3 gives 0.0765. Read [3-bit seeds for the 64 GB class](results/2026-11-04-qwen38-s3-tier.md).
+
+## [2026-11-04] result | A high seed tier that follows the routing: a simulation
+
+`tools/qwen4_tier_sim.py` replays the routing traces through a high tier of the most used experts (a decayed count,
+refreshed every 16 tokens). At 10.4 GB of P4 it serves 64% to 71% of router choices, and loads 3 to 5 experts for each
+token. Read [the tier simulation](results/2026-11-04-qwen38-tier-sim.md).
+
+## [2026-11-04] plan | A high seed tier that follows the routing of Qwen3.8-Flash-Next
+
+A draft for Matt's go: S3 or P3 for all experts, and P4 for the session's hot set, moved by the engine. Read
+[the adaptive tiers plan](plans/2026-11-04-qwen38-adaptive-tiers.md).

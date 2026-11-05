@@ -42,6 +42,8 @@ Work that is not done yet, with its gates and hypotheses.
 
 - [2026-11-04: SeedLM packs for Qwen3.8-Flash-Next](plans/2026-11-04-qwen38-flash-next.md): steps, gates, costs and
   the PLE table choice, for a PC with a 16 GB GPU.
+- [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
+  engine keeps the session's hot experts in P4 and the rest in S3 or P3.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
   64, 96 and 128 GB of RAM and a 12 GB GPU. Each must match an Unsloth V3.1 pack.
 
@@ -94,6 +96,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   random or `down_proj` third in P4, 0.0450 with the in-domain hot third.
 - [2026-11-04: 3-bit seeds (S3) for the 64 GB class](results/2026-11-04-qwen38-s3-tier.md): S3 alone 0.142, twice
   UD-IQ3_XXS. With the text's own hot third in P3, 0.0765 at 3.35 bits.
+- [2026-11-04: A high seed tier that follows the routing](results/2026-11-04-qwen38-tier-sim.md): a simulation. At
+  10.4 GB the tier serves 64% to 71% of router choices and loads 3 to 5 experts for each token.
 
 ## For contributors and agents
 

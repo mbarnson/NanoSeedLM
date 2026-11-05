@@ -50,6 +50,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `hf_llama_kld.sh` | Score Unsloth packs and emulated seed packs against BF16 in llama.cpp, with the BF16 PLE table |
 | `hf_qwen4_routes.sh` | Record routing traces of a pack on chat and code text, on an HF Jobs GPU node |
 | `qwen4_tier_map.py` | Write a per-expert tier map from routing traces (most used experts), at random, or by projection |
+| `qwen4_tier_sim.py` | Simulate a high tier that follows the routing: its share of router choices and its loads |
 | `mova_capture.py` | Activation statistics for the expert search, through MLX |
 | `mova_score.py` | Scores in MLX |
 | `mova_export.py` | Inputs for `nslm-mova-score`, `nslm-mova-gen`, `nslm-mova-bench` and route studies |
