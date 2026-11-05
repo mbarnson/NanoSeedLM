@@ -16,6 +16,8 @@ typedef struct { int HD, K, dil, T; } Q4PleConvArgs;                  // (K - 1)
 typedef struct { int D, R, pad[2]; } Q4QsaMeanArgs;                   // block keys: ix_dim, ix_ratio
 typedef struct { int nh, D, rs, maxdone, k, pad[3]; } Q4QsaArgs;      // scores and top k
 typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int pad; } Q4AttArgs;   // hd a multiple of 32, <= 256
+typedef struct { int w, ss, pos0, pad; } Q4StoreArgs;                 // cache rows: width, source row stride, first position
+typedef struct { int d, k, pad[2]; } Q4CombineArgs;                   // MoE combine: hidden size, top k
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
@@ -147,6 +149,31 @@ kernel void k_q4_hc_add(constant Q4HcArgs& a [[buffer(0)]], device float* H [[bu
     for (int s = 0; s < a.hc; ++s) H[((ulong) t * a.hc + s) * a.d + i] += b * inj[t * a.hc + s];
 }
 
+// grid (d, T): the embedding x[t] copied into each of the hc streams of H[t] (Q4HcArgs hc, d)
+kernel void k_q4_tile(constant Q4HcArgs& a [[buffer(0)]], device const float* x [[buffer(1)]], device float* H [[buffer(2)]],
+                      uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y;
+    if (i >= a.d) return;
+    const float v = x[(ulong) t * a.d + i];
+    for (int s = 0; s < a.hc; ++s) H[((ulong) t * a.hc + s) * a.d + i] = v;
+}
+// grid (w, T): dst[(pos0 + t) * w + i] = src[t * ss + i] (the K, V and raw indexer key caches)
+kernel void k_q4_store(constant Q4StoreArgs& a [[buffer(0)]], device float* dst [[buffer(1)]], device const float* src [[buffer(2)]],
+                       uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y;
+    if (i < a.w) dst[(ulong) (a.pos0 + t) * a.w + i] = src[(ulong) t * a.ss + i];
+}
+// grid (d, T): out[t] = sigmoid(sg[t]) sh[t] + sum_j wt[t][j] D[t][j] (the routed experts' rows, token-major pairs)
+kernel void k_q4_moe_combine(constant Q4CombineArgs& a [[buffer(0)]], device const float* D [[buffer(1)]], device const float* wt [[buffer(2)]],
+                             device const float* sh [[buffer(3)]], device const float* sg [[buffer(4)]], device float* out [[buffer(5)]],
+                             uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y;
+    if (i >= a.d) return;
+    float s = sigm(sg[t]) * sh[(ulong) t * a.d + i];
+    for (int j = 0; j < a.k; ++j) s += wt[(ulong) t * a.k + j] * D[((ulong) t * a.k + j) * a.d + i];
+    out[(ulong) t * a.d + i] = s;
+}
+
 // ---- head norm + RoPE, the router ----------------------------------------------------------------------------------
 
 // Threadgroup (head, row), 128 threads: RMSNorm (1 + w) of the head, then RoPE of its first rot values at position
@@ -268,12 +295,14 @@ kernel void k_q4_qsa_scores(constant Q4QsaArgs& a [[buffer(0)]], device const fl
     if (lane == 0) sc[(ulong) t * a.maxdone + j] = s;
 }
 // Threadgroup per row (256 threads): the k-th largest score by a radix select on its bits (scores are >= 0), then every
-// score above it and, of the equal ones, those of the highest blocks.  Rows with done <= k are left as they are.
+// score above it in block order (attention sums the keys in this order, so it must not depend on timing: a
+// threadgroup-wide prefix of the matches, as CUDA's ballot prefix) and, of the equal ones, those of the highest blocks.
+// Rows with done <= k are left as they are.
 kernel void k_q4_qsa_topk(constant Q4QsaArgs& a [[buffer(0)]], device const float* sc [[buffer(1)]], device const int* done [[buffer(2)]],
                           device int* sel [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float red[32];
-    threadgroup atomic_int nout;
+    threadgroup uint wcnt[8];
     const int n = done[t];
     if (n <= a.k) return;
     device const uint* u = (device const uint*) (sc + (ulong) t * a.maxdone);
@@ -284,14 +313,23 @@ kernel void k_q4_qsa_topk(constant Q4QsaArgs& a [[buffer(0)]], device const floa
         for (int j = (int) tid; j < n; j += 256) cnt += u[j] >= cand ? 1.0f : 0.0f;
         if (tg_sum(cnt, red, lane, sg, 8) >= (float) a.k) p = cand;
     }
-    if (tid == 0) atomic_store_explicit(&nout, 0, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     device int* out = sel + (ulong) t * a.k;
-    for (int j = (int) tid; j < n; j += 256)
-        if (u[j] > p) out[atomic_fetch_add_explicit(&nout, 1, memory_order_relaxed)] = j;
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    uint nout = 0;   // the same in every thread
+    for (int j0 = 0; j0 < n; j0 += 256) {
+        const int j = j0 + (int) tid;
+        const uint f = j < n && u[j] > p ? 1u : 0u;
+        const uint before_lane = simd_prefix_exclusive_sum(f), in_sg = simd_sum(f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous chunk's reads of wcnt are done
+        if (lane == 0) wcnt[sg] = in_sg;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint before = nout, total = 0;
+        for (uint x = 0; x < 8; ++x) { before += x < sg ? wcnt[x] : 0u; total += wcnt[x]; }
+        if (f) out[before + before_lane] = j;
+        nout += total;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0)
-        for (int j = n - 1, m = atomic_load_explicit(&nout, memory_order_relaxed); j >= 0 && m < a.k; --j)
+        for (int j = n - 1, m = (int) nout; j >= 0 && m < a.k; --j)
             if (u[j] == p) out[m++] = j;
 }
 

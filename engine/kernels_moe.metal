@@ -224,7 +224,7 @@ static inline float silu_bf(float g) {   // nn.silu on a BF16 tensor: g * sigmoi
 }
 
 // ---- embedding -------------------------------------------------------------------------------------------------------
-// x[t][:] = row ids[t] of the table (BF16, Q8 dequantized to BF16, or SEED4P4 decoded to BF16: W seeds, S coefficient
+// x[t][:] = row ids[t] of the table (BF16, Q8 / Q4 dequantized to BF16, or SEED4P4 decoded to BF16: W seeds, S coefficient
 // words, B the int32 bias, G the 32-bit stream table, EN exponent codes; tile_weights' arithmetic for one weight)
 kernel void k_embed(constant int& d [[buffer(0)]], device const ushort* W [[buffer(1)]], device const uint* QW [[buffer(2)]],
                     device const ushort* S [[buffer(3)]], device const ushort* B [[buffer(4)]],
@@ -263,6 +263,11 @@ kernel void k_embed(constant int& d [[buffer(0)]], device const ushort* W [[buff
         const uint w = QW[(row * (ulong) d + c) / 4];
         const float q = (float) ((w >> (8 * (c % 4))) & 255u);
         const ulong gi = (row * (ulong) d + c) / 64;
+        v = bfr(bf(S[gi]) * q + bf(B[gi]));
+    } else if (FC_FMT == MF_Q4) {   // MLX affine 4-bit: 8 nibbles a word, low first; group AFF_GS (qwen4's embedding: 32)
+        const ulong e = row * (ulong) d + c;
+        const float q = (float) ((QW[e / 8] >> (4 * (e % 8))) & 15u);
+        const ulong gi = e / AFF_GS;
         v = bfr(bf(S[gi]) * q + bf(B[gi]));
     } else v = bf(W[row * (ulong) d + c]);
     x[(ulong) t * d + c] = v;
