@@ -1,5 +1,6 @@
 // engine/kernels_qwen4.cu - CUDA kernels of qwen4 (engine/kernels_qwen4.h), the counterparts of nslm/qwen4_ops.h.
 // f32 values and sums.
+#include <limits.h>
 #include <math.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
@@ -807,6 +808,171 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
         }
 }
 
+// Prompt rows TC_RG at a time: block (KV group, row group), 4 warps for each m-tile of 16 (row, head) pairs. The keys come
+// in tiles of TC_KT from the union of the rows' selected blocks and tails, in block order, once for all the rows. Each row
+// takes a key at most its position, in its tail or in a block it selected (selm). The rows' lists are sorted first (sl).
+#define TC_RG 4
+static int tc4_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+static size_t tc4_smem(int hd, int mt, int topk) {
+    return sizeof(float) * ((size_t) TC_KT * (hd + 8) + (size_t) mt * 4 * 256 + (size_t) mt * 16 * TC_PS) + sizeof(int) * (size_t) TC_RG * tc4_pow2(topk);
+}
+__global__ void __launch_bounds__(512, 1) k_q4_attend_tc4(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
+                                                          const int32_t* nsel, const int32_t* dpos, float* o, int T, int P) {
+    using namespace nvcuda;
+    typedef wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> FragA;
+    extern __shared__ __align__(32) float tcs[];   // the Q, then K or V, tile [16][ld]; partial S [mt][4][256]; P [mt 16][TC_PS]; sl
+    __shared__ int keys[TC_KT], selm[TC_KT], posr[TC_RG], nsr[TC_RG], tailr[TC_RG], nkeys;
+    __shared__ float mx[64], sum[64], alpha[64];
+    const int hd = a.hd, ld = hd + 8, G = a.nh / a.nkv, g = blockIdx.x, t0 = blockIdx.y * TC_RG, nr = min(TC_RG, T - t0);
+    const int tid = threadIdx.x, w = tid >> 5, mt = w >> 2, ws = w & 3, MT = blockDim.x >> 7, ds = hd / 4;
+    const int gq = (tid & 31) >> 2, tq = tid & 3;
+    float* Ks = tcs, *Sp = Ks + TC_KT * ld, *Ps = Sp + MT * 4 * 256;
+    int* sl = (int*) (Ps + MT * 16 * TC_PS);
+    if (tid < TC_RG) {
+        const int r = min(tid, nr - 1), pos = a.pos0 + (dpos ? *dpos : 0) + t0 + r, ns = tid < nr ? nsel[t0 + r] : 0;
+        posr[tid] = pos; nsr[tid] = ns; tailr[tid] = ns ? (pos + 1) / a.R * a.R : 0;
+    }
+    if (tid < MT * 16) { mx[tid] = -INFINITY; sum[tid] = 0.0f; }
+    __syncthreads();
+    for (int x = tid; x < TC_RG * P; x += blockDim.x) {
+        const int r = x / P, j = x % P;
+        sl[x] = j < nsr[r] ? sel[(size_t) (t0 + r) * a.topk + j] : INT_MAX;
+    }
+    for (int k = 2; k <= P; k <<= 1)   // bitonic sort of each row's list, ascending
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            __syncthreads();
+            for (int x = tid; x < TC_RG * P; x += blockDim.x) {
+                const int i = x % P, ij = i ^ j;
+                int* sr = sl + x / P * P;
+                if (ij > i && (sr[i] > sr[ij]) == ((i & k) == 0)) { const int v = sr[i]; sr[i] = sr[ij]; sr[ij] = v; }
+            }
+        }
+    FragA qh[8], ql[8];   // the warp's m-tile, dims [ws ds, (ws + 1) ds)
+    for (int m0 = 0; m0 < MT; ++m0) {
+        __syncthreads();
+        for (int x = tid; x < 16 * hd; x += blockDim.x) {
+            const int m = m0 * 16 + x / hd, r = m / G, h = m % G;
+            Ks[x / hd * ld + x % hd] = r < nr ? q[(size_t) (t0 + r) * a.qld + (size_t) (g * G + h) * 2 * hd + x % hd] : 0.0f;
+        }
+        __syncthreads();
+        if (mt == m0)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (j < ds / 8) {
+                    FragA f;
+                    wmma::load_matrix_sync(f, Ks + ws * ds + 8 * j, ld);
+                    tf32_split(f, qh[j], ql[j]);
+                }
+    }
+    float oc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) oc[j][0] = oc[j][1] = oc[j][2] = oc[j][3] = 0.0f;
+    int cur[TC_RG] = {0, 0, 0, 0}, fb = 0, fe = 0;   // thread 0: the lists' cursors, and the next and last block of the tails
+    if (tid == 0) {
+        int tmin = tailr[0];
+        for (int r = 1; r < nr; ++r) tmin = min(tmin, tailr[r]);
+        fb = tmin / a.R;
+        fe = posr[nr - 1] / a.R;
+    }
+    for (;;) {
+        __syncthreads();   // the previous tile (or Q) is read
+        if (tid == 0) {    // the next blocks of the union, each with the rows that selected it
+            int nk = 0;
+            while (nk + a.R <= TC_KT) {
+                int b = fb <= fe ? fb : INT_MAX;
+                for (int r = 0; r < nr; ++r) if (cur[r] < nsr[r]) b = min(b, sl[r * P + cur[r]]);
+                if (b == INT_MAX) break;
+                int m = 0;
+                for (int r = 0; r < nr; ++r) if (cur[r] < nsr[r] && sl[r * P + cur[r]] == b) { m |= 1 << r; ++cur[r]; }
+                if (b == fb) ++fb;
+                for (int u = 0; u < a.R; ++u, ++nk) { keys[nk] = b * a.R + u <= posr[nr - 1] ? b * a.R + u : -1; selm[nk] = m; }
+            }
+            for (int u = nk; u < TC_KT; ++u) keys[u] = -1;
+            nkeys = nk;
+        }
+        __syncthreads();
+        if (!nkeys) break;
+        tc_fetch(a, keys, K, g, ld, Ks);
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> sacc;
+        wmma::fill_fragment(sacc, 0.0f);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (j < ds / 8) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kb;
+                wmma::load_matrix_sync(kb, Ks + ws * ds + 8 * j, ld);
+                mma3s(sacc, qh[j], ql[j], kb);
+            }
+        wmma::store_matrix_sync(Sp + (mt * 4 + ws) * 256, sacc, 16, wmma::mem_row_major);
+        __syncthreads();
+        tc_fetch(a, keys, V, g, ld, Ks);
+        {   // m-row m: 8 threads of 2 keys each, as k_q4_attend_tc, with each row's keys
+            const int m = tid >> 3, h = tid & 7, r = m / G, i = m & 15;
+            const float* sp = Sp + (m >> 4) * 4 * 256;
+            float sc[2], mt2 = -INFINITY;
+            for (int u = 0; u < 2; ++u) {
+                const int kk = 2 * h + u, key = keys[kk], x = i * 16 + kk;
+                const int in = r < nr && key >= 0 && key <= posr[r] && (key >= tailr[r] || (selm[kk] >> r & 1));
+                sc[u] = in ? (sp[x] + sp[256 + x] + sp[512 + x] + sp[768 + x]) * a.scale : -INFINITY;
+                mt2 = fmaxf(mt2, sc[u]);
+            }
+            for (int sh = 1; sh < 8; sh <<= 1) mt2 = fmaxf(mt2, __shfl_xor_sync(FULL, mt2, sh));
+            const float m0 = mx[m], m1 = fmaxf(m0, mt2);
+            float ps = 0;
+            for (int u = 0; u < 2; ++u) {
+                const float p = sc[u] == -INFINITY ? 0.0f : expf(sc[u] - m1);
+                Ps[m * TC_PS + 2 * h + u] = p;
+                ps += p;
+            }
+            for (int sh = 1; sh < 8; sh <<= 1) ps += __shfl_xor_sync(FULL, ps, sh);
+            if (!h) {
+                const float al = m0 == -INFINITY ? 0.0f : expf(m0 - m1);
+                alpha[m] = al;
+                sum[m] = sum[m] * al + ps;
+                mx[m] = m1;
+            }
+        }
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        const int mb = mt * 16;
+        const float a0 = alpha[mb + gq], a1 = alpha[mb + gq + 8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { oc[j][0] *= a0; oc[j][1] *= a0; oc[j][2] *= a1; oc[j][3] *= a1; }
+#pragma unroll
+        for (int k8 = 0; k8 < TC_KT; k8 += 8) {
+            const float* pr = Ps + (size_t) mb * TC_PS;
+            const float pv[4] = {pr[gq * TC_PS + k8 + tq], pr[(gq + 8) * TC_PS + k8 + tq], pr[gq * TC_PS + k8 + tq + 4], pr[(gq + 8) * TC_PS + k8 + tq + 4]};
+            uint32_t ph[4], pl[4];
+            tf32_parts<4>(pv, ph, pl);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (j < ds / 8) {
+                    const float* vb = Ks + (size_t) (k8 + tq) * ld + ws * ds + 8 * j + gq;
+                    const float bv[2] = {vb[0], vb[4 * ld]};
+                    uint32_t bh[2], bl[2];
+                    tf32_parts<2>(bv, bh, bl);
+                    mma_tf32(oc[j], ph, bh);
+                    mma_tf32(oc[j], ph, bl);
+                    mma_tf32(oc[j], pl, bh);
+                }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {   // O / sum, gated: m-rows gq (u < 2) and gq + 8, columns 2 tq + u % 2
+            const int m = mt * 16 + gq + 8 * (u >> 1), r = m / G, h = m % G, i = ws * ds + 8 * j + 2 * tq + (u & 1);
+            if (j < ds / 8 && r < nr)
+                o[((size_t) (t0 + r) * a.nh + (size_t) g * G + h) * hd + i] =
+                    oc[j][u] / sum[m] * sigm(q[(size_t) (t0 + r) * a.qld + (size_t) (g * G + h) * 2 * hd + hd + i]);
+        }
+}
+static int attend_tc4(const Qwen4Cfg* c, int mt, int topk) {   // fits, and may take its shared memory
+    static int set;
+    if (!set) set = cudaFuncSetAttribute(k_q4_attend_tc4, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 << 10) == cudaSuccess;
+    return set && mt <= 4 && c->head_dim % 64 == 0 && c->head_dim <= 256 && TC_KT % c->ix_ratio == 0 && tc4_smem(c->head_dim, mt, topk) <= (96 << 10);
+}
 static int attend_tc(const Qwen4Cfg* c) {   // the tensor-core kernel fits, and may take its shared memory
     static int set;
     if (!set) set = cudaFuncSetAttribute(k_q4_attend_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) tc_smem(256)) == cudaSuccess;
@@ -923,6 +1089,10 @@ int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, 
     if (T <= 8 && G <= 32) {   // decode rows: keys split over AD_S blocks a KV group, then the splits combined
         k_q4_attend_d<<<dim3((unsigned) c->n_kv, AD_S, (unsigned) T), 32 * (unsigned) G, 0, s>>>(a, q, K, V, sel, nsel, dpos, part);
         k_q4_attend_dc<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, part, o);
+    } else if (T > 8 && attend_tc4(c, (TC_RG * G + 15) / 16, a.topk)) {   // prompt rows TC_RG at a time
+        const int mt = (TC_RG * G + 15) / 16;
+        k_q4_attend_tc4<<<dim3((unsigned) c->n_kv, (unsigned) (T + TC_RG - 1) / TC_RG), 128 * (unsigned) mt, tc4_smem(c->head_dim, mt, a.topk), s>>>(
+            a, q, K, V, sel, nsel, dpos, o, T, tc4_pow2(a.topk));
     } else if (T > 8 && attend_tc(c))   // prompt rows on tensor cores
         k_q4_attend_tc<<<dim3((unsigned) c->n_kv, (unsigned) T), 128, tc_smem(c->head_dim), s>>>(a, q, K, V, sel, nsel, dpos, o);
     else if (T > 8 && G <= 32)   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
