@@ -18,6 +18,7 @@
 #include "model_st.h"
 #include "qwen4_ops.h"
 #include "rows.h"
+#include "vram.h"
 
 #define Q4E_NEV 32768   // Q4E_PROFILE events of one forward
 
@@ -514,11 +515,13 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
 #undef F
 #undef I
-    if (e->cache && !e->err[0]) {   // after the buffers: cache_gb < 0 takes the free VRAM less NSLM_VRAM_RESERVE_MB (512)
+    if (e->cache && !e->err[0]) {   // after the buffers: at most the free VRAM less the reserve (cache_gb < 0: all of it)
         size_t fr = 0, to = 0;
-        const double res = getenv("NSLM_VRAM_RESERVE_MB") ? atof(getenv("NSLM_VRAM_RESERVE_MB")) : 512;
+        const double res = nslm_vram_reserve_mb();
         cudaMemGetInfo(&fr, &to);
-        build_cache(e, o->cache_gb > 0 ? o->cache_gb : ((double) fr - res * 1048576.0) / 1e9);
+        const double most = ((double) fr - res * 1048576.0) / 1e9;
+        if (o->cache_gb > most) fprintf(stderr, "qwen4: expert cache %.1f GB, not %.1f: %.0f MB of VRAM stay free (NSLM_VRAM_RESERVE_MB)\n", most, o->cache_gb, res);
+        build_cache(e, o->cache_gb > 0 && o->cache_gb < most ? o->cache_gb : most);
     }
     for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     e->nb = (int) nb;
