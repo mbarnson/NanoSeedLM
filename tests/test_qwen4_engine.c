@@ -202,6 +202,13 @@ static void cpu_tail_check(void) {
         const int same = !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V * ND);
         int first = -1;   // the first step whose logits differ from the GPU's
         for (int t = 0; first < 0 && t < ND; ++t) if (memcmp(lg[1] + (size_t) t * V, lg[0] + (size_t) t * V, sizeof(float) * (size_t) V)) first = t;
+        printf("cpu_tail by step:");
+        for (int t = 0; t < ND; ++t) {
+            double dt = 0;
+            for (int v = 0; v < V; ++v) dt = fmax(dt, fabs((double) lg[1][(size_t) t * V + v] - lg[0][(size_t) t * V + v]) / m);
+            printf(" %.0e", dt);
+        }
+        printf("\n");
         printf("cpu_tail on the seed fixture: logits %.1e / %.1e (first / last step) from the GPU's, equal up to step %d of %d; the tail "
                "dropped %.1e / %.1e; the GPU with all experts in VRAM %.1e / %.1e; %llu misses against %llu\n", d[1][0], d[1][1],
                first < 0 ? ND : first, ND, d[3][0], d[3][1], d[4][0], d[4][1], (unsigned long long) miss[1], (unsigned long long) miss[0]);
