@@ -58,7 +58,13 @@ struct Q4Eng {
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
     float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
-    int32_t *d_ids, *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
+    int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
+    // A forward's input: hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
+    // from din, so a CUDA graph of T decode rows serves every position.  emb_h (PLE rows) and hlog (logits) are pinned too.
+    int32_t *hin, *din;
+    float* hlog;
+    int nb, nple, cap, no_graph;   // QSA block slots; PLE layers; capturing a graph; NSLM_NO_GRAPH
+    cudaGraphExec_t graph[2][MV_MAXT + 1];   // [with logits][rows]
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
     MmTile* tiles;
     int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
@@ -98,6 +104,13 @@ static void* dmem(Q4Eng* e, const void* p, size_t n) {
     if (p) cudaMemcpy(d, p, n, cudaMemcpyHostToDevice);
     else cudaMemset(d, 0, n ? n : 16);
     return d;
+}
+// n bytes of pinned host memory, freed at close
+static void* pin(Q4Eng* e, size_t n) {
+    void* h = NULL;
+    if (cudaHostAlloc(&h, n ? n : 16, cudaHostAllocDefault) != cudaSuccess) { fail(e, "cannot pin %zu bytes of host memory", n); return NULL; }
+    track(&e->host, &e->nhost, &e->chost, h);
+    return h;
 }
 // a copy of p in mapped host memory; its device address
 static void* hmem(Q4Eng* e, const void* p, size_t n) {
@@ -359,12 +372,17 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * ka); e->Gb = F(T * ka); e->Ub = F(T * ka);
     e->Dx = F(T * c->top_k * c->d); e->sh = F(T * c->d); e->sgv = F(T); e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab); e->y = F(T * vd);
     e->cv = F(T * cd); e->qkvb = F(T * cd); e->zb = F(T * vd); e->bb = F(T * c->lin_hv); e->ab = F(T * c->lin_hv);
-    e->d_ids = I(T); e->ind = I(T * c->top_k); e->sel = I(T * (c->ix_budget / c->ix_ratio)); e->done = I(T); e->nsel = I(T); e->zero = I(T);
+    e->din = I(T + 1); e->ind = I(T * c->top_k); e->sel = I(T * (c->ix_budget / c->ix_ratio)); e->done = I(T); e->nsel = I(T); e->zero = I(T);
     e->perm = I(T * c->top_k); e->ntiles = I(2 * (size_t) c->n_exp + 3);
     e->tiles = (MmTile*) dmem(e, NULL, sizeof(MmTile) * (T * c->top_k / MMT_BN + (size_t) c->n_exp));
 #undef F
 #undef I
-    e->emb_h = (float*) malloc(sizeof(float) * T * (size_t) c->ple_dim);
+    for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
+    e->nb = (int) nb;
+    e->hin = (int32_t*) pin(e, sizeof(int32_t) * (T + 1));
+    e->emb_h = (float*) pin(e, sizeof(float) * T * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
+    e->hlog = (float*) pin(e, sizeof(float) * (size_t) Q4E_LOGIT_ROWS * c->vocab);
+    e->no_graph = getenv("NSLM_NO_GRAPH") != NULL;
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
     for (int i = 0; e->prof && i < 1024; ++i) cudaEventCreate(&e->ev[i]);
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
@@ -386,7 +404,8 @@ void q4e_close(Q4Eng* e) {
     }
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
-    free(e->dev); free(e->host); free(e->emb_h); free(e->ids);
+    for (int w = 0; w < 2; ++w) for (int t = 0; t <= MV_MAXT; ++t) if (e->graph[w][t]) cudaGraphExecDestroy(e->graph[w][t]);
+    free(e->dev); free(e->host); free(e->ids);
     if (e->s) cudaStreamDestroy(e->s);
     if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
@@ -438,14 +457,22 @@ static void hc_mix(Q4Eng* e, const float* norm, const W* down, const W* upw, con
     if (injw) { mv(e, injw, e->normed, e->inj, T); kq4_hc_gate(e->s, c->hc, e->inj, T * c->hc); }
 }
 
-static int ple(Q4Eng* e, int l, int T) {
+// The PLE rows of rows [pos, pos + T) of each PLE layer, into emb_h: host work, before the rows' device work
+static int ple_rows(Q4Eng* e, int T) {
+    const Qwen4Cfg* c = &e->c;
+    for (int l = 0; l < c->n_layer; ++l)
+        for (int t = 0; c->ple[l] >= 0 && t < T; ++t)
+            if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
+                                e->emb_h + ((size_t) c->ple[l] * MAXT + t) * c->ple_dim))
+                return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
+    return 0;
+}
+
+static void ple(Q4Eng* e, int l, int T) {
     const Qwen4Cfg* c = &e->c;
     Layer* L = &e->L[l];
     const int HD = c->hc * c->d;
-    for (int t = 0; t < T; ++t)
-        if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t, e->emb_h + (size_t) t * c->ple_dim))
-            return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
-    cudaMemcpyAsync(e->emb, e->emb_h, sizeof(float) * (size_t) T * c->ple_dim, cudaMemcpyHostToDevice, e->s);
+    cudaMemcpyAsync(e->emb, e->emb_h + (size_t) c->ple[l] * MAXT * c->ple_dim, sizeof(float) * (size_t) T * c->ple_dim, cudaMemcpyHostToDevice, e->s);
     mv(e, &L->key, e->emb, e->keys, T);
     kq4_norm1p(e->s, e->keys, HD, c->d, L->nk, c->eps, e->keys, T);
     mv(e, &L->val, e->emb, e->vals, T);
@@ -453,34 +480,26 @@ static int ple(Q4Eng* e, int l, int T) {
     kq4_ple_gate(e->s, c, e->keys, e->qs, e->vals, e->gated, T);
     kq4_norm1p(e->s, e->gated, HD, c->d, L->nc, c->eps, e->keys, T);   // keys now holds the conv input
     kq4_ple_conv(e->s, c, L->pw, e->keys, e->gated, L->hist, e->H, T);
-    return 0;
 }
 
 static int attention(Q4Eng* e, Layer* L, int T) {
     const Qwen4Cfg* c = &e->c;
-    const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio, iw = (c->ix_heads + 1) * D, topk = c->ix_budget / R;
+    const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio, iw = (c->ix_heads + 1) * D;
     mv(e, &L->q, e->x, e->qp, T);
     mv(e, &L->k, e->x, e->kk, T);
     mv(e, &L->v, e->x, e->vv, T);
-    kq4_head_norm_rope(e->s, c, e->qp, c->n_head * 2 * hd, c->n_head, 2 * hd, hd, L->qn, e->pos, T);
-    kq4_head_norm_rope(e->s, c, e->kk, kvw, c->n_kv, hd, hd, L->kn, e->pos, T);
-    cudaMemcpyAsync(L->K + (size_t) e->pos * kvw, e->kk, sizeof(float) * (size_t) T * kvw, cudaMemcpyDeviceToDevice, e->s);
-    cudaMemcpyAsync(L->V + (size_t) e->pos * kvw, e->vv, sizeof(float) * (size_t) T * kvw, cudaMemcpyDeviceToDevice, e->s);
+    kq4_head_norm_rope(e->s, c, e->qp, c->n_head * 2 * hd, c->n_head, 2 * hd, hd, L->qn, 0, e->din, T);
+    kq4_head_norm_rope(e->s, c, e->kk, kvw, c->n_kv, hd, hd, L->kn, 0, e->din, T);
+    kq4_store(e->s, L->K, kvw, e->kk, kvw, 0, e->din, T);
+    kq4_store(e->s, L->V, kvw, e->vv, kvw, 0, e->din, T);
     mv(e, &L->ix, e->x, e->ixo, T);
-    cudaMemcpy2DAsync(L->raw + (size_t) e->pos * D, sizeof(float) * D, e->ixo + (size_t) c->ix_heads * D, sizeof(float) * (size_t) iw,
-                      sizeof(float) * D, (size_t) T, cudaMemcpyDeviceToDevice, e->s);
-    kq4_head_norm_rope(e->s, c, e->ixo, iw, c->ix_heads, D, D, L->iqn, e->pos, T);
-    kq4_qsa_blocks(e->s, c, L->raw, L->ikn, e->pos / R, (e->pos + T) / R, L->blk);
-    int32_t done[MAXT], nsel[MAXT], maxdone = 0;
-    for (int t = 0; t < T; ++t) {
-        done[t] = (e->pos + t + 1) / R;
-        nsel[t] = done[t] > topk ? topk : 0;
-        if (done[t] > maxdone) maxdone = done[t];
-    }
-    cudaMemcpyAsync(e->done, done, sizeof(int32_t) * (size_t) T, cudaMemcpyHostToDevice, e->s);
-    cudaMemcpyAsync(e->nsel, nsel, sizeof(int32_t) * (size_t) T, cudaMemcpyHostToDevice, e->s);
-    kq4_qsa_select(e->s, c, e->ixo, iw, L->blk, e->done, maxdone, e->sc, e->sel, T);
-    if (kq4_attend(e->s, c, e->qp, L->K, L->V, e->pos, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
+    kq4_store(e->s, L->raw, D, e->ixo + (size_t) c->ix_heads * D, iw, 0, e->din, T);
+    kq4_head_norm_rope(e->s, c, e->ixo, iw, c->ix_heads, D, D, L->iqn, 0, e->din, T);
+    kq4_qsa_blocks(e->s, c, L->raw, L->ikn, 0, e->din, T, L->blk);
+    kq4_qsa_rows(e->s, c, 0, e->din, e->done, e->nsel, T);
+    // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
+    kq4_qsa_select(e->s, c, e->ixo, iw, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
+    if (kq4_attend(e->s, c, e->qp, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
     mv(e, &L->o, e->o, e->br, T);
     return 0;
 }
@@ -538,16 +557,17 @@ static void moe(Q4Eng* e, int l, int T) {
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->sgv, e->br, T);
 }
 
-static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
+// The device work of T rows, from the pinned input to the pinned logits (want: with the head)
+static int enqueue(Q4Eng* e, int T, int want) {
     const Qwen4Cfg* c = &e->c;
     mark(e, ST_EMBED);
-    cudaMemcpyAsync(e->d_ids, ids, sizeof(int32_t) * (size_t) T, cudaMemcpyHostToDevice, e->s);
-    kc_embed(e->s, e->embed.fmt, e->embed.w, c->d, e->d_ids, e->x, T);
+    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t) * (size_t) (T + 1), cudaMemcpyHostToDevice, e->s);
+    kc_embed(e->s, e->embed.fmt, e->embed.w, c->d, e->din + 1, e->x, T);
     kq4_tile(e->s, c->hc, c->d, e->x, e->H, T);
     mark(e, ST_EMBED);
     for (int l = 0; l < c->n_layer; ++l) {
         Layer* L = &e->L[l];
-        if (c->ple[l] >= 0 && ple(e, l, T)) return -1;
+        if (c->ple[l] >= 0) ple(e, l, T);
         mark(e, ST_PLE);
         hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
         mark(e, ST_HC);
@@ -560,14 +580,37 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
         mark(e, ST_EXPERT);
     }
-    if (logits) {   // prompt rows without logits skip the mixer and the head
+    if (want) {   // prompt rows without logits skip the mixer and the head
         hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
         mv(e, &e->head, e->x, e->logits, T);
-        cudaMemcpyAsync(logits, e->logits, sizeof(float) * (size_t) T * c->vocab, cudaMemcpyDeviceToHost, e->s);
+        cudaMemcpyAsync(e->hlog, e->logits, sizeof(float) * (size_t) T * c->vocab, cudaMemcpyDeviceToHost, e->s);
         mark(e, ST_HEAD);
     }
+    return e->err[0] ? -1 : 0;
+}
+
+// Decode rows (up to MV_MAXT) run as a CUDA graph, captured once for each row count, with or without logits
+static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
+    e->hin[0] = e->pos;
+    memcpy(e->hin + 1, ids, sizeof(int32_t) * (size_t) T);
+    if (ple_rows(e, T)) return -1;
+    const int want = logits != NULL, graph = T <= MV_MAXT && !e->prof && !e->stream && !e->no_graph;
+    cudaGraphExec_t* ge = &e->graph[want][T];
+    if (graph && !*ge) {
+        cudaGraph_t gr = NULL;
+        if (cudaStreamBeginCapture(e->s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return fail(e, "CUDA graph capture failed");
+        e->cap = 1;
+        const int rc = enqueue(e, T, want);
+        e->cap = 0;
+        if (cudaStreamEndCapture(e->s, &gr) != cudaSuccess || rc) { if (gr) cudaGraphDestroy(gr); return fail(e, "CUDA graph capture failed"); }
+        const cudaError_t ri = cudaGraphInstantiate(ge, gr, 0);
+        cudaGraphDestroy(gr);
+        if (ri != cudaSuccess) { *ge = NULL; return fail(e, "CUDA graph: %s", cudaGetErrorString(ri)); }
+    }
+    if (graph ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : enqueue(e, T, want)) return fail(e, "CUDA: forward failed");
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
+    if (logits) memcpy(logits, e->hlog, sizeof(float) * (size_t) T * e->c.vocab);
     prof_collect(e);
     e->pos += T;
     return 0;

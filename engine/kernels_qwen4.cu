@@ -174,18 +174,14 @@ void kq4_tile(cudaStream_t s, int hc, int d, const float* x, float* H, int T) {
     k_q4_tile<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(hc, d, x, H);
 }
 
-// Block (head, row): RMSNorm (1 + w) of the head, then RoPE of its first rot values (f32 angles from a double inverse
-// frequency, cos and sin in double: as the C ops)
-__global__ void __launch_bounds__(128) k_q4_head_norm_rope(float* x, int rs, int hs, int hd, const float* w, float eps, int rot,
-                                                           double theta, int pos0) {
-    __shared__ float red[32], v[1024];
-    float* xh = x + (size_t) blockIdx.y * rs + (size_t) blockIdx.x * hs;
+// One block: RMSNorm (1 + w) of xh[hd], then RoPE of its first rot values at pos (f32 angles from a double inverse
+// frequency, cos and sin in double: as the C ops).  red[32] and v[hd] are the block's shared scratch.
+static __device__ void norm_rope(float* xh, int hd, const float* w, float eps, int rot, double theta, int pos, float* red, float* v) {
     float ss = 0;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) ss += xh[i] * xh[i];
     const float r = rsqrtf(block_sum(ss, red) / hd + eps);
     for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = xh[i] * r * (1.0f + w[i]);
     __syncthreads();
-    const int pos = pos0 + (int) blockIdx.y;
     for (int i = threadIdx.x; i < hd; i += blockDim.x) {
         float o = v[i];
         if (i < rot) {
@@ -197,8 +193,23 @@ __global__ void __launch_bounds__(128) k_q4_head_norm_rope(float* x, int rs, int
         xh[i] = o;
     }
 }
-void kq4_head_norm_rope(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T) {
-    k_q4_head_norm_rope<<<dim3((unsigned) nh, (unsigned) T), 128, 0, s>>>(x, rs, hs, hd, w, c->eps, c->rot_dim, (double) c->rope_theta, pos0);
+// Block (head, row) at position pos0 (+ *dpos) + row
+__global__ void __launch_bounds__(128) k_q4_head_norm_rope(float* x, int rs, int hs, int hd, const float* w, float eps, int rot,
+                                                           double theta, int pos0, const int32_t* dpos) {
+    __shared__ float red[32], v[1024];
+    norm_rope(x + (size_t) blockIdx.y * rs + (size_t) blockIdx.x * hs, hd, w, eps, rot, theta, pos0 + (dpos ? *dpos : 0) + (int) blockIdx.y, red, v);
+}
+void kq4_head_norm_rope(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0,
+                        const int32_t* dpos, int T) {
+    k_q4_head_norm_rope<<<dim3((unsigned) nh, (unsigned) T), 128, 0, s>>>(x, rs, hs, hd, w, c->eps, c->rot_dim, (double) c->rope_theta, pos0, dpos);
+}
+// dst[(pos + t) * w + i] = src[t * ss + i], pos = pos0 (+ *dpos)
+__global__ void k_q4_store(float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos) {
+    const int t = (int) blockIdx.y, i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < w) dst[(size_t) (pos0 + (dpos ? *dpos : 0) + t) * w + i] = src[(size_t) t * ss + i];
+}
+void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T) {
+    k_q4_store<<<dim3((unsigned) (w + 255) / 256, (unsigned) T), 256, 0, s>>>(dst, w, src, ss, pos0, dpos);
 }
 
 // One warp per row: k rounds of a warp arg max of the logits (ties to the higher expert); weights exp(l - max) renormalised
@@ -284,20 +295,35 @@ void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float
 
 // ---- QSA ---------------------------------------------------------------------------------------------------------------
 
-__global__ void k_q4_qsa_mean(int D, int R, const float* raw, int j0, float* blk) {
-    const int j = j0 + (int) blockIdx.x;
+// Block b: key block j = pos / R + b if rows [pos, pos + T) complete it: the mean of its R raw keys, then norm + RoPE at
+// position j * R
+__global__ void __launch_bounds__(128) k_q4_qsa_blocks(int D, int R, const float* raw, const float* w, float eps, int rot, double theta,
+                                                       int pos0, const int32_t* dpos, int T, float* blk) {
+    __shared__ float red[32], v[1024];
+    const int pos = pos0 + (dpos ? *dpos : 0), j = pos / R + (int) blockIdx.x;
+    if (j >= (pos + T) / R) return;
+    float* bj = blk + (size_t) j * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float m = 0;
         for (int u = 0; u < R; ++u) m += raw[((size_t) j * R + u) * D + i];
-        blk[(size_t) j * D + i] = m / R;
+        bj[i] = m / R;
     }
+    __syncthreads();
+    norm_rope(bj, D, w, eps, rot, theta, j * R, red, v);
 }
-void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int j0, int j1, float* blk) {
-    if (j1 <= j0) return;
-    k_q4_qsa_mean<<<(unsigned) (j1 - j0), 128, 0, s>>>(c->ix_dim, c->ix_ratio, raw, j0, blk);
-    // block j sits at RoPE position j * ratio: one "row" per block, rows ratio positions apart
-    for (int j = j0; j < j1; ++j)
-        kq4_head_norm_rope(s, c, blk + (size_t) j * c->ix_dim, c->ix_dim, 1, c->ix_dim, c->ix_dim, w, j * c->ix_ratio, 1);
+void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int pos0, const int32_t* dpos, int T, float* blk) {
+    k_q4_qsa_blocks<<<(unsigned) (T / c->ix_ratio + 1), 128, 0, s>>>(c->ix_dim, c->ix_ratio, raw, w, c->eps, c->rot_dim, (double) c->rope_theta,
+                                                                 pos0, dpos, T, blk);
+}
+__global__ void k_q4_qsa_rows(int R, int k, int pos0, const int32_t* dpos, int32_t* done, int32_t* nsel, int T) {
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= T) return;
+    const int d = (pos0 + (dpos ? *dpos : 0) + t + 1) / R;
+    done[t] = d;
+    nsel[t] = d > k ? k : 0;
+}
+void kq4_qsa_rows(cudaStream_t s, const Qwen4Cfg* c, int pos0, const int32_t* dpos, int32_t* done, int32_t* nsel, int T) {
+    k_q4_qsa_rows<<<(unsigned) (T + 255) / 256, 256, 0, s>>>(c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, dpos, done, nsel, T);
 }
 
 // Warp per (row, block): sum over heads of relu(q_h . blk_j)
@@ -365,10 +391,10 @@ typedef struct {
 // Block (head, row), 8 warps: each warp takes every 8th visible key with an online softmax (lanes hold hd / 32 dims of q
 // and of the output), then the warps merge; the output is gated by sigmoid of the query's gate half
 __global__ void __launch_bounds__(256) k_q4_attend(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
-                                                   const int32_t* nsel, float* o) {
+                                                   const int32_t* nsel, const int32_t* dpos, float* o) {
     __shared__ float sm[8], sl[8], sacc[8][256];
     const int h = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31, dl = a.hd / 32, g = h / (a.nh / a.nkv);
-    const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
     const float* qh = q + ((size_t) t * a.nh + h) * 2 * a.hd;
     float qv[8], acc[8], m = -INFINITY, l = 0;
     for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
@@ -397,11 +423,11 @@ __global__ void __launch_bounds__(256) k_q4_attend(AttArgs a, const float* q, co
         o[((size_t) t * a.nh + h) * a.hd + i] = v / L * sigm(qh[a.hd + i]);
     }
 }
-int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* sel,
-               const int32_t* nsel, float* o, int T) {
+int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
+               const int32_t* sel, const int32_t* nsel, float* o, int T) {
     if (c->head_dim % 32 || c->head_dim > 256) return -1;
     const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, 1.0f / sqrtf((float) c->head_dim)};
-    k_q4_attend<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, K, V, sel, nsel, o);
+    k_q4_attend<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, K, V, sel, nsel, dpos, o);
     return 0;
 }
 

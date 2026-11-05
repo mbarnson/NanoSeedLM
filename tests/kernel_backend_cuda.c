@@ -600,7 +600,7 @@ int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up,
 }
 int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T) {
     float* dx = (float*) dev(x, 4 * (size_t) rs * T);
-    kq4_head_norm_rope(0, c, dx, rs, nh, hs, hd, (const float*) dev(w, 4 * (size_t) hd), pos0, T);
+    kq4_head_norm_rope(0, c, dx, rs, nh, hs, hd, (const float*) dev(w, 4 * (size_t) hd), pos0, NULL, T);
     return done("kq4_head_norm_rope", x, dx, 4 * (size_t) rs * T);
 }
 int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T) {
@@ -628,7 +628,8 @@ int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float
     for (int t = 0; t < T; ++t) if (done_[t] > maxdone) maxdone = done_[t];
     float* db = (float*) dev(NULL, 4 * (size_t) nb * D);
     int32_t* ds = (int32_t*) dev(sel, 4 * (size_t) T * k);
-    kq4_qsa_blocks(0, c, (const float*) dev(raw, 4 * (size_t) nb * c->ix_ratio * D), (const float*) dev(w, 4 * (size_t) D), 0, nb, db);
+    kq4_qsa_blocks(0, c, (const float*) dev(raw, 4 * (size_t) nb * c->ix_ratio * D), (const float*) dev(w, 4 * (size_t) D), 0, NULL,
+                   nb * c->ix_ratio, db);
     kq4_qsa_select(0, c, (const float*) dev(iq, 4 * (size_t) rs * T), rs, db, (const int32_t*) dev(done_, 4 * (size_t) T), maxdone,
                    (float*) dev(NULL, 4 * (size_t) T * (maxdone ? maxdone : 1)), ds, T);
     if (fetch("kq4_qsa_blocks", blk, db, 4 * (size_t) nb * D)) return -1;
@@ -638,7 +639,7 @@ int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float*
                  const int32_t* nsel, float* o, int T) {
     const size_t kv = (size_t) npos * c->n_kv * c->head_dim, no = (size_t) T * c->n_head * c->head_dim;
     float* dout = (float*) dev(NULL, 4 * no);
-    if (kq4_attend(0, c, (const float*) dev(q, 4 * no * 2), (const float*) dev(K, 4 * kv), (const float*) dev(V, 4 * kv), pos0,
+    if (kq4_attend(0, c, (const float*) dev(q, 4 * no * 2), (const float*) dev(K, 4 * kv), (const float*) dev(V, 4 * kv), pos0, NULL,
                    (const int32_t*) dev(sel, 4 * (size_t) T * (c->ix_budget / c->ix_ratio)), (const int32_t*) dev(nsel, 4 * (size_t) T), dout, T)) {
         done("kq4_attend", NULL, NULL, 0);
         printf("FAIL: kq4_attend: head_dim not supported\n");

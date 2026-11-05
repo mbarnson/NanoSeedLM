@@ -1,6 +1,7 @@
 // tests/test_qwen4_engine.c - the qwen4 CUDA engine on tests/data/qwen4_tiny against mlx-vlm's float32 logits: matvec
-// rows (any split, the same logits) and one GEMM row of 48, with and without the smallest expert cache.  Also kc_bucket
-// for qwen4's 512 experts (the tiny model has 8).  Skipped without a GPU.
+// rows (any split, the same logits, CUDA graphs or not) and one GEMM row of 48, with and without the smallest expert
+// cache.  Also kc_bucket for qwen4's 512 experts (the tiny model has 8).  Skipped without a GPU.
+#define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c99 (Windows: _putenv_s)
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,14 @@
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+static void set_env(const char* k, const char* v) {   // v = NULL: unset
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
 
 // kc_bucket of rows x k skewed selections over n experts against the host grouping: pairs by expert, tiles of <= MMT_BN
 static void bucket_check(int n, int rows, int k) {
@@ -67,6 +76,20 @@ int main(void) {
     const int rows[8] = {7, 1, 1, 8, 8, 8, 8, 7};
     for (int i = 0, at = 0; i < 8; at += rows[i++]) CHECK(q4e_forward(e, ids + at, rows[i], got + (size_t) at * V) == 0, "forward: %s", q4e_error(e));
     CHECK(q4e_pos(e) == n, "position %d", q4e_pos(e));
+    {   // the decode rows above ran as CUDA graphs: without them, the same logits
+        set_env("NSLM_NO_GRAPH", "1");
+        Q4Eng* ng = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
+        set_env("NSLM_NO_GRAPH", NULL);
+        CHECK(ng != NULL, "open without graphs: %s", err);
+        int diff = 0;
+        for (int i = 0, at = 0; ng && i < 8; at += rows[i++]) {
+            CHECK(q4e_forward(ng, ids + at, rows[i], again + (size_t) at * V) == 0, "forward without graphs: %s", q4e_error(ng));
+            for (size_t j = (size_t) at * V; j < (size_t) (at + rows[i]) * V; ++j) diff += got[j] != again[j];
+        }
+        printf("decode rows with and without CUDA graphs: %d logits differ\n", diff);
+        CHECK(diff == 0, "CUDA graphs change the logits of decode rows");
+        q4e_close(ng);
+    }
     q4e_reset(e);
     for (int at = 0; at < n; at += 8) CHECK(q4e_forward(e, ids + at, n - at < 8 ? n - at : 8, again + (size_t) at * V) == 0, "rows of 8: %s", q4e_error(e));
     q4e_reset(e);

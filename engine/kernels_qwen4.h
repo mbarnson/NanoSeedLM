@@ -27,8 +27,12 @@ void kq4_hc_add(cudaStream_t s, int hc, int d, float* H, const float* branch, co
 
 // H[t][s][i] = x[t][i] for each of hc streams
 void kq4_tile(cudaStream_t s, int hc, int d, const float* x, float* H, int T);
-// qwen4_head_norm_rope on row t of x (row stride rs) at position pos0 + t: nh heads of hd at hs apart; w [hd]
-void kq4_head_norm_rope(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0, int T);
+// Positions: row t of a call is at pos0 + t, plus the device int *dpos when dpos is not NULL (a CUDA graph's rows).
+// qwen4_head_norm_rope on row t of x (row stride rs): nh heads of hd at hs apart; w [hd]
+void kq4_head_norm_rope(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0,
+                        const int32_t* dpos, int T);
+// dst[(pos + t) * w + i] = src[t * ss + i]: rows into a cache at their positions
+void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T);
 // qwen4_route of logits[T][n_exp] into ind, wt [T][top_k] (top_k <= 32)
 void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
 // out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t]) sh[t]
@@ -36,16 +40,18 @@ void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* 
 // qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated)
 void kq4_ple_gate(cudaStream_t s, const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, int T);
 void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* H, int T);
-// QSA: block keys j0 .. j1 - 1 (qwen4_qsa_block) from the raw key cache raw[pos][ix_dim] into blk[j][ix_dim]
-void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int j0, int j1, float* blk);
+// QSA: the block keys (qwen4_qsa_block) that rows [pos, pos + T) complete, from the raw key cache raw[pos][ix_dim] into
+// blk[j][ix_dim]; done[t] (blocks complete at row t) and nsel[t] (budget / ratio when done[t] exceeds it, else 0)
+void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int pos0, const int32_t* dpos, int T, float* blk);
+void kq4_qsa_rows(cudaStream_t s, const Qwen4Cfg* c, int pos0, const int32_t* dpos, int32_t* done, int32_t* nsel, int T);
 // qwen4_qsa_select for row t (iq[t][ix_heads][ix_dim] at row stride rs, done[t] blocks) into sel[t][budget / ratio];
 // sc is scratch of T x maxdone floats.  Rows with done[t] <= budget / ratio are left as they are.
 void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, const float* blk, const int32_t* done, int maxdone,
                     float* sc, int32_t* sel, int T);
-// qwen4_attend for row t at position pos0 + t: q[t][n_head][2 head_dim], caches K, V [pos][n_kv][head_dim], nsel[t] blocks
-// of sel[t][budget / ratio]; o[t][n_head][head_dim].  -1 unless head_dim is a multiple of 32, at most 256.
-int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* sel,
-               const int32_t* nsel, float* o, int T);
+// qwen4_attend for row t: q[t][n_head][2 head_dim], caches K, V [pos][n_kv][head_dim], nsel[t] blocks of
+// sel[t][budget / ratio]; o[t][n_head][head_dim].  -1 unless head_dim is a multiple of 32, at most 256.
+int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
+               const int32_t* sel, const int32_t* nsel, float* o, int T);
 
 #ifdef __cplusplus
 }
