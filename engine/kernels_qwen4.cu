@@ -530,7 +530,7 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
 // matrices, padded with zeros; keys come in tiles of TC_KT. S = Q K^T and O = P V are TF32 mma in three parts
 // (hi hi + hi lo + lo hi, near f32). Two passes: the scores' row maxima, then P and P V, so no accumulator rescales.
 // A warp keeps its Q fragments (split once) in registers. The K, then V, tile comes by cp.async into one buffer whose
-// rows are hd + 8 floats apart (a fragment's rows in different banks): 22 KB of shared memory a block.
+// rows are hd + 8 floats apart (a fragment's rows in different banks): 22 KB of shared memory, 4 blocks an SM.
 #define TC_KT 16
 template <typename F> static __device__ __forceinline__ void tf32_split(const F& f, F& hi, F& lo) {
     for (int i = 0; i < f.num_elements; ++i) {
@@ -560,7 +560,7 @@ static __device__ __forceinline__ void tc_fetch(const AttArgs& a, const int* key
     __pipeline_commit();
 }
 static size_t tc_smem(int hd) { return sizeof(float) * ((size_t) TC_KT * (hd + 8) + 5 * 256); }
-__global__ void __launch_bounds__(128) k_q4_attend_tc(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
+__global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
                                                       const int32_t* nsel, const int32_t* dpos, float* o) {
     using namespace nvcuda;
     typedef wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> FragA;
