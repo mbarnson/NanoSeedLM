@@ -701,3 +701,12 @@ tokens/s at 1K, 5.6K and 20K). MTP verify rows still equal decode rows bit for b
 `e53d81c`: after the day's Metal decode kernels, P3 decodes code at 61.5 tokens per second with 1 draft, against 48.9
 without drafts, and chat at 57.5 against 47.2. The text is the same at every K. Read
 [MTP drafts on the M4 Max, again](results/2026-11-05-qwen38-mtp-m4max-rerun.md).
+
+## [2026-11-05] result | The tail skip and the CPU tail on an RTX PRO 6000 at the 4080's cache
+
+HF jobs `6aece14c` and `6aece564`, an 8.1 GB cache. The tail skip (D3) fails gate DL at R = 8 and 9 (KL 0.073 and 0.053
+against 0.036). It failed at R = 7 on the RTX 4080 too. Renormalized weights make it worse (0.123 and 0.088 at 7 and 8). The CPU tail (`--cpu-tail 7`, with the
+BF16 fix) gives 0.030: rounding noise, not a gain. It halves decode on this machine, 66.5 to 33.4 tokens per second.
+The hand-off adds about 30 us. One P3 expert takes 1.6 ms of one core, and the GPU's own work to overlap is about
+150 us a layer. `068617c` caps the CPU at N experts a layer (`--cpu-tail N`). Read
+[The tail skip and the CPU tail on an RTX PRO 6000](results/2026-11-05-qwen38-tail-hf.md).

@@ -138,6 +138,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   MTP and 57 without. A step costs 10.5 ms + 7.1 ms a row, against our 9 ms + 25 ms.
 - [2026-11-05: P3H, the MTP head with P = 3 seed experts](results/2026-11-05-qwen38-p3h-head.md): on the RTX 4080 the
   head joins the expert cache. Code with drafts is 8% to 9% faster, but drafts still lose there. No gain on the M4 Max.
+- [2026-11-05: The tail skip and the CPU tail on an RTX PRO 6000](results/2026-11-05-qwen38-tail-hf.md): the tail skip
+  fails gate DL at R = 7 to 9. The CPU tail keeps the KL but halves decode there: one P3 expert is 1.6 ms of one core.
 
 ## For contributors and agents
 
