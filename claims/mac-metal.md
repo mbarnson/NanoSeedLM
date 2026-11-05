@@ -1,11 +1,17 @@
-# mac-metal claims (updated 2026-11-05T14:55:20Z)
+# mac-metal claims (updated 2026-11-05T20:47:05Z)
 
-- **Done (2026-11-05 14:52Z):** the Metal qwen4 engine is on main 22675d8 (pc-cuda's fast-forward, Matt's go; green on
-  all three). P3 on the M4 Max: decode 42-43 tok/s short, 36-38 after 19.8K tokens; prompt 400-440 tok/s. nslm-chat
-  and nslm-serve run Qwen3.8-Flash-Next on Metal.
-- **Done:** MTP step M1's golden: mac/qwen4-mtp-golden 0936d38 (tests/data/qwen4_tiny/model-mtp.safetensors and
-  tests/data/qwen4_tiny_mtp_golden.safetensors on cloud's b92e85d), for cloud to take.
-- **Now (Matt: MTP go):** the Metal side of MTP. First the k_mv Q4 path at 40 blocks a row equal for T = 1 and T > 1.
-  Then per-row recurrent state in k_q4_gdn_step / gdn_conv / ple_conv (for an accept-m verify API, as proposed to
-  cloud), then the draft head on Metal once qwen4_ref_mtp is on main. Files: engine/*.metal, engine/qwen4_gpu.m (mine).
-- Later: QSA indexer at long context; prompt GEMM tile loads; llama.cpp (Metal) on UD-Q4_K_XL as the Mac baseline.
+# mac-metal claims (updated 2026-11-05T20:48Z)
+
+- **Done (on main e53d81c):**
+  - MTP drafts on Metal (plan step M4): the head, q4e_draft / q4e_forward_keep / q4e_accept, and verify rows bit for bit equal to decode rows.
+  - The day's Metal decode kernels: P3 decode 41.3 -> 48.9 tok/s without drafts, 61.5 with 1 draft.
+  - Prompt GEMM k_mm64: 445 -> 507 tok/s at 5.6K tokens.
+  - QSA top-k: 20K-context decode 40.5 -> 45.2.
+  - Results page docs/results/2026-11-05-qwen38-mtp-m4max-rerun.md (on mac/qwen4-decode a08dc8e, docs only).
+- **Now (cloud's go, 20:37Z):** MTP drafts in nslm-chat. Q4E_DRAFTS = K (off by default), greedy only, gate MB.
+  - Files: engine/qwen4_api.c (eng_generate), harness/nslm-chat.c (its greedy loop only), and a new tests/test_qwen4_api_mtp.c.
+- **Mine:** engine/*.metal, engine/qwen4_gpu.m, engine/mova_gpu.m, tests/kernel_backend_metal.m, tests/test_qwen4_metal.c.
+- **Later:**
+  - Fuse the hyper-connection inject rows into the down GEMM (about 1.3% of a prompt).
+  - Prompt attention (latency-bound tile walk; a shared K/V buffer was slower).
+  - A chunked DeltaNet for prompt rows.
