@@ -412,7 +412,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->xr = (e->max_pos + e->mt - 1) / e->mt * e->mt;
     if (e->xr > Q4E_PASS_ROWS) e->xr = Q4E_PASS_ROWS / e->mt * e->mt;
     e->host_experts = !(o && o->vram_experts);
-    e->cache = e->host_experts && o && o->cache_gb > 0;
+    e->cache = e->host_experts && o && o->cache_gb != 0;
     e->stream = e->cache && o->stream_experts;
     if (o && o->stream_experts && !e->cache) { snprintf(err, (size_t) errlen, "--stream-experts needs --expert-cache-gb"); ns_close(&e->nm); free(e); return NULL; }
     if (o && o->ple_gguf) {
@@ -434,7 +434,6 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
             fail(e, "the PLE GGUF has %lld rows, the model's table %lld (and one PLE layer)", (long long) e->table->rows, (long long) e->ng[0].rows);
         load_layer(e, l);
     }
-    if (e->cache && !e->err[0]) build_cache(e, o->cache_gb);
     const size_t T = (size_t) e->mt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, kf = (size_t) c->top_k * c->ff_exp;
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
@@ -461,6 +460,12 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->tiles = (MmTile*) dmem(e, NULL, sizeof(MmTile) * (T * c->top_k / MMT_BN + (size_t) c->n_exp));
 #undef F
 #undef I
+    if (e->cache && !e->err[0]) {   // after the buffers: cache_gb < 0 takes the free VRAM less NSLM_VRAM_RESERVE_MB (512)
+        size_t fr = 0, to = 0;
+        const double res = getenv("NSLM_VRAM_RESERVE_MB") ? atof(getenv("NSLM_VRAM_RESERVE_MB")) : 512;
+        cudaMemGetInfo(&fr, &to);
+        build_cache(e, o->cache_gb > 0 ? o->cache_gb : ((double) fr - res * 1048576.0) / 1e9);
+    }
     for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     e->nb = (int) nb;
     e->hin = (int32_t*) pin(e, sizeof(int32_t) * (e->xr / e->mt) * (T + 1));   // a slot of T + 1 for each chunk of a pass

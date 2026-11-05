@@ -20,7 +20,7 @@ typedef struct {
     int max_pos;            // context positions (0: 4096)
     int vram_experts;       // the routed experts in VRAM too (a GPU with room for the pack but the PLE table)
     const char* ple_gguf;   // the PLE n-gram table from this GGUF (Unsloth's engram files), not from the model folder
-    double cache_gb;        // > 0: a VRAM cache of host experts (LRU, at least one layer's experts); 0: read host memory
+    double cache_gb;        // > 0: a VRAM cache of host experts (LRU, at least one layer's); < 0: all free VRAM; 0: none
     int stream_experts;     // with cache_gb: misses read from the folder's files, no pinned copy (RAM below the experts)
     int rows;               // rows of one prompt forward (0: Q4E_MAX_ROWS or Q4E_BIG_ROWS), from Q4E_LOGIT_ROWS to the context
 } Q4EOpts;
