@@ -5,8 +5,8 @@
 #   SRC=/b/src OUT=/b/kld [PACKS="Q8_0 P3 P4 UD-IQ3_XXS UD-Q3_K_XL UD-IQ4_XS UD-Q4_K_XL"] [CHUNKS=64] [MAPS=/b/maps] \
 #     [S3BANK=/b/s3/experts-s3] [TQBANK=/b/tq] bash tools/hf_llama_kld.sh
 #
-# A pack is an Unsloth folder, a seed or trellis tier (P3, P4, S3, TQ3, TQ4: the Q8_0 shards with those experts,
-# nslm-qwen4-emulate; TQk is the folder TQBANK/TQk of nslm-moe --codec tq --tq-k k banks), or
+# A pack is an Unsloth folder, a seed or trellis tier (P3, P4, S3, TQ{K}L{L}: the Q8_0 shards with those experts,
+# nslm-qwen4-emulate; TQ3L12 is the folder TQBANK/TQ3L12 of nslm-moe --codec tq banks, as tools/hf_seedbank.sh writes), or
 # LOW+HIGH@NAME: experts from two tiers by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py), e.g. S3+P3@down.  The
 # reference logits: BF16 on the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
 set -uo pipefail
@@ -22,7 +22,7 @@ pip install -q --break-system-packages "huggingface_hub[hf_xet]" pyarrow >/dev/n
 mkdir -p "$OUT" /m /w
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader; uptime; free -g | head -2; df -h / | tail -1
 
-seed() {   # seed P3|P4|S3|TQk: that tier in /m/seed-TIER, kept for the next packs (S3, TQk: banks from the bucket)
+seed() {   # seed P3|P4|S3|TQ*: that tier in /m/seed-TIER, kept for the next packs (S3, TQk: banks from the bucket)
     [ -d "/m/seed-$1" ] && return
     local t0; t0=$(date +%s)
     if [ "$1" = S3 ]; then mkdir -p /m/seed-S3 && cp "${S3BANK:-/b/s3/experts-s3}"/*.blks /m/seed-S3/

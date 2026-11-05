@@ -13,7 +13,8 @@
 # and down (--scope gud).  ONLY=SUBSTR downloads only the shards that hold tensors named with SUBSTR (mlp.experts.).
 #
 # JOBS: moe3 / moe4 routed and value experts (nslm-moe --scope all, AW) at P = 3 / 4, moes3 at S3 (C = 12, P = 4, 3 bits a
-# weight, .blks banks for nslm-qwen4-emulate); dense3 / dense4 / dense8 the dense
+# weight, .blks banks for nslm-qwen4-emulate), tqK.L trellis-coded experts at K bits a weight and L-bit states
+# (nslm-moe --codec tq on this GPU, .blkt banks in OUT/TQ{K}L{L}); dense3 / dense4 / dense8 the dense
 # tensors (nslm-dense --mode gptq) at P = 3 / 4 / 8; mla3 / mla4 / mla8 an MLA model's projections (nslm-moe --scope mla,
 # GPTQ) at P = 3 / 4 / 8, after one capture on GPU 0 (nslm-mova-mlacapture over CALIB, the model being an MLA folder; the
 # capture is kept in OUT/mla-capture and reused).  MOE_EXTRA / DENSE_EXTRA: more options (e.g. one layer, for a benchmark).
@@ -56,7 +57,7 @@ if [ -d "${XTX:-}" ]; then mkdir -p /tmp/xtx && cp -r "$XTX"/. /tmp/xtx/ && XTX=
 rm -rf /work && cp -r "$SRC" /work
 cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
 TARGETS=""   # only what JOBS needs (the MLA capture builds the whole CUDA engine)
-for j in $JOBS; do case $j in moe*) TARGETS+=" nslm-moe" ;; dense*) TARGETS+=" nslm-dense" ;; mla*) TARGETS+=" nslm-moe nslm-mova-mlacapture" ;; esac; done
+for j in $JOBS; do case $j in moe*|tq*) TARGETS+=" nslm-moe" ;; dense*) TARGETS+=" nslm-dense" ;; mla*) TARGETS+=" nslm-moe nslm-mova-mlacapture" ;; esac; done
 cmake --build /work/build -j "$(nproc)" --target $TARGETS 2>&1 | grep -E "error" || true
 BIN=/work/build/bin
 nvidia-smi --query-gpu=index,name,memory.total --format=csv | tee "$LOG/gpus.csv"
@@ -79,6 +80,8 @@ run_gpu() {   # one GPU: its shard of every job, in order
             moe3) "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/experts-p3" --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
             moe4) "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/experts-p4" --p4 --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
             moes3) "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/experts-s3" --codec s3 --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
+            tq*.*) local k=${j#tq} && "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/TQ${k%.*}L${k#*.}" --codec tq --tq-k "${k%.*}" \
+                       --tq-l "${k#*.}" --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
             dense3|dense4|dense8)
                 "$BIN/nslm-dense" --model "$MODEL" --xtx "$XTX" --out "$OUT/dense-p${j#dense}" --mode gptq --codec "p${j#dense}" \
                     --shard "$g/$GPUS" --workers "$WORKERS" $DENSE_EXTRA ;;

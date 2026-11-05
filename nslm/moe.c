@@ -18,7 +18,8 @@
 //       P = 8 (.blk8: 32-bit coefficient words, then the exponent codes) blocks (nslm/searchp.h, nslm/gptq.h)
 //   --codec s3 (CUDA): C = 12, P = 4 blocks, 3 bits a weight (nslm/searchc_gpu.h), written as .blks: as .blk4 with
 //       nb = rows * ceil(cols / 12), a row's last block padded (ns_open_bank reads them)
-//   --codec tq [--tq-k 3] [--tq-l 12] (CPU, --workers threads): trellis-coded rows (nslm/trellis.h), K bits a weight,
+//   --codec tq [--tq-k 3] [--tq-l 12] (the GPU encoder when there is one, else the CPU; the same words): trellis-coded
+//       rows (nslm/trellis.h), K bits a weight,
 //       L-bit states, blocks of 256 (320 for rows of 640), as .blkt (MoeBlkHeader with n_seeds = L, n_exp = K,
 //       refit = T; float rel[E], wrel[E]; uint32 words[E][rows][nslm_tq_row_words]; uint16 BF16 scales[E][rows][blocks])
 //   nslm-moe --expand --blk DIR --out DIR [--scope gu] [--p4]   OUT/L{l}_{proj}.safetensors: 'w' [E][rows][cols] BF16
@@ -59,6 +60,7 @@
 #include "searchc_gpu.h"
 #include "searchp_gpu.h"
 #include "trellis.h"
+#include "trellis_gpu.h"
 
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
     for (int i = 1; i + 1 < argc; ++i) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -637,6 +639,8 @@ static void* tq_worker(void* arg) {
         uint32_t* words = (uint32_t*) calloc(nw * (size_t) rows * (size_t) E, 4);
         uint16_t* sc = (uint16_t*) calloc(nb * (size_t) rows * (size_t) E, 2);
         NsTqScratch z;
+        char msg[256];
+        NslmTqGpu* gpu = nslm_tq_gpu_open(msg, sizeof msg);   // NULL: the CPU encoder
         if (!rel || !wrel || !hh || !y || !words || !sc || nslm_tq_scratch_init(&z, T, g_tql, g_tqk)) {
             fprintf(stderr, "L%d %s: out of memory\n", l, kProj[p]);
             atomic_store(&j->failed, 1);
@@ -649,10 +653,18 @@ static void* tq_worker(void* arg) {
             if (!w) { atomic_store(&j->failed, 1); break; }
             act_h(l, p, e, j->n0, hh);
             double se = 0, sw = 0, wse = 0, wsw = 0;
+            const size_t e0 = (size_t) e * rows;
+            if (gpu && nslm_tq_gpu_encode(gpu, w, hh, rows, cols, T, g_tql, g_tqk, words + e0 * nw, sc + e0 * nb, NULL, msg, sizeof msg)) {
+                fprintf(stderr, "L%d %s expert %d: %s\n", l, kProj[p], e, msg);
+                atomic_store(&j->failed, 1);
+                free(w);
+                break;
+            }
             for (int r = 0; r < rows; ++r) {
                 const float* wr = w + (size_t) r * cols;
-                const size_t at = (size_t) e * rows + (size_t) r;
-                nslm_tq_encode_row(wr, hh, cols, T, &z, words + at * nw, sc + at * nb, y);
+                const size_t at = e0 + (size_t) r;
+                if (gpu) nslm_tq_decode_row(words + at * nw, sc + at * nb, cols, T, g_tql, g_tqk, y);
+                else nslm_tq_encode_row(wr, hh, cols, T, &z, words + at * nw, sc + at * nb, y);
                 for (int c = 0; c < cols; ++c) {
                     const double d = (double) wr[c] - y[c];
                     se += d * d; sw += (double) wr[c] * wr[c]; wse += hh[c] * d * d; wsw += hh[c] * (double) wr[c] * wr[c];
@@ -666,8 +678,8 @@ static void* tq_worker(void* arg) {
         double mr = 0, mw = 0;
         int ne = 0;
         for (int e = 0; e < E; ++e) if (rel[e] > 0) { mr += rel[e]; mw += wrel[e]; ++ne; }
-        printf("L%-2d %-9s %3d x %4dx%-4d  L %d K %d T %d (%.3f bits)  rel_err %.5f  weighted %.5f  %7.1f s\n", l, kProj[p], E, rows,
-               cols, g_tql, g_tqk, T, 32.0 * nw / cols + 16.0 * nb / cols, ne ? mr / ne : 0, ne ? mw / ne : 0, h.seconds);
+        printf("L%-2d %-9s %3d x %4dx%-4d  L %d K %d T %d (%.3f bits)  rel_err %.5f  weighted %.5f  %7.1f s %s\n", l, kProj[p], E, rows,
+               cols, g_tql, g_tqk, T, 32.0 * nw / cols + 16.0 * nb / cols, ne ? mr / ne : 0, ne ? mw / ne : 0, h.seconds, gpu ? "GPU" : "CPU");
         if (j->e1 < 0 && !atomic_load(&j->failed)) {
             snprintf(tmp, sizeof tmp, "%s.tmp", path);
             f = fopen(tmp, "wb");
@@ -678,6 +690,7 @@ static void* tq_worker(void* arg) {
             if (!ok) { fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno)); remove(tmp); atomic_store(&j->failed, 1); }
         }
         nslm_tq_scratch_free(&z);
+        nslm_tq_gpu_close(gpu);
         free(rel); free(wrel); free(hh); free(y); free(words); free(sc);
     }
     return NULL;
