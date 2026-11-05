@@ -134,6 +134,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   fixes, drafts are 14% to 27% slower. Each verify row pays the PCIe copies of its missed experts.
 - [2026-11-05: Strata on the RTX 4080 PC](results/2026-11-05-strata-4080-probe.md): IQ3_S at 85 tokens per second with
   MTP and 57 without. A step costs 10.5 ms + 7.1 ms a row, against our 9 ms + 25 ms.
+- [2026-11-05: P3H, the MTP head with P = 3 seed experts](results/2026-11-05-qwen38-p3h-head.md): on the RTX 4080 the
+  head joins the expert cache. Code with drafts is 8% to 9% faster, but drafts still lose there. No gain on the M4 Max.
 
 ## For contributors and agents
 

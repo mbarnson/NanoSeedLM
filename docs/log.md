@@ -670,3 +670,19 @@ of T rows takes about 10.5 ms + 7.1 ms x T, and ours about 9 ms + 25 ms x T. Str
 against our 3.5), and computes most misses on the CPU. Each of our rows copies its misses over PCIe. Read
 [Strata on the RTX 4080 PC](results/2026-11-05-strata-4080-probe.md). The plan
 [decode on the RTX 4080 near Strata's speed](plans/2026-11-05-qwen38-decode-4080.md) follows from it.
+
+## [2026-11-05] result | P3H, the MTP head with P = 3 seed experts
+
+P3H is P3 with its MTP head's routed experts as P = 3 seeds. The CUDA (RTX 4080) and Metal (M4 Max) head searches gave
+the same seeds. On the RTX 4080 the head joins the expert cache (plan step D1, `c7a58b0`). Draft runs then keep 3,008 to
+3,101 slots, not 2,368 to 2,461, and code with drafts is 7.7% to 9.2% faster. Chat gains 0.4% to 4.0%. Drafts still lose
+to no drafts on the 4080, and gate DA passes at 1 draft only. On the M4 Max, P3H is not faster. Read
+[P3H](results/2026-11-05-qwen38-p3h-head.md).
+
+## [2026-11-05] fix | D4: the CPU tail rounds as the GPU does
+
+`4997a53`: the RTX 4080's first gate DC run of `--cpu-tail 7` gave a 13% higher decode-row KL. The GPU expert path rounds
+gate, up, SwiGLU and the down output to BF16, and the CPU tail did not. Now it does. The engine test could not see the
+error, because its seed experts were about 1e-5 of the residual. Its experts are now as large as the residual
+(`38ef15e`). On an RTX PRO 6000, the first decode step then equals the GPU's bit for bit. After 20 steps the logits
+differ by 1.1e-3, against 9.6e-2 with the tail dropped. A thrashing cache equals every expert in VRAM at all 20 steps.
