@@ -86,6 +86,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   977 tokens per second on a 15,922-token prompt.
 - [2026-11-04: Seed layouts against Unsloth's tensors on one layer](results/2026-11-04-qwen38-seed-probe.md): 3-bit
   seeds have 16% more weighted error than IQ3_XXS. Gate G6 fails.
+- [2026-11-04: Expert use by text domain](results/2026-11-04-qwen38-routing-domains.md): a hot third of the experts
+  serves 80% to 93% of its own text's router choices, and 20% to 63% of another domain's.
 
 ## For contributors and agents
 

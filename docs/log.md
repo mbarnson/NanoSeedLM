@@ -367,3 +367,10 @@ weight the error by Unsloth's imatrix. Read
 layer. `tools/gguf_experts.py` gives the same measure for the tensors of a GGUF. On layer 20, 3-bit seeds have 0.213
 and Unsloth's IQ3_XXS has 0.184, so gate G6 fails. P4 has 0.079 and Q4_K has 0.070. Read
 [Seed layouts against Unsloth's tensors on one layer](results/2026-11-04-qwen38-seed-probe.md).
+
+## [2026-11-04] result | Expert use of Qwen3.8-Flash-Next by text domain
+
+`518147a`: `tools/hf_qwen4_routes.sh` records routing traces of the P3 pack on chat, code and wiki text. The most used
+third of each layer's experts serves 80% to 93% of its own text's choices. Code's hot third serves 20% to 29% of the
+other texts' choices, against 33% for a random third. Read
+[Expert use by text domain](results/2026-11-04-qwen38-routing-domains.md).
