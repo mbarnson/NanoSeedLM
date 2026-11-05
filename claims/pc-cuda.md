@@ -1,7 +1,7 @@
-# pc-cuda claims (updated 2026-11-05T02:49:10Z)
+# pc-cuda claims (updated 2026-11-05T02:52:55Z)
 
-- Nothing open. Done: the fp4 MLA decode gap is on main a085dce (rows >= 12288 positions take 32-head blocks).
-- Next for others: windows on cloud's rebased claude/sleepy-brown-k67z9u head when posted.
-- Queue (CUDA files): P4 down-projection gather (K = 640 misses mv_lane's paired SEED4P4 path; 75.5 GB/s on the 4080);
-  SEED6P8 reader for the CUDA engine; Windows VRAM reserve default (WDDM over-commit); KV VRAM rows by active slot;
-  plan S0.3 baselines (Strata, llama.cpp on UD-Q4_K_XL) and S0.2 STREAM triad; full-model GPTQ capture when Matt is around.
+- **Now:** the P4 (SEED4P4) decode gather at K = 640 (qwen4 down 2560 x 640: 122 us, 75.5 GB/s on the 4080; mv_lane's
+  paired path needs nbk % 64 == 0). Branch `pc/p4-gather` from main a085dce. Files: engine/kernels_moe.cu (mine).
+- Waiting: linux and macos on PR #17 head 350481b, then I fast-forward main to it.
+- Queue (CUDA files): SEED6P8 reader for the CUDA engine; Windows VRAM reserve default (WDDM over-commit); KV VRAM rows by
+  active slot; plan S0.3 baselines and S0.2 STREAM triad; full-model GPTQ capture when Matt is around.
