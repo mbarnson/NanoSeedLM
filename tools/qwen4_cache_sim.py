@@ -2,6 +2,7 @@
 """tools/qwen4_cache_sim.py - replay a routing trace of the qwen4 CUDA engine (Q4E_ROUTES=FILE) through expert cache
 policies of SLOTS slots: the engine's LRU (its hits must match the engine's), LFU, a static hot set with LRU for the
 rest, and Belady's optimum (the most hits any policy can get).  Counts are per (forward, layer, distinct expert).
+--window K admits the union of K consecutive decode tokens at once, as a verify step of K rows (MTP drafts) would.
 
   python3 tools/qwen4_cache_sim.py --trace routes.bin --layers 48 --experts 512 --top-k 10 --slots 3255 4069
 """
@@ -20,6 +21,23 @@ def read_trace(path, layers, k):
         ids = struct.unpack_from("<%di" % n, data, at + 4)
         at += 4 + 4 * n
         out.append((t, [sorted(set(ids[l * t * k:(l + 1) * t * k])) for l in range(layers)]))
+    return out
+
+
+def window(trace, k):
+    """Runs of k consecutive one-row forwards as one forward of k rows (each layer: the union of their experts)."""
+    out, run = [], []
+    def flush():
+        if run: out.append((len(run), [sorted(set().union(*(r[l] for r in run))) for l in range(len(run[0]))]))
+        run.clear()
+    for t, layer_sets in trace:
+        if t != 1:
+            flush()
+            out.append((t, layer_sets))
+            continue
+        run.append(layer_sets)
+        if len(run) == k: flush()
+    flush()
     return out
 
 
@@ -118,11 +136,15 @@ def main():
     ap.add_argument("--experts", type=int, default=512)
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--slots", type=int, nargs="+", required=True)
+    ap.add_argument("--window", type=int, default=1)
     a = ap.parse_args()
-    adm = admits(read_trace(a.trace, a.layers, a.top_k), a.experts)
+    trace = read_trace(a.trace, a.layers, a.top_k)
+    ntok = sum(t for t, _ in trace if t == 1)
+    if a.window > 1: trace = window(trace, a.window)
+    adm = admits(trace, a.experts)
     half = len(adm) // 2
     freq = Counter(u for _, units in adm[:half] for u in units)   # the hot set from the first half of the admits only
-    print("%d admits (%d decode)" % (len(adm), sum(d for d, _ in adm)))
+    print("%d admits (%d decode), %d decode tokens, window %d" % (len(adm), sum(d for d, _ in adm), ntok, a.window))
     for s in a.slots:
         rows = [("lru (the engine)", run(adm, s, a.layers, a.experts, "lru")), ("lfu", run(adm, s, a.layers, a.experts, "lfu"))]
         for share in (0.25, 0.5, 0.75):
@@ -131,8 +153,8 @@ def main():
         rows.append(("belady (optimum)", belady(adm, s, a.layers, a.experts)))
         print("slots %d:" % s)
         for name, (h, m, dh, dm) in rows:
-            print("  %-18s hits %7d  misses %7d  (%.1f%%)   decode: hits %7d  misses %7d  (%.1f%%)"
-                  % (name, h, m, 100 * h / max(1, h + m), dh, dm, 100 * dh / max(1, dh + dm)))
+            print("  %-18s hits %7d  misses %7d  (%.1f%%)   decode: hits %7d  misses %7d  (%.1f%%), %.1f misses a token"
+                  % (name, h, m, 100 * h / max(1, h + m), dh, dm, 100 * dh / max(1, dh + dm), dm / max(1, ntok)))
 
 
 if __name__ == "__main__":
