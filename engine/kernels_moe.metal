@@ -10,7 +10,8 @@ using namespace metal;
 
 // Weight formats (per tensor): BF16; MLX affine Q8 / Q4, group 64 (Q4 also 32: AFF_GS), dequantized to BF16 as mx.dequantize does;
 // SEED4 / SEED4P4: LFSR seeds, expanded from the per-seed stream table.
-enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6P8 = 5 };   // = NS_* (nslm/model_st.h)
+enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6P8 = 5, MF_TCQ = 8 };   // = NS_* (nslm/model_st.h)
+// MF_TCQ: trellis-coded rows (nslm/trellis.h format v0); KtWeight / NsTensor group = L | K << 8 | T << 16
 #define MV_MAXT 8          // dense matvec: tokens per weight-row load
 #define MV_ROWS 8          // simdgroups per matvec threadgroup
 #define MVS_TG 256         // k_mv_split: threads per output row

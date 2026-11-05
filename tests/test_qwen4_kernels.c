@@ -1,11 +1,12 @@
 // tests/test_qwen4_kernels.c - the qwen4 kernels against nslm/qwen4_ops.h on each GPU backend that has them.
-// f32 kernels: within 1e-4 of the largest reference value; Q4 group 32 within BF16 rounding.
+// f32 kernels: within 1e-4 of the largest reference value; Q4 group 32 and trellis rows within BF16 rounding.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "kernel_backend.h"
+#include "trellis.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -134,6 +135,53 @@ static void q4g32_case(int R, int K) {
     free(q); free(sc); free(bi);
 }
 
+// Trellis-coded experts (MF_TCQ, nslm/trellis.h format v0) through the decode gathers: kt_mv_sel (down) and kt_mv_gu
+// (gate slice sel[p], up slice sel[p] + 1), against a C matvec over nslm_tq_decode_row rows; outputs are BF16
+static void tcq_case(int L, int KB, int T, int R, int K, int P, int xdiv) {
+    const int S = 5, nb = K / T;
+    const size_t nw = nslm_tq_row_words(K, T, L, KB);
+    uint32_t* words = (uint32_t*) malloc(sizeof(uint32_t) * nw * R * S);
+    uint16_t* sc = (uint16_t*) malloc(sizeof(uint16_t) * (size_t) nb * R * S);
+    float* dec = (float*) malloc(sizeof(float) * (size_t) K * R * S);
+    for (size_t i = 0; i < nw * R * S; ++i) words[i] = (uint32_t) (frand(0, 65536)) << 16 | (uint32_t) frand(0, 65536);
+    for (size_t i = 0; i < (size_t) nb * R * S; ++i) sc[i] = f2bf(frand(0.0002f, 0.002f));
+    for (size_t r = 0; r < (size_t) R * S; ++r) nslm_tq_decode_row(words + nw * r, sc + (size_t) nb * r, K, T, L, KB, dec + (size_t) K * r);
+    KtWeight w;
+    memset(&w, 0, sizeof w);
+    w.fmt = MF_TCQ; w.S = S; w.R = R; w.K = K; w.w = words; w.s = sc;
+    w.wn = sizeof(uint32_t) * nw * R * S; w.sn = sizeof(uint16_t) * (size_t) nb * R * S; w.group = L | KB << 8 | T << 16;
+    const int nx = (P + xdiv - 1) / xdiv;
+    int32_t* sel = (int32_t*) malloc(sizeof(int32_t) * P);
+    for (int p = 0; p < P; ++p) sel[p] = (p * 3 + 1) % (S - 1);   // the up slice sel + 1 stays in range
+    float *x = rnd((size_t) nx * K, -1, 1), *y = rnd((size_t) P * R, 0, 0), *y_k = rnd((size_t) P * R, 0, 0);
+    for (int p = 0; p < P; ++p)
+        for (int r = 0; r < R; ++r) {
+            const float* xr = x + (size_t) (p / xdiv) * K;
+            double g = 0, u = 0;
+            for (int k = 0; k < K; ++k) {
+                g += (double) dec[((size_t) sel[p] * R + r) * K + k] * xr[k];
+                u += (double) dec[((size_t) (sel[p] + 1) * R + r) * K + k] * xr[k];
+            }
+            const float gb = bf2f(f2bf((float) g)), sg = bf2f(f2bf(1.0f / (1.0f + expf(-gb))));
+            y[(size_t) p * R + r] = bf2f(f2bf(bf2f(f2bf(gb * sg)) * bf2f(f2bf((float) u))));
+        }
+    int rc = kt_mv_gu(&w, P, xdiv, sel, x, y_k);
+    CHECK(rc == 0, "tcq gate+up L %d K %d T %d failed", L, KB, T);
+    printf("  tcq gate+up L %d K %d T %d, %d x %d, %d pairs: %.1e\n", L, KB, T, R, K, P, rel(y_k, y, (size_t) P * R));
+    CHECK(rel(y_k, y, (size_t) P * R) < 2e-2, "tcq gate+up L %d K %d T %d differs", L, KB, T);
+    for (int p = 0; p < P; ++p)
+        for (int r = 0; r < R; ++r) {
+            double acc = 0;
+            for (int k = 0; k < K; ++k) acc += (double) dec[((size_t) sel[p] * R + r) * K + k] * x[(size_t) (p / xdiv) * K + k];
+            y[(size_t) p * R + r] = bf2f(f2bf((float) acc));
+        }
+    rc = kt_mv_sel(&w, P, xdiv, sel, x, y_k);
+    CHECK(rc == 0, "tcq gather L %d K %d T %d failed", L, KB, T);
+    printf("  tcq gather  L %d K %d T %d, %d x %d, %d pairs: %.1e\n", L, KB, T, R, K, P, rel(y_k, y, (size_t) P * R));
+    CHECK(rel(y_k, y, (size_t) P * R) < 1e-2, "tcq gather L %d K %d T %d differs", L, KB, T);
+    free(words); free(sc); free(dec); free(sel); free(x); free(y); free(y_k);
+}
+
 static int cmp_i32(const void* a, const void* b) { return *(const int32_t*) a - *(const int32_t*) b; }
 static Qwen4Cfg big_cfg(void) {   // the Qwen3.8-Flash-Next sizes the kernels below need
     Qwen4Cfg c;
@@ -246,6 +294,10 @@ int main(void) {
     hc_case(4, 64, 32, 5);
     norm_long_case(10240, 3);
     q4g32_case(96, 2560);
+    if (kt_has_fmt(MF_TCQ)) {      // trellis experts: gate/up and down at 1 and 3 tokens, and L 12
+        for (int KB = 2; KB <= 4; ++KB) { tcq_case(16, KB, 256, 64, 2560, 10, 10); tcq_case(16, KB, 320, 200, 640, 30, 10); }
+        tcq_case(12, 3, 256, 40, 512, 6, 3);
+    } else printf("  tcq: not on %s\n", kt_name());
     norm_rope_route_case();
     ple_case();
     qsa_attend_case();

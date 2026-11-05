@@ -9,6 +9,7 @@
 #include "kernels_qwen4.h"
 #include "kvq.h"
 #include "lfsr.h"
+#include "trellis.h"
 
 static uint32_t *g_stab24, *g_stab32;   // the seed tables: lfsr_stream24 (SEED4) and lfsr_stream32 (SEED4P4)
 static void* g_live[64];                 // this call's device allocations
@@ -77,6 +78,12 @@ static void slices(const KtWeight* w, WSlice* out, const uint32_t** G) {
         memset(o, 0, sizeof *o);
         switch (w->fmt) {
         case MF_BF16: o->p[0] = W + s * rk * 2; break;
+        case MF_TCQ: {   // words [R][row_words], BF16 scales [R][K / T] a slice
+            const int L = w->group & 255, KB = w->group >> 8 & 255, T = w->group >> 16;
+            o->p[0] = W + (size_t) s * w->R * nslm_tq_row_words(w->K, T, L, KB) * 4;
+            o->p[1] = S + (size_t) s * w->R * (size_t) (w->K / T) * 2;
+            break;
+        }
         case MF_Q8: case MF_Q4:
             o->p[0] = W + s * rk / (w->fmt == MF_Q8 ? 1 : 2);
             o->p[1] = S + s * rk / (w->group ? w->group : 64) * 2;
@@ -94,6 +101,7 @@ static void slices(const KtWeight* w, WSlice* out, const uint32_t** G) {
 }
 
 int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
+    if (w->fmt == MF_TCQ) return 1;   // trellis rows: decode gathers only (kt_mv_sel, kt_mv_gu)
     WSlice ws[8];
     const uint32_t* G;
     slices(w, ws, &G);
@@ -108,6 +116,12 @@ int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const floa
     slices(w, ws, &G);
     const size_t yn = sizeof(float) * (size_t) P * w->R;
     float* dy = (float*) dev(NULL, yn);
+    if (w->fmt == MF_TCQ) {
+        if (kc_tq_mv_sel(0, w->group & 255, w->group >> 8 & 255, w->group >> 16, (const WSlice*) dev(ws, sizeof(WSlice) * (size_t) w->S),
+                         w->K, w->R, (const float*) dev(x, sizeof(float) * (size_t) ((P + xdiv - 1) / xdiv) * w->K), w->K, dy, w->R,
+                         (const int32_t*) dev(sel, 4 * (size_t) P), P, xdiv)) { done("kc_tq_mv_sel", NULL, NULL, 0); return 1; }
+        return done("kc_tq_mv_sel", y, dy, yn);
+    }
     kc_mv_sel(0, w->fmt, (const WSlice*) dev(ws, sizeof(WSlice) * (size_t) w->S), w->K, w->R,
               (const float*) dev(x, sizeof(float) * (size_t) ((P + xdiv - 1) / xdiv) * w->K), w->K, dy, w->R,
               (const int32_t*) dev(sel, 4 * (size_t) P), P, xdiv, G);
@@ -120,6 +134,12 @@ int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float
     const size_t yn = sizeof(float) * (size_t) P * w->R;
     float* da = (float*) dev(NULL, yn);
     const WSlice* d = (const WSlice*) dev(ws, sizeof(WSlice) * (size_t) w->S);
+    if (w->fmt == MF_TCQ) {
+        if (kc_tq_mv_gu(0, w->group & 255, w->group >> 8 & 255, w->group >> 16, d, d + 1, w->K, w->R,
+                        (const float*) dev(x, sizeof(float) * (size_t) ((P + xdiv - 1) / xdiv) * w->K), w->K, da, w->R,
+                        (const int32_t*) dev(sel, 4 * (size_t) P), P, xdiv)) { done("kc_tq_mv_gu", NULL, NULL, 0); return 1; }
+        return done("kc_tq_mv_gu", a, da, yn);
+    }
     kc_mv_gu(0, w->fmt, d, d + 1, w->K, w->R, (const float*) dev(x, sizeof(float) * (size_t) ((P + xdiv - 1) / xdiv) * w->K),
              w->K, da, w->R, (const int32_t*) dev(sel, 4 * (size_t) P), P, xdiv, G);
     return done("kc_mv_gu", a, da, yn);
@@ -360,7 +380,7 @@ int kt_mla_prefill(MlaArgs a, const float* q, const float* qr, const uint16_t* K
     return done("kc_mla_prefill", o, dout, qn);
 }
 
-int kt_has_fmt(int fmt) { return fmt >= MF_BF16 && fmt <= MF_SEED4P4; }   // no SEED6P8 kernels yet
+int kt_has_fmt(int fmt) { return (fmt >= MF_BF16 && fmt <= MF_SEED4P4) || fmt == MF_TCQ; }   // no SEED6P8 kernels yet; TCQ: gathers only
 int kt_embed_seed(const KtWeight* w, const int32_t* ids, int n, float* x) { (void) w; (void) ids; (void) n; (void) x; return 1; }
 int kt_embed(int fmt, const uint16_t* E, const uint32_t* q8, const uint16_t* s8, const uint16_t* b8, int V, int d,
              const int32_t* ids, int n, float* x) {
