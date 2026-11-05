@@ -416,6 +416,18 @@ void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot,
     if (R > 0 && R < k) k_q4_tail_skip<<<(unsigned) (T * k + 127) / 128, 128, 0, s>>>(ind, wt, slot, T * k, k, R);
 }
 
+__global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag) {
+    const uint32_t v = ++*seq;
+    __threadfence_system();
+    *flag = v;
+}
+__global__ void k_q4_wait(const uint32_t* seq, volatile const uint32_t* ack) {
+    const uint32_t v = *seq;
+    while (*ack < v) __nanosleep(100);
+}
+void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag) { k_q4_signal<<<1, 1, 0, s>>>(seq, flag); }
+void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack) { k_q4_wait<<<1, 1, 0, s>>>(seq, ack); }
+
 __global__ void k_q4_moe_combine(int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= d) return;
