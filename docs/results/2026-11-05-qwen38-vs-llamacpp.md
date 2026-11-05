@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next P3 against llama.cpp UD-Q3_K_XL on one RTX PRO 6000 (2026-11-05)
 
 **Result.** With the routed experts in host memory, the P3 pack fills a 29,120-token prompt at 4,222 tokens per
-second. It decodes at 53.8. llama.cpp with Unsloth's UD-Q3_K_XL (`-ot exps=CPU`) does 793 and 9.9 on the same GPU. With
-everything in VRAM, llama.cpp is faster: 5,130 and 114 against 4,418 and 87.6. The two packs have about the same
-quality: KL divergence against BF16 is 0.0600 for P3 and 0.0593 for UD-Q3_K_XL.
+second. It decodes at 53.8. llama.cpp with Unsloth's UD-Q3_K_XL (`-ot exps=CPU`) does 793 and 9.9 on the same GPU.
+With everything in VRAM, llama.cpp is faster: 5,130 and 114 against 4,418 and 87.6. The two packs have about the
+same quality: KL divergence against BF16 is 0.0600 for P3 and 0.0593 for UD-Q3_K_XL.
 
 **Status.** Current. One GPU type. The RTX 4080, where Matt sees Strata IQ3_S at about 2,700 and 60 tokens per second,
 is not measured here.
