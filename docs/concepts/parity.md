@@ -59,6 +59,7 @@ same results as the engine.
 | Paged KV cache | Yes (macOS 26.4 or later) | No | No |
 | OpenAI-compatible server | `nslm-serve` | `nslm-serve` | oMLX |
 | Seed search | Yes | Yes | No |
+| Seed search of other block sizes (C = 12 and 16, `searchc.cu`) | No | Yes | No |
 
 ## See also
 
