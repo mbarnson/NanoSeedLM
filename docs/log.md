@@ -560,10 +560,11 @@ on. Now the cache shrinks to keep the reserve. The reserve is 2560 MB on a GPU t
 
 ## [2026-11-05] engine | MTP drafts on Metal
 
-`1464fb3`, `8344d76`, `383d17b`: plan step M4. The Metal engine has the MTP head, `q4e_draft`, `q4e_forward_keep` and
+`9b15787`, `9594126`, `fe89c07`: plan step M4. The Metal engine has the MTP head, `q4e_draft`, `q4e_forward_keep` and
 `q4e_accept`, as CUDA's `ecd552f` and `7cfd557` do, so `nslm-qwen4-gen --drafts` works on macOS. The verify rows write the
 recurrent state after each row to snapshot buffers, and `q4e_accept` swaps the kept row's buffers in, so a failed
-draft copies nothing. On the M4 Max, P3, greedy, 256 tokens at most (tokens/s, two runs within 1%):
+draft copies nothing. Read [MTP drafts on the M4 Max](results/2026-11-05-qwen38-mtp-m4max.md) for the current
+numbers. On the M4 Max, P3, greedy, 256 tokens at most (tokens/s, two runs within 1%):
 
 | Prompt | No drafts | 1 draft | 2 drafts | 3 drafts |
 |---|---|---|---|---|
@@ -579,7 +580,7 @@ about 240,000 logits a row. mlx-vlm 0.7.12's own MTP reached 51.8 (code) and 43.
 
 ## [2026-11-05] kernel | Metal matvecs: verify rows 20 to 35% cheaper, and the seed stream table in halves
 
-`ce92da1`: k_mv with Q4 and 2 to 8 tokens runs 20 to 35% faster, so each MTP verify row costs less. On the M4 Max,
+`39cef39`: k_mv with Q4 and 2 to 8 tokens runs 20 to 35% faster, so each MTP verify row costs less. On the M4 Max,
 P3, greedy, at most 256 tokens (tokens/s, two runs within 0.5%):
 
 | Prompt | No drafts | 1 draft | 2 drafts | 3 drafts |

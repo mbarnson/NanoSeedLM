@@ -54,7 +54,7 @@ same results as the engine.
 | Qwen3.8-Flash-Next PLE table from an Unsloth engram GGUF | No | Yes (`--ple-gguf`) | No (mlx-vlm's SSD PLE view) |
 | Qwen3.8-Flash-Next VRAM cache of host experts | No | Yes (`--expert-cache-gb`) | No |
 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve` (`engine/engine.c`) | Yes | Yes | Yes (mlx-vlm) |
-| Qwen3.8-Flash-Next MTP drafts (`q4e_draft`, `nslm-qwen4-gen --drafts`) | Not yet (plan step M4) | Yes | Yes (mlx-vlm) |
+| Qwen3.8-Flash-Next MTP drafts (`q4e_draft`, `nslm-qwen4-gen --drafts`) | Yes (`qwen4_gpu.m`) | Yes | Yes (mlx-vlm) |
 | Affine Q4 with group 32 (the 4-bit MLX packs) | Matvec, GEMM | Yes (matvec, GEMM, embedding) | Yes |
 | Qwen3.8-Flash-Next kernels (`test_qwen4_kernels`) | Yes (`kernels_qwen4.metal`) | Yes (`kernels_qwen4.cu`) | Yes (mlx-vlm) |
 | Fused kernel for MLA prompts | `k_mla_prefill` | `k_mla_prefill` | `_MLA_PREFILL` |
