@@ -2,10 +2,13 @@
 // kernels of engine/kernels_cuda.h and the qwen4 kernels of engine/kernels_qwen4.h.
 #include "qwen4_eng.h"
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <cuda_runtime_api.h>
 
@@ -66,6 +69,8 @@ struct Q4Eng {
     int32_t *hin, *din;
     float* hlog;
     int nb, nple, cap, no_graph;   // QSA block slots; PLE layers; capturing a graph; NSLM_NO_GRAPH
+    int ple_threads;               // Q4E_PLE_THREADS: threads for the PLE rows of 64 rows or more
+    double host_ms[2];             // Q4E_PROFILE: host time of the PLE prefetch and the PLE rows
     cudaGraphExec_t graph[2][MV_MAXT + 1];   // [with logits][rows]
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
@@ -387,6 +392,10 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->emb_h = (float*) pin(e, sizeof(float) * XR * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
     e->hlog = (float*) pin(e, sizeof(float) * (size_t) Q4E_LOGIT_ROWS * c->vocab);
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL;
+    const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    e->ple_threads = getenv("Q4E_PLE_THREADS") ? atoi(getenv("Q4E_PLE_THREADS")) : ncpu > 16 ? 16 : ncpu > 1 ? (int) ncpu : 1;
+    if (e->ple_threads < 1) e->ple_threads = 1;
+    if (e->ple_threads > 16) e->ple_threads = 16;
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
     if (getenv("Q4E_ROUTES") && !(e->routes = fopen(getenv("Q4E_ROUTES"), "wb"))) fail(e, "cannot write %s", getenv("Q4E_ROUTES"));
     if (e->routes) {
@@ -409,6 +418,7 @@ void q4e_close(Q4Eng* e) {
         fprintf(stderr, "Q4E_PROFILE: %.0f ms on the GPU stream\n", total);
         for (int i = 0; i < ST_N; ++i)
             if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
+        fprintf(stderr, "Q4E_PROFILE: host PLE prefetch %.0f ms, PLE rows %.0f ms (%d threads)\n", e->host_ms[0], e->host_ms[1], e->ple_threads);
         for (int i = 0; i < 1024; ++i) cudaEventDestroy(e->ev[i]);
     }
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
@@ -467,16 +477,45 @@ static void hc_mix(Q4Eng* e, const float* norm, const W* down, const W* upw, con
     if (injw) { mv(e, injw, e->normed, e->inj, T); kq4_hc_gate(e->s, c->hc, e->inj, T * c->hc); }
 }
 
-// The PLE rows of rows [pos, pos + T) of each PLE layer, into emb_h: host work, before the rows' device work
-static int ple_rows(Q4Eng* e, int T) {
+static double host_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return 1e3 * (double) ts.tv_sec + 1e-6 * (double) ts.tv_nsec;
+}
+
+typedef struct { Q4Eng* e; int t0, t1, prefetch, bad; } PleJob;   // bad: 1 + the failing layer
+static void* ple_worker(void* arg) {
+    PleJob* j = (PleJob*) arg;
+    Q4Eng* e = j->e;
     const Qwen4Cfg* c = &e->c;
-    for (int l = 0; l < c->n_layer; ++l)
-        for (int t = 0; c->ple[l] >= 0 && t < T; ++t)
-            if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
-                                e->emb_h + ((size_t) c->ple[l] * XR + t) * c->ple_dim))
-                return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
+    for (int l = 0; l < c->n_layer && !j->bad; ++l)
+        for (int t = j->t0; c->ple[l] >= 0 && t < j->t1; ++t) {
+            if (j->prefetch) qwen4_ple_prefetch(&e->nm, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t);
+            else if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
+                                     e->emb_h + ((size_t) c->ple[l] * XR + t) * c->ple_dim)) { j->bad = l + 1; break; }
+        }
+    return NULL;
+}
+
+// The PLE rows [pos, pos + T) of each PLE layer: their pages asked of the OS (prefetch), or into emb_h. Host work,
+// before the rows' device work; calls of 64 rows or more split the rows over ple_threads threads.
+static int ple_run(Q4Eng* e, int T, int prefetch) {
+    PleJob j[16];
+    pthread_t th[16];
+    const int nw = T < 64 ? 1 : e->ple_threads;
+    const double t0 = e->prof ? host_ms() : 0;
+    for (int w = 0; w < nw; ++w) {
+        j[w] = (PleJob) {e, (int) ((int64_t) T * w / nw), (int) ((int64_t) T * (w + 1) / nw), prefetch, 0};
+        if (nw > 1) pthread_create(&th[w], NULL, ple_worker, &j[w]);
+    }
+    if (nw == 1) ple_worker(&j[0]);
+    for (int w = 0; nw > 1 && w < nw; ++w) pthread_join(th[w], NULL);
+    if (e->prof) e->host_ms[prefetch ? 0 : 1] += host_ms() - t0;
+    for (int w = 0; w < nw; ++w)
+        if (j[w].bad) return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", j[w].bad - 1);
     return 0;
 }
+static int ple_rows(Q4Eng* e, int T) { return ple_run(e, T, 0); }
 
 static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first row in emb_h
     const Qwen4Cfg* c = &e->c;
@@ -674,8 +713,7 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     if (e->pos + n > e->max_pos) return fail(e, "the context is full (%d positions)", e->max_pos);
     for (int i = 0; i < n; ++i) if (ids[i] < 0 || ids[i] >= e->embed.rows) return fail(e, "token %d out of range", ids[i]);
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
-    for (int l = 0; l < e->c.n_layer; ++l)   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
-        for (int t = 0; e->c.ple[l] >= 0 && t < n; ++t) qwen4_ple_prefetch(&e->nm, e->table, &e->c, &e->ng[e->c.ple[l]], l, e->ids, e->pos + t);
+    ple_run(e, n, 1);   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
     if (!logits && n > MAXT && !e->routes) {   // a long prompt: layer-major passes (Q4E_ROUTES traces chunk by chunk)
         for (int i = 0; i < n; i += XR) if (forward_pass(e, ids + i, n - i < XR ? n - i : XR)) return -1;
         return 0;

@@ -186,6 +186,18 @@ int main(void) {
             CHECK(diff == 0, "the layer-major pass changes the next token's logits");
             q4e_close(e);
         }
+        set_env("Q4E_PLE_THREADS", "1");   // the PLE rows on one thread: the same pass, bit for bit
+        e = q4e_open("tests/data/qwen4_tiny", &ol, err, sizeof err);
+        CHECK(e != NULL, "open: %s", err);
+        if (e) {
+            CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, rows3) == 0, "a serial pass: %s", q4e_error(e));
+            int diff = 0;
+            for (int v = 0; v < V; ++v) diff += pass[v] != rows3[v];
+            printf("the pass with PLE rows on one thread or many: %d logits differ\n", diff);
+            CHECK(diff == 0, "threaded PLE rows change the logits");
+            q4e_close(e);
+        }
+        set_env("Q4E_PLE_THREADS", NULL);
         free(lid); free(pass); free(rows3);
     }
     free(got);
