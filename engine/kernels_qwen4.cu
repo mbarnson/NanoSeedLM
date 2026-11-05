@@ -228,6 +228,22 @@ void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n) { kq4_hc_lo(s, hc, i
 void kq4_hc_mix(cudaStream_t s, int hc, int d, const float* normed, const float* up, float* mixed, int T) {
     k_q4_hc_mix<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(hc, d, normed, up, mixed);
 }
+// k_q4_hc_add, then k_q4_norm1p of each stream into normed, in one pass: block (row, stream), the same threads and order
+__global__ void __launch_bounds__(256) k_q4_hc_add_norm(int hc, int d, float* H, const float* br, const float* inj, const float* w,
+                                                        float eps, float* normed) {
+    __shared__ float red[32];
+    const int t = blockIdx.x / hc, s = blockIdx.x % hc;
+    float* h = H + ((size_t) t * hc + s) * d;
+    const float* b = br + (size_t) t * d;
+    const float g = inj[t * hc + s];
+    float ss = 0;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) { h[i] += b[i] * g; ss += h[i] * h[i]; }
+    const float r = rsqrtf(block_sum(ss, red) / d + eps);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) normed[((size_t) t * hc + s) * d + i] = h[i] * r * (1.0f + w[s * d + i]);
+}
+void kq4_hc_add_norm(cudaStream_t s, int hc, int d, float* H, const float* branch, const float* inj, const float* w, float eps, float* normed, int T) {
+    k_q4_hc_add_norm<<<(unsigned) (T * hc), 256, 0, s>>>(hc, d, H, branch, inj, w, eps, normed);
+}
 void kq4_hc_add(cudaStream_t s, int hc, int d, float* H, const float* branch, const float* inj, int T) {
     k_q4_hc_add<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(hc, d, H, branch, inj);
 }

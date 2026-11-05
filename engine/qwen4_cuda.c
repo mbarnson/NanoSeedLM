@@ -559,11 +559,11 @@ static void prof_collect(Q4Eng* e) {   // after the stream's sync
 // ---- the forward of up to mt rows ------------------------------------------------------------------------------------
 
 // The streams of H mixed into e->x (nslm/qwen4_ops.h). down: hc_rank rows, then (inj) the hc rows of the weights that
-// add the branch back, into e->inj
+// add the branch back, into e->inj. norm NULL: e->normed holds the normed streams already (kq4_hc_add_norm).
 static void hc_mix(Q4Eng* e, const float* norm, const W* down, const W* upw, int inj, int T) {
     const Qwen4Cfg* c = &e->c;
     const int HD = c->hc * c->d, ld = down->rows;
-    kq4_norm1p(e->s, e->H, HD, c->d, norm, c->eps, e->normed, T);
+    if (norm) kq4_norm1p(e->s, e->H, HD, c->d, norm, c->eps, e->normed, T);
     mv(e, down, e->normed, e->lo, T);
     kq4_hc_lo(e->s, c->hc, e->lo, T, c->hc_rank, ld, inj ? e->inj : NULL);
     mvx(e, upw, e->lo, ld, e->up, T);
@@ -726,8 +726,8 @@ static int layer(Q4Eng* e, int l, int T, int row0) {
     mark(e, ST_HC);
     if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
     mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
-    kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
-    hc_mix(e, L->hc_norm[1], &L->hc_di[1], &L->hc_up[1], 1, T);
+    kq4_hc_add_norm(e->s, c->hc, c->d, e->H, e->br, e->inj, L->hc_norm[1], c->eps, e->normed, T);
+    hc_mix(e, NULL, &L->hc_di[1], &L->hc_up[1], 1, T);
     mark(e, ST_HC);
     moe(e, l, T);
     kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);

@@ -27,6 +27,8 @@ void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n);
 void kq4_hc_mix(cudaStream_t s, int hc, int d, const float* normed, const float* up, float* mixed, int T);
 void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n);
 void kq4_hc_add(cudaStream_t s, int hc, int d, float* H, const float* branch, const float* inj, int T);
+// kq4_hc_add, then normed[t] = qwen4_norm1p(H[t], hc * d, d, w, eps)
+void kq4_hc_add_norm(cudaStream_t s, int hc, int d, float* H, const float* branch, const float* inj, const float* w, float eps, float* normed, int T);
 // Both on lo [rows][ld]: the act on a row's first rank values in place, the gate of the rest into inj [rows][ld - rank]
 void kq4_hc_lo(cudaStream_t s, int hc, float* lo, int rows, int rank, int ld, float* inj);
 
