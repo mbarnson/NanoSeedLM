@@ -363,7 +363,7 @@ weight the error by Unsloth's imatrix. Read
 
 ## [2026-11-04] result | Seed layouts against Unsloth's tensors on one layer of Qwen3.8-Flash-Next
 
-`c76e09f`, `08b1c6a`: `nslm-moe --probe` measures the imatrix-weighted error of seed layouts on sampled blocks of one
+`6fe04dd`, `f714f50`: `nslm-moe --probe` measures the imatrix-weighted error of seed layouts on sampled blocks of one
 layer. `tools/gguf_experts.py` gives the same measure for the tensors of a GGUF. On layer 20, 3-bit seeds have 0.213
 and Unsloth's IQ3_XXS has 0.184, so gate G6 fails. P4 has 0.079 and Q4_K has 0.070. Read
 [Seed layouts against Unsloth's tensors on one layer](results/2026-11-04-qwen38-seed-probe.md).
