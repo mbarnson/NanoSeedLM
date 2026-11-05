@@ -7,7 +7,10 @@
 #include <sys/stat.h>
 
 #include "format.h"
+#include "model_st.h"
 #include "moe.h"
+#include "rows.h"
+#include "searchc.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -113,6 +116,55 @@ int main(void) {
         CHECK(a && b, "loader and seed core in the pack");
         if (a) fclose(a);
         if (b) fclose(b);
+    }
+
+    // ---- an S3 seed bank (.blks: C = 12, P = 4, a padded last block) read as a model: rows as nslmc_decode_block ----
+    {
+        mkdir("out", 0755);
+        mkdir("out/test_moe_bank", 0755);
+        enum { E = 2, R = 3, C = 28, NBK = 3, NB = R * NBK };   // 28 columns: the last block holds 4 weights
+        MoeBlkHeader h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, "NSLMBLKS", 8);
+        h.rows = R; h.cols = C; h.n_experts = E;
+        const int32_t bias[E] = {-20, -18};
+        const float zero[2 * E] = {0};
+        uint16_t sd[E * NB], cf[E * NB];
+        uint8_t ec[E * NB];
+        for (int k = 0; k < E * NB; ++k) { sd[k] = (uint16_t) (1000 + 37 * k); cf[k] = (uint16_t) (0x1357u * (unsigned) k); ec[k] = (uint8_t) (k % 16); }
+        FILE* f = fopen("out/test_moe_bank/L1_down_proj.blks", "wb");
+        fwrite(&h, sizeof h, 1, f); fwrite(bias, 4, E, f); fwrite(zero, 4, 2 * E, f);
+        fwrite(sd, 2, E * NB, f); fwrite(cf, 2, E * NB, f); fwrite(ec, 1, E * NB, f);
+        fclose(f);
+        f = fopen("out/test_moe_bank/L2_gate_proj.blks", "wb");   // short: refused
+        fwrite(&h, sizeof h, 1, f);
+        fclose(f);
+        NsModel m;
+        char berr[256] = "";
+        CHECK(ns_open_bank(&m, "out/test_moe_bank", berr, sizeof berr) != 0, "a short .blks accepted");
+        remove("out/test_moe_bank/L2_gate_proj.blks");
+        CHECK(ns_open_bank(&m, "out/test_moe_bank", berr, sizeof berr) == 0 && m.n == 1, "bank: %s", berr);
+        const NsTensor* t = ns_find(&m, "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight");
+        CHECK(t && t->enc == NS_SEEDS3 && t->slices == E && t->rows == R && t->cols == C, "bank tensor");
+        NsRows* nr = (NsRows*) malloc(sizeof *nr);
+        ns_rows_init(nr);
+        int same = 1;
+        for (int e = 0; t && e < E; ++e)
+            for (int r = 0; r < R; ++r) {
+                float out[C];
+                ns_row_f32(nr, t, e, r, 1, out);
+                for (int j = 0; j < NBK; ++j) {
+                    const int k = (e * R + r) * NBK + j;
+                    uint16_t bf[12];
+                    nslmc_decode_block(12, 4, sd[k], cf[k], bias[e] + ec[k], bf);
+                    for (int c = 0; c < 12 && 12 * j + c < C; ++c) same &= out[12 * j + c] == nslm4_bf2f(bf[c]);
+                }
+            }
+        CHECK(same, "S3 rows differ from nslmc_decode_block");
+        CHECK(t && ns_stream_len(NS_SEEDS3, E, R, C, 0) == 2 * E * NB && ns_stream_len(NS_SEEDS3, E, R, C, 3) == E * NB, "S3 stream sizes");
+        ns_close(&m);
+        free(nr);
+        CHECK(ns_open_bank(&m, "out/test_moe_pack", berr, sizeof berr) != 0, "a folder without banks opened");
     }
 
     // ---- 3-D BF16 safetensors round trip ----

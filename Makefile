@@ -90,7 +90,7 @@ $(BIN)/nslm-mova-kbench: harness/nslm-mova-kbench.m harness/common.h engine/kern
 	$(CC) $(OBJCFLAGS) harness/nslm-mova-kbench.m $(LIBS) -o $@
 
 # ---- compressor: seed search (C + the Metal search glue) and the packer -------------------------------------------
-SEARCH_O  := $(OBJ)/search_metal.o $(OBJ)/search4_metal.o $(OBJ)/searchp_metal.o
+SEARCH_O  := $(OBJ)/search_metal.o $(OBJ)/search4_metal.o $(OBJ)/searchc_metal.o $(OBJ)/searchp_metal.o
 $(OBJ)/%_metal.o: nslm/%_metal.m $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -c $< -o $@

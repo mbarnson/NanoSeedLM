@@ -4,9 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// The header of nslm-moe's .blk / .blk4 / .blk8 block files.
+#include "model_st.h"
+
+// The header of nslm-moe's .blk / .blk4 / .blk8 / .blks block files.
 typedef struct {
-    char magic[8];   // "NSLMBLKM", "NSLMBLK4", "NSLMBLK8"
+    char magic[8];   // "NSLMBLKM", "NSLMBLK4", "NSLMBLK8", "NSLMBLKS" (S3: C = 12, P = 4)
     uint32_t rows, cols, n_experts;
     uint32_t n_seeds, n_exp, refit;
     int32_t exp_delta[3];
@@ -17,6 +19,11 @@ typedef struct {
 // Stream s (model_st.h order) of an nslm-moe block file of E slices of rows x cols: P = 3 (.blk, SEED4) or P = 4
 // (.blk4, SEED4P4, exponent codes low nibble first).  -1 when blk is not that file.
 int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int cols, int s, uint8_t* dst);
+
+// The S3 seed banks of a folder (nslm-moe --codec s3: L{l}_{gate,up,down}_proj.blks, as .blk4 with blocks of 12, a row's
+// last block padded) as NS_SEEDS3 tensors language_model.model.layers.L.mlp.switch_mlp.PROJ.weight, mapped for the
+// process.  0, or -1 with err (no bank, or a file of the wrong size).
+int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen);
 
 // Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.
 int nslm_copy_loader(const char* loader, const char* dir);

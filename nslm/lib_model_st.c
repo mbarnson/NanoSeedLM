@@ -38,6 +38,10 @@ static uint64_t stream_len(int enc, int slices, int rows, int cols, int group, i
     case NS_SEED4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : 0;
     case NS_SEED4P4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
     case NS_SEED6P8: return s == 0 ? 2 * (n / 8) : s == 1 ? 4 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
+    case NS_SEEDS3: {   // blocks of 12, the last one of a row padded; one exponent code byte each
+        const uint64_t nb = (uint64_t) slices * (uint64_t) rows * (uint64_t) ((cols + 11) / 12);
+        return s < 2 ? 2 * nb : s == 2 ? 4 * (uint64_t) slices : nb;
+    }
     default: return 0;
     }
 }

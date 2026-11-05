@@ -16,6 +16,8 @@
 //       (nslm-mova-mlacapture --xtx DIR: L{l}_{x,v,q,o}.xtx), H dampened by damp * mean(diag H); the heads of a per-head
 //       map with one exponent bias search together; --codec p3 / p8 in place of --p4: P = 3 (.blk, SEED4 nibble words) or
 //       P = 8 (.blk8: 32-bit coefficient words, then the exponent codes) blocks (nslm/searchp.h, nslm/gptq.h)
+//   --codec s3 (CUDA): C = 12, P = 4 blocks, 3 bits a weight (nslm/searchc_gpu.h), written as .blks: as .blk4 with
+//       nb = rows * ceil(cols / 12), a row's last block padded (ns_open_bank reads them)
 //   nslm-moe --expand --blk DIR --out DIR [--scope gu] [--p4]   OUT/L{l}_{proj}.safetensors: 'w' [E][rows][cols] BF16
 //   Qwen3.8-Flash-Next (config.json model_type qwen4_exp, --scope gu|gud|d): --imatrix FILE (a llama.cpp imatrix GGUF)
 //       in place of --act; experts stacked as gate_up_proj [E][2F][D] (gate rows first) and down_proj [E][D][F].
@@ -51,6 +53,7 @@
 #include "search4.h"
 #include "search4_gpu.h"
 #include "searchc.h"
+#include "searchc_gpu.h"
 #include "searchp_gpu.h"
 
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
@@ -316,6 +319,20 @@ static int g_p4;   // --p4: 4.5-bit blocks (nslm/search4.h), written as .blk4
 static char g_lib4[1024];
 static const char* g_xtx;   // --xtx DIR: GPTQ for the MLA projections
 static int g_pc;            // --codec p3 / p8 (MLA GPTQ only): P, else 0
+static int g_s3;            // --codec s3: C = 12, P = 4 blocks (nslm/searchc_gpu.h, CUDA), written as .blks
+static const char* blk_ext(void) { return g_pc == 8 ? "blk8" : g_s3 ? "blks" : g_p4 ? "blk4" : "blk"; }
+static const char* blk_magic(void) { return g_pc == 8 ? "NSLMBLK8" : g_s3 ? "NSLMBLKS" : g_p4 ? "NSLMBLK4" : "NSLMBLKM"; }
+// nslm_choose_bias for blocks of C along each row (a short last block): the window ends at the largest block norm
+static int bias_c(const float* w, int rows, int cols, int C) {
+    int top = -1000;
+    for (int r = 0; r < rows; ++r)
+        for (int c0 = 0; c0 < cols; c0 += C) {
+            float n2 = 0.0f;
+            for (int c = c0; c < c0 + C && c < cols; ++c) n2 += w[(size_t) r * cols + c] * w[(size_t) r * cols + c];
+            if (n2 > 0.0f) { const int v = ilogbf(2.0f * sqrtf(n2)) - 2; if (v > top) top = v; }
+        }
+    return top + 1 - 15;
+}
 static char g_libp[1024];
 static double g_damp = 0.01;
 
@@ -421,7 +438,7 @@ static int gptqp_job(NslmPGpu* gp, const Search4Opts* o4, int l, int p, int rows
 static int blk_done(const char* path, const SearchOpts* o, double n0, MoeBlkHeader* h) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
-    const int ok = fread(h, sizeof *h, 1, f) == 1 && !memcmp(h->magic, g_pc == 8 ? "NSLMBLK8" : g_p4 ? "NSLMBLK4" : "NSLMBLKM", 8) && h->n_seeds == (uint32_t) o->n_seeds &&
+    const int ok = fread(h, sizeof *h, 1, f) == 1 && !memcmp(h->magic, blk_magic(), 8) && h->n_seeds == (uint32_t) o->n_seeds &&
                    h->n_exp == (uint32_t) o->n_exp && h->refit == (uint32_t) o->refit && h->n0 == (float) n0;
     fclose(f);
     return ok;
@@ -430,21 +447,22 @@ static int blk_done(const char* path, const SearchOpts* o, double n0, MoeBlkHead
 static void* job_worker(void* arg) {
     Jobs* j = (Jobs*) arg;
     char err[512], path[2048], name[128];
-    NslmGpu* gpu = g_p4 || g_pc ? NULL : nslm_gpu_open(j->metallib, err, sizeof err);
+    NslmGpu* gpu = g_p4 || g_pc || g_s3 ? NULL : nslm_gpu_open(j->metallib, err, sizeof err);
+    NslmCGpu* gpuc = g_s3 ? nslmc_gpu_open(err, sizeof err) : NULL;
     Nslm4Gpu* gpu4 = g_p4 ? nslm4_gpu_open(g_lib4, err, sizeof err) : NULL;
     NslmPGpu* gpup = g_pc ? nslmp_gpu_open(g_libp, err, sizeof err) : NULL;
-    if (!gpu && !gpu4 && !gpup) { fprintf(stderr, "gpu: %s\n", err); atomic_store(&j->failed, 1); return NULL; }
+    if (!gpu && !gpu4 && !gpup && !gpuc) { fprintf(stderr, "gpu: %s\n", err); atomic_store(&j->failed, 1); return NULL; }
     for (;;) {
         const int k = atomic_fetch_add(&j->next, 1);
         if (k >= j->n || atomic_load(&j->failed)) break;
         const int l = j->items[k].l, p = j->items[k].p;
         const int rows = proj_rows(l, p), cols = proj_cols(l, p), E = proj_experts(p);
-        const size_t nb = (size_t) rows * cols / NSLM_C;
-        snprintf(path, sizeof path, "%s/L%d_%s.%s", j->out, l, kProj[p], g_pc == 8 ? "blk8" : g_p4 ? "blk4" : "blk");
+        const size_t nb = g_s3 ? (size_t) rows * (size_t) ((cols + 11) / 12) : (size_t) rows * cols / NSLM_C;
+        snprintf(path, sizeof path, "%s/L%d_%s.%s", j->out, l, kProj[p], blk_ext());
         MoeBlkHeader h;
         if (blk_done(path, j->o, j->n0, &h)) { printf("L%-2d %-9s done (%.1f s)\n", l, kProj[p], h.seconds); continue; }
         memset(&h, 0, sizeof h);
-        memcpy(h.magic, g_pc == 8 ? "NSLMBLK8" : g_p4 ? "NSLMBLK4" : "NSLMBLKM", 8);
+        memcpy(h.magic, blk_magic(), 8);
         h.rows = (uint32_t) rows; h.cols = (uint32_t) cols; h.n_experts = (uint32_t) E;
         h.n_seeds = (uint32_t) j->o->n_seeds; h.n_exp = (uint32_t) j->o->n_exp; h.refit = (uint32_t) j->o->refit;
         memcpy(h.exp_delta, j->o->exp_delta, sizeof h.exp_delta);
@@ -452,8 +470,8 @@ static void* job_worker(void* arg) {
         int32_t* bias = (int32_t*) malloc(4 * (size_t) E);
         float* rel = (float*) malloc(4 * (size_t) E), *wrel = (float*) malloc(4 * (size_t) E);
         uint16_t* seed = (uint16_t*) malloc(2 * nb * (size_t) E), *nib = (uint16_t*) malloc(2 * nb * (size_t) E);
-        uint8_t* ec = g_p4 || g_pc ? (uint8_t*) malloc(nb * (size_t) E) : NULL;   // P = 4 / 8 (and 3 before packing): exponent codes
-        uint32_t* cw = g_pc ? (uint32_t*) malloc(4 * nb * (size_t) E) : NULL;     // P = 3 / 8: coefficient words
+        uint8_t* ec = g_p4 || g_pc || g_s3 ? (uint8_t*) malloc(nb * (size_t) E) : NULL;   // P = 4 / 8 (and 3 before packing): exponent codes
+        uint32_t* cw = g_pc || g_s3 ? (uint32_t*) malloc(4 * nb * (size_t) E) : NULL;     // P = 3 / 8 and S3: coefficient words
         float* er = (float*) malloc(4 * nb), *hh = (float*) malloc(4 * (size_t) cols), *sh = (float*) malloc(4 * (size_t) cols);
         const double t0 = now_s();
         double gsearch = 0;
@@ -495,12 +513,14 @@ static void* job_worker(void* arg) {
             float* w = load_proj(l, p, e);
             if (!w) { atomic_store(&j->failed, 1); break; }
             int64_t clamped = 0;
-            bias[e] = nslm_choose_bias(w, (int64_t) nb, &clamped);
+            bias[e] = g_s3 ? bias_c(w, rows, cols, 12) : nslm_choose_bias(w, (int64_t) nb, &clamped);
             act_h(l, p, e, j->n0, hh);
             for (int c = 0; c < cols; ++c) sh[c] = sqrtf(hh[c] > 1e-12f ? hh[c] : 1e-12f);
             const double ts = now_s();
             const Search4Opts o4 = {j->o->n_seeds, j->o->n_exp, {j->o->exp_delta[0], j->o->exp_delta[1], j->o->exp_delta[2]}, j->o->refit};
-            if (g_p4 ? nslm4_gpu_search(gpu4, w, rows, cols, sh, bias[e], &o4, seed + (size_t) e * nb, nib + (size_t) e * nb,
+            if (g_s3 ? nslmc_gpu_search(gpuc, 12, 4, w, rows, cols, sh, bias[e], &o4, seed + (size_t) e * nb, cw + (size_t) e * nb,
+                                        ec + (size_t) e * nb, er, err, sizeof err)
+                : g_p4 ? nslm4_gpu_search(gpu4, w, rows, cols, sh, bias[e], &o4, seed + (size_t) e * nb, nib + (size_t) e * nb,
                                         ec + (size_t) e * nb, er, err, sizeof err)
                      : nslm_gpu_search(gpu, w, rows, cols, sh, bias[e], j->o, j->prune, seed + (size_t) e * nb, nib + (size_t) e * nb,
                                        er, err, sizeof err)) {
@@ -520,7 +540,19 @@ static void* job_worker(void* arg) {
                        now_s() - ts, (long long) n, hmin, hmax, bias[e], (long long) clamped);
             }
             double se = 0, sw = 0, wse = 0, wsw = 0;
-            for (size_t b = 0; b < nb; ++b) {
+            const int nbk = (cols + 11) / 12;
+            for (size_t b = 0; g_s3 && b < nb; ++b) {   // S3: blocks of 12 along a row, the last one short
+                uint16_t bf[12];
+                const size_t k = (size_t) e * nb + b;
+                nslmc_decode_block(12, 4, seed[k], (uint16_t) cw[k], bias[e] + ec[k], bf);
+                const int r = (int) (b / (size_t) nbk), c0 = (int) (b % (size_t) nbk) * 12;
+                for (int c = c0; c < c0 + 12 && c < cols; ++c) {
+                    const double x = w[(size_t) r * cols + c], d = x - nslm_bf2f(bf[c - c0]);
+                    se += d * d; sw += x * x;
+                    wse += hh[c] * d * d; wsw += hh[c] * x * x;
+                }
+            }
+            for (size_t b = 0; !g_s3 && b < nb; ++b) {
                 uint16_t bf[NSLM_C];
                 if (g_p4) nslm4_decode_block(seed[(size_t) e * nb + b], nib[(size_t) e * nb + b], bias[e] + ec[(size_t) e * nb + b], bf);
                 else nslm_decode_block(seed[(size_t) e * nb + b], nib[(size_t) e * nb + b], bias[e], bf);
@@ -541,6 +573,8 @@ static void* job_worker(void* arg) {
             break;
         }
         h.seconds = now_s() - t0;
+        if (g_s3)   // 4 coefficients fit 16 bits, as .blk4
+            for (size_t k = 0; k < nb * (size_t) E; ++k) nib[k] = (uint16_t) cw[k];
         if (g_pc == 3)   // SEED4 nibble words: the exponent code, then the 3 coefficients; no code stream
             for (size_t k = 0; k < nb * (size_t) E; ++k) nib[k] = (uint16_t) (ec[k] | cw[k] << 4);
         char tmp[2100];
@@ -811,7 +845,9 @@ int main(int argc, char** argv) {
     g_damp = atof(opt(argc, argv, "--damp", "0.01"));
     const char* codec = opt(argc, argv, "--codec", NULL);
     g_pc = codec && !strcmp(codec, "p3") ? 3 : codec && !strcmp(codec, "p8") ? 8 : 0;
-    if (codec && (!g_pc || g_p4 || !g_xtx)) { fprintf(stderr, "--codec p3|p8 goes with --scope mla --xtx (not --p4)\n"); return 2; }
+    g_s3 = codec && !strcmp(codec, "s3");
+    if (codec && !g_s3 && (!g_pc || g_p4 || !g_xtx)) { fprintf(stderr, "--codec p3|p8 goes with --scope mla --xtx (not --p4)\n"); return 2; }
+    if (g_s3 && (g_p4 || g_xtx)) { fprintf(stderr, "--codec s3 is an activation-weighted search (not --p4 or --xtx)\n"); return 2; }
     snprintf(g_libp, sizeof g_libp, "%s/searchp.metallib", opt(argc, argv, "--res", "out/res"));
     if (g_xtx && (!g_mla.on || !(g_p4 || g_pc))) { fprintf(stderr, "--xtx goes with --scope mla --p4 (or --codec p3|p8)\n"); return 2; }
     if (g_xtx) printf("GPTQ over X^T X from %s, damp %.3g\n", g_xtx, g_damp);

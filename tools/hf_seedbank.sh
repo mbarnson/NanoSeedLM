@@ -12,7 +12,8 @@
 # Qwen3.8-Flash-Next: IMATRIX=FILE or REPO:FILE (a llama.cpp imatrix) in place of ACT, so moe3 / moe4 search gate, up
 # and down (--scope gud).  ONLY=SUBSTR downloads only the shards that hold tensors named with SUBSTR (mlp.experts.).
 #
-# JOBS: moe3 / moe4 routed and value experts (nslm-moe --scope all, AW) at P = 3 / 4; dense3 / dense4 / dense8 the dense
+# JOBS: moe3 / moe4 routed and value experts (nslm-moe --scope all, AW) at P = 3 / 4, moes3 at S3 (C = 12, P = 4, 3 bits a
+# weight, .blks banks for nslm-qwen4-emulate); dense3 / dense4 / dense8 the dense
 # tensors (nslm-dense --mode gptq) at P = 3 / 4 / 8; mla3 / mla4 / mla8 an MLA model's projections (nslm-moe --scope mla,
 # GPTQ) at P = 3 / 4 / 8, after one capture on GPU 0 (nslm-mova-mlacapture over CALIB, the model being an MLA folder; the
 # capture is kept in OUT/mla-capture and reused).  MOE_EXTRA / DENSE_EXTRA: more options (e.g. one layer, for a benchmark).
@@ -77,6 +78,7 @@ run_gpu() {   # one GPU: its shard of every job, in order
         case $j in
             moe3) "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/experts-p3" --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
             moe4) "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/experts-p4" --p4 --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
+            moes3) "$BIN/nslm-moe" --model "$MODEL" $CALIB_ARGS --out "$OUT/experts-s3" --codec s3 --shard "$g/$GPUS" --workers "$WORKERS" $MOE_EXTRA ;;
             dense3|dense4|dense8)
                 "$BIN/nslm-dense" --model "$MODEL" --xtx "$XTX" --out "$OUT/dense-p${j#dense}" --mode gptq --codec "p${j#dense}" \
                     --shard "$g/$GPUS" --workers "$WORKERS" $DENSE_EXTRA ;;

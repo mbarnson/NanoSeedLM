@@ -2,9 +2,13 @@
 #include "moe.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "json.h"
 
@@ -98,6 +102,44 @@ int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int 
         const uint8_t* ec = base + 12 * e + 4 * nb * e;
         for (size_t k = 0; k < nb * e; k += 2) dst[k / 2] = (uint8_t) ((ec[k] & 15) | ((k + 1 < nb * e ? ec[k + 1] & 15 : 0) << 4));
     }
+    return 0;
+}
+
+static int bank_cmp(const void* a, const void* b) { return strcmp(((const NsTensor*) a)->name, ((const NsTensor*) b)->name); }
+
+int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen) {
+    static const char* kp[3] = {"gate_proj", "up_proj", "down_proj"};
+    memset(m, 0, sizeof *m);
+    int cap = 0;
+    for (int l = 0; l < 256; ++l)
+        for (int p = 0; p < 3; ++p) {
+            char path[2048];
+            snprintf(path, sizeof path, "%s/L%d_%s.blks", dir, l, kp[p]);
+            const int fd = open(path, O_RDONLY);
+            struct stat sb;
+            if (fd < 0) continue;
+            const size_t len = fstat(fd, &sb) ? 0 : (size_t) sb.st_size;
+            const MoeBlkHeader* h = len >= sizeof *h ? (const MoeBlkHeader*) mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+            close(fd);
+            if (h == (const void*) MAP_FAILED) h = NULL;
+            const size_t E = h ? h->n_experts : 0, nb = h ? (size_t) h->rows * ((h->cols + 11) / 12) : 0;
+            if (!h || memcmp(h->magic, "NSLMBLKS", 8) || len != sizeof *h + 12 * E + 5 * nb * E) {
+                snprintf(err, (size_t) errlen, "%s: not an S3 seed bank", path);
+                free(m->t);
+                memset(m, 0, sizeof *m);
+                return -1;
+            }
+            if (m->n == cap) m->t = (NsTensor*) realloc(m->t, sizeof(NsTensor) * (size_t) (cap = cap ? 2 * cap : 64));
+            NsTensor* t = &m->t[m->n++];
+            memset(t, 0, sizeof *t);
+            snprintf(t->name, sizeof t->name, "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, kp[p]);
+            t->enc = NS_SEEDS3; t->slices = (int) E; t->rows = (int) h->rows; t->cols = (int) h->cols;
+            const uint8_t* b = (const uint8_t*) (h + 1);   // bias[E], rel[E], wrel[E], seeds, coefficients, codes
+            const uint8_t* at[4] = {b + 12 * E, b + 12 * E + 2 * nb * E, b, b + 12 * E + 4 * nb * E};
+            for (int s = 0; s < 4; ++s) { t->s[s].p = at[s]; t->s[s].len = ns_stream_len(NS_SEEDS3, t->slices, t->rows, t->cols, s); }
+        }
+    if (!m->n) { snprintf(err, (size_t) errlen, "%s: no S3 seed banks (L*_*.blks)", dir); return -1; }
+    qsort(m->t, (size_t) m->n, sizeof(NsTensor), bank_cmp);
     return 0;
 }
 

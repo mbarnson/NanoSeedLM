@@ -1,6 +1,7 @@
 // nslm/qwen4_emulate.c - nslm-qwen4-emulate: a seed pack's routed experts written into the Q8_0 expert tensors of
 // Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them (an emulated pack, nslm/emulate.h).  With several
-// packs, MAP (uint8 [layer][gate, up, down][expert], tools/qwen4_tier_map.py) names the pack of each expert.
+// packs, MAP (uint8 [layer][gate, up, down][expert], tools/qwen4_tier_map.py) names the pack of each expert.  A pack is a
+// model folder or an S3 seed bank folder (nslm-moe --codec s3).
 //   nslm-qwen4-emulate --pack DIR [--pack DIR ...] [--map FILE] [--workers 8] SHARD.gguf [SHARD.gguf ...]
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include <time.h>
 
 #include "emulate.h"
+#include "moe.h"
 
 static uint8_t* read_map(const char* path, size_t* n) {
     FILE* f = fopen(path, "rb");
@@ -54,7 +56,7 @@ int main(int argc, char** argv) {
     const NsModel* pk[NS_EMU_PACKS];
     char err[512];
     for (int k = 0; k < np; ++k) {
-        if (ns_open(&m[k], dirs[k], err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
+        if (ns_open(&m[k], dirs[k], err, sizeof err) && ns_open_bank(&m[k], dirs[k], err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
         pk[k] = &m[k];
     }
     int want = 0, done = 0, rc = 0;

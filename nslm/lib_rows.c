@@ -6,6 +6,7 @@
 #include "format.h"
 #include "lfsr.h"
 #include "search4.h"
+#include "searchc.h"
 
 static float bf2f(uint16_t h) { uint32_t u = (uint32_t) h << 16; float f; memcpy(&f, &u, 4); return f; }
 static float bfr(float x) {
@@ -69,6 +70,18 @@ void ns_row_f32(const NsRows* r, const NsTensor* t, int slice, int row, int roun
                 for (int p = 0; p < P; ++p) isum += ((int32_t) ((st >> (cc * P + p + 1)) & 0xFFFFu) - 32768) * q[p];
                 out[j * 8 + cc] = (float) isum * sc;
             }
+        }
+        break;
+    }
+    case NS_SEEDS3: {   // BF16-rounded (nslmc_decode_block) whatever round says
+        const int nbk = (K + 11) / 12;
+        const uint64_t k0 = ((uint64_t) slice * R + (uint64_t) row) * (uint64_t) nbk;
+        int32_t eb;
+        memcpy(&eb, t->s[2].p + 4 * (size_t) slice, 4);
+        for (int j = 0; j < nbk; ++j) {
+            uint16_t bf[12];
+            nslmc_decode_block(12, 4, ((const uint16_t*) t->s[0].p)[k0 + j], ((const uint16_t*) t->s[1].p)[k0 + j], eb + t->s[3].p[k0 + j], bf);
+            for (int c = 0; c < 12 && 12 * j + c < K; ++c) out[12 * j + c] = nslm4_bf2f(bf[c]);
         }
         break;
     }
