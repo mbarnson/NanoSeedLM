@@ -31,12 +31,13 @@ METALLIBS := $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib $(RES)/se
              $(RES)/searchp.metallib
 ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes \
              nslm-mova-mlacapture
-TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-qwen4-pack nslm-qwen4-emulate nslm-bits-probe nslm-cpu-seed-bench)
+TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-qwen4-pack nslm-qwen4-emulate nslm-bits-probe nslm-cpu-seed-bench \
+                             nslm-qwen4-gen)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c tests/test_searchc_gpu.c tests/test_searchp_gpu.c \
                             tests/test_mova_kernels.c tests/test_qwen4_kernels.c \
-                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_engine_dispatch.c,$(wildcard tests/test_*.c))
+                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_engine_dispatch.c tests/test_qwen4_metal.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
-             $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels
+             $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels $(BIN)/test_qwen4_metal
 
 .PHONY: all build test test-mlx clean
 all: build
@@ -63,6 +64,11 @@ $(RES)/searchp.metallib: nslm/searchp.metal nslm/searchp_gpu.h nslm/lfsr.h
 # ---- objects: the engine (Metal), the shared harness and the C library ---------------------------------------------
 ENG_O     := $(OBJ)/mova_gpu.o
 $(ENG_O): engine/mova_gpu.m $(ENG_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(OBJCFLAGS) -c $< -o $@
+# the qwen4 Metal engine (engine/qwen4_eng.h), for nslm-qwen4-gen and test_qwen4_metal
+Q4E_O     := $(OBJ)/qwen4_gpu.o
+$(Q4E_O): engine/qwen4_gpu.m engine/qwen4_eng.h engine/kernels_moe.metal engine/kernels_qwen4.metal $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
 HARN_O    := $(patsubst harness/%.c,$(OBJ)/h_%.o,$(HARNESS))
@@ -148,6 +154,12 @@ $(BIN)/test_qwen4_kernels: tests/test_qwen4_kernels.c tests/kernel_backend_metal
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c tests/test_qwen4_kernels.c -o $(OBJ)/test_qwen4_kernels.o
 	$(CC) $(OBJCFLAGS) -Itests tests/kernel_backend_metal.m $(OBJ)/test_qwen4_kernels.o $(LIB_O) $(LIBS) -o $@
+$(BIN)/test_qwen4_metal: tests/test_qwen4_metal.c $(Q4E_O) $(LIB_O) $(NSLM_HDRS) $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< $(Q4E_O) $(LIB_O) $(LIBS) -lm -lpthread -o $@
+$(BIN)/nslm-qwen4-gen: harness/nslm-qwen4-gen.c $(Q4E_O) $(HARN_O) $(LIB_O) $(HARN_HDRS) $(NSLM_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< $(Q4E_O) $(HARN_O) $(LIB_O) $(LIBS) $(HLIBS) -lm -lpthread -o $@
 
 $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 	$(PY) tools/mova_affine_golden.py --out $(OUT)/test/affine
