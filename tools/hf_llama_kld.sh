@@ -3,9 +3,10 @@
 # table (RAM-tier plan T1), on an HF Jobs node with 1 TB of RAM and 384 GB of VRAM (rtx-pro-6000x4).
 #
 #   SRC=/b/src OUT=/b/kld [PACKS="Q8_0 P3 P4 UD-IQ3_XXS UD-Q3_K_XL UD-IQ4_XS UD-Q4_K_XL"] [CHUNKS=64] [MAPS=/b/maps] \
-#     [S3BANK=/b/s3/experts-s3] bash tools/hf_llama_kld.sh
+#     [S3BANK=/b/s3/experts-s3] [TQBANK=/b/tq] bash tools/hf_llama_kld.sh
 #
-# A pack is an Unsloth folder, a seed tier (P3, P4, S3: the Q8_0 shards with those experts, nslm-qwen4-emulate), or
+# A pack is an Unsloth folder, a seed or trellis tier (P3, P4, S3, TQ3, TQ4: the Q8_0 shards with those experts,
+# nslm-qwen4-emulate; TQk is the folder TQBANK/TQk of nslm-moe --codec tq --tq-k k banks), or
 # LOW+HIGH@NAME: experts from two tiers by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py), e.g. S3+P3@down.  The
 # reference logits: BF16 on the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
 set -uo pipefail
@@ -21,10 +22,11 @@ pip install -q --break-system-packages "huggingface_hub[hf_xet]" pyarrow >/dev/n
 mkdir -p "$OUT" /m /w
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader; uptime; free -g | head -2; df -h / | tail -1
 
-seed() {   # seed P3|P4|S3: that tier in /m/seed-TIER, kept for the next packs (S3: a seed bank from the bucket)
+seed() {   # seed P3|P4|S3|TQk: that tier in /m/seed-TIER, kept for the next packs (S3, TQk: banks from the bucket)
     [ -d "/m/seed-$1" ] && return
     local t0; t0=$(date +%s)
     if [ "$1" = S3 ]; then mkdir -p /m/seed-S3 && cp "${S3BANK:-/b/s3/experts-s3}"/*.blks /m/seed-S3/
+    elif [[ $1 == TQ* ]]; then mkdir -p "/m/seed-$1" && cp "${TQBANK:-/b/tq}/$1"/*.blkt "/m/seed-$1/"
     else hf download "${SEED[$1]%@*}" --revision "${SEED[$1]#*@}" --local-dir "/m/seed-$1" --max-workers 32 >/dev/null; fi
     echo "== $1: fetched in $(( $(date +%s) - t0 )) s, $(du -sh "/m/seed-$1" | cut -f1)"
 }
@@ -70,7 +72,7 @@ for pk in $PACKS; do
     case $pk in
         Q8_0) [ -d /m/Q8_0 ] || get Q8_0 -00003-of-00006; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf
             stamp "$PLE" 3 6; dir=/m/Q8_0 ;;
-        P3|P4|S3|*+*@*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
+        P3|P4|S3|TQ*|*+*@*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
             t1=$(date +%s)
             if [[ $pk == *@* ]]; then
                 lo=${pk%%+*} hi=${pk#*+}; hi=${hi%@*}
