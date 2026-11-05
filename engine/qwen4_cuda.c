@@ -72,7 +72,7 @@ struct Q4Eng {
     const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *Hall;   // the hidden streams of a pass, xr rows; H: the current chunk's
-    float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated, *inv;   // inv: RoPE's
+    float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *part, *emb, *emb_h, *keys, *qs, *vals, *gated, *inv;   // inv: RoPE's
     float *lg, *wt, *A, *As, *Dx, *sh, *logits, *y, *cv, *qkvb;   // As: the shared expert's activations (decode)
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
     // A chunk's input: its slot of hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
@@ -456,12 +456,12 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
     const Buf mix[] = {{&e->normed, T * HD}, {&e->lo, T * (c->hc_rank + c->hc)}, {&e->up, T * HD}};
     const Buf pl[] = {{&e->emb, T * c->ple_dim}, {&e->keys, T * HD}, {&e->qs, T * HD}, {&e->vals, T * c->d}, {&e->gated, T * HD}};
-    const Buf att[] = {{&e->qp, T * att_ld(c)}, {&e->o, T * c->n_head * c->head_dim}, {&e->sc, T * nb}};
+    const Buf att[] = {{&e->qp, T * att_ld(c)}, {&e->o, T * c->n_head * c->head_dim}, {&e->sc, T * nb}, {&e->part, kq4_attend_part_len(c)}};
     const Buf lin[] = {{&e->y, T * vd}, {&e->cv, T * cd}, {&e->qkvb, T * gdn_ld(c)}};
     const Buf ffn[] = {{&e->lg, T * (c->n_exp + 1)}, {&e->wt, T * c->top_k}, {&e->A, T * ka}, {&e->Gb, T * ka}, {&e->Ub, T * ka},
                        {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}, {&e->As, MV_MAXT * (size_t) c->ff_shared}};
     const Buf* grp[] = {mix, pl, att, lin, ffn};
-    const int ng[] = {3, 5, 3, 3, 8};
+    const int ng[] = {3, 5, 4, 3, 8};
     size_t most = 0;
     for (int i = 0; i < 5; ++i) if (bufs_len(grp[i], ng[i]) > most) most = bufs_len(grp[i], ng[i]);
     float* work = F(most);
@@ -666,7 +666,7 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
     kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
     mark(e, ST_QSA);
-    if (kq4_attend_ld(e->s, c, e->qp, ld, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
+    if (kq4_attend_part(e->s, c, e->qp, ld, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, e->part, T)) return fail(e, "head_dim %d not supported", hd);
     mark(e, ST_ATTN);
     mv(e, &L->o, e->o, e->br, T);
     mark(e, ST_PROJ);

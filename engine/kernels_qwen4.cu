@@ -813,12 +813,105 @@ int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K
                const int32_t* sel, const int32_t* nsel, float* o, int T) {
     return kq4_attend_ld(s, c, q, c->n_head * 2 * c->head_dim, K, V, pos0, dpos, sel, nsel, o, T);
 }
+// Decode rows: block (KV group, split, row), a warp per head of the group. Split sp takes keys [n sp / AD_S, n (sp + 1) / AD_S)
+// of the row's n. Their K and V come in tiles of AT_KT through shared memory, once for all heads. part: m, l, acc[hd].
+#define AD_S 32
+__global__ void k_q4_attend_d(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel, const int32_t* nsel,
+                              const int32_t* dpos, float* part) {
+    __shared__ float Ks[AT_KT][256], Vs[AT_KT][256];
+    __shared__ int keys[AT_KT];
+    const int g = blockIdx.x, sp = blockIdx.y, t = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31, dl = a.hd / 32;
+    const int h = g * (a.nh / a.nkv) + w;
+    const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    const int k0 = (int) ((int64_t) n * sp / AD_S), k1 = (int) ((int64_t) n * (sp + 1) / AD_S);
+    const float* qh = q + (size_t) t * a.qld + (size_t) h * 2 * a.hd;
+    float qv[8], acc[8], m = -INFINITY, l = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { qv[i] = i < dl ? qh[lane + 32 * i] : 0.0f; acc[i] = 0; }
+    for (int b = k0; b < k1; b += AT_KT) {
+        const int nk = min(AT_KT, k1 - b);
+        __syncthreads();   // the previous tile is read
+        if (threadIdx.x < nk) {
+            const int k = b + threadIdx.x;
+            keys[threadIdx.x] = k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < nk * a.hd; i += blockDim.x) {
+            const size_t off = ((size_t) keys[i / a.hd] * a.nkv + g) * a.hd + i % a.hd;
+            Ks[i / a.hd][i % a.hd] = K[off];
+            Vs[i / a.hd][i % a.hd] = V[off];
+        }
+        __syncthreads();
+        float d[AT_KT], mx = m;
+#pragma unroll
+        for (int j = 0; j < AT_KT; ++j) {
+            d[j] = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) if (i < dl) d[j] += qv[i] * Ks[j][lane + 32 * i];
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1)   // the tile's dot products reduced together, as warp_sum does each
+#pragma unroll
+            for (int j = 0; j < AT_KT; ++j) d[j] += __shfl_xor_sync(FULL, d[j], o);
+#pragma unroll
+        for (int j = 0; j < AT_KT; ++j) if (j < nk) { d[j] *= a.scale; mx = fmaxf(mx, d[j]); }
+        const float cf = expf(m - mx);
+        l *= cf;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] *= cf;
+#pragma unroll
+        for (int j = 0; j < AT_KT; ++j)
+            if (j < nk) {
+                const float p = expf(d[j] - mx);
+                l += p;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) if (i < dl) acc[i] += p * Vs[j][lane + 32 * i];
+            }
+        m = mx;
+    }
+    float* pp = part + (((size_t) t * a.nh + h) * AD_S + sp) * (a.hd + 2);
+    if (lane == 0) { pp[0] = m; pp[1] = l; }
+    for (int i = 0; i < dl; ++i) pp[2 + lane + 32 * i] = acc[i];
+}
+// Block (head, row): the AD_S splits of k_q4_attend_d, then the output gate
+__global__ void k_q4_attend_dc(AttArgs a, const float* q, const float* part, float* o) {
+    __shared__ float wt[AD_S];
+    __shared__ float L;
+    const int h = blockIdx.x, t = blockIdx.y, st = a.hd + 2;
+    const float* p = part + ((size_t) t * a.nh + h) * AD_S * st;
+    if (threadIdx.x < 32) {
+        const float ms = threadIdx.x < AD_S ? p[threadIdx.x * st] : -INFINITY, M = warp_max(ms);
+        const float e = ms == -INFINITY ? 0.0f : expf(ms - M);
+        if (threadIdx.x < AD_S) wt[threadIdx.x] = e;
+        const float sl = warp_sum(threadIdx.x < AD_S ? p[threadIdx.x * st + 1] * e : 0.0f);
+        if (threadIdx.x == 0) L = sl;
+    }
+    __syncthreads();
+    const float* qh = q + (size_t) t * a.qld + (size_t) h * 2 * a.hd;
+    for (int i = threadIdx.x; i < a.hd; i += blockDim.x) {
+        float v = 0;
+        for (int x = 0; x < AD_S; ++x) v += p[x * st + 2 + i] * wt[x];
+        o[((size_t) t * a.nh + h) * a.hd + i] = v / L * sigm(qh[a.hd + i]);
+    }
+}
+size_t kq4_attend_part_len(const Qwen4Cfg* c) { return (size_t) 8 * c->n_head * AD_S * (c->head_dim + 2); }
 int kq4_attend_ld(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
                   const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, int T) {
+    float* part = NULL;
+    if (T <= 8 && cudaMalloc(&part, sizeof(float) * kq4_attend_part_len(c)) != cudaSuccess) return -1;
+    const int rc = kq4_attend_part(s, c, q, qld, K, V, pos0, dpos, sel, nsel, o, part, T);
+    cudaFree(part);
+    return rc;
+}
+int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
+                    const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, float* part, int T) {
     if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv) return -1;
     const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, qld, 1.0f / sqrtf((float) c->head_dim)};
     const int G = c->n_head / c->n_kv;
-    if (T > 8 && attend_tc(c))   // prompt rows on tensor cores
+    if (T <= 8 && G <= 32) {   // decode rows: keys split over AD_S blocks a KV group, then the splits combined
+        k_q4_attend_d<<<dim3((unsigned) c->n_kv, AD_S, (unsigned) T), 32 * (unsigned) G, 0, s>>>(a, q, K, V, sel, nsel, dpos, part);
+        k_q4_attend_dc<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, part, o);
+    } else if (T > 8 && attend_tc(c))   // prompt rows on tensor cores
         k_q4_attend_tc<<<dim3((unsigned) c->n_kv, (unsigned) T), 128, tc_smem(c->head_dim), s>>>(a, q, K, V, sel, nsel, dpos, o);
     else if (T > 8 && G <= 32)   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
         k_q4_attend_g<<<dim3((unsigned) c->n_kv, (unsigned) T), 32 * (unsigned) G, sizeof(float) * 2 * AT_KT * (size_t) c->head_dim, s>>>(
