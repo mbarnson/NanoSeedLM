@@ -51,14 +51,6 @@ struct Q4Eng {
     cudaStream_t s;
     int max_pos, pos, host_experts, cache, stream;
     CachePool pool;   // the expert cache (cache = 1)
-    // decode: the next layer's router on this layer's state picks experts, which a second stream copies while this layer
-    // finishes.  pre: a view of pool (the same slots, tables and ticks) with its own job list.
-    CachePool pre;
-    cudaStream_t cs;
-    cudaEvent_t ev_admit, ev_pred[QWEN4_MAX_LAYERS];
-    int predict, pending;   // the layer whose predicted copies the main stream joins first, or -1
-    int32_t* pind;
-    float *plg, *pwt;
     uint64_t ulen[3][4];   // bytes of each expert stream in a unit
     uint8_t* stage;        // stream = 1: pinned staging of the units one admit brings
     int32_t* hjobs;        // stream = 1: the admit's jobs, read back (pinned)
@@ -314,21 +306,6 @@ static void build_cache(Q4Eng* e, double gb) {
         e->L[l].ed.tab = p->tab + ((size_t) l * 3 + 2) * E;
     }
     free(us); free(su); free(tab);
-    e->pending = -1;
-    if (e->stream || getenv("NSLM_NO_PREDICT")) return;   // streamed units come through the host: no prediction
-    int lo = 0, hi = 0;   // the copy stream first: its few blocks run ahead of the layer's kernels
-    e->pre = *p;
-    e->pre.jobs = (int32_t*) dmem(e, NULL, 8 * (size_t) E);
-    e->pre.njobs = (int32_t*) dmem(e, NULL, 16);
-    e->pre.stats = (uint32_t*) dmem(e, NULL, 16);
-    e->pind = (int32_t*) dmem(e, NULL, 4 * (size_t) MV_MAXT * c->top_k);
-    e->pwt = (float*) dmem(e, NULL, 4 * (size_t) MV_MAXT * c->top_k);
-    e->plg = (float*) dmem(e, NULL, 4 * (size_t) MV_MAXT * c->n_exp);
-    if (cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess || cudaStreamCreateWithPriority(&e->cs, cudaStreamNonBlocking, hi) != cudaSuccess ||
-        cudaEventCreateWithFlags(&e->ev_admit, cudaEventDisableTiming) != cudaSuccess) { fail(e, "expert prediction: CUDA setup failed"); return; }
-    for (int l = 0; l < c->n_layer; ++l)
-        if (cudaEventCreateWithFlags(&e->ev_pred[l], cudaEventDisableTiming) != cudaSuccess) { fail(e, "expert prediction: CUDA setup failed"); return; }
-    e->predict = 1;
 }
 
 void q4e_cache_stats(Q4Eng* e, uint64_t* hits, uint64_t* misses, int* slots) {
@@ -410,11 +387,6 @@ void q4e_close(Q4Eng* e) {
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
     free(e->dev); free(e->host); free(e->emb_h); free(e->ids);
-    if (e->predict) {
-        cudaEventDestroy(e->ev_admit);
-        for (int l = 0; l < e->c.n_layer; ++l) cudaEventDestroy(e->ev_pred[l]);
-        cudaStreamDestroy(e->cs);
-    }
     if (e->s) cudaStreamDestroy(e->s);
     if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
@@ -531,7 +503,6 @@ static void moe(Q4Eng* e, int l, int T) {
     kq4_route(e->s, c, e->lg, e->ind, e->wt, T);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
-        if (e->pending == l) { cudaStreamWaitEvent(e->s, e->ev_pred[l], 0); e->pending = -1; }
         kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
         if (!e->stream) kc_cache_copy(e->s, &e->pool, 64);
         else {   // the admit's (unit, slot) jobs back to the host, the units from the files, then to their slots
@@ -544,16 +515,6 @@ static void moe(Q4Eng* e, int l, int T) {
                 unit_bytes(e, e->hjobs[4 + 2 * j], st);
                 cudaMemcpyAsync(e->pool.vram + (uint64_t) e->hjobs[5 + 2 * j] * ub, st, ub, cudaMemcpyHostToDevice, e->s);
             }
-        }
-        if (e->predict && T <= MV_MAXT && l + 1 < c->n_layer) {   // never replaces this layer's slots (CACHE_PROTECT_PREV)
-            mv(e, &e->L[l + 1].gate, e->x, e->plg, T);
-            kq4_route(e->s, c, e->plg, e->pind, e->pwt, T);
-            kc_cache_admit(e->s, &e->pre, l + 1, e->pind, P, CACHE_PROTECT_PREV);
-            cudaEventRecord(e->ev_admit, e->s);
-            cudaStreamWaitEvent(e->cs, e->ev_admit, 0);
-            kc_cache_copy(e->cs, &e->pre, 8);
-            cudaEventRecord(e->ev_pred[l + 1], e->cs);
-            e->pending = l + 1;
         }
     }
     mark(e, ST_ROUTE);

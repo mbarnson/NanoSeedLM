@@ -22,7 +22,7 @@
 | `NSLM_KV_VRAM_MB`, `NSLM_EXPERT_VRAM_MB` | | Fixed VRAM shares for the KV cache and the experts |
 | `NSLM_CACHE_STATS=1` | off | Write the expert cache hits at exit |
 | `NSLM_NO_GRAPH=1` | off | Do not use CUDA graphs for decode |
-| `NSLM_NO_PREDICT=1` | off | Do not predict the experts of the next layer during decode (K2-Horizon-MoVA and Qwen3.8-Flash-Next) |
+| `NSLM_NO_PREDICT=1` | off | Do not predict the experts of the next layer during decode (K2-Horizon-MoVA) |
 | `Q4E_PROFILE=1` | off | Qwen3.8-Flash-Next: write the GPU time of each forward stage at exit |
 | `NSLM_SEED_GEMM_F32=1` | off | Keep seed weights in f32 in the prompt GEMM. This changed neither KLD nor NLL, and it costs about 30% of prompt speed at 4K |
 | `NSLM_PREFILL_RANGE` | 8192, or 32768 when the KV cache is partly in host memory | Prompt rows that the engine computes layer by layer at a time. Each range copies the earlier host rows again |
