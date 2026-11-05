@@ -423,3 +423,9 @@ second on an RTX PRO 6000. `39967ad` fixes `Q4E_PROFILE` for long prompts. Read
 `6ddfdc7`: a pass now holds the context (in chunks of 1,024 rows, at most 32,768), not 8,192 rows. A 15,922-token
 prompt copies each layer's experts once, not twice: 1,343 tokens per second on an RTX PRO 6000 (+9%) and 682 on an
 A100 (+15%). A 29,120-token prompt runs at 1,414 and 746. Read [prefill by stage](results/2026-11-04-qwen38-prefill-stages.md).
+
+## [2026-11-04] plan | MTP drafts in the CUDA engine for Qwen3.8-Flash-Next
+
+A draft for Matt's go. On the M4 Max, mac-metal measured the P3 pack with MTP: code 39.6 to 51.8 tokens per second at
+2 drafts, chat 40.1 to 43.1. The plan adds the MTP head and a state snapshot to the CUDA engine. Read
+[the MTP plan](plans/2026-11-04-qwen38-mtp.md).

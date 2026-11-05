@@ -42,6 +42,8 @@ Work that is not done yet, with its gates and hypotheses.
 
 - [2026-11-04: SeedLM packs for Qwen3.8-Flash-Next](plans/2026-11-04-qwen38-flash-next.md): steps, gates, costs and
   the PLE table choice, for a PC with a 16 GB GPU.
+- [2026-11-04: MTP drafts in the CUDA engine](plans/2026-11-04-qwen38-mtp.md): draft. The model's MTP head drafts
+  tokens, and one main forward verifies them (+31% on code on the M4 Max).
 - [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
   engine keeps the session's hot experts in P4 and the rest in S3 or P3.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
