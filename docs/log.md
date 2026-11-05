@@ -576,3 +576,24 @@ the same order for any row count. Each decode row's attention kernel and key spl
 from the longest row of its forward. A 4-row forward then gives the logits of four one-row forwards bit for bit, after
 20 to 2,400 tokens. Before the attention change, 4 rows that straddled 512 keys or a 128-key split boundary changed
 about 240,000 logits a row. mlx-vlm 0.7.12's own MTP reached 51.8 (code) and 43.1 (chat) at 2 drafts.
+
+## [2026-11-05] kernel | Metal matvecs: verify rows 20 to 35% cheaper, and the seed stream table in halves
+
+`ce92da1`: k_mv with Q4 and 2 to 8 tokens runs 20 to 35% faster, so each MTP verify row costs less. On the M4 Max,
+P3, greedy, at most 256 tokens (tokens/s, two runs within 0.5%):
+
+| Prompt | No drafts | 1 draft | 2 drafts | 3 drafts |
+|---|---|---|---|---|
+| Code | 40.9 | 53.8 | 56.0 | 54.2 |
+| Chat | 42.0 | 50.6 | 47.0 | 42.4 |
+
+Before, it was 50.1 / 52.2 / 50.6 (code) and 47.4 / 43.8 / 39.7 (chat). The text is the same at every K, and 2- to
+4-row verify forwards still equal one-row forwards bit for bit on P3. The speedup is an effect of Apple's compiler,
+found by A/B and not understood: the multi-token loop compiles faster with a never-taken path that reads x's block
+sums from threadgroup memory. A plain barrier, the select alone, or limits on unrolling do not reproduce it.
+
+The LFSR stream tables are linear over GF(2): G[s] = G[s & 255] ^ G[s & 0xFF00] for every seed. So the seed matvecs
+read two 256-entry halves from threadgroup memory, not a 256 KB table: +2% decode on P3, bit for bit.
+
+A simdgroup-MMA matvec (8 rows x 8 tokens a simdgroup) was tried first. It is T-invariant by construction and flat
+from 1 to 8 tokens, but 1.4 to 1.5 times slower than k_mv at one token, so plain decode would lose.
