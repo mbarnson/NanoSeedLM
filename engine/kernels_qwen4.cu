@@ -405,15 +405,22 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
     kq4_route_ld(s, c, logits, c->n_exp, ind, wt, T);
 }
 
-__global__ void k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R) {
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= P || p % k < R || slot[ind[p]] >= 0) return;
-    for (int q = 0; q < P; ++q) if (q % k < R && ind[q] == ind[p]) return;   // a higher rank brings it anyway
-    ind[p] = ind[p - p % k];
-    wt[p] = 0.0f;
+__global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R, int renorm) {
+    __shared__ int skip[256];
+    const int p = threadIdx.x;
+    int sk = p < P && p % k >= R && slot[ind[p]] < 0;
+    for (int q = 0; sk && q < P; ++q) sk = !(q % k < R && ind[q] == ind[p]);   // a higher rank brings it anyway
+    skip[p] = sk;
+    __syncthreads();
+    if (sk) ind[p] = ind[p - p % k];
+    if (!renorm) { if (sk) wt[p] = 0.0f; return; }
+    if (p >= P / k) return;   // renorm: thread p scales row p's kept weights to the row's sum
+    float all = 0, kept = 0;
+    for (int j = 0; j < k; ++j) { all += wt[p * k + j]; kept += skip[p * k + j] ? 0 : wt[p * k + j]; }
+    for (int j = 0; j < k; ++j) wt[p * k + j] = skip[p * k + j] ? 0.0f : wt[p * k + j] * (all / kept);
 }
-void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R) {
-    if (R > 0 && R < k) k_q4_tail_skip<<<(unsigned) (T * k + 127) / 128, 128, 0, s>>>(ind, wt, slot, T * k, k, R);
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm) {
+    if (R > 0 && R < k && T * k <= 256) k_q4_tail_skip<<<1, 256, 0, s>>>(ind, wt, slot, T * k, k, R, renorm);
 }
 
 __global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag) {

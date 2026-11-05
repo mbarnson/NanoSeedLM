@@ -51,8 +51,9 @@ void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int 
 void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
 void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
 // Q4EOpts.tail_skip on ind, wt [T][k]: a pair of rank >= R whose expert misses (slot[x] < 0), and that no row routes at a
-// rank below R, takes its row's first expert and weight 0 (so nothing is copied for it)
-void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R);
+// rank below R, takes its row's first expert and weight 0 (so nothing is copied for it). renorm: the row's kept weights
+// scale up to its sum. T * k <= 256
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm);
 // A GPU-host hand-off that a CUDA graph can replay (plan D4): kq4_signal adds 1 to the device count seq and writes it to
 // flag (mapped host memory); kq4_wait spins until the host's ack (mapped) reaches seq
 void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag);

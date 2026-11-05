@@ -99,7 +99,7 @@ struct Q4Eng {
     W m_fe, m_fh, m_down, m_up;
     float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog;
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and state copies)
-    int tail_skip;                        // Q4EOpts.tail_skip
+    int tail_skip, tail_renorm;           // Q4EOpts.tail_skip; Q4E_TAIL_RENORM=1 (an A/B): the kept weights scaled up
     cudaGraphExec_t dgraph[Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
@@ -439,6 +439,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     if (e->xr > Q4E_PASS_ROWS) e->xr = Q4E_PASS_ROWS / e->mt * e->mt;
     e->host_experts = !(o && o->vram_experts);
     e->tail_skip = o ? o->tail_skip : 0;
+    e->tail_renorm = getenv("Q4E_TAIL_RENORM") && atoi(getenv("Q4E_TAIL_RENORM")) > 0;
     e->cache = e->host_experts && o && o->cache_gb != 0;
     e->stream = e->cache && o->stream_experts;
     if (o && o->stream_experts && !e->cache) { snprintf(err, (size_t) errlen, "--stream-experts needs --expert-cache-gb"); ns_close(&e->nm); free(e); return NULL; }
@@ -801,7 +802,7 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route_ld(e->s, c, e->lg, c->n_exp + 1, e->ind, e->wt, T);
     if (e->routes && l >= 0) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
-    if (e->tail_skip && e->cache && side && l >= 0) kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip);
+    if (e->tail_skip && e->cache && side && l >= 0) kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
         kc_cache_admit(e->s, &e->pool, l >= 0 ? l : c->n_layer, e->ind, P, 0);

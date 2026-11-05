@@ -56,10 +56,11 @@ static void bucket_check(int n, int rows, int k) {
 }
 
 // kq4_tail_skip on rows x k picks over n experts, half of them missing from the cache, against the rule on the host
-static void tail_skip_check(int rows, int k, int n, int R) {
+static void tail_skip_check(int rows, int k, int n, int R, int renorm) {
     const int P = rows * k;
     int32_t* ind = (int32_t*) malloc(4 * (size_t) P), *slot = (int32_t*) malloc(4 * (size_t) n), *got = (int32_t*) malloc(4 * (size_t) P);
     float* wt = (float*) malloc(4 * (size_t) P), *gw = (float*) malloc(4 * (size_t) P);
+    int* skip = (int*) malloc(sizeof(int) * (size_t) P);
     uint32_t x = 777;
     for (int i = 0; i < n; ++i) { x = x * 1664525u + 1013904223u; slot[i] = (x >> 9) & 1 ? (int) i : -1; }
     for (int i = 0; i < P; ++i) { x = x * 1664525u + 1013904223u; ind[i] = (int) ((x >> 8) % (uint32_t) n); wt[i] = 0.5f + (float) (i % k); }
@@ -68,19 +69,27 @@ static void tail_skip_check(int rows, int k, int n, int R) {
     cudaMalloc((void**) &di, 4 * (size_t) P); cudaMalloc((void**) &ds, 4 * (size_t) n); cudaMalloc((void**) &dw, 4 * (size_t) P);
     cudaMemcpy(di, ind, 4 * (size_t) P, cudaMemcpyHostToDevice); cudaMemcpy(ds, slot, 4 * (size_t) n, cudaMemcpyHostToDevice);
     cudaMemcpy(dw, wt, 4 * (size_t) P, cudaMemcpyHostToDevice);
-    kq4_tail_skip(0, di, dw, ds, rows, k, R);
+    kq4_tail_skip(0, di, dw, ds, rows, k, R, renorm);
     cudaMemcpy(got, di, 4 * (size_t) P, cudaMemcpyDeviceToHost); cudaMemcpy(gw, dw, 4 * (size_t) P, cudaMemcpyDeviceToHost);
     int bad = 0, skipped = 0;
     for (int p = 0; p < P; ++p) {
-        int skip = p % k >= R && slot[ind[p]] < 0;
-        for (int q = 0; skip && q < P; ++q) skip = !(q % k < R && ind[q] == ind[p]);
-        skipped += skip;
-        bad += skip ? got[p] != ind[p - p % k] || gw[p] != 0.0f : got[p] != ind[p] || gw[p] != wt[p];
+        skip[p] = p % k >= R && slot[ind[p]] < 0;
+        for (int q = 0; skip[p] && q < P; ++q) skip[p] = !(q % k < R && ind[q] == ind[p]);
+        skipped += skip[p];
     }
-    printf("kq4_tail_skip, %d rows of %d over %d experts from rank %d: %d of %d pairs skipped\n", rows, k, n, R, skipped, P);
+    for (int t = 0; t < rows; ++t) {
+        float all = 0, kept = 0;
+        for (int j = 0; j < k; ++j) { all += wt[t * k + j]; kept += skip[t * k + j] ? 0 : wt[t * k + j]; }
+        for (int j = 0, p = t * k; j < k; ++j, ++p) {
+            const float w = skip[p] ? 0.0f : renorm ? wt[p] * (all / kept) : wt[p];
+            bad += got[p] != (skip[p] ? ind[t * k] : ind[p]) || gw[p] != w;
+        }
+    }
+    printf("kq4_tail_skip, %d rows of %d over %d experts from rank %d%s: %d of %d pairs skipped\n", rows, k, n, R, renorm ? ", renorm" : "",
+           skipped, P);
     CHECK(cudaGetLastError() == cudaSuccess && bad == 0 && skipped > 0, "kq4_tail_skip: %d pairs wrong", bad);
     cudaFree(di); cudaFree(ds); cudaFree(dw);
-    free(ind); free(slot); free(got); free(wt); free(gw);
+    free(ind); free(slot); free(got); free(wt); free(gw); free(skip);
 }
 
 int main(void) {
@@ -88,8 +97,10 @@ int main(void) {
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { printf("SKIP: no CUDA device\n"); return 77; }
     bucket_check(512, 128, 10);   // qwen4: 512 experts, top 10, a prompt chunk of 128 rows
     bucket_check(128, 64, 8);     // MoVA
-    tail_skip_check(4, 10, 64, 7);   // a verify step of 4 rows, top 10
-    tail_skip_check(1, 10, 512, 7);  // one decode row of Qwen3.8-Flash-Next
+    for (int rn = 0; rn < 2; ++rn) {
+        tail_skip_check(4, 10, 64, 7, rn);   // a verify step of 4 rows, top 10
+        tail_skip_check(1, 10, 512, 7, rn);  // one decode row of Qwen3.8-Flash-Next
+    }
     char err[512] = "";
     StFile st;
     if (st_open_file(&st, "tests/data/qwen4_tiny_golden.safetensors", err, sizeof err)) { printf("FAIL: %s\n", err); return 1; }
