@@ -973,9 +973,11 @@ static void test_mla(void) {
         CHECK(!bad, "MLA rope + latent cache write: %d mismatches", bad);
     }
     // latent attention: 32 heads, r 768, rows in three slots, 1 split or 5; 20 heads (not a multiple of the kernel's head
-    // blocks), r 64, 3 splits; a prompt chunk (45 consecutive rows of one slot, 8 heads, r 96, one pass)
-    static const struct { int nh, r, T, ns; } C[4] = {{32, 768, 3, 1}, {32, 768, 3, 5}, {20, 64, 3, 3}, {8, 96, 45, 1}};
-    for (int cs = 0; cs < 4; ++cs) {
+    // blocks), r 64, 3 splits; a prompt chunk (45 consecutive rows of one slot, 8 heads, r 96, one pass); 40 splits with
+    // long rows from position 150 (a.pad[2]: rows 300 and 299 long, 37 short), 32 heads r 768 and 20 heads r 64
+    static const struct { int nh, r, T, ns, lp; } C[6] = {{32, 768, 3, 1, 0}, {32, 768, 3, 5, 0}, {20, 64, 3, 3, 0}, {8, 96, 45, 1, 0},
+                                                          {32, 768, 3, 40, 150}, {20, 64, 3, 40, 150}};
+    for (int cs = 0; cs < 6; ++cs) {
         const int nh = C[cs].nh, r = C[cs].r, NP = 640, T = C[cs].T, ns = C[cs].ns;
         int pos[45], kv0[45];
         for (int t = 0; t < T; ++t) {
@@ -991,7 +993,7 @@ static void test_mla(void) {
         RowInfo ri[45];
         memset(ri, 0, sizeof ri);
         for (int t = 0; t < T; ++t) { ri[t].pos = pos[t]; ri[t].kv0 = kv0[t]; }
-        const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
+        const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0, 0, C[cs].lp}};
         int bad = 0;
         if (kt_mla_attn(a, ql, qr, Kc, Vc, NP, ri, ol, T)) ++fails;
         else {
@@ -1296,8 +1298,9 @@ static void test_mla_kvq(int fmt) {
         CHECK(!bad, "MLA %s cache rows to f32: %d mismatches", fn, bad);
     }
     // latent attention (the cases of test_mla): bit-equal to the BF16 kernel on the decoded cache
-    static const struct { int nh, r, T, ns; } C[4] = {{32, 768, 3, 1}, {32, 768, 3, 5}, {20, 64, 3, 3}, {8, 96, 45, 1}};
-    for (int cs = 0; cs < 4; ++cs) {
+    static const struct { int nh, r, T, ns, lp; } C[6] = {{32, 768, 3, 1, 0}, {32, 768, 3, 5, 0}, {20, 64, 3, 3, 0}, {8, 96, 45, 1, 0},
+                                                          {32, 768, 3, 40, 150}, {20, 64, 3, 40, 150}};
+    for (int cs = 0; cs < 6; ++cs) {
         const int nh = C[cs].nh, r = C[cs].r, NP = 640, T = C[cs].T, ns = C[cs].ns;
         float* ql = malloc(4 * (size_t) T * nh * r), *qr = malloc(4 * (size_t) T * nh * 128);
         float* o1 = malloc(4 * (size_t) T * nh * r), *o2 = malloc(4 * (size_t) T * nh * r);
@@ -1313,7 +1316,7 @@ static void test_mla_kvq(int fmt) {
             ri[t].pos = T == 3 ? (const int[3]){300, 299, 37}[t] : 37 + t;
             ri[t].kv0 = T == 3 ? (const int[3]){0, 310, 600}[t] : 19;
         }
-        const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0}};
+        const MlaArgs a = {nh, r, (301 + ns - 1) / ns, ns, (float) (1 / sqrt(128.0)), {0, 0, C[cs].lp}};
         if (kt_mla_attn_q(a, fmt, ql, qr, kv, NP, ri, o1, T) || kt_mla_attn(a, ql, qr, Kd, Vd, NP, ri, o2, T)) ++fails;
         else CHECK(!memcmp(o1, o2, 4 * (size_t) T * nh * r), "MLA %s latent attention (%d heads, r %d, %d rows, %d splits): "
                    "differs from the decoded BF16 cache's", fn, nh, r, T, ns);
@@ -1339,7 +1342,7 @@ static void test_mla_kvq(int fmt) {
         else CHECK(!memcmp(o1, o2, 4 * qn_n), "MLA %s prompt attention (expanded): differs from the decoded BF16 cache's", fn);
         free(qn); free(qr); free(g); free(o1); free(o2); free(kn); free(vn); free(Kq); free(Ks); free(Kd); free(ri);
     }
-    printf("MLA %s cache: write, decode, latent attention (4 cases) and expanded prompt attention checked\n", fn);
+    printf("MLA %s cache: write, decode, latent attention (6 cases) and expanded prompt attention checked\n", fn);
 }
 
 int main(void) {

@@ -147,7 +147,8 @@ int kc_heads_mm(cudaStream_t s, HmvArgs a, int fmt, WSlice W, const float* x, co
 void kc_mla_rope(cudaStream_t s, MlaArgs a, float* qr, const float* kr, const float* c, KvView kv, const RowInfo* ri,
                  const float* inv, int T);
 // latent attention into olat [T][n_head][r]: a.n_splits > 1 splits the keys (partials in part: T x n_head x n_splits x
-// (r + 2) floats) and reduces; 1 is one pass
+// (r + 2) floats) and reduces; 1 is one pass.  Decode, a.pad[2] > 0: rows at positions >= a.pad[2] take up to n_splits
+// splits in blocks of 32 heads, the others at most 32 splits in blocks of 16 (kernels_moe.cu, mla_row_splits)
 void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, KvView kv, const RowInfo* ri, float* part,
                  float* olat, int T);
 // MLA prompt rows without absorption.  Decompression (q_lat [H][r][128] in qfmt, v_up [H][128][r] in vfmt, each as

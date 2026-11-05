@@ -35,6 +35,7 @@
 #ifndef MAX_SPLITS
 #define MAX_SPLITS 32            // decode attention: at most this many key splits
 #endif
+#define MLA_MAX_SPLITS 64        // MLA decode with 32 heads a block (kc_mla_dec_heads): twice MAX_SPLITS
 #define MAX_LOGIT_ROWS 64        // LM head rows per pass
 #define MAX_TILES (MAXP / MMT_BN + 128)
 
@@ -152,8 +153,8 @@ struct Eng {
     int32_t *ids_all, *h_ids_all;
     RowInfo *ri_all, *h_ri_all;
     int xmax;
-    cudaGraphExec_t graphs[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 2];   // small forwards, by (rows, splits, head)
-    uint64_t graph_use[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 2], graph_tick;   // last launch of each (LRU)
+    cudaGraphExec_t graphs[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 4];   // small forwards, by (rows, splits, long rows, head)
+    uint64_t graph_use[(MV_MAXT + 1) * (MAX_SPLITS + 1) * 4], graph_tick;   // last launch of each (LRU)
     int ngraphs;        // instantiated (at most MAX_GRAPHS: each is a whole forward's thousands of nodes)
     int no_graph;
     EngMem mem;
@@ -728,7 +729,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->ri = (RowInfo*) scratch(e, (uint64_t) T * sizeof(RowInfo));
     e->inv = (float*) scratch(e, 64 * 4);
     // rows x splits <= 1024 (attn_splits); MLA splits only forwards of <= MV_MAXT rows (prompt chunks: one pass)
-    e->part = (float*) scratch(e, c->mla ? (uint64_t) MV_MAXT * MAX_SPLITS * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4
+    e->part = (float*) scratch(e, c->mla ? (uint64_t) MV_MAXT * MLA_MAX_SPLITS * c->n_head * ((rmax > ATT_HD ? rmax : ATT_HD) + 2) * 4
                                          : (uint64_t) 1024 * c->n_head * (ATT_HD + 2) * 4);
     if (c->mla) {
         e->lat = (float*) scratch(e, (uint64_t) T * rmax * 4);
@@ -1042,6 +1043,22 @@ static int attn_splits(int T, int max_ctx) {
     while (ns > 1 && T * ns > 1024) --ns;
     return ns < 1 ? 1 : ns;
 }
+// MLA decode: rows at positions >= this take 32 heads a block (kc_mla_attn, a.pad[2]); NSLM_MLA_DEC_LONG, 0 = never.
+// RTX 4080, K2 MLA r 768, 32 heads, decode tok/s with all rows long vs none: fp4 -5.5% at 4k, -1% at 8k, +4.5% at 16k,
+// +10.5% at 32k; bf16 -4.5%, -3%, 0, +61% (32k: part of the KV in host memory, whose keys cross PCIe once, not twice).
+// At least 2048, so a step with a long row has MAX_SPLITS splits for its short rows, as it would without one.
+static int mla_long_pos(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* s = getenv("NSLM_MLA_DEC_LONG");
+        v = s ? atoi(s) : 12288;
+        if (v > 0 && v < 2048) v = 2048;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+// a decode step of keys up to max_ctx has a long row (its MLA attention takes MLA_MAX_SPLITS splits)
+static int mla_long_steps(int max_ctx) { return mla_long_pos() > 0 && max_ctx > mla_long_pos(); }
 
 // Layer l's KV cache: VRAM rows, then the host rows, or their staged copy while a prompt pass computes the layer.
 static KvView kv_view(Eng* e, int l) {
@@ -1178,11 +1195,13 @@ static void encode_mla_attn(Eng* e, int l, int T, const RowInfo* RI, int ns, int
     }
     enc_heads_mv(e, &ql, e->q, qd, g->head_dim, NULL, e->qlat, T);
     tgroup(e, MOVA_TG_ATTN);
-    // decode: twice the GQA splits (keys in parts of >= 64), at most MAX_SPLITS: one block holds all of a row's heads
-    // (kc_mla_attn).  64 splits measured no faster at 8k (RTX 4080: the reduce's cost doubled).  A row's split count
-    // depends on its position alone, so batched rows match rows decoded alone.
-    const int nsp = T > MV_MAXT || e->prompt ? 1 : (2 * ns < MAX_SPLITS ? 2 * ns : MAX_SPLITS);
-    const MlaArgs ma = {H, r, 64, nsp, 1.0f / sqrtf((float) g->head_dim), {0}};
+    // decode: twice the GQA splits (keys in parts of >= 64), at most MAX_SPLITS: one block holds 16 of a row's heads
+    // (kc_mla_attn).  64 splits measured no faster at 8k (RTX 4080: the reduce's cost doubled).  Rows at positions >=
+    // mla_long_pos() take 32 heads a block and MLA_MAX_SPLITS splits instead (a.pad[2]), when the step has such a row.
+    // A row's kernel and split count depend on its position alone, so batched rows match rows decoded alone.
+    const int dec = T <= MV_MAXT && !e->prompt, lng = dec && mla_long_steps(max_ctx);
+    const int nsp = !dec ? 1 : lng ? MLA_MAX_SPLITS : (2 * ns < MAX_SPLITS ? 2 * ns : MAX_SPLITS);
+    const MlaArgs ma = {H, r, 64, nsp, 1.0f / sqrtf((float) g->head_dim), {0, 0, lng ? mla_long_pos() : 0}};
     const KvView kv = kv_view(e, l);
     kc_mla_rope(e->st, ma, e->qrp, e->k, e->lat, kv, RI, e->inv, T);
     kc_mla_attn(e->st, ma, e->qlat, e->qrp, kv, RI, e->part, e->olat, T);
@@ -1363,11 +1382,12 @@ static int forward_rows(Eng* e, const int32_t* tok, const RowInfo* rows, int T, 
         !CK(cudaMemcpyAsync(e->ri, e->h_ri, (size_t) T * sizeof(RowInfo), cudaMemcpyHostToDevice, e->st)))
         return -1;
     // Forwards of up to MV_MAXT rows (decode, prompt-lookup verification) have no host round trip: they run as a CUDA
-    // graph, captured once per (rows, attention splits, head) and launched as one unit.  The head is all rows or none
-    // (a head from row 0 < h0 < T would be baked into the graph).
+    // graph, captured once per (rows, attention splits, MLA long rows, head) and launched as one unit.  The head is all
+    // rows or none (a head from row 0 < h0 < T would be baked into the graph).
     const int graph = T <= MV_MAXT && !e->prompt && !e->timing_on && !e->no_graph && (h0 == 0 || h0 >= T);
     if (graph) {
-        const int key = ((T * (MAX_SPLITS + 1) + attn_splits(T, max_ctx)) * 2 + (h0 < T));
+        const int lng = e->c.mla && mla_long_steps(max_ctx);
+        const int key = (((T * (MAX_SPLITS + 1) + attn_splits(T, max_ctx)) * 2 + lng) * 2 + (h0 < T));
         if (!e->graphs[key]) {
             if (e->ngraphs >= MAX_GRAPHS) {   // drop the least recently launched
                 int lru = -1;

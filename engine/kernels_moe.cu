@@ -1210,15 +1210,23 @@ __global__ void __launch_bounds__(32 * MLA_HG) k_mla_attn(MlaArgs a, const float
             if (j < nl) pp[2 + lane + 32 * j] = acc[j];
     }
 }
+// Decode MLA attention, a.pad[2] > 0: rows at positions >= a.pad[2] ("long") take blocks of 32 heads (k_mla_attn_tc<2>)
+// and up to a.n_splits splits; the others blocks of 16 heads and up to MLA_SPLITS_SHORT, as with a.pad[2] = 0.  A long
+// row's keys are staged (FP8 / FP4: decoded) once for all 32 heads, not once per 16-head block; twice the splits keep
+// as many blocks busy.  A row's kernel and split count depend on its position alone (batched rows match rows alone).
+#define MLA_SPLITS_SHORT 32
+static __device__ __forceinline__ int mla_row_splits(const MlaArgs& a, int pos) {
+    return a.pad[2] > 0 && pos < a.pad[2] && a.n_splits > MLA_SPLITS_SHORT ? MLA_SPLITS_SHORT : a.n_splits;
+}
 // Reduce the latent attention's splits: olat[t][h][d] = bf16(acc / l).  Block (head, row); threads stride d.
-__global__ void __launch_bounds__(128) k_mla_reduce(MlaArgs a, const float* part, float* olat) {
-    const int h = (int) blockIdx.x, t = (int) blockIdx.y, r = a.r, w = r + 2;
+__global__ void __launch_bounds__(128) k_mla_reduce(MlaArgs a, const RowInfo* ri, const float* part, float* olat) {
+    const int h = (int) blockIdx.x, t = (int) blockIdx.y, r = a.r, w = r + 2, ns = mla_row_splits(a, ri[t].pos);
     const float* pp = part + ((size_t) t * a.n_head + h) * a.n_splits * w;
     float m = -INFINITY;
-    for (int s = 0; s < a.n_splits; ++s) m = fmaxf(m, pp[s * w]);
+    for (int s = 0; s < ns; ++s) m = fmaxf(m, pp[s * w]);
     for (int d = (int) (blockIdx.z * blockDim.x + threadIdx.x); d < r; d += (int) (gridDim.z * blockDim.x)) {
         float l = 0, acc = 0;
-        for (int s = 0; s < a.n_splits; ++s) {
+        for (int s = 0; s < ns; ++s) {
             const float ms = pp[s * w];
             if (ms == -INFINITY) continue;
             const float c = expf(ms - m);
@@ -1349,7 +1357,8 @@ __global__ void __launch_bounds__(32 * MLAT_W) k_mla_attn_tc(MlaArgs a, const fl
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, gq = lane >> 2, t4 = lane & 3;
     const int split = (int) blockIdx.x, h0 = (int) blockIdx.y * Q, t = (int) blockIdx.z;
     const int pos = ri[t].pos, kv0 = ri[t].kv0;
-    const int nsr = min(a.n_splits, (pos + a.chunk) / a.chunk);
+    if (a.pad[2] > 0 && a.n_splits > 1 && (pos >= a.pad[2]) != (MT == 2)) return;   // the other launch's row
+    const int nsr = min(mla_row_splits(a, pos), (pos + a.chunk) / a.chunk);
     const int chunk = (pos + nsr) / nsr;
     const int p0 = split * chunk, p1 = min(pos + 1, p0 + chunk);
     const int ntile = p1 > p0 ? (p1 - p0 + MLAT_KT - 1) / MLAT_KT : 0;
@@ -2203,17 +2212,24 @@ void kc_mla_attn(cudaStream_t s, MlaArgs a, const float* ql, const float* qr, Kv
     }
     if (tc && a.r <= MLAT_MAXR && a.r % 16 == 0) {
         float* o = a.n_splits > 1 ? part : olat;
-        if (a.n_splits > 1)   // decode: 16 heads a block
-            k_mla_attn_tc<1><<<dim3((unsigned) a.n_splits, (unsigned) (a.n_head + 15) / 16, (unsigned) T), 32 * MLAT_W, mlat_smem(a.r, 1), s>>>(
+        if (a.n_splits > 1) {   // decode: short rows in blocks of 16 heads; long rows (a.pad[2]) in blocks of 32
+            const int ns1 = a.pad[2] > 0 && a.n_splits > MLA_SPLITS_SHORT ? MLA_SPLITS_SHORT : a.n_splits;
+            k_mla_attn_tc<1><<<dim3((unsigned) ns1, (unsigned) (a.n_head + 15) / 16, (unsigned) T), 32 * MLAT_W, mlat_smem(a.r, 1), s>>>(
                 a, ql, qr, kv, ri, o);
-        else
+            if (a.pad[2] > 0)
+                k_mla_attn_tc<2><<<dim3((unsigned) a.n_splits, (unsigned) (a.n_head + 31) / 32, (unsigned) T), 32 * MLAT_W, mlat_smem(a.r, 2), s>>>(
+                    a, ql, qr, kv, ri, o);
+        } else
             k_mla_attn_tc<2><<<dim3(1, (unsigned) (a.n_head + 31) / 32, (unsigned) T), 32 * MLAT_W, mlat_smem(a.r, 2), s>>>(a, ql, qr, kv, ri, o);
-        if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
+        if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, ri, part, olat);
         return;
     }
+    // the one-pass kernel has no long rows: every row in blocks of MLA_HG heads, at most MLA_SPLITS_SHORT splits
+    if (a.pad[2] > 0 && a.n_splits > MLA_SPLITS_SHORT) a.n_splits = MLA_SPLITS_SHORT;
+    a.pad[2] = 0;
     k_mla_attn<<<dim3((unsigned) a.n_splits, (unsigned) (a.n_head + MLA_HG - 1) / MLA_HG, (unsigned) T), 32 * MLA_HG, 0, s>>>(
         a, ql, qr, kv, ri, a.n_splits > 1 ? part : olat);
-    if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, part, olat);
+    if (a.n_splits > 1) k_mla_reduce<<<dim3((unsigned) a.n_head, (unsigned) T, (unsigned) (a.r + 127) / 128), 128, 0, s>>>(a, ri, part, olat);
 }
 
 // Resident-only exact shared-map kernels; existing unshared kernel bodies are retained byte-for-byte.
