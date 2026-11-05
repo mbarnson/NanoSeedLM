@@ -433,7 +433,7 @@ __global__ void __launch_bounds__(256) k_q4_attend(AttArgs a, const float* q, co
     }
 }
 // Prompt rows: block (KV group, row), a warp per query head of the group. The row's keys come in tiles of AT_KT; each
-// key's K and V is read once into shared memory for all heads of the group (one online softmax per head, in key order)
+// key's K and V is read once into shared memory for all heads of the group. Each head takes one online-softmax step a tile
 #define AT_KT 16
 __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel, const int32_t* nsel,
                               const int32_t* dpos, float* o) {
@@ -459,15 +459,26 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
             Vs[x] = V[at];
         }
         __syncthreads();
-        for (int kk = 0; kk < nk; ++kk) {
-            float d = 0;
-            for (int i = 0; i < dl; ++i) d += qv[i] * kvs[kk * a.hd + lane + 32 * i];
-            d = warp_sum(d) * a.scale;
-            const float mn = fmaxf(m, d), cf = expf(m - mn), p = expf(d - mn);
-            for (int i = 0; i < dl; ++i) acc[i] = acc[i] * cf + p * Vs[kk * a.hd + lane + 32 * i];
-            l = l * cf + p;
-            m = mn;
+        float d[AT_KT], mt = m, ps = 0;   // the tile's scores first (independent), then one softmax step for the tile
+#pragma unroll
+        for (int kk = 0; kk < AT_KT; ++kk) {
+            float x = 0;
+            for (int i = 0; kk < nk && i < dl; ++i) x += qv[i] * kvs[kk * a.hd + lane + 32 * i];
+            d[kk] = x;
         }
+#pragma unroll
+        for (int kk = 0; kk < AT_KT; ++kk) { d[kk] = kk < nk ? warp_sum(d[kk]) * a.scale : -INFINITY; mt = fmaxf(mt, d[kk]); }
+        const float cf = expf(m - mt);
+        for (int i = 0; i < dl; ++i) acc[i] *= cf;
+#pragma unroll
+        for (int kk = 0; kk < AT_KT; ++kk) {
+            if (kk >= nk) break;
+            const float p = expf(d[kk] - mt);
+            ps += p;
+            for (int i = 0; i < dl; ++i) acc[i] += p * Vs[kk * a.hd + lane + 32 * i];
+        }
+        l = l * cf + ps;
+        m = mt;
     }
     for (int i = 0; i < dl; ++i) o[((size_t) t * a.nh + h) * a.hd + lane + 32 * i] = acc[i] / l * sigm(qh[a.hd + lane + 32 * i]);
 }
