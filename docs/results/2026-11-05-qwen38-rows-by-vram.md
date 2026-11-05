@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next prompt chunks of 16,384 rows on large GPUs (2026-11-05)
 
-**Result.** On an RTX PRO 6000, a 29,120-token prompt of the P3 pack runs at 3,606 tokens per second in chunks of
-4,096 rows, 4,096 in chunks of 8,192, and 4,222 in chunks of 16,384. The engine now takes 16,384 rows by default on
-GPUs of 64 GB or more, for about 3 GB more VRAM. A 15,922-token prompt then runs at 4,165 tokens per second, in one
-forward. Decode did not change (53.8 tokens per second).
+**Result.** On an RTX PRO 6000, a 29,120-token prompt of the P3 pack runs at 3,606 tokens per second in 4,096-row
+chunks. It runs at 4,096 in 8,192-row chunks, and 4,222 in 16,384-row chunks. The engine now takes 16,384 rows by
+default on GPUs of 64 GB or more, for about 3 GB more VRAM. A 15,922-token prompt then runs at 4,165 tokens per
+second, in one forward. Decode did not change (53.8 tokens per second).
 
 **Status.** Current. One prompt text, one pack. GPUs below 64 GB, such as the RTX 4080, keep 4,096 rows.
 
