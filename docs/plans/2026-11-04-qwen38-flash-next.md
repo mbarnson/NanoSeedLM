@@ -303,10 +303,13 @@ experimental, and PCIe carries all misses.
 
 Each item is one climb step:
 
-1. V1: all missed experts over PCIe, as the CUDA engine does now.
+1. V1: all missed experts over PCIe, as the CUDA engine does now. Measured: P3 with 8 GB of cache misses 118 experts a
+   token, about 290 MB ([cache policies](../results/2026-11-04-qwen38-cache-policies.md)).
 2. V2: the CPU share from S6.
-3. V3: a static set of hot experts in VRAM, from router choices, with the adaptive cache for the rest.
-4. V4: MTP drafts, and the draft length.
+3. V3: a static set of hot experts in VRAM, from router choices, with the adaptive cache for the rest. Done: a hot set,
+   LFU and ARC all serve fewer uses than LRU. A next-layer prediction serves more but decodes slower.
+4. V4: MTP drafts, and the draft length. A verify window does not reduce the misses for each token
+   ([verify windows](../results/2026-11-04-qwen38-verify-windows.md)). MTP can share only the rest of a step.
 5. V5: the other weights in P8, to free VRAM for the expert cache.
 6. V6: each PLE table type, from NVMe.
 

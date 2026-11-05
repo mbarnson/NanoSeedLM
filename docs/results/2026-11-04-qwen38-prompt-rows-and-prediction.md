@@ -6,8 +6,8 @@ tokens per second in forwards of 1,024 rows. In forwards of 128 rows, it runs at
 A prediction of the next layer's experts in decode cut the misses by 44%. But decode went from 40.6 to 39.0 tokens per
 second, so we removed it.
 
-**Status.** Current. The test used HF Jobs, not the RTX 4080. The RTX 4080 has PCIe 4, so a cache miss costs more
-there, and the prediction may help on it.
+**Status.** Current. A test with CUDA graphs on an A100 (PCIe 4) also found the prediction slower: 18.8 against 20.5
+tokens per second (log entry of 2026-11-04, "The decode expert prediction on PCIe 4").
 
 ## Setup
 

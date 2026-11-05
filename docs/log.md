@@ -332,3 +332,11 @@ steps would be. The misses for each token stay at 118 (8 GB) and 94 (10 GB). So 
 traffic, about 290 MB a token for P3 at 8 GB. They can only share the other costs of a step over the accepted tokens.
 Read [Expert cache misses of MTP verify windows](results/2026-11-04-qwen38-verify-windows.md).
 
+## [2026-11-04] result | The decode expert prediction on PCIe 4, with CUDA graphs
+
+The next-layer expert prediction of `1cd7c57`, on top of the CUDA graphs (local commit `3390402`), on an HF Jobs A100
+(PCIe 4, job `6aebdb82c78863f9c63314d5`): P3 decodes 161 tokens at 18.64 and 18.86 tokens per second with it, and at
+20.40 and 20.52 without it (8 GB cache). The misses go from 25.6k to 14.4k, and the text is the same. So the prediction
+stays out. Its wrong guesses also cost PCIe traffic, and decode is bound by that bandwidth. The A100 decodes slower than
+the RTX 4080 did at `5ed8d1b` (28 tokens per second). So its absolute speeds do not model the 4080.
+
