@@ -816,6 +816,12 @@ static const uint8_t* ct_unit(Q4Eng* e, int l, int x, int i, int s) {
     return e->arena_h + ((uint64_t) l * e->c.n_exp + (uint64_t) x) * e->pool.unit_bytes + e->pool.off[i][s];
 }
 // Each pool worker claims items until none are left: a worker the OS stops holds back one item, not a share
+// BF16 at the GPU expert path's points (kernels_moe.cu mv_gu_body, store_y): the CPU tail differs only in sum order
+static float ct_bf(float x) { return nslm_bf2f(nslm_f2bf(x)); }
+static float ct_act(float g, float u) {   // bf16(silu(bf16(g)) * bf16(u)), silu on a BF16 tensor
+    g = ct_bf(g);
+    return ct_bf(ct_bf(g * ct_bf(1.0f / (1.0f + expf(-g)))) * ct_bf(u));
+}
 static int ct_items(Q4Eng* e, const void* ctx, int i0, int i1) {   // item: group << 16 | matrix << 8 | 64-row chunk
     CtJob* j = (CtJob*) ctx;
     const Qwen4Cfg* c = &e->c;
@@ -863,7 +869,7 @@ static void ct_layer(Q4Eng* e) {
         for (int r = 0; r < g[k].n; ++r)
             for (size_t f = 0; f < F; ++f) {
                 const float gt = j.gu[((size_t) k * 2 * M + r) * F + f], up = j.gu[((size_t) (k * 2 + 1) * M + r) * F + f];
-                j.tmp[r * F + f] = gt / (1.0f + expf(-gt)) * up;
+                j.tmp[r * F + f] = ct_act(gt, up);
             }
         cpu_seed_xt(j.tmp, g[k].n, (int) F / 8, j.act + k * M * F, j.axs + k * M * (F / 8));
         for (int ch = 0; ch * CT_ROWS < (int) D; ++ch) j.item[j.nitems++] = k << 16 | ch;
@@ -871,7 +877,8 @@ static void ct_layer(Q4Eng* e) {
     atomic_store(&j.next, 0);
     pool_run(e, e->nth + 1, ct_items, &j);
     for (int k = 0; k < ng; ++k)
-        for (int r = 0; r < g[k].n; ++r) memcpy(e->cy_h + (size_t) g[k].j[r] * D, j.down + (k * M + r) * D, sizeof(float) * D);
+        for (int r = 0; r < g[k].n; ++r)
+            for (size_t i = 0; i < D; ++i) e->cy_h[(size_t) g[k].j[r] * D + i] = ct_bf(j.down[(k * M + r) * D + i]);
 }
 static void* ct_thread(void* arg) {   // answers each layer's signal (kq4_signal) after its CPU work; spins during a forward
     Q4Eng* e = (Q4Eng*) arg;
