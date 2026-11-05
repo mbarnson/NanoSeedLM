@@ -735,6 +735,6 @@ close to the bound for Gaussian weights. Read [Trellis-coded experts: weight err
 ## [2026-11-05] result | The CPU tail on the RTX 4080: slower at every setting
 
 `cb3d6b6`, pc-cuda's RTX 4080, P3, the automatic cache: `--cpu-tail 1` and `2` decode at 31.9 and 26.9 tokens per
-second, against 37.2 without. The CPU removes 22% and 41% of the misses, but one CPU expert takes 240 to 340 us, more
+second, against 37.2 without. The CPU removes 22% and 41% of the misses. But one CPU expert takes 240 to 340 us, more
 than the PCIe 4 copy it saves. Plan step D4 closes. Read
 [The CPU tail on the RTX 4080](results/2026-11-05-qwen38-cpu-tail-4080.md).
