@@ -48,6 +48,8 @@ Work that is not done yet, with its gates and hypotheses.
   engine keeps the session's hot experts in P4 and the rest in S3 or P3.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
   64, 96 and 128 GB of RAM and a 12 GB GPU. Each must match an Unsloth V3.1 pack.
+- [2026-11-05: Prompt attention that loads each key tile once for several rows](plans/2026-11-05-qwen38-shared-tile-attention.md):
+  4 neighbouring rows select about 1.5 times one row's blocks, so their K and V loads can fall 2.7 times.
 
 ## Results
 
