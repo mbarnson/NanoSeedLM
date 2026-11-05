@@ -453,10 +453,12 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
             keys[threadIdx.x] = k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
         }
         __syncthreads();
-        for (int x = threadIdx.x; x < nk * a.hd; x += blockDim.x) {
-            const size_t at = ((size_t) keys[x / a.hd] * a.nkv + g) * a.hd + x % a.hd;
-            kvs[x] = K[at];
-            Vs[x] = V[at];
+        const int h4 = a.hd / 4;   // 16-byte loads: fewer load rounds a tile
+#pragma unroll 4
+        for (int x = threadIdx.x; x < nk * h4; x += blockDim.x) {
+            const size_t at = (((size_t) keys[x / h4] * a.nkv + g) * a.hd) / 4 + x % h4;
+            ((float4*) kvs)[x] = ((const float4*) K)[at];
+            ((float4*) Vs)[x] = ((const float4*) V)[at];
         }
         __syncthreads();
         float d[AT_KT], mt = m, ps = 0;   // the tile's scores first (independent), then one softmax step for the tile
