@@ -560,6 +560,11 @@ __global__ void __launch_bounds__(1024) k_bucket_place(const int32_t* inds, int 
                                                                float* y, const int32_t* sel, const uint32_t* G, int nt) { \
         mv_body(F, a, wd, ws, x, y, sel, G, nt);                                                                         \
     }                                                                                                                    \
+    /* nt = 1 (decode, gathers): the same mv_lane arithmetic without the multi-token paths' registers */                 \
+    __global__ void __launch_bounds__(32 * MV_ROWS) k_mv1_##SUF(MvArgs a, WSlice wd, const WSlice* ws, const float* x,  \
+                                                                float* y, const int32_t* sel, const uint32_t* G, int nt) { \
+        mv_body(F, a, wd, ws, x, y, sel, G, 1);                                                                          \
+    }                                                                                                                    \
     __global__ void __launch_bounds__(32 * MV_ROWS) k_mv_gu_##SUF(MvArgs a, const WSlice* wg, const WSlice* wu,         \
                                                                   const float* x, float* y, const int32_t* sel,          \
                                                                   const uint32_t* G) {                                   \
@@ -581,6 +586,7 @@ typedef void (*MvGuKernel)(MvArgs, const WSlice*, const WSlice*, const float*, f
 typedef void (*MmKernel)(MmArgs, WSlice, const WSlice*, const float*, float*, const int32_t*, const MmTile*, const int32_t*,
                          const uint32_t*);
 static const MvKernel MV_K[5] = {k_mv_bf16, k_mv_seed4, k_mv_q8, k_mv_q4, k_mv_seed4p4};
+static const MvKernel MV1_K[5] = {k_mv1_bf16, k_mv1_seed4, k_mv1_q8, k_mv1_q4, k_mv1_seed4p4};   // T = 1
 static const MvGuKernel MVGU_K[5] = {k_mv_gu_bf16, k_mv_gu_seed4, k_mv_gu_q8, k_mv_gu_q4, k_mv_gu_seed4p4};
 static const MmKernel MM_K[5] = {k_mm_bf16, k_mm_seed4, k_mm_q8, k_mm_q4, k_mm_seed4p4};
 template <int F>   // the seed formats with exact (three-term) weights
@@ -2085,14 +2091,14 @@ void kc_gnorm(cudaStream_t s, int d, float eps, const float* x, const uint16_t* 
 void kc_mv(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int xs, float* y, int ys, int T, int add,
            const uint32_t* G) {
     MvArgs a = {K, R, T, 1, xs, ys, 0, add};
-    MV_K[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, 1), 32 * MV_ROWS, 0, s>>>(a, w, NULL, x, y, NULL, G, T);
+    (T == 1 ? MV1_K : MV_K)[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, 1), 32 * MV_ROWS, 0, s>>>(a, w, NULL, x, y, NULL, G, T);
 }
 void kc_mv_sel(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
                const int32_t* sel, int P, int xdiv, const uint32_t* G) {
     MvArgs a = {K, R, P, xdiv, xs, ys, 0, 0};
     WSlice none;
     memset(&none, 0, sizeof none);
-    MV_K[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P), 32 * MV_ROWS, 0, s>>>(a, none, ws, x, y, sel, G, 1);
+    MV1_K[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P), 32 * MV_ROWS, 0, s>>>(a, none, ws, x, y, sel, G, 1);
 }
 void kc_mv_gu(cudaStream_t s, int fmt, const WSlice* wg, const WSlice* wu, int K, int R, const float* x, int xs, float* a_,
               int ys, const int32_t* sel, int P, int xdiv, const uint32_t* G) {
