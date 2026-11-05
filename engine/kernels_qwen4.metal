@@ -15,7 +15,8 @@ typedef struct { int hc, d, pad[2]; } Q4PleGateArgs;
 typedef struct { int HD, K, dil, T; } Q4PleConvArgs;                  // (K - 1) * dil <= 32
 typedef struct { int D, R, pad[2]; } Q4QsaMeanArgs;                   // block keys: ix_dim, ix_ratio
 typedef struct { int nh, D, rs, maxdone, k, pad[3]; } Q4QsaArgs;      // scores and top k
-typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int pad; } Q4AttArgs;   // hd a multiple of 32, <= 256
+typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit; } Q4AttArgs;   // hd a multiple of 32, <= 256;
+                                                                                         // nsplit: k_q4_attend_g's key splits
 typedef struct { int w, ss, pos0, pad; } Q4StoreArgs;                 // cache rows: width, source row stride, first position
 typedef struct { int d, k, pad[2]; } Q4CombineArgs;                   // MoE combine: hidden size, top k
 #ifndef ATG_NQ
@@ -398,25 +399,30 @@ kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float*
 #define ATG_K 8
 kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* K [[buffer(2)]],
                           device const float* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
-                          device float* o [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+                          device float* o [[buffer(6)]], device float* part [[buffer(7)]], uint3 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float sK[ATG_K * 256], sV[ATG_K * 256];
-    threadgroup float sS[2][ATG_NQ][64], sP[2][64], sD[2][64], sL[2][8];
+    threadgroup float sS[2][ATG_NQ][64], sP[2][64], sD[2][64], sL[2][8], sM[2][8];
     threadgroup int sR[2];
     const int g = (int) tg.x, t = (int) tg.y, G = a.nh / a.nkv, hd = a.hd, kvw = a.nkv * hd;
     const int ht = (int) sg / ATG_NQ, dh = (int) sg % ATG_NQ, nj = hd / (8 * ATG_NQ), j0 = dh * nj;   // dim tiles j0 .. j0 + nj - 1
     const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    // split tg.z of nsp: keys [kb, ke), whole tiles of ATG_K (decode rows: the splits' partials go to part, then
+    // k_q4_attend_comb merges them; one split writes the output itself)
+    const int nsp = a.nsplit > 1 ? a.nsplit : 1, per = ((n + nsp - 1) / nsp + ATG_K - 1) / ATG_K * ATG_K;
+    const int kb = (int) tg.z * per, ke = min(n, kb + per);
     const bool active = ht * 8 < G;
     device const float* qb = q + ((ulong) t * a.nh + (ulong) g * G + ht * 8) * 2 * hd;   // 8 heads, stride 2 hd
     simdgroup_float8x8 O[32 / ATG_NQ];   // the loops run to a constant so that O[] stays in registers
     for (int j = 0; j < 32 / ATG_NQ; ++j) O[j] = simdgroup_float8x8(0);
     float m = -INFINITY, l = 0;   // half 0, lanes 0..7: head row `lane` of the tile
-    for (int k0 = 0; k0 < n; k0 += ATG_K) {
+    for (int k0 = kb; k0 < ke; k0 += ATG_K) {
         threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous tile's reads are done
         for (int x = (int) tid; x < ATG_K * hd; x += 64 * ATG_NQ) {
             const int r = x / hd, i = x % hd, k = k0 + r;
             float kv = 0.0f, vv = 0.0f;
-            if (k < n) {
+            if (k < ke) {
                 const int key = k < ns * a.R ? sel[(ulong) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
                 kv = K[(ulong) key * kvw + (ulong) g * hd + i];
                 vv = V[(ulong) key * kvw + (ulong) g * hd + i];
@@ -444,7 +450,7 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
                 for (int c = 0; c < 8; ++c) {
                     float sum = 0.0f;
                     for (int u = 0; u < ATG_NQ; ++u) sum += sS[ht][u][lane * 8 + c];
-                    sc[c] = k0 + c < n ? sum * a.scale : -INFINITY;
+                    sc[c] = k0 + c < ke ? sum * a.scale : -INFINITY;
                     mx = max(mx, sc[c]);
                 }
                 cf = exp(m - mx);   // 0 on the first tile (m = -inf; key k0 is visible, so mx is finite)
@@ -477,12 +483,39 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
     threadgroup float* sO = ht == 0 ? sK : sV;
     if (active) {
         for (int j = 0; j < 32 / ATG_NQ; ++j) if (j < nj) simdgroup_store(O[j], sO + (j0 + j) * 8, (ulong) hd);
-        if (dh == 0 && lane < 8) sL[ht][lane] = l;
+        if (dh == 0 && lane < 8) { sL[ht][lane] = l; sM[ht][lane] = m; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int h = 0; active && h < 8 && ht * 8 + h < G; ++h)
-        for (int i = j0 * 8 + (int) lane; i < (j0 + nj) * 8; i += 32)
-            o[((ulong) t * a.nh + (ulong) g * G + ht * 8 + h) * hd + i] = sO[h * hd + i] / sL[ht][h] * sigm(qb[(ulong) h * 2 * hd + hd + i]);
+    for (int h = 0; active && h < 8 && ht * 8 + h < G; ++h) {
+        const ulong head = (ulong) t * a.nh + (ulong) g * G + ht * 8 + h;
+        if (nsp == 1) {
+            for (int i = j0 * 8 + (int) lane; i < (j0 + nj) * 8; i += 32)
+                o[head * hd + i] = sO[h * hd + i] / sL[ht][h] * sigm(qb[(ulong) h * 2 * hd + hd + i]);
+        } else {   // this split's partial: O unnormalised, then its max and sum (m = -inf: no keys)
+            device float* pb = part + (head * nsp + tg.z) * (hd + 2);
+            for (int i = j0 * 8 + (int) lane; i < (j0 + nj) * 8; i += 32) pb[i] = sO[h * hd + i];
+            if (dh == 0 && lane == 0) { pb[hd] = sM[ht][h]; pb[hd + 1] = sL[ht][h]; }
+        }
+    }
+}
+
+// k_q4_attend_g's nsplit partials of decode rows merged: threadgroup (head h, row t), 256 threads; the output / L, gated by
+// sigmoid of the query's gate half
+kernel void k_q4_attend_comb(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* part [[buffer(2)]],
+                             device float* o [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const int h = (int) tg.x, t = (int) tg.y, hd = a.hd, nsp = a.nsplit, st = hd + 2;
+    const ulong head = (ulong) t * a.nh + h;
+    device const float* pb = part + head * nsp * st;
+    float M = -INFINITY;
+    for (int s = 0; s < nsp; ++s) M = max(M, pb[s * st + hd]);
+    float L = 0.0f;
+    for (int s = 0; s < nsp; ++s) { const float ms = pb[s * st + hd]; if (ms != -INFINITY) L += pb[s * st + hd + 1] * exp(ms - M); }
+    device const float* qh = q + head * 2 * hd;
+    for (int i = (int) tid; i < hd; i += 256) {
+        float v = 0.0f;
+        for (int s = 0; s < nsp; ++s) { const float ms = pb[s * st + hd]; if (ms != -INFINITY) v += pb[s * st + i] * exp(ms - M); }
+        o[head * hd + i] = v / L * sigm(qh[hd + i]);
+    }
 }
 
 #endif   // __METAL_VERSION__

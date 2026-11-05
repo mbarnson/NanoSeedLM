@@ -933,20 +933,29 @@ int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float
 int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
                  const int32_t* nsel, float* o, int T) {
     if (c->head_dim % 32 || c->head_dim > 256) { printf("FAIL: kt_q4_attend: head_dim not supported\n"); return -1; }
-    // as the engine: the grouped kernel (the group's heads as matrix rows) for prompt rows, or with KT_ATTEND_G=1
-    const int grouped = (T > MV_MAXT || getenv("KT_ATTEND_G")) && c->n_head / c->n_kv <= 16;
-    id<MTLComputePipelineState> p = pipe4(grouped ? "k_q4_attend_g" : "k_q4_attend");
-    if (!p) return -1;
+    // as the engine: the grouped kernel (the group's heads as matrix rows) for prompt rows, or with KT_ATTEND_G=1;
+    // KT_ATTEND_SPLIT=N: the grouped kernel in N key splits, merged by k_q4_attend_comb (the engine's long decode rows)
+    const int nsplit = getenv("KT_ATTEND_SPLIT") ? atoi(getenv("KT_ATTEND_SPLIT")) : 0;
+    const int grouped = (T > MV_MAXT || getenv("KT_ATTEND_G") || nsplit > 1) && c->n_head / c->n_kv <= 16;
+    id<MTLComputePipelineState> p = pipe4(grouped ? "k_q4_attend_g" : "k_q4_attend"), pc = nsplit > 1 ? pipe4("k_q4_attend_comb") : nil;
+    if (!p || (nsplit > 1 && !pc)) return -1;
     const size_t kv = (size_t) npos * c->n_kv * c->head_dim, no = (size_t) T * c->n_head * c->head_dim;
     const int topk = c->ix_budget / c->ix_ratio;
     id<MTLBuffer> qb = buf(NULL, 4 * (no * 2 + (size_t) 32 * c->head_dim)), Kb = buf(K, 4 * kv), Vb = buf(V, 4 * kv),
                   sb = buf(sel, 4 * (size_t) T * topk), nb = buf(nsel, 4 * (size_t) T), ob = buf(NULL, 4 * no);
     memcpy(qb.contents, q, 4 * no * 2);   // + 16 heads of slack: k_q4_attend_g reads its padding heads
-    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), 0};
+    const int ns = nsplit > 1 ? nsplit : 1;
+    id<MTLBuffer> pb = buf(NULL, 4 * (size_t) T * c->n_head * ns * (c->head_dim + 2));
+    const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), ns};
     if (run(^(id<MTLComputeCommandEncoder> e) {
-            enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob]);
-            if (grouped) [e dispatchThreadgroups:TGS(c->n_kv, T) threadsPerThreadgroup:TGS(64 * ATG_NQ, 1)];
+            enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob, pb]);
+            if (grouped) [e dispatchThreadgroups:MTLSizeMake((NSUInteger) c->n_kv, (NSUInteger) T, (NSUInteger) ns) threadsPerThreadgroup:TGS(64 * ATG_NQ, 1)];
             else [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
+            if (ns > 1) {
+                [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                enc4(e, pc, &aa, sizeof aa, @[qb, pb, ob]);
+                [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
+            }
         }))
         return -1;
     memcpy(o, ob.contents, 4 * no);

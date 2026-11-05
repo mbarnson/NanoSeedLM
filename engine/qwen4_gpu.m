@@ -67,12 +67,14 @@ struct Q4Eng {
     int32_t* ids;                      // the context (host), for the PLE n-grams
     id<MTLBuffer> x, H, normed, lo, up, inj, br, qp, kk, vv, o, ixo, sc, emb, keys, qs, vals, gated;
     id<MTLBuffer> lg, wt, A, Gb, Ub, Dx, sh, sgv, logits, y, cv, qkvb, zb, bb, ab;
-    id<MTLBuffer> tok, ind, sel, done, nsel, zero, perm, tiles;
+    id<MTLBuffer> tok, ind, sel, done, nsel, zero, perm, tiles, apart;   // apart: k_q4_attend_g's split partials
     id<MTLCommandBuffer> cb;   // the forward being encoded
     id<MTLComputeCommandEncoder> enc;
-    int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage
+    int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage; 2: decode rows only
+    int prof_skip;             // this forward's rows are not counted (Q4E_PROFILE=2 and T > MV_MAXT)
     int no_split;              // Q4E_NO_SPLIT=1: k_mv for the few-row projections too (A / B)
     int no_attg;               // Q4E_NO_ATTG=1: prompt rows through k_q4_attend too (A / B)
+    int no_splitk;             // Q4E_NO_SPLITK=1: long decode rows through k_q4_attend too (A / B)
     double stage_ms[10];
     char err[256];
 };
@@ -146,7 +148,7 @@ static void mark(Q4Eng* e, int stage) {
     if (!e->prof || !e->cb) return;
     id<MTLCommandBuffer> cb = e->cb;
     if (cmd_wait(e)) return;
-    e->stage_ms[stage] += 1e3 * (cb.GPUEndTime - cb.GPUStartTime);
+    if (!e->prof_skip) e->stage_ms[stage] += 1e3 * (cb.GPUEndTime - cb.GPUStartTime);
     cmd_begin(e);
 }
 static void B(Q4Eng* e, int i, id<MTLBuffer> b, uint64_t off) { [e->enc setBuffer:b offset:off atIndex:(NSUInteger) i]; }
@@ -538,9 +540,20 @@ static void attention(Q4Eng* e, Layer* L, int T) {
         tgs(e, (uint64_t) T, 1, 256);
     }
     mark(e, ST_QSA);
-    const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, e->pos, 1.0f / sqrtf((float) hd), 0};
-    // prompt rows: a KV group's heads as the rows of simdgroup matrices, each key tile loaded once for all of them
-    const int grouped = T > MV_MAXT && c->n_head / c->n_kv <= 16 && hd % (8 * ATG_NQ) == 0 && !e->no_attg;
+    // prompt rows: a KV group's heads as the rows of simdgroup matrices, each key tile loaded once for all of them.
+    // Decode rows with long key lists: the same in key splits, merged by k_q4_attend_comb (k_q4_attend reloads each
+    // key for each of the group's heads)
+    const int canG = c->n_head / c->n_kv <= 16 && hd % (8 * ATG_NQ) == 0;
+    int nmax = 0;
+    for (int t = 0; t < T; ++t) {
+        const int pos = e->pos + t, done = (pos + 1) / R, ns = done > e->kq ? e->kq : 0, tail = ns ? (pos + 1) / R * R : 0;
+        const int n = ns * R + pos + 1 - tail;
+        if (n > nmax) nmax = n;
+    }
+    const int split = T <= MV_MAXT && canG && nmax >= 512 && !e->no_splitk;
+    const int nsp = split ? (nmax + 127) / 128 < 32 ? (nmax + 127) / 128 : 32 : 1;
+    const int grouped = (T > MV_MAXT && canG && !e->no_attg) || split;
+    const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, e->pos, 1.0f / sqrtf((float) hd), nsp};
     [e->enc setComputePipelineState:pipe4(e, grouped ? "k_q4_attend_g" : "k_q4_attend")];
     A_(e, &aa, sizeof aa);
     B(e, 1, e->qp, 0);
@@ -549,8 +562,18 @@ static void attention(Q4Eng* e, Layer* L, int T) {
     B(e, 4, e->sel, 0);
     B(e, 5, e->nsel, 0);
     B(e, 6, e->o, 0);
-    if (grouped) tgs(e, (uint64_t) c->n_kv, (uint64_t) T, 64 * ATG_NQ);
+    B(e, 7, e->apart, 0);
+    if (grouped) [e->enc dispatchThreadgroups:MTLSizeMake((NSUInteger) c->n_kv, (NSUInteger) T, (NSUInteger) nsp)
+                     threadsPerThreadgroup:MTLSizeMake(64 * ATG_NQ, 1, 1)];
     else tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
+    if (nsp > 1) {
+        [e->enc setComputePipelineState:pipe4(e, "k_q4_attend_comb")];
+        A_(e, &aa, sizeof aa);
+        B(e, 1, e->qp, 0);
+        B(e, 2, e->apart, 0);
+        B(e, 3, e->o, 0);
+        tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
+    }
     mark(e, ST_ATTEND);
     mv(e, &L->o, e->o, e->br, T);
 }
@@ -742,12 +765,14 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->cv = F(T * cd); e->qkvb = F(T * cd); e->zb = F(T * vd); e->bb = F(T * c->lin_hv); e->ab = F(T * c->lin_hv);
         e->tok = dbuf(e, NULL, 4 * T); e->ind = dbuf(e, NULL, 4 * T * c->top_k); e->sel = dbuf(e, NULL, 4 * T * (size_t) (e->kq ? e->kq : 1));
         e->done = dbuf(e, NULL, 4 * T); e->nsel = dbuf(e, NULL, 4 * T); e->zero = dbuf(e, NULL, 4 * T);
-        e->perm = dbuf(e, NULL, 4 * T * c->top_k); e->tiles = dbuf(e, NULL, sizeof(MmTile) * (T * c->top_k / MM_BN + (size_t) c->n_exp + 1));
+        e->perm = dbuf(e, NULL, 4 * T * c->top_k);
+        e->apart = F((size_t) MV_MAXT * c->n_head * 32 * (c->head_dim + 2)); e->tiles = dbuf(e, NULL, sizeof(MmTile) * (T * c->top_k / MM_BN + (size_t) c->n_exp + 1));
     }
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
-    e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
+    e->prof = getenv("Q4E_PROFILE") ? atoi(getenv("Q4E_PROFILE")) : 0;
     e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
     e->no_attg = getenv("Q4E_NO_ATTG") != NULL;
+    e->no_splitk = getenv("Q4E_NO_SPLITK") != NULL;
     if (@available(macOS 15.0, *)) {   // the weights and buffers resident on the GPU
         MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
         e->residency = e->err[0] ? nil : [e->dev newResidencySetWithDescriptor:rd error:nil];
@@ -779,7 +804,7 @@ void q4e_close(Q4Eng* e) {
     e->mix_norm = e->stab = e->stab32 = e->inv = nil;
     e->x = e->H = e->normed = e->lo = e->up = e->inj = e->br = e->qp = e->kk = e->vv = e->o = e->ixo = e->sc = e->emb = nil;
     e->keys = e->qs = e->vals = e->gated = e->lg = e->wt = e->A = e->Gb = e->Ub = e->Dx = e->sh = e->sgv = e->logits = nil;
-    e->y = e->cv = e->qkvb = e->zb = e->bb = e->ab = e->tok = e->ind = e->sel = e->done = e->nsel = e->zero = e->perm = e->tiles = nil;
+    e->y = e->cv = e->qkvb = e->zb = e->bb = e->ab = e->tok = e->ind = e->sel = e->done = e->nsel = e->zero = e->perm = e->tiles = e->apart = nil;
     free(e->ids);
     if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
@@ -812,6 +837,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         nsel[t] = done[t] > e->kq ? e->kq : 0;
     }
     if (ple_rows(e, T)) return -1;
+    e->prof_skip = e->prof == 2 && T > MV_MAXT;
     cmd_begin(e);
     embed(e, T);
     mark(e, ST_EMBED);
@@ -837,7 +863,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     }
     id<MTLCommandBuffer> last = e->cb;
     if (cmd_wait(e)) return -1;
-    if (e->prof) e->stage_ms[ST_HEAD] += 1e3 * (last.GPUEndTime - last.GPUStartTime);
+    if (e->prof && !e->prof_skip) e->stage_ms[ST_HEAD] += 1e3 * (last.GPUEndTime - last.GPUStartTime);
     if (logits) memcpy(logits, e->logits.contents, sizeof(float) * (size_t) T * c->vocab);
     e->pos += T;
     return 0;
