@@ -29,7 +29,7 @@ typedef struct {   // a weight: its format and shape, slice 0, and a device tabl
 } W;
 
 typedef struct {
-    W hc_down[2], hc_up[2], hc_inj[2];
+    W hc_di[2], hc_up[2];   // each mix: the down rows, then the hc inject rows (one GEMM of the same input); up
     float* hc_norm[2];
     W qkv, z, b, a, out;                        // Gated DeltaNet
     Q4GdnDev gw;
@@ -165,6 +165,29 @@ static void load_w(Q4Eng* e, W* w, int host, const char* fmt, ...) {
     *w = (W) {t->enc, t->slices, t->rows, t->cols, tab[0], (const WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) t->slices)};
     free(tab);
 }
+// Two dense weights of the same input (BF16, Q8 or Q4, one encoding and width) as one in VRAM: the rows of a, then of b
+static void load_cat(Q4Eng* e, W* w, const char* na, const char* nb) {
+    const NsTensor* t[2] = {ns_find(&e->nm, na), ns_find(&e->nm, nb)};
+    if (!t[0] || !t[1]) { fail(e, "%s: missing", t[0] ? nb : na); return; }
+    if (t[0]->enc != t[1]->enc || (t[0]->enc != NS_BF16 && t[0]->enc != NS_Q4 && t[0]->enc != NS_Q8) || t[0]->cols != t[1]->cols ||
+        t[0]->group != t[1]->group || t[0]->slices != 1 || t[1]->slices != 1 || (t[0]->enc != NS_BF16 && t[0]->group != 32 && t[0]->group != 64)) {
+        fail(e, "%s and %s: not one dense encoding and width", na, nb);
+        return;
+    }
+    WSlice ws;
+    memset(&ws, 0, sizeof ws);
+    for (int s = 0; s < 4; ++s) {
+        const uint64_t la = t[0]->s[s].len, lb = t[1]->s[s].len;
+        uint8_t* h = la ? (uint8_t*) malloc(la + lb) : NULL;
+        if (!h) continue;
+        memcpy(h, t[0]->s[s].p, la);
+        memcpy(h + la, t[1]->s[s].p, lb);
+        ws.p[s] = dmem(e, h, la + lb);
+        free(h);
+    }
+    if (t[0]->enc != NS_BF16) ws.gs = t[0]->group == 32 ? 5 : 6;
+    *w = (W) {t[0]->enc, 1, t[0]->rows + t[1]->rows, t[0]->cols, ws, (const WSlice*) dmem(e, &ws, sizeof ws)};
+}
 // A BF16 vector of n values (any shape) as f32 in VRAM
 static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
     char name[192];
@@ -180,10 +203,11 @@ static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
 
 static const uint32_t* G(const Q4Eng* e, const W* w) { return w->fmt == MF_SEED4P4 ? e->g32 : e->g24; }
 // y[T][rows] = W x[T][cols]: the matvec for up to MV_MAXT rows, the tensor-core GEMM (BF16 inputs) for more
-static void mv(Q4Eng* e, const W* w, const float* x, float* y, int T) {
-    if (T <= MV_MAXT) kc_mv(e->s, w->fmt, w->w, w->cols, w->rows, x, w->cols, y, w->rows, T, 0, G(e, w));
-    else kc_mm(e->s, w->fmt, w->w, w->cols, w->rows, x, w->cols, y, w->rows, T, 0, G(e, w));
+static void mvx(Q4Eng* e, const W* w, const float* x, int xs, float* y, int T) {   // x rows xs apart
+    if (T <= MV_MAXT) kc_mv(e->s, w->fmt, w->w, w->cols, w->rows, x, xs, y, w->rows, T, 0, G(e, w));
+    else kc_mm(e->s, w->fmt, w->w, w->cols, w->rows, x, xs, y, w->rows, T, 0, G(e, w));
 }
+static void mv(Q4Eng* e, const W* w, const float* x, float* y, int T) { mvx(e, w, x, w->cols, y, T); }
 
 static void load_layer(Q4Eng* e, int l) {
     const Qwen4Cfg* c = &e->c;
@@ -193,9 +217,11 @@ static void load_layer(Q4Eng* e, int l) {
     for (int b = 0; b < 2; ++b) {
         const char* hc = b ? "mlp_hyper_connection" : "attn_hyper_connection";
         L->hc_norm[b] = load_v(e, HD, "%s.%d.%s.hc_norm.weight", p, l, hc);
-        load_w(e, &L->hc_down[b], 0, "%s.%d.%s.input_mix_weight_down.weight", p, l, hc);
+        char nd[192], ni[192];
+        snprintf(nd, sizeof nd, "%s.%d.%s.input_mix_weight_down.weight", p, l, hc);
+        snprintf(ni, sizeof ni, "%s.%d.%s.block_inject_weight.weight", p, l, hc);
+        load_cat(e, &L->hc_di[b], nd, ni);
         load_w(e, &L->hc_up[b], 0, "%s.%d.%s.input_mix_weight_up.weight", p, l, hc);
-        load_w(e, &L->hc_inj[b], 0, "%s.%d.%s.block_inject_weight.weight", p, l, hc);
     }
     if (c->attn[l]) {
         const int nb = e->max_pos / c->ix_ratio + 1;
@@ -403,7 +429,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab);
     // Each stage's buffers live only inside the stage (x, br and inj carry between stages), so the stages share one region
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared, kvw = (size_t) c->n_kv * c->head_dim;
-    const Buf mix[] = {{&e->normed, T * HD}, {&e->lo, T * c->hc_rank}, {&e->up, T * HD}};
+    const Buf mix[] = {{&e->normed, T * HD}, {&e->lo, T * (c->hc_rank + c->hc)}, {&e->up, T * HD}};
     const Buf pl[] = {{&e->emb, T * c->ple_dim}, {&e->keys, T * HD}, {&e->qs, T * HD}, {&e->vals, T * c->d}, {&e->gated, T * HD}};
     const Buf att[] = {{&e->qp, T * c->n_head * 2 * c->head_dim}, {&e->kk, T * kvw}, {&e->vv, T * kvw},
                        {&e->o, T * c->n_head * c->head_dim}, {&e->ixo, T * iw}, {&e->sc, T * nb}};
@@ -521,16 +547,17 @@ static void prof_collect(Q4Eng* e) {   // after the stream's sync
 
 // ---- the forward of up to mt rows ------------------------------------------------------------------------------------
 
-// The streams of H mixed into e->x; with inj, the weights that add the branch back (nslm/qwen4_ops.h)
-static void hc_mix(Q4Eng* e, const float* norm, const W* down, const W* upw, const W* injw, int T) {
+// The streams of H mixed into e->x (nslm/qwen4_ops.h). down: hc_rank rows, then (inj) the hc rows of the weights that
+// add the branch back, into e->inj
+static void hc_mix(Q4Eng* e, const float* norm, const W* down, const W* upw, int inj, int T) {
     const Qwen4Cfg* c = &e->c;
-    const int HD = c->hc * c->d;
+    const int HD = c->hc * c->d, ld = down->rows;
     kq4_norm1p(e->s, e->H, HD, c->d, norm, c->eps, e->normed, T);
     mv(e, down, e->normed, e->lo, T);
-    kq4_hc_act(e->s, c->hc, e->lo, T * c->hc_rank);
-    mv(e, upw, e->lo, e->up, T);
+    kq4_hc_act_rows(e->s, c->hc, e->lo, T, c->hc_rank, ld);
+    mvx(e, upw, e->lo, ld, e->up, T);
     kq4_hc_mix(e->s, c->hc, c->d, e->normed, e->up, e->x, T);
-    if (injw) { mv(e, injw, e->normed, e->inj, T); kq4_hc_gate(e->s, c->hc, e->inj, T * c->hc); }
+    if (inj) kq4_hc_gate_rows(e->s, c->hc, e->lo + c->hc_rank, ld, e->inj, T);
 }
 
 static double host_ms(void) {
@@ -687,12 +714,12 @@ static int layer(Q4Eng* e, int l, int T, int row0) {
     Layer* L = &e->L[l];
     if (c->ple[l] >= 0) ple(e, l, T, row0);
     mark(e, ST_PLE);
-    hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
+    hc_mix(e, L->hc_norm[0], &L->hc_di[0], &L->hc_up[0], 1, T);
     mark(e, ST_HC);
     if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
     mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
     kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
-    hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
+    hc_mix(e, L->hc_norm[1], &L->hc_di[1], &L->hc_up[1], 1, T);
     mark(e, ST_HC);
     moe(e, l, T);
     kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
@@ -725,7 +752,7 @@ static int enqueue(Q4Eng* e, int T, int want) {   // the rows of slot 0 through 
         if (layer(e, l, T, 0)) return -1;
     }
     if (want) {   // prompt rows without logits skip the mixer and the head
-        hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
+        hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, 0, T);
         mv(e, &e->head, e->x, e->logits, T);
         cudaMemcpyAsync(e->hlog, e->logits, sizeof(float) * (size_t) T * e->c.vocab, cudaMemcpyDeviceToHost, e->s);
         mark(e, ST_HEAD);

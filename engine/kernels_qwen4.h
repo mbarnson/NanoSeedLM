@@ -24,6 +24,9 @@ void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n);
 void kq4_hc_mix(cudaStream_t s, int hc, int d, const float* normed, const float* up, float* mixed, int T);
 void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n);
 void kq4_hc_add(cudaStream_t s, int hc, int d, float* H, const float* branch, const float* inj, int T);
+// The same act on rows of cols values ld apart, and the gate of hc values a row (src rows ld apart) into inj [rows][hc]
+void kq4_hc_act_rows(cudaStream_t s, int hc, float* lo, int rows, int cols, int ld);
+void kq4_hc_gate_rows(cudaStream_t s, int hc, const float* src, int ld, float* inj, int rows);
 
 // H[t][s][i] = x[t][i] for each of hc streams
 void kq4_tile(cudaStream_t s, int hc, int d, const float* x, float* H, int T);

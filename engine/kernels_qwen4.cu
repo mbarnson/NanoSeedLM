@@ -182,13 +182,13 @@ void kq4_norm1p(cudaStream_t s, const float* x, int len, int g, const float* w, 
     k_q4_norm1p<<<(unsigned) (T * (len / g)), 256, 0, s>>>(x, len, g, w, eps, y);
 }
 
-__global__ void k_q4_hc_act(float inv_hc, float* lo, int n) {
+__global__ void k_q4_hc_act(float inv_hc, float* lo, int cols, int ld, int n) {   // n = rows * cols, rows ld apart
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { const float x = lo[i] * inv_hc; lo[i] = x * sigm(x); }
+    if (i < n) { float* p = lo + (size_t) (i / cols) * ld + i % cols; const float x = *p * inv_hc; *p = x * sigm(x); }
 }
-__global__ void k_q4_hc_gate(float inv_hc, float* inj, int n) {
+__global__ void k_q4_hc_gate(float inv_hc, const float* src, int ld, int hc, float* inj, int n) {   // n = rows * hc
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) inj[i] = 2.0f * sigm(inj[i] * inv_hc);
+    if (i < n) inj[i] = 2.0f * sigm(src[(size_t) (i / hc) * ld + i % hc] * inv_hc);
 }
 __global__ void k_q4_hc_mix(int hc, int d, const float* normed, const float* up, float* mixed) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -204,8 +204,14 @@ __global__ void k_q4_hc_add(int hc, int d, float* H, const float* branch, const 
     const float b = branch[(size_t) t * d + i];
     for (int s = 0; s < hc; ++s) H[((size_t) t * hc + s) * d + i] += b * inj[t * hc + s];
 }
-void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n) { k_q4_hc_act<<<(unsigned) (n + 255) / 256, 256, 0, s>>>(1.0f / hc, lo, n); }
-void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n) { k_q4_hc_gate<<<(unsigned) (n + 255) / 256, 256, 0, s>>>(1.0f / hc, inj, n); }
+void kq4_hc_act_rows(cudaStream_t s, int hc, float* lo, int rows, int cols, int ld) {
+    k_q4_hc_act<<<(unsigned) (rows * cols + 255) / 256, 256, 0, s>>>(1.0f / hc, lo, cols, ld, rows * cols);
+}
+void kq4_hc_gate_rows(cudaStream_t s, int hc, const float* src, int ld, float* inj, int rows) {
+    k_q4_hc_gate<<<(unsigned) (rows * hc + 255) / 256, 256, 0, s>>>(1.0f / hc, src, ld, hc, inj, rows * hc);
+}
+void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n) { kq4_hc_act_rows(s, hc, lo, 1, n, n); }
+void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n) { kq4_hc_gate_rows(s, hc, inj, hc, inj, n / hc); }
 void kq4_hc_mix(cudaStream_t s, int hc, int d, const float* normed, const float* up, float* mixed, int T) {
     k_q4_hc_mix<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(hc, d, normed, up, mixed);
 }
