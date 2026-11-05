@@ -8,6 +8,9 @@
 //       routed tokens by routing weight^2; --experts A-B profiles those experts only and writes nothing
 //       (NSLM_MOE_VERBOSE=1: per-expert times)
 //   nslm-moe --model DIR --act FILE --check L,PROJ,EXPERT,K    GPU vs the CPU search on K column groups of one expert
+//   nslm-moe --model DIR --imatrix FILE --probe L,PROJ,EXPERTS,BLOCKS [--probe-ref FILE] [--workers 4]   the weighted
+//       error of seed layouts (C, P) = (8, 3), (8, 4), (12, 4), (16, 7) on BLOCKS sampled blocks of EXPERTS experts (CPU,
+//       nslm/searchc.h); --probe-ref: also of the BF16 weights 'w' [E][rows][cols] of FILE (e.g. a dequantized GGUF tensor)
 //   --scope mla --p4 --xtx DIR [--damp 0.01]: the MLA projections by GPTQ (nslm/gptq4.h) over their inputs' X^T X
 //       (nslm-mova-mlacapture --xtx DIR: L{l}_{x,v,q,o}.xtx), H dampened by damp * mean(diag H); the heads of a per-head
 //       map with one exponent bias search together; --codec p3 / p8 in place of --p4: P = 3 (.blk, SEED4 nibble words) or
@@ -46,6 +49,7 @@
 #include "search_gpu.h"
 #include "search4.h"
 #include "search4_gpu.h"
+#include "searchc.h"
 #include "searchp_gpu.h"
 
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
@@ -626,6 +630,100 @@ static int check(const char* spec, const SearchOpts* o, double n0, const char* m
     return bad ? 1 : 0;
 }
 
+// ---- probe: the weighted error of seed layouts on sampled blocks, before a full search (plan T2) ---------------------
+
+typedef struct {
+    int C, P, nb, bias, next;
+    const float *w, *sh;
+    const Search4Opts* o;
+    float* err;
+    pthread_mutex_t mu;
+} ProbeJob;
+static void* probe_worker(void* arg) {
+    ProbeJob* j = (ProbeJob*) arg;
+    for (;;) {
+        pthread_mutex_lock(&j->mu);
+        const int k = j->next++;
+        pthread_mutex_unlock(&j->mu);
+        if (k >= j->nb) return NULL;
+        uint16_t s;
+        uint32_t c;
+        uint8_t e;
+        nslmc_search_ref(j->C, j->P, j->w + (size_t) k * j->C, j->sh + (size_t) k * j->C, 1, j->bias, j->o, &s, &c, &e, j->err + k);
+    }
+}
+
+static int probe(const char* spec, const char* refp, const SearchOpts* so, double n0, int workers) {
+    int l = 0, ne = 0, nbk = 0, p = 0;
+    char pn[32], err[512];
+    if (sscanf(spec, "%d,%31[^,],%d,%d", &l, pn, &ne, &nbk) != 4 || ne < 1 || nbk < 1) { fprintf(stderr, "--probe L,PROJ,EXPERTS,BLOCKS\n"); return 2; }
+    while (p < NPROJ && strcmp(kProj[p], pn)) ++p;
+    if (p == NPROJ) { fprintf(stderr, "unknown projection %s\n", pn); return 2; }
+    const Search4Opts o = {so->n_seeds, so->n_exp, {so->exp_delta[0], so->exp_delta[1], so->exp_delta[2]}, so->refit};
+    const int rows = proj_rows(l, p), cols = proj_cols(l, p), E = proj_experts(p), NL = 4;
+    static const int lay[4][2] = {{8, 3}, {8, 4}, {12, 4}, {16, 7}};
+    StFile ref;
+    const StEntry* rw = NULL;
+    if (refp && (st_open_file(&ref, refp, err, sizeof err) || !(rw = st_find(&ref, "w")) || rw->shape[0] != E || rw->shape[1] != rows ||
+                 rw->shape[2] != cols)) { fprintf(stderr, "--probe-ref %s: no 'w' [%d][%d][%d] %s\n", refp, E, rows, cols, err); return 2; }
+    double rel[5] = {0};
+    float* hh = (float*) malloc(4 * (size_t) cols), *sh = (float*) malloc(4 * (size_t) cols);
+    float* wb = (float*) malloc(4 * (size_t) nbk * NSLMC_MAXC), *sb = (float*) malloc(4 * (size_t) nbk * NSLMC_MAXC);
+    float* eb = (float*) malloc(4 * (size_t) nbk);
+    const double t0 = now_s();
+    for (int i = 0; i < ne; ++i) {
+        const int e = (int) ((int64_t) i * E / ne);
+        float* w = load_proj(l, p, e);
+        if (!w) return 2;
+        act_h(l, p, e, n0, hh);
+        for (int c = 0; c < cols; ++c) sh[c] = sqrtf(hh[c] > 1e-12f ? hh[c] : 1e-12f);
+        for (int li = 0; li < NL; ++li) {
+            const int C = lay[li][0], P = lay[li][1], ng = cols / C;   // whole blocks only
+            int top = -1000;   // the exponent window ends at the largest block norm (nslm_choose_bias, C weights a block)
+            for (int r = 0; r < rows; ++r)
+                for (int g = 0; g < ng; ++g) {
+                    float n2 = 0.0f;
+                    for (int c = 0; c < C; ++c) n2 += w[(size_t) r * cols + g * C + c] * w[(size_t) r * cols + g * C + c];
+                    if (n2 > 0.0f) { const int v = (int) floorf(log2f(2.0f * sqrtf(n2))) - 2; if (v > top) top = v; }
+                }
+            double num = 0, den = 0;
+            for (int k = 0; k < nbk; ++k) {   // spread over rows and column groups
+                const int r = (int) (((int64_t) k * 7919 + i * 31) % rows), g = (int) (((int64_t) k * 104729 + i * 17) % ng);
+                for (int c = 0; c < C; ++c) {
+                    wb[k * C + c] = w[(size_t) r * cols + g * C + c];
+                    sb[k * C + c] = sh[g * C + c];
+                    den += (double) (wb[k * C + c] * sb[k * C + c]) * (wb[k * C + c] * sb[k * C + c]);
+                }
+            }
+            ProbeJob j = {C, P, nbk, top + 1 - 15, 0, wb, sb, &o, eb, PTHREAD_MUTEX_INITIALIZER};
+            pthread_t th[64];
+            const int nt = workers < 1 ? 1 : workers > 64 ? 64 : workers;
+            for (int t = 0; t < nt; ++t) pthread_create(&th[t], NULL, probe_worker, &j);
+            for (int t = 0; t < nt; ++t) pthread_join(th[t], NULL);
+            for (int k = 0; k < nbk; ++k) num += eb[k];
+            rel[li] += sqrt(num / den) / ne;
+        }
+        if (rw) {   // the reference weights of the same expert, on all blocks
+            const uint16_t* rb = (const uint16_t*) st_data(&ref, rw) + (size_t) e * rows * cols;
+            double num = 0, den = 0;
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < cols; ++c) {
+                    const double x = (double) w[(size_t) r * cols + c] * sh[c], d = x - (double) nslm_bf2f(rb[(size_t) r * cols + c]) * sh[c];
+                    num += d * d;
+                    den += x * x;
+                }
+            rel[4] += sqrt(num / den) / ne;
+        }
+        free(w);
+    }
+    printf("probe L%d %s: %d experts, %d blocks each, %d seeds, %.0f s\n", l, kProj[p], ne, nbk, o.n_seeds, now_s() - t0);
+    for (int li = 0; li < NL; ++li)
+        printf("  C %2d P %d  %.2f bits  weighted relative error %.4f\n", lay[li][0], lay[li][1], nslmc_bits(lay[li][0], lay[li][1]), rel[li]);
+    if (rw) printf("  %-28s weighted relative error %.4f\n", refp, rel[4]);
+    free(hh); free(sh); free(wb); free(sb); free(eb);
+    return 0;
+}
+
 // ---- expansion ------------------------------------------------------------------------------------------------------
 
 static int expand(const char* blk, const char* out, int mask) {
@@ -699,6 +797,8 @@ int main(int argc, char** argv) {
     else printf("calibration: %lld tokens, layers %d-%d; weighting %s; prior n0 %.0f; budget %d seeds; exponents e+0 e-1 e+1; refit 1\n",
                 (long long) g_tokens, g_l0, g_l0 + g_nl - 1, g_w2 ? "w2" : "plain", n0, o.n_seeds);
     if (opt(argc, argv, "--check", NULL)) return check(opt(argc, argv, "--check", NULL), &o, n0, lib);
+    if (opt(argc, argv, "--probe", NULL))
+        return probe(opt(argc, argv, "--probe", NULL), opt(argc, argv, "--probe-ref", NULL), &o, n0, atoi(opt(argc, argv, "--workers", "4")));
 
     const char* out = opt(argc, argv, "--out", NULL);
     if (!out) { fprintf(stderr, "--out DIR\n"); return 2; }
