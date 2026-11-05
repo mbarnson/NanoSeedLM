@@ -1,7 +1,7 @@
 # CUDA graphs for Qwen3.8-Flash-Next decode (2026-11-04)
 
-**Result.** On an RTX PRO 6000 with an 8 GB expert cache, P3 decodes at 46.5 tokens per second with CUDA graphs and
-at 42.1 without them: 10.6% faster. The text and the cache hits are the same with and without the graphs.
+**Result.** The test used an RTX PRO 6000 with an 8 GB expert cache. P3 decodes at 46.5 tokens per second with CUDA
+graphs and at 42.1 without them: 10.6% faster. The text and the cache hits are the same with and without the graphs.
 
 **Status.** Current. The test used HF Jobs on Linux. Kernel launches cost more on Windows, so the gain on the RTX 4080
 may be larger. That is not measured.
