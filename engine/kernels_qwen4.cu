@@ -1,6 +1,7 @@
 // engine/kernels_qwen4.cu - CUDA kernels of qwen4 (engine/kernels_qwen4.h), the counterparts of nslm/qwen4_ops.h.
 // f32 values and sums.
 #include <math.h>
+#include <mma.h>
 #include <stdint.h>
 
 #include "kernels_qwen4.h"
@@ -485,6 +486,108 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
     for (int i = 0; i < dl; ++i) o[((size_t) t * a.nh + h) * a.hd + lane + 32 * i] = acc[i] / l * sigm(qh[a.hd + lane + 32 * i]);
 }
 
+// Prompt rows on tensor cores: block (KV group, row), 4 warps. The group's heads (at most 16) are the rows of the
+// matrices, padded with zeros; keys come in tiles of TC_KT. S = Q K^T and O = P V are TF32 mma in three parts
+// (hi hi + hi lo + lo hi, near f32). Two passes: the scores' row maxima, then P and P V, so no accumulator rescales.
+#define TC_KT 16
+template <typename F> static __device__ __forceinline__ void tf32_split(const F& f, F& hi, F& lo) {
+    for (int i = 0; i < f.num_elements; ++i) {
+        hi.x[i] = nvcuda::wmma::__float_to_tf32(f.x[i]);
+        lo.x[i] = nvcuda::wmma::__float_to_tf32(f.x[i] - hi.x[i]);
+    }
+}
+template <typename A, typename B, typename C> static __device__ __forceinline__ void mma3(C& c, const A& a, const B& b) {
+    A ah, al;
+    B bh, bl;
+    tf32_split(a, ah, al);
+    tf32_split(b, bh, bl);
+    nvcuda::wmma::mma_sync(c, ah, bh, c);
+    nvcuda::wmma::mma_sync(c, ah, bl, c);
+    nvcuda::wmma::mma_sync(c, al, bh, c);
+}
+static size_t tc_smem(int hd) { return sizeof(float) * ((size_t) (16 + 2 * TC_KT) * hd + 5 * 256); }
+__global__ void __launch_bounds__(128) k_q4_attend_tc(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
+                                                      const int32_t* nsel, const int32_t* dpos, float* o) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) float tcs[];   // Q [16][hd], K and V tiles [TC_KT][hd], 4 partial S, P [16][16]
+    __shared__ int keys[TC_KT];
+    __shared__ float mx[16], sum[16];
+    const int hd = a.hd, G = a.nh / a.nkv, g = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, tid = threadIdx.x, ds = hd / 4;
+    const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    float* Qs = tcs, *Ks = Qs + 16 * hd, *Vs = Ks + TC_KT * hd, *Sp = Vs + TC_KT * hd, *Ps = Sp + 4 * 256;
+    const float* qg = q + ((size_t) t * a.nh + (size_t) g * G) * 2 * hd;   // head h of the group: qg + h * 2 hd
+    for (int x = tid; x < 16 * hd; x += blockDim.x) Qs[x] = x / hd < G ? qg[(size_t) (x / hd) * 2 * hd + x % hd] : 0.0f;
+    if (tid < 16) { mx[tid] = -INFINITY; sum[tid] = 0.0f; }
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> oacc[4];   // the warp's columns [w ds, (w + 1) ds), 16 a tile
+    for (int j = 0; j < ds / 16; ++j) wmma::fill_fragment(oacc[j], 0.0f);
+    for (int pass = 0; pass < 2; ++pass)
+        for (int k0 = 0; k0 < n; k0 += TC_KT) {
+            const int nk = min(TC_KT, n - k0);
+            __syncthreads();   // the previous tile is read
+            if (tid < TC_KT) {
+                const int k = k0 + tid;
+                keys[tid] = tid >= nk ? -1 : k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+            }
+            __syncthreads();
+            for (int x = tid; x < TC_KT * hd / 4; x += blockDim.x) {
+                const int kk = x / (hd / 4);
+                float4 kv = make_float4(0, 0, 0, 0), vv = kv;
+                if (keys[kk] >= 0) {
+                    const size_t at = (((size_t) keys[kk] * a.nkv + g) * hd) / 4 + x % (hd / 4);
+                    kv = ((const float4*) K)[at];
+                    if (pass) vv = ((const float4*) V)[at];
+                }
+                ((float4*) Ks)[x] = kv;
+                ((float4*) Vs)[x] = vv;
+            }
+            __syncthreads();
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> sacc;   // warp w: the dims [w ds, (w + 1) ds) of S
+            wmma::fill_fragment(sacc, 0.0f);
+            for (int d0 = w * ds; d0 < (w + 1) * ds; d0 += 8) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> qa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kb;
+                wmma::load_matrix_sync(qa, Qs + d0, hd);
+                wmma::load_matrix_sync(kb, Ks + d0, hd);   // K^T: the tile [key][dim] read column-major
+                mma3(sacc, qa, kb);
+            }
+            wmma::store_matrix_sync(Sp + w * 256, sacc, 16, wmma::mem_row_major);
+            __syncthreads();
+            if (tid < 16) {   // row tid: pass 0 its maximum, pass 1 its probabilities and their sum
+                float m = mx[tid], l = sum[tid];
+                for (int kk = 0; kk < TC_KT; ++kk) {
+                    const int x = tid * 16 + kk;
+                    const float sc = (Sp[x] + Sp[256 + x] + Sp[512 + x] + Sp[768 + x]) * a.scale;
+                    const int ok = kk < nk && tid < G;
+                    if (!pass) m = ok ? fmaxf(m, sc) : m;
+                    else {
+                        const float p = ok ? expf(sc - m) : 0.0f;
+                        Ps[x] = p;
+                        l += p;
+                    }
+                }
+                if (!pass) mx[tid] = m;
+                else sum[tid] = l;
+            }
+            if (!pass) continue;
+            __syncthreads();
+            for (int j = 0; j < ds / 16; ++j)
+                for (int k8 = 0; k8 < TC_KT; k8 += 8) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> pa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> vb;
+                    wmma::load_matrix_sync(pa, Ps + k8, 16);
+                    wmma::load_matrix_sync(vb, Vs + (size_t) k8 * hd + w * ds + j * 16, hd);
+                    mma3(oacc[j], pa, vb);
+                }
+        }
+    __syncthreads();
+    for (int j = 0; j < ds / 16; ++j) wmma::store_matrix_sync(Ks + w * ds + j * 16, oacc[j], hd, wmma::mem_row_major);   // O [16][hd]
+    __syncthreads();
+    for (int x = tid; x < G * hd; x += blockDim.x) {
+        const int h = x / hd, i = x % hd;
+        o[((size_t) t * a.nh + (size_t) g * G + h) * hd + i] = Ks[x] / sum[h] * sigm(qg[(size_t) h * 2 * hd + hd + i]);
+    }
+}
+
 void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks) {
     cudaFuncAttributes fa;
     *regs = cudaFuncGetAttributes(&fa, k_q4_attend_g) == cudaSuccess ? fa.numRegs : -1;
@@ -497,7 +600,11 @@ int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K
     if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv) return -1;
     const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, 1.0f / sqrtf((float) c->head_dim)};
     const int G = c->n_head / c->n_kv;
-    if (T > 8 && G <= 32)   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
+    if (T > 8 && G <= 16 && c->head_dim % 64 == 0) {   // prompt rows on tensor cores
+        static int smem_set;
+        if (!smem_set) smem_set = cudaFuncSetAttribute(k_q4_attend_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) tc_smem(256)) == cudaSuccess;
+        k_q4_attend_tc<<<dim3((unsigned) c->n_kv, (unsigned) T), 128, tc_smem(c->head_dim), s>>>(a, q, K, V, sel, nsel, dpos, o);
+    } else if (T > 8 && G <= 32)   // prompt rows: the group's heads share each key's reads (12x less K / V traffic at 24 / 2 heads)
         k_q4_attend_g<<<dim3((unsigned) c->n_kv, (unsigned) T), 32 * (unsigned) G, sizeof(float) * 2 * AT_KT * (size_t) c->head_dim, s>>>(
             a, q, K, V, sel, nsel, dpos, o);
     else k_q4_attend<<<dim3((unsigned) c->n_head, (unsigned) T), 256, 0, s>>>(a, q, K, V, sel, nsel, dpos, o);
