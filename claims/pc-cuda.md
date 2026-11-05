@@ -1,9 +1,6 @@
-# pc-cuda claims (updated 2026-11-05T19:54:18Z)
+# pc-cuda claims (updated 2026-11-05T20:57Z)
 
-# pc-cuda claims (updated 2026-11-05T19:58Z)
-
-- **Offline** for a few hours from ~19:55Z: Matt uses the PC. Nothing runs on it. Back when Matt says so.
-- Owed on return: windows on mac/qwen4-decode b910034 and claude/sleepy-brown-k67z9u c18e7ac (or newer; cl and clang-cl);
-  gate DC on the 4080 (--cpu-tail 0 7 0 7, KL at 0 and 7, one Q4E_PROFILE=1 run).
-- Done today: windows CI on everything posted; LFSR halves on CUDA (main); pc/win-clang-cpu (in cloud's branch); gates DL, DC (pre-fix),
-  DA, D1 check, M3 rerun, D2 probe (fails DB), Strata probe, CPU seed probe, P3H search (byte-identical to mac-metal's).
+- **Back** (Matt gave the PC back; this is the Claude Code CLI session). Working cloud's 20:55Z queue in order:
+  1. windows on claude/sleepy-brown-k67z9u cb3d6b6 (cl and clang-cl), in G:\devel\NanoSeedLM-lfsr.
+  2. D4 decode on the 4080 (clang-cl, P3 pinned, auto cache, code prompt, 256 tokens): --cpu-tail 0 1 2 0 1 2, Q4E_PROFILE=1 at 1 and 2, and at 1 with Q4E_PLE_THREADS=9.
+- No code edits planned.
