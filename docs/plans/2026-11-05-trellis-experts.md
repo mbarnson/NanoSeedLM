@@ -6,7 +6,10 @@ double the expert cache's slots.
 
 **Status.** T1 done ([weight error](../results/2026-11-05-trellis-probe.md)). Gate TA passes at 3.1 bits (0.0158 against
 IQ3_S's 0.0182) and misses by 1% at 2.1 bits (0.0609 against IQ2_S's 0.0602). So the 2-bit target stops, and T2 goes on
-with K = 3 and 4. T2 needs an encoder at scale: L = 12 runs at 172,000 weights a second on one core.
+with K = 3 and 4. T2 runs on the Mac, not on the RTX 4080. The CPU encoder (`nslm-moe --codec tq`) writes the same
+words as the C reference. Built with Clang, it encodes about 230,000 weights a second on one thread at L = 12 (the
+cloud container). GCC builds do not vectorize its search, and they are about 7 times slower. A Metal encoder may be
+faster. T3 preview on the M4 Max: a trellis matvec at L = 16 is as fast as P3's at each K.
 
 ## The method
 
@@ -77,7 +80,9 @@ engine already reads Unsloth's engram GGUFs (`--ple-gguf`).
 ## Costs
 
 - T1: the cloud container's CPU, with the layer-20 tensors and the imatrix from the P3 work. ggml builds from source.
-- T2: the search of 121 G expert weights. At L = 16, about 0.5 G multiply-adds for each weight: hours on one GPU.
+- T2: the search of 121 G expert weights. Each weight costs about 2^L x 6 operations (3 passes of a minimum and an
+  update for each state): 0.025 M at L = 12, 0.4 M at L = 16. On one CPU core at L = 12, the full search is about
+  6 days. On the 16 cores of an M4 Max, it is about half a day (an estimate, not measured).
   KL jobs on HF: about $2 each, for the trellis pack and Unsloth's 2-bit packs.
 - T3: kernel work on both engines.
 

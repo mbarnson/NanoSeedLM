@@ -7,7 +7,8 @@
 // (the sum of 4 near-uniform bytes is near-Gaussian: mean 510, standard deviation 147.8). Each block has one BF16
 // scale. Consecutive windows overlap, so s_t = (s_{t-1} >> K) | (b_t << (L - K)), b_t the K new bits: a trellis with
 // 2^L states and 2^K branches a state. The encoder picks the bits by a Viterbi search over the trellis, for the least
-// importance-weighted squared error sum_t h_t (w_t - a q(s_t))^2.
+// importance-weighted squared error sum_t h_t (w_t - a q(s_t))^2, in float without fused multiply-adds. Ties: the
+// predecessor with the lowest dropped bits j (s_{t-1} = (s_t mod 2^(L-K)) << K | j), then the lowest last state.
 //
 // Storage: a row's blocks are concatenated (block b at bit b n), little-endian in 32-bit words (stream bit i is bit
 // (i & 31) of word i >> 5), padded to whole words plus one spare word so every window is one 64-bit read.
@@ -34,7 +35,7 @@ static inline size_t nslm_tq_row_words(int cols, int T, int L, int K) {
 }
 
 // Scratch of one encoder thread: 2^L-state costs and the back pointers of a block of up to T weights.
-typedef struct { float *cost, *ncost, *m, *ac; uint8_t* back; int* st; int L, K, T; } NsTqScratch;
+typedef struct { float *cost, *ncost, *m, *ac, *jm; uint8_t* back; int *st, *rev; int L, K, T; } NsTqScratch;
 int nslm_tq_scratch_init(NsTqScratch* z, int T, int L, int K);   // 0, or -1 (no memory, or L, K out of range)
 void nslm_tq_scratch_free(NsTqScratch* z);
 

@@ -7,54 +7,61 @@
 
 #include "lfsr.h"
 
+static int rev_bits(int x, int n) { int r = 0; for (int i = 0; i < n; ++i) r |= (x >> i & 1) << (n - 1 - i); return r; }
+
 int nslm_tq_scratch_init(NsTqScratch* z, int T, int L, int K) {
     memset(z, 0, sizeof *z);
     if (L < 2 || L > NSLM_TQ_MAXL || K < 1 || K > NSLM_TQ_MAXK || K >= L || T < 1) return -1;
     const size_t N = (size_t) 1 << L, Q = (size_t) 1 << (L - K);
     z->cost = malloc(sizeof(float) * N); z->ncost = malloc(sizeof(float) * N); z->ac = malloc(sizeof(float) * N);
-    z->m = malloc(sizeof(float) * Q);
-    z->back = malloc(Q * (size_t) T); z->st = malloc(sizeof(int) * (size_t) T);
+    z->m = malloc(sizeof(float) * Q); z->jm = malloc(sizeof(float) * Q);
+    z->back = malloc(Q * (size_t) T); z->st = malloc(sizeof(int) * (size_t) T); z->rev = malloc(sizeof(int) * N);
     z->L = L; z->K = K; z->T = T;
-    if (!z->cost || !z->ncost || !z->ac || !z->m || !z->back || !z->st) { nslm_tq_scratch_free(z); return -1; }
+    if (!z->cost || !z->ncost || !z->ac || !z->m || !z->back || !z->st || !z->rev || !z->jm) { nslm_tq_scratch_free(z); return -1; }
+    for (size_t u = 0; u < N; ++u) z->rev[u] = rev_bits((int) u, L);
     return 0;
 }
 void nslm_tq_scratch_free(NsTqScratch* z) {
-    free(z->cost); free(z->ncost); free(z->ac); free(z->m); free(z->back); free(z->st);
+    free(z->cost); free(z->ncost); free(z->ac); free(z->m); free(z->back); free(z->st); free(z->rev); free(z->jm);
     memset(z, 0, sizeof *z);
 }
 
-// The least sum_t h_t (w_t - a q(s_t))^2 over all paths: s_t's predecessors are ((s_t mod 2^(L-K)) << K) | j,
-// j < 2^K, contiguous, so one min over them serves the 2^K states that share s_t's low L - K bits. Path into z->st.
+// The least sum_t h_t (w_t - a q(s_t))^2 over all paths, on bit-reversed labels u = rev(s): the window update
+// s_t = s_{t-1} >> K | b << (L - K) becomes u_t = (u_{t-1} << K | b') mod 2^L, whose predecessors (u >> K) | j << (L - K)
+// lie in 2^K contiguous runs, so both loops vectorize. Path (windows s_t) into z->st.
 static void viterbi(const float* w, const float* h, int n, float a, NsTqScratch* z) {
     const int L = z->L, K = z->K, N = 1 << L, Q = 1 << (L - K), H = 1 << K;
-    for (int s = 0; s < N; ++s) z->ac[s] = a * (float) nslm_tq_code((uint32_t) s);
-    for (int s = 0; s < N; ++s) { const float d = w[0] - z->ac[s]; z->cost[s] = (h ? h[0] : 1.0f) * d * d; }
+    float* restrict cost = z->cost, *restrict ncost = z->ncost, *restrict m = z->m, *restrict ac = z->ac;
+    const int* restrict rev = z->rev;
+    for (int u = 0; u < N; ++u) ac[u] = a * (float) nslm_tq_code((uint32_t) rev[u]);
+    for (int u = 0; u < N; ++u) { const float d = w[0] - ac[u]; cost[u] = (h ? h[0] : 1.0f) * d * d; }
     for (int t = 1; t < n; ++t) {
-        uint8_t* bk = z->back + (size_t) t * Q;
-        for (int q = 0; q < Q; ++q) {
-            const float* c = z->cost + (size_t) q * H;
-            int b = 0;
-            for (int j = 1; j < H; ++j) if (c[j] < c[b]) b = j;
-            z->m[q] = c[b];
-            bk[q] = (uint8_t) b;
+        float* restrict jm = z->jm;   // the argmin as a float (exact below 2^24), so both selects follow one compare
+        uint8_t* restrict bk = z->back + (size_t) t * Q;
+        for (int q = 0; q < Q; ++q) { m[q] = cost[q]; jm[q] = 0.0f; }
+        for (int j = 1; j < H; ++j) {   // j: the K bits that drop out of s, in order, so a tie keeps the lowest j
+            const int r = rev_bits(j, K);
+            const float* restrict c = cost + (size_t) r * Q;
+            const float fr = (float) r;
+            for (int q = 0; q < Q; ++q) { const float cq = c[q], mq = m[q], jq = jm[q]; m[q] = cq < mq ? cq : mq; jm[q] = cq < mq ? fr : jq; }
         }
+        for (int q = 0; q < Q; ++q) bk[q] = (uint8_t) jm[q];
         const float wt = w[t], ht = h ? h[t] : 1.0f;
-        for (int hi = 0; hi < H; ++hi)
-            for (int q = 0; q < Q; ++q) {
-                const int s = q | hi << (L - K);
-                const float d = wt - z->ac[s];
-                z->ncost[s] = z->m[q] + ht * d * d;
-            }
-        float* sw = z->cost; z->cost = z->ncost; z->ncost = sw;
+        for (int q = 0; q < Q; ++q) {   // the 2^K successors of group q are contiguous
+            const float mq = m[q], *restrict aq = ac + (size_t) q * H;
+            float* restrict nq = ncost + (size_t) q * H;
+            for (int b = 0; b < H; ++b) { const float d = wt - aq[b]; nq[b] = mq + ht * d * d; }
+        }
+        float* sw = cost; cost = ncost; ncost = sw;
     }
-    int s = 0;
-    for (int i = 1; i < N; ++i) if (z->cost[i] < z->cost[s]) s = i;
+    int u = 0;
+    for (int i = 1; i < N; ++i) if (cost[i] < cost[u] || (cost[i] == cost[u] && rev[i] < rev[u])) u = i;   // ties: lowest s
     for (int t = n - 1; t > 0; --t) {
-        z->st[t] = s;
-        const int q = s & (Q - 1);
-        s = q << K | z->back[(size_t) t * Q + q];
+        z->st[t] = rev[u];
+        const int q = u >> K;
+        u = q | z->back[(size_t) t * Q + q] << (L - K);
     }
-    z->st[0] = s;
+    z->st[0] = rev[u];
 }
 
 static void put_bits(uint32_t* row, uint64_t bit, uint32_t v, int nb) {   // nb <= 16 bits of v at stream bit `bit`

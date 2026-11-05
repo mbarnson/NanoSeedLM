@@ -28,7 +28,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 
 | Tool | Use |
 |---|---|
-| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8-Flash-Next experts take `--imatrix` |
+| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8-Flash-Next experts take `--imatrix`. `--codec tq --tq-k K --tq-l L` writes trellis-coded experts (`.blkt`) on the CPU. Build it with Clang |
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 | `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, from an MLX base folder |

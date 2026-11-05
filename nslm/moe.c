@@ -18,6 +18,9 @@
 //       P = 8 (.blk8: 32-bit coefficient words, then the exponent codes) blocks (nslm/searchp.h, nslm/gptq.h)
 //   --codec s3 (CUDA): C = 12, P = 4 blocks, 3 bits a weight (nslm/searchc_gpu.h), written as .blks: as .blk4 with
 //       nb = rows * ceil(cols / 12), a row's last block padded (ns_open_bank reads them)
+//   --codec tq [--tq-k 3] [--tq-l 12] (CPU, --workers threads): trellis-coded rows (nslm/trellis.h), K bits a weight,
+//       L-bit states, blocks of 256 (320 for rows of 640), as .blkt (MoeBlkHeader with n_seeds = L, n_exp = K,
+//       refit = T; float rel[E], wrel[E]; uint32 words[E][rows][nslm_tq_row_words]; uint16 BF16 scales[E][rows][blocks])
 //   nslm-moe --expand --blk DIR --out DIR [--scope gu] [--p4]   OUT/L{l}_{proj}.safetensors: 'w' [E][rows][cols] BF16
 //   Qwen3.8-Flash-Next (config.json model_type qwen4_exp, --scope gu|gud|d): --imatrix FILE (a llama.cpp imatrix GGUF)
 //       in place of --act; experts stacked as gate_up_proj [E][2F][D] (gate rows first) and down_proj [E][D][F].
@@ -55,6 +58,7 @@
 #include "searchc.h"
 #include "searchc_gpu.h"
 #include "searchp_gpu.h"
+#include "trellis.h"
 
 static const char* opt(int argc, char** argv, const char* name, const char* def) {
     for (int i = 1; i + 1 < argc; ++i) if (!strcmp(argv[i], name)) return argv[i + 1];
@@ -321,6 +325,8 @@ static char g_lib4[1024];
 static const char* g_xtx;   // --xtx DIR: GPTQ for the MLA projections
 static int g_pc;            // --codec p3 / p8 (MLA GPTQ only): P, else 0
 static int g_s3;            // --codec s3: C = 12, P = 4 blocks (nslm/searchc_gpu.h, CUDA), written as .blks
+static int g_tqk, g_tql;    // --codec tq: K bits a weight, L-bit states (nslm/trellis.h, CPU), written as .blkt
+static int tq_block(int cols) { return cols % 256 == 0 ? 256 : cols % 320 == 0 ? 320 : cols; }
 static const char* blk_ext(void) { return g_pc == 8 ? "blk8" : g_s3 ? "blks" : g_p4 ? "blk4" : "blk"; }
 static const char* blk_magic(void) { return g_pc == 8 ? "NSLMBLK8" : g_s3 ? "NSLMBLKS" : g_p4 ? "NSLMBLK4" : "NSLMBLKM"; }
 // nslm_choose_bias for blocks of C along each row (a short last block): the window ends at the largest block norm
@@ -604,6 +610,79 @@ static void* job_worker(void* arg) {
     return NULL;
 }
 
+// ---- --codec tq: trellis-coded rows on the CPU, one (layer, projection) job a worker ----------------------------------
+
+static void* tq_worker(void* arg) {
+    Jobs* j = (Jobs*) arg;
+    char path[2048], tmp[2100];
+    for (;;) {
+        const int k = atomic_fetch_add(&j->next, 1);
+        if (k >= j->n || atomic_load(&j->failed)) break;
+        const int l = j->items[k].l, p = j->items[k].p;
+        const int rows = proj_rows(l, p), cols = proj_cols(l, p), E = proj_experts(p), T = tq_block(cols);
+        const size_t nw = nslm_tq_row_words(cols, T, g_tql, g_tqk), nb = (size_t) (cols + T - 1) / T;
+        snprintf(path, sizeof path, "%s/L%d_%s.blkt", j->out, l, kProj[p]);
+        MoeBlkHeader h;
+        FILE* f = fopen(path, "rb");
+        const int done = f && fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "NSLMBLKT", 8) && h.n_seeds == (uint32_t) g_tql &&
+                         h.n_exp == (uint32_t) g_tqk && h.refit == (uint32_t) T && h.n0 == (float) j->n0;
+        if (f) fclose(f);
+        if (done && j->e1 < 0) { printf("L%-2d %-9s done (%.1f s)\n", l, kProj[p], h.seconds); continue; }
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, "NSLMBLKT", 8);
+        h.rows = (uint32_t) rows; h.cols = (uint32_t) cols; h.n_experts = (uint32_t) E;
+        h.n_seeds = (uint32_t) g_tql; h.n_exp = (uint32_t) g_tqk; h.refit = (uint32_t) T; h.n0 = (float) j->n0;
+        float* rel = (float*) calloc((size_t) E, 4), *wrel = (float*) calloc((size_t) E, 4), *hh = (float*) malloc(4 * (size_t) cols);
+        float* y = (float*) malloc(4 * (size_t) cols);
+        uint32_t* words = (uint32_t*) calloc(nw * (size_t) rows * (size_t) E, 4);
+        uint16_t* sc = (uint16_t*) calloc(nb * (size_t) rows * (size_t) E, 2);
+        NsTqScratch z;
+        if (!rel || !wrel || !hh || !y || !words || !sc || nslm_tq_scratch_init(&z, T, g_tql, g_tqk)) {
+            fprintf(stderr, "L%d %s: out of memory\n", l, kProj[p]);
+            atomic_store(&j->failed, 1);
+            break;
+        }
+        const double t0 = now_s();
+        for (int e = 0; e < E && !atomic_load(&j->failed); ++e) {
+            if (j->e1 >= 0 && (e < j->e0 || e > j->e1)) continue;
+            float* w = load_proj(l, p, e);
+            if (!w) { atomic_store(&j->failed, 1); break; }
+            act_h(l, p, e, j->n0, hh);
+            double se = 0, sw = 0, wse = 0, wsw = 0;
+            for (int r = 0; r < rows; ++r) {
+                const float* wr = w + (size_t) r * cols;
+                const size_t at = (size_t) e * rows + (size_t) r;
+                nslm_tq_encode_row(wr, hh, cols, T, &z, words + at * nw, sc + at * nb, y);
+                for (int c = 0; c < cols; ++c) {
+                    const double d = (double) wr[c] - y[c];
+                    se += d * d; sw += (double) wr[c] * wr[c]; wse += hh[c] * d * d; wsw += hh[c] * (double) wr[c] * wr[c];
+                }
+            }
+            rel[e] = (float) sqrt(se / sw);
+            wrel[e] = (float) sqrt(wse / wsw);
+            free(w);
+        }
+        h.seconds = now_s() - t0;
+        double mr = 0, mw = 0;
+        int ne = 0;
+        for (int e = 0; e < E; ++e) if (rel[e] > 0) { mr += rel[e]; mw += wrel[e]; ++ne; }
+        printf("L%-2d %-9s %3d x %4dx%-4d  L %d K %d T %d (%.3f bits)  rel_err %.5f  weighted %.5f  %7.1f s\n", l, kProj[p], E, rows,
+               cols, g_tql, g_tqk, T, 32.0 * nw / cols + 16.0 * nb / cols, ne ? mr / ne : 0, ne ? mw / ne : 0, h.seconds);
+        if (j->e1 < 0 && !atomic_load(&j->failed)) {
+            snprintf(tmp, sizeof tmp, "%s.tmp", path);
+            f = fopen(tmp, "wb");
+            int ok = f && fwrite(&h, sizeof h, 1, f) == 1 && fwrite(rel, 4, (size_t) E, f) == (size_t) E && fwrite(wrel, 4, (size_t) E, f) == (size_t) E &&
+                     fwrite(words, 4, nw * rows * (size_t) E, f) == nw * rows * (size_t) E && fwrite(sc, 2, nb * rows * (size_t) E, f) == nb * rows * (size_t) E;
+            if (f && fclose(f)) ok = 0;
+            if (ok && rename(tmp, path)) ok = 0;
+            if (!ok) { fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno)); remove(tmp); atomic_store(&j->failed, 1); }
+        }
+        nslm_tq_scratch_free(&z);
+        free(rel); free(wrel); free(hh); free(y); free(words); free(sc);
+    }
+    return NULL;
+}
+
 // ---- the CPU check: K whole column groups of one expert, activation-weighted, against the GPU -----------------------
 
 typedef struct { SeedTab* tab; const float* sh; int s0, s1; } TabJob;
@@ -847,7 +926,15 @@ int main(int argc, char** argv) {
     const char* codec = opt(argc, argv, "--codec", NULL);
     g_pc = codec && !strcmp(codec, "p3") ? 3 : codec && !strcmp(codec, "p8") ? 8 : 0;
     g_s3 = codec && !strcmp(codec, "s3");
-    if (codec && !g_s3 && (!g_pc || g_p4 || !g_xtx)) { fprintf(stderr, "--codec p3|p8 goes with --scope mla --xtx (not --p4)\n"); return 2; }
+    if (codec && !strcmp(codec, "tq")) {
+        g_tqk = atoi(opt(argc, argv, "--tq-k", "3"));
+        g_tql = atoi(opt(argc, argv, "--tq-l", "12"));
+        if (g_p4 || g_xtx || g_tqk < 1 || g_tqk > NSLM_TQ_MAXK || g_tql <= g_tqk || g_tql > NSLM_TQ_MAXL) {
+            fprintf(stderr, "--codec tq: an activation-weighted CPU encode (not --p4 or --xtx), 1 <= --tq-k < --tq-l <= 16\n");
+            return 2;
+        }
+    }
+    if (codec && !g_s3 && !g_tqk && (!g_pc || g_p4 || !g_xtx)) { fprintf(stderr, "--codec p3|p8 goes with --scope mla --xtx (not --p4)\n"); return 2; }
     if (g_s3 && (g_p4 || g_xtx)) { fprintf(stderr, "--codec s3 is an activation-weighted search (not --p4 or --xtx)\n"); return 2; }
     snprintf(g_libp, sizeof g_libp, "%s/searchp.metallib", opt(argc, argv, "--res", "out/res"));
     if (g_xtx && (!g_mla.on || !(g_p4 || g_pc))) { fprintf(stderr, "--xtx goes with --scope mla --p4 (or --codec p3|p8)\n"); return 2; }
@@ -877,9 +964,9 @@ int main(int argc, char** argv) {
     Jobs j = {items, n, 0, out, lib, &o, n0, !has_flag(argc, argv, "--no-prune"), 0, 0, -1};
     if (opt(argc, argv, "--experts", NULL)) sscanf(opt(argc, argv, "--experts", NULL), "%d-%d", &j.e0, &j.e1);
     const double t0 = now_s();
-    pthread_t th[16];
-    for (int i = 0; i < workers && i < 16; ++i) pthread_create(&th[i], NULL, job_worker, &j);
-    for (int i = 0; i < workers && i < 16; ++i) pthread_join(th[i], NULL);
+    pthread_t th[64];
+    for (int i = 0; i < workers && i < 64; ++i) pthread_create(&th[i], NULL, g_tqk ? tq_worker : job_worker, &j);
+    for (int i = 0; i < workers && i < 64; ++i) pthread_join(th[i], NULL);
     if (atomic_load(&j.failed)) return 1;
     printf("moe_total_s=%.1f (%d jobs, %d workers)\n", now_s() - t0, n, workers);
     return 0;
