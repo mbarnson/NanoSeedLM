@@ -2,6 +2,7 @@
 // kernels of engine/kernels_cuda.h and the qwen4 kernels of engine/kernels_qwen4.h.
 #include "qwen4_eng.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include "cpu_seed4.h"
 #include "kernels_cuda.h"
 #include "kernels_qwen4.h"
 #include "lfsr.h"
@@ -43,8 +45,11 @@ typedef struct {
     float *kconv, *kS, *khist;   // q4e_forward_keep: the state after each row but the last (MTP)
 } Layer;
 
-typedef struct { Q4Eng* e; int i0, i1, prefetch, bad; } PleJob;   // items: rows (prefetch), else (row, head); bad: 1 + layer
-static void* ple_pool(void* arg);   // a worker of the PLE pool
+// A share [i0, i1) of n items of fn on the pool; rc: fn's result (0, or the first item's error)
+typedef struct { Q4Eng* e; int (*fn)(Q4Eng* e, const void* ctx, int i0, int i1); const void* ctx; int i0, i1, rc; } PoolJob;
+static void* pool_worker(void* arg);
+static size_t ct_floats(const Qwen4Cfg* c);   // plan D4 (below)
+static void* ct_thread(void* arg);
 
 struct Q4Eng {
     Qwen4Cfg c;
@@ -90,7 +95,7 @@ struct Q4Eng {
     pthread_mutex_t pmu;
     pthread_cond_t pgo, pdone;
     int pgen, pnw, pndone, pquit, nth;
-    PleJob pj[16];
+    PoolJob pj[16];
     double host_ms[2];             // Q4E_PROFILE: host time of the PLE prefetch and the PLE rows
     cudaGraphExec_t graph[4][MV_MAXT + 1];   // [with logits + 2 keep][rows]
     // The MTP head (Q4EOpts.mtp): it runs one row behind each forward. Hm: its streams; Hall[-1]: the last main row's
@@ -101,6 +106,19 @@ struct Q4Eng {
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and state copies)
     int tail_skip, tail_renorm;           // Q4EOpts.tail_skip; Q4E_TAIL_RENORM=1 (an A/B): the kept weights scaled up
     int head_cached;                      // the MTP head's experts are the cache's sparse layer n_layer (layer 0's format)
+    // Plan D4 (Q4EOpts.cpu_tail): the decode tail's missed experts on the CPU, from the pinned arena. Mapped host memory:
+    // cj (the pick's list), cx (the rows' x), cy (each pair's output), hs (flag at 0, ack at 16); dseq counts hand-offs
+    int cpu_tail;
+    volatile int cfwd, cquit;   // a forward is in flight (the thread spins), stop
+    int cstart;
+    pthread_mutex_t cmu;
+    pthread_cond_t ccv;         // the thread sleeps here between forwards
+    int32_t *cj_h, *cj_d;
+    float *cx_h, *cx_d, *cy_h, *cy_d, *cbuf;
+    uint32_t *hs_h, *hs_d, *dseq;
+    const uint8_t* arena_h;
+    int32_t* ebias;   // [units][3]: each unit's exponent biases
+    pthread_t cth;
     cudaGraphExec_t dgraph[Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
@@ -362,6 +380,7 @@ static void build_cache(Q4Eng* e, double gb) {
         return;
     } else track(&e->host, &e->nhost, &e->chost, host);
     WSlice* tab = (WSlice*) calloc((size_t) units * 3, sizeof(WSlice));
+    if (e->cpu_tail) e->ebias = (int32_t*) calloc((size_t) units * 3, sizeof(int32_t));
     for (int l = 0; l < NL; ++l)
         for (int i = 0; i < 3; ++i) {
             const NsTensor* t = e->et[l][i];
@@ -372,11 +391,13 @@ static void build_cache(Q4Eng* e, double gb) {
                 for (int s = 0; s < 4 && host; ++s)
                     if (len[i][s]) memcpy(host + ((uint64_t) l * E + x) * ub + p->off[i][s], t->s[s].p + len[i][s] * (uint64_t) x, len[i][s]);
                 if (t->enc == NS_SEED4 || t->enc == NS_SEED4P4) memcpy(&w->eb, t->s[2].p + 4 * (size_t) x, 4);
+                if (e->ebias) e->ebias[((size_t) l * E + x) * 3 + i] = w->eb;
                 if (t->enc == NS_Q4 || t->enc == NS_Q8) w->gs = t->group == 32 ? 5 : 6;
             }
             for (int s = 0; s < 4 && host; ++s) st_dontneed(t->s[s].p, t->s[s].len);   // the arena holds them: the file pages go
         }
     p->host = (const uint8_t*) dh;
+    e->arena_h = host;
     p->vram = (uint8_t*) dmem(e, NULL, ub * (uint64_t) p->slots);
     int32_t* us = (int32_t*) malloc(4 * (size_t) units);
     int32_t* su = (int32_t*) malloc(4 * (size_t) p->slots);
@@ -447,6 +468,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     if (e->xr > Q4E_PASS_ROWS) e->xr = Q4E_PASS_ROWS / e->mt * e->mt;
     e->host_experts = !(o && o->vram_experts);
     e->tail_skip = o ? o->tail_skip : 0;
+    e->cpu_tail = o ? o->cpu_tail : 0;
+    if (e->cpu_tail && (!e->cache || e->stream || !cpu_seed4_on()))
+        fail(e, "--cpu-tail needs --expert-cache-gb, pinned experts and the CPU seed kernel (a Clang build)");
     e->tail_renorm = getenv("Q4E_TAIL_RENORM") && atoi(getenv("Q4E_TAIL_RENORM")) > 0;
     e->cache = e->host_experts && o && o->cache_gb != 0;
     e->stream = e->cache && o->stream_experts;
@@ -536,6 +560,29 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         if (o->cache_gb > most) fprintf(stderr, "qwen4: expert cache %.2f GB, not %.2f: %.0f MB of VRAM stay free (NSLM_VRAM_RESERVE_MB)\n", most, o->cache_gb, res);
         build_cache(e, o->cache_gb > 0 && o->cache_gb < most ? o->cache_gb : most);
     }
+    if (e->cpu_tail && !e->err[0]) {   // plan D4: the mapped list, rows and outputs, the hand-off words, the CPU thread
+        const size_t P = (size_t) MV_MAXT * c->top_k;
+        if (e->et[0][0]->enc != NS_SEED4) fail(e, "--cpu-tail: P = 3 seed experts only");
+        void* m[4] = {NULL, NULL, NULL, NULL};
+        const size_t len[4] = {4 * (2 + 4 * P), sizeof(float) * MV_MAXT * c->d, sizeof(float) * P * c->d, 4 * 64};
+        for (int i = 0; i < 4 && !e->err[0]; ++i) {
+            if (cudaHostAlloc(&m[i], len[i], cudaHostAllocMapped) != cudaSuccess) { fail(e, "--cpu-tail: cannot map host memory"); break; }
+            memset(m[i], 0, len[i]);
+            track(&e->host, &e->nhost, &e->chost, m[i]);
+        }
+        if (!e->err[0]) {
+            e->cj_h = (int32_t*) m[0]; e->cx_h = (float*) m[1]; e->cy_h = (float*) m[2]; e->hs_h = (uint32_t*) m[3];
+            cudaHostGetDevicePointer((void**) &e->cj_d, m[0], 0); cudaHostGetDevicePointer((void**) &e->cx_d, m[1], 0);
+            cudaHostGetDevicePointer((void**) &e->cy_d, m[2], 0); cudaHostGetDevicePointer((void**) &e->hs_d, m[3], 0);
+            e->dseq = (uint32_t*) dmem(e, NULL, 4);
+            e->cbuf = (float*) malloc(sizeof(float) * ct_floats(c));
+            cpu_seed4_table();
+            pthread_mutex_init(&e->cmu, NULL);
+            pthread_cond_init(&e->ccv, NULL);
+            if (!e->cbuf || pthread_create(&e->cth, NULL, ct_thread, e)) fail(e, "--cpu-tail: no CPU thread");
+            else e->cstart = 1;
+        }
+    }
     for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     e->nb = (int) nb;
     e->hin = (int32_t*) pin(e, sizeof(int32_t) * (e->xr / e->mt) * (T + 1));   // a slot of T + 1 for each chunk of a pass
@@ -566,7 +613,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     pthread_cond_init(&e->pdone, NULL);
     for (e->pj[0].e = e; e->nth < e->ple_threads - 1; ++e->nth) {
         e->pj[e->nth + 1].e = e;
-        if (pthread_create(&e->pth[e->nth], NULL, ple_pool, &e->pj[e->nth + 1])) break;
+        if (pthread_create(&e->pth[e->nth], NULL, pool_worker, &e->pj[e->nth + 1])) break;
     }
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
     if (getenv("Q4E_ROUTES") && !(e->routes = fopen(getenv("Q4E_ROUTES"), "wb"))) fail(e, "cannot write %s", getenv("Q4E_ROUTES"));
@@ -585,6 +632,14 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 void q4e_close(Q4Eng* e) {
     if (!e) return;
     cudaDeviceSynchronize();
+    if (e->cstart) {   // the D4 thread reads the mapped words freed below
+        pthread_mutex_lock(&e->cmu);
+        e->cquit = 1;
+        pthread_cond_signal(&e->ccv);
+        pthread_mutex_unlock(&e->cmu);
+        pthread_join(e->cth, NULL);
+    }
+    free(e->cbuf); free(e->ebias);
     if (e->ple_threads) {   // the PLE pool (started once ple_threads is set)
         pthread_mutex_lock(&e->pmu);
         e->pquit = 1;
@@ -678,24 +733,23 @@ static double host_ms(void) {
     return 1e3 * (double) ts.tv_sec + 1e-6 * (double) ts.tv_nsec;
 }
 
-static void* ple_worker(void* arg) {
-    PleJob* j = (PleJob*) arg;
-    Q4Eng* e = j->e;
+// PLE items: rows (prefetch), else (row, head); 1 + the layer of a missing row
+static int ple_items(Q4Eng* e, const void* ctx, int i0, int i1) {
     const Qwen4Cfg* c = &e->c;
-    const int H = j->prefetch ? 1 : e->ng[0].heads;
-    for (int l = 0; l < c->n_layer && !j->bad; ++l)
-        for (int i = j->i0; c->ple[l] >= 0 && i < j->i1; ++i) {
+    const int prefetch = *(const int*) ctx, H = prefetch ? 1 : e->ng[0].heads;
+    for (int l = 0; l < c->n_layer; ++l)
+        for (int i = i0; c->ple[l] >= 0 && i < i1; ++i) {
             const int t = i / H;
-            if (j->prefetch) qwen4_ple_prefetch(&e->nm, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t);
+            if (prefetch) qwen4_ple_prefetch(&e->nm, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t);
             else if (qwen4_ple_head(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t, i % H,
-                                    e->emb_h + ((size_t) c->ple[l] * e->xr + t) * c->ple_dim)) { j->bad = l + 1; break; }
+                                    e->emb_h + ((size_t) c->ple[l] * e->xr + t) * c->ple_dim)) return l + 1;
         }
-    return NULL;
+    return 0;
 }
 
-static void* ple_pool(void* arg) {   // worker w of the pool
-    Q4Eng* e = ((PleJob*) arg)->e;
-    const int w = (int) ((PleJob*) arg - e->pj);
+static void* pool_worker(void* arg) {   // worker w of the pool
+    Q4Eng* e = ((PoolJob*) arg)->e;
+    const int w = (int) ((PoolJob*) arg - e->pj);
     int gen = 0;
     pthread_mutex_lock(&e->pmu);
     for (;;) {
@@ -704,7 +758,8 @@ static void* ple_pool(void* arg) {   // worker w of the pool
         gen = e->pgen;
         if (w >= e->pnw) continue;
         pthread_mutex_unlock(&e->pmu);
-        ple_worker(&e->pj[w]);
+        PoolJob* j = &e->pj[w];
+        j->rc = j->fn(e, j->ctx, j->i0, j->i1);
         pthread_mutex_lock(&e->pmu);
         if (++e->pndone == e->pnw - 1) pthread_cond_signal(&e->pdone);
     }
@@ -712,12 +767,10 @@ static void* ple_pool(void* arg) {   // worker w of the pool
     return NULL;
 }
 
-// The PLE rows [pos, pos + T) of each PLE layer: their pages asked of the OS (prefetch), or into emb_h. Host work,
-// before the rows' device work, on the pool; decode rows split by head, so their page reads overlap.
-static int ple_run(Q4Eng* e, int T, int prefetch) {
-    const int n = prefetch ? T : T * e->ng[0].heads, nw = n < e->nth + 1 ? n : e->nth + 1;
-    const double t0 = e->prof ? host_ms() : 0;
-    for (int w = 0; w < nw; ++w) e->pj[w] = (PleJob) {e, (int) ((int64_t) n * w / nw), (int) ((int64_t) n * (w + 1) / nw), prefetch, 0};
+// fn over n items, split on the pool (the caller runs the first share); the first non-zero result
+static int pool_run(Q4Eng* e, int n, int (*fn)(Q4Eng*, const void*, int, int), const void* ctx) {
+    const int nw = n < e->nth + 1 ? n : e->nth + 1;
+    for (int w = 0; w < nw; ++w) e->pj[w] = (PoolJob) {e, fn, ctx, (int) ((int64_t) n * w / nw), (int) ((int64_t) n * (w + 1) / nw), 0};
     if (nw > 1) {
         pthread_mutex_lock(&e->pmu);
         e->pnw = nw;
@@ -726,16 +779,117 @@ static int ple_run(Q4Eng* e, int T, int prefetch) {
         pthread_cond_broadcast(&e->pgo);
         pthread_mutex_unlock(&e->pmu);
     }
-    if (nw > 0) ple_worker(&e->pj[0]);
+    if (nw > 0) e->pj[0].rc = fn(e, ctx, e->pj[0].i0, e->pj[0].i1);
     if (nw > 1) {
         pthread_mutex_lock(&e->pmu);
         while (e->pndone < nw - 1) pthread_cond_wait(&e->pdone, &e->pmu);
         pthread_mutex_unlock(&e->pmu);
     }
-    if (e->prof) e->host_ms[prefetch ? 0 : 1] += host_ms() - t0;
-    for (int w = 0; w < nw; ++w)
-        if (e->pj[w].bad) return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", e->pj[w].bad - 1);
+    for (int w = 0; w < nw; ++w) if (e->pj[w].rc) return e->pj[w].rc;
     return 0;
+}
+
+// ---- plan D4: the decode tail's missed experts on the CPU --------------------------------------------------------------
+// A layer's list (kq4_tail_skip) groups by expert. Pass 1: each group's gate and up rows; then SwiGLU on the host; pass 2:
+// the down rows. Items are 64-row chunks of one group's matrix, so the pool splits each pass.
+#define CT_ROWS 64
+typedef struct { int x, n, j[MV_MAXT]; } CtGroup;   // an expert and the list entries (pairs) that use it
+// The scratch of G = MV_MAXT * top_k groups of MV_MAXT rows: x transposed (xt, xs), gate and up (gu), the SwiGLU
+// transposed (act, axs), the down outputs (down), and tmp (a group's rows before a transpose)
+typedef struct { const CtGroup* g; int pass, nitems; int item[3 * MV_MAXT * 32 * 40]; float *xt, *xs, *gu, *act, *axs, *down, *tmp; } CtJob;
+static size_t ct_floats(const Qwen4Cfg* c) {
+    const size_t G = (size_t) MV_MAXT * c->top_k, M = MV_MAXT, D = c->d, F = c->ff_exp;
+    return G * M * (D + D / 8 + 2 * F + F + F / 8 + D) + M * D;
+}
+static void ct_bufs(CtJob* j, float* b, const Qwen4Cfg* c) {
+    const size_t G = (size_t) MV_MAXT * c->top_k, M = MV_MAXT, D = c->d, F = c->ff_exp;
+    j->xt = b; j->xs = j->xt + G * M * D; j->gu = j->xs + G * M * (D / 8); j->act = j->gu + G * M * 2 * F;
+    j->axs = j->act + G * M * F; j->down = j->axs + G * M * (F / 8); j->tmp = j->down + G * M * D;
+}
+
+static const uint8_t* ct_unit(Q4Eng* e, int l, int x, int i, int s) {
+    return e->arena_h + ((uint64_t) l * e->c.n_exp + (uint64_t) x) * e->pool.unit_bytes + e->pool.off[i][s];
+}
+static int ct_items(Q4Eng* e, const void* ctx, int i0, int i1) {   // item: group << 16 | matrix << 8 | 64-row chunk
+    const CtJob* j = (const CtJob*) ctx;
+    const Qwen4Cfg* c = &e->c;
+    const size_t M = MV_MAXT, D = c->d, F = c->ff_exp;
+    const int l = e->cj_h[1];
+    for (int it = i0; it < i1; ++it) {
+        const int g = j->item[it] >> 16, m = j->item[it] >> 8 & 255, r0 = (j->item[it] & 255) * CT_ROWS, i = j->pass ? 2 : m;
+        const int rows = (int) (j->pass ? D : F), kb = (int) (j->pass ? F : D) / 8, r1 = r0 + CT_ROWS < rows ? r0 + CT_ROWS : rows;
+        const CtGroup* G = &j->g[g];
+        const float* xt = j->pass ? j->act + g * M * F : j->xt + g * M * D;
+        const float* xs = j->pass ? j->axs + g * M * (F / 8) : j->xs + g * M * (D / 8);
+        float* y = j->pass ? j->down + g * M * D : j->gu + ((size_t) g * 2 + m) * M * F;
+        cpu_seed3_rows((const uint16_t*) ct_unit(e, l, G->x, i, 0), (const uint16_t*) ct_unit(e, l, G->x, i, 1),
+                       e->ebias[((size_t) l * c->n_exp + G->x) * 3 + i], cpu_seed4_table(), xt, xs, G->n, kb, r0, r1, y, rows);
+    }
+    return 0;
+}
+static void ct_layer(Q4Eng* e) {
+    const Qwen4Cfg* c = &e->c;
+    const int n = e->cj_h[0];
+    const size_t M = MV_MAXT, D = c->d, F = c->ff_exp;
+    static CtGroup g[MV_MAXT * 32];
+    static CtJob j;
+    int ng = 0;
+    for (int p = 0; p < n; ++p) {   // the groups, in list order
+        const int x = e->cj_h[3 + 4 * p];
+        int k = 0;
+        while (k < ng && g[k].x != x) ++k;
+        if (k == ng) g[ng++] = (CtGroup) {x, 0, {0}};
+        g[k].j[g[k].n++] = p;
+    }
+    j.g = g; j.pass = 0; j.nitems = 0;
+    ct_bufs(&j, e->cbuf, c);
+    for (int k = 0; k < ng; ++k) {
+        for (int r = 0; r < g[k].n; ++r) memcpy(j.tmp + r * D, e->cx_h + (size_t) e->cj_h[2 + 4 * g[k].j[r]] * D, sizeof(float) * D);
+        cpu_seed_xt(j.tmp, g[k].n, (int) D / 8, j.xt + k * M * D, j.xs + k * M * (D / 8));
+        for (int m = 0; m < 2; ++m) for (int ch = 0; ch * CT_ROWS < (int) F; ++ch) j.item[j.nitems++] = k << 16 | m << 8 | ch;
+    }
+    pool_run(e, j.nitems, ct_items, &j);
+    j.pass = 1; j.nitems = 0;
+    for (int k = 0; k < ng; ++k) {
+        for (int r = 0; r < g[k].n; ++r)
+            for (size_t f = 0; f < F; ++f) {
+                const float gt = j.gu[((size_t) k * 2 * M + r) * F + f], up = j.gu[((size_t) (k * 2 + 1) * M + r) * F + f];
+                j.tmp[r * F + f] = gt / (1.0f + expf(-gt)) * up;
+            }
+        cpu_seed_xt(j.tmp, g[k].n, (int) F / 8, j.act + k * M * F, j.axs + k * M * (F / 8));
+        for (int ch = 0; ch * CT_ROWS < (int) D; ++ch) j.item[j.nitems++] = k << 16 | ch;
+    }
+    pool_run(e, j.nitems, ct_items, &j);
+    for (int k = 0; k < ng; ++k)
+        for (int r = 0; r < g[k].n; ++r) memcpy(e->cy_h + (size_t) g[k].j[r] * D, j.down + (k * M + r) * D, sizeof(float) * D);
+}
+static void* ct_thread(void* arg) {   // answers each layer's signal (kq4_signal) after its CPU work; spins during a forward
+    Q4Eng* e = (Q4Eng*) arg;
+    volatile uint32_t* hs = e->hs_h;
+    uint32_t done = 0;
+    while (!e->cquit) {
+        const uint32_t v = hs[0];
+        if (v == done && !e->cfwd) {
+            pthread_mutex_lock(&e->cmu);
+            while (!e->cfwd && !e->cquit) pthread_cond_wait(&e->ccv, &e->cmu);
+            pthread_mutex_unlock(&e->cmu);
+        }
+        if (v == done) continue;
+        ct_layer(e);
+        done = v;
+        __sync_synchronize();
+        hs[16] = v;
+    }
+    return NULL;
+}
+
+// The PLE rows [pos, pos + T) of each PLE layer: their pages asked of the OS (prefetch), or into emb_h. Host work,
+// before the rows' device work, on the pool; decode rows split by head, so their page reads overlap.
+static int ple_run(Q4Eng* e, int T, int prefetch) {
+    const double t0 = e->prof ? host_ms() : 0;
+    const int bad = pool_run(e, prefetch ? T : T * e->ng[0].heads, ple_items, &prefetch);
+    if (e->prof) e->host_ms[prefetch ? 0 : 1] += host_ms() - t0;
+    return bad ? fail(e, "layer %d: a PLE table shard is missing or does not hold a row", bad - 1) : 0;
 }
 static int ple_rows(Q4Eng* e, int T) { return ple_run(e, T, 0); }
 
@@ -810,7 +964,13 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route_ld(e->s, c, e->lg, c->n_exp + 1, e->ind, e->wt, T);
     if (e->routes && l >= 0) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
-    if (e->tail_skip && e->cache && side && l >= 0) kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm);
+    const int ct = e->cpu_tail && side && l >= 0;   // D4: the tail's misses to the CPU, beside the GPU's work
+    if (ct) {
+        kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->cpu_tail, 0, e->cj_d, l);
+        cudaMemcpyAsync(e->cx_d, e->x, sizeof(float) * (size_t) T * c->d, cudaMemcpyDeviceToDevice, e->s);
+        kq4_signal(e->s, e->dseq, e->hs_d);
+    } else if (e->tail_skip && e->cache && side && l >= 0)
+        kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm, NULL, 0);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache && (l >= 0 || e->head_cached)) {   // bring the routed experts missing from VRAM (the pool's tables then point at them)
         kc_cache_admit(e->s, &e->pool, l >= 0 ? l : c->n_layer, e->ind, P, 0);
@@ -845,6 +1005,10 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
         cudaStreamWaitEvent(e->s, e->ev_sh, 0);
     }
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->lg + c->n_exp, c->n_exp + 1, e->br, T);
+    if (ct) {
+        kq4_wait(e->s, e->dseq, e->hs_d + 16);
+        kq4_cpu_add(e->s, e->br, e->cy_d, e->cj_d, c->d, T);
+    }
 }
 
 // The device work of a chunk of T rows: its input slot to din, the embedding into H, a layer, the head (pinned logits)
@@ -992,9 +1156,11 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         cudaGraphDestroy(gr);
         if (ri != cudaSuccess) { *ge = NULL; return fail(e, "CUDA graph: %s", cudaGetErrorString(ri)); }
     }
-    if (graph ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : enqueue(e, T, want)) return fail(e, "CUDA: forward failed");
-    if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
-        return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
+    if (e->cstart) { pthread_mutex_lock(&e->cmu); e->cfwd = 1; pthread_cond_signal(&e->ccv); pthread_mutex_unlock(&e->cmu); }
+    if (graph ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : enqueue(e, T, want)) { e->cfwd = 0; return fail(e, "CUDA: forward failed"); }
+    const cudaError_t se = cudaStreamSynchronize(e->s);
+    e->cfwd = 0;
+    if (se != cudaSuccess || cudaGetLastError() != cudaSuccess) return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     if (logits) memcpy(logits, e->hlog, sizeof(float) * (size_t) T * e->c.vocab);
     const size_t nr = (size_t) e->c.n_layer * T * e->c.top_k;
     if (e->routes && (cudaMemcpy(e->hroute, e->droute, sizeof(int32_t) * nr, cudaMemcpyDeviceToHost) != cudaSuccess ||

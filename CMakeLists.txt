@@ -58,6 +58,9 @@ file(GLOB NSLM_LIB_SRC ${CMAKE_SOURCE_DIR}/nslm/lib_*.c)
 # CUDA does not call it; keep the MSVC/GCC library build on portable sources.
 if(MSVC OR NOT CMAKE_C_COMPILER_ID MATCHES "^(Clang|AppleClang)$")
   list(FILTER NSLM_LIB_SRC EXCLUDE REGEX "/lib_cpu_seed4\\.c$")
+  list(APPEND NSLM_LIB_SRC ${CMAKE_SOURCE_DIR}/nslm/cpu_seed4_none.c)   # cpu_seed4_on() is 0: no CPU expert path
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/nslm/lib_cpu_seed4.c PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 add_library(nslm STATIC ${NSLM_LIB_SRC})
 target_include_directories(nslm PUBLIC nslm harness)

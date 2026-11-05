@@ -69,7 +69,7 @@ static void tail_skip_check(int rows, int k, int n, int R, int renorm) {
     cudaMalloc((void**) &di, 4 * (size_t) P); cudaMalloc((void**) &ds, 4 * (size_t) n); cudaMalloc((void**) &dw, 4 * (size_t) P);
     cudaMemcpy(di, ind, 4 * (size_t) P, cudaMemcpyHostToDevice); cudaMemcpy(ds, slot, 4 * (size_t) n, cudaMemcpyHostToDevice);
     cudaMemcpy(dw, wt, 4 * (size_t) P, cudaMemcpyHostToDevice);
-    kq4_tail_skip(0, di, dw, ds, rows, k, R, renorm);
+    kq4_tail_skip(0, di, dw, ds, rows, k, R, renorm, NULL, 0);
     cudaMemcpy(got, di, 4 * (size_t) P, cudaMemcpyDeviceToHost); cudaMemcpy(gw, dw, 4 * (size_t) P, cudaMemcpyDeviceToHost);
     int bad = 0, skipped = 0;
     for (int p = 0; p < P; ++p) {

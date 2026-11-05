@@ -22,6 +22,8 @@ static void build_table(void) {
     for (int s = 1; s < 65536; ++s) g_table[s] = lfsr_stream32((uint16_t) s);
 }
 
+int cpu_seed4_on(void) { return 1; }
+
 uint32_t* cpu_seed4_table(void) {
     pthread_once(&g_once, build_table);
     return g_table;
@@ -448,47 +450,71 @@ void cpu_seed_xt(const float* x, int ntok, int kb, float* xt, float* xs) {
         }
 }
 
+// One vector step of cpu_seed3_rows: blocks [b, b + NL) of the row for all tokens. NL < VW (a last step) loads zero lanes
+// (q = 0, x = 0), which add nothing; NL == VW gives fixed-size loads.
+#define ROWS3_STEP(NL)                                                                                      \
+    {                                                                                                       \
+        h16v s16 = 0, q16 = 0;                                                                              \
+        memcpy(&s16, sp + b, sizeof(uint16_t) * (size_t) (NL));                                             \
+        memcpy(&q16, qp + b, sizeof(uint16_t) * (size_t) (NL));                                             \
+        const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);          \
+        u16v t;                                                                                             \
+        for (int i = 0; i < VW; ++i) t[i] = table[s16[i]];                                                  \
+        const u16v lo = s | t << 16;                                                                        \
+        f16v v[24];                                                                                         \
+        for (int c = 0; c < 24; ++c) v[c] = (f16v) VBITS(STATE(lo, t, c + 1));                              \
+        const i16v qi = (i16v) q;                                                                           \
+        const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v); \
+        const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);                                      \
+        const f16v qs = 1.5f * ((q0 + q1) + q2);                                                            \
+        const f16v sc = (f16v) ((u16v) (bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32;                     \
+        for (int k = 0; k < ntok; ++k) {                                                                    \
+            const float* xk = xt + (size_t) k * 8 * kb + b;                                                 \
+            f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, xb = 0.0f;                                                \
+            for (int c = 0; c < 8; ++c) {                                                                   \
+                f16v xc = 0.0f;                                                                             \
+                memcpy(&xc, xk + (size_t) c * kb, sizeof(float) * (size_t) (NL));                           \
+                a0 = fma16(xc, v[3 * c], a0);                                                               \
+                a1 = fma16(xc, v[3 * c + 1], a1);                                                           \
+                a2 = fma16(xc, v[3 * c + 2], a2);                                                           \
+            }                                                                                               \
+            memcpy(&xb, xs + (size_t) k * kb + b, sizeof(float) * (size_t) (NL));                           \
+            const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - qs * xb;                                       \
+            acc[k] = fma16(d, sc, acc[k]);                                                                  \
+        }                                                                                                   \
+    }
+
 void cpu_seed3_rows(const uint16_t* seeds, const uint16_t* nibs, int bias, const uint32_t* table, const float* xt,
                     const float* xs, int ntok, int kb, int r0, int r1, float* y, int ys) {
     for (int r = r0; r < r1; ++r) {
         const uint16_t* sp = seeds + (size_t) r * kb, *qp = nibs + (size_t) r * kb;
         f16v acc[CPU_SEED4_MAX_TOK];
         for (int k = 0; k < ntok; ++k) acc[k] = 0.0f;
-        for (int b = 0; b < kb; b += VW) {
-            h16v s16, q16;
-            memcpy(&s16, sp + b, sizeof s16);
-            memcpy(&q16, qp + b, sizeof q16);
-            const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
-            u16v t;
-            for (int i = 0; i < VW; ++i) t[i] = table[sp[b + i]];
-            const u16v lo = s | t << 16;
-            f16v v[24];
-#define GEN(c)                                                                                   \
-            v[3 * (c)] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 1));                                \
-            v[3 * (c) + 1] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 2));                            \
-            v[3 * (c) + 2] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 3));
-            GEN(0) GEN(1) GEN(2) GEN(3) GEN(4) GEN(5) GEN(6) GEN(7)
-#undef GEN
-            const i16v qi = (i16v) q;
-            const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v);
-            const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);
-            const f16v qs = 1.5f * ((q0 + q1) + q2);
-            const f16v sc = (f16v) ((u16v) (bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32;
-            for (int k = 0; k < ntok; ++k) {
-                const float* xk = xt + (size_t) k * 8 * kb + b;
+        int b = 0;
+        if (ntok == 1)   // one token: the states inside the dot products, no state array (as the tiled matvec)
+            for (; b + VW <= kb; b += VW) {
+                h16v s16, q16;
+                memcpy(&s16, sp + b, sizeof s16);
+                memcpy(&q16, qp + b, sizeof q16);
+                const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
+                u16v t;
+                for (int i = 0; i < VW; ++i) t[i] = table[sp[b + i]];
+                const u16v lo = s | t << 16;
                 f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, xb;
-                for (int c = 0; c < 8; ++c) {
-                    f16v xc;
-                    memcpy(&xc, xk + (size_t) c * kb, sizeof xc);
-                    a0 = fma16(xc, v[3 * c], a0);
-                    a1 = fma16(xc, v[3 * c + 1], a1);
-                    a2 = fma16(xc, v[3 * c + 2], a2);
-                }
-                memcpy(&xb, xs + (size_t) k * kb + b, sizeof xb);
-                const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - qs * xb;
-                acc[k] = fma16(d, sc, acc[k]);
+#define C1(c) { f16v xc; memcpy(&xc, xt + (size_t) (c) * kb + b, sizeof xc); \
+                a0 = fma16(xc, (f16v) VBITS(STATE(lo, t, 3 * (c) + 1)), a0); a1 = fma16(xc, (f16v) VBITS(STATE(lo, t, 3 * (c) + 2)), a1); \
+                a2 = fma16(xc, (f16v) VBITS(STATE(lo, t, 3 * (c) + 3)), a2); }
+                C1(0) C1(1) C1(2) C1(3) C1(4) C1(5) C1(6) C1(7)
+#undef C1
+                const i16v qi = (i16v) q;
+                const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v);
+                const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);
+                memcpy(&xb, xs + b, sizeof xb);
+                const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - 1.5f * ((q0 + q1) + q2) * xb;
+                acc[0] = fma16(d, (f16v) ((u16v) (bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32, acc[0]);
             }
-        }
+        for (; b + VW <= kb; b += VW) ROWS3_STEP(VW)
+        if (b < kb) ROWS3_STEP(kb - b)
         for (int k = 0; k < ntok; ++k) {
             float sum = 0;
             for (int i = 0; i < VW; ++i) sum += acc[k][i];
@@ -496,4 +522,4 @@ void cpu_seed3_rows(const uint16_t* seeds, const uint16_t* nibs, int bias, const
         }
     }
 }
-
+#undef ROWS3_STEP

@@ -189,6 +189,8 @@ int main(void) {
     ok &= check3(37, 10, -19, 1, 1);
     ok &= check3(640, 320, -21, 4, 3);
     ok &= check3_rows(37, 16, -19, 1);
+    ok &= check3_rows(40, 4, -19, 3);      // fewer blocks than a vector step (the tiny model's down)
+    ok &= check3_rows(24, 37, -20, 2);
     ok &= check3_rows(640, 320, -21, 4);   // a qwen4 expert's gate / up, an MTP verify window
     ok &= check3_rows(2560, 80, -22, 2);   // its down (2560 x 640)
     printf("test_cpu_seed4: %s\n", ok ? "PASS" : "FAIL");

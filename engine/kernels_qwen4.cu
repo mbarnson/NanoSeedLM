@@ -405,13 +405,21 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
     kq4_route_ld(s, c, logits, c->n_exp, ind, wt, T);
 }
 
-__global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R, int renorm) {
+__global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R, int renorm,
+                                                      volatile int32_t* list, int layer) {
     __shared__ int skip[256];
     const int p = threadIdx.x;
     int sk = p < P && p % k >= R && slot[ind[p]] < 0;
     for (int q = 0; sk && q < P; ++q) sk = !(q % k < R && ind[q] == ind[p]);   // a higher rank brings it anyway
     skip[p] = sk;
     __syncthreads();
+    if (list) {   // the CPU computes the picked pairs: (row, expert, pair, weight bits) in pair order
+        int at = 0;
+        for (int q = 0; q < p; ++q) at += skip[q];
+        if (sk) { list[2 + 4 * at] = p / k; list[3 + 4 * at] = ind[p]; list[4 + 4 * at] = p; list[5 + 4 * at] = __float_as_int(wt[p]); }
+        if (p == 0) { int n = 0; for (int q = 0; q < P; ++q) n += skip[q]; list[0] = n; list[1] = layer; }
+        __threadfence_system();
+    }
     if (sk) ind[p] = ind[p - p % k];
     if (!renorm) { if (sk) wt[p] = 0.0f; return; }
     if (p >= P / k) return;   // renorm: thread p scales row p's kept weights to the row's sum
@@ -419,8 +427,18 @@ __global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, c
     for (int j = 0; j < k; ++j) { all += wt[p * k + j]; kept += skip[p * k + j] ? 0 : wt[p * k + j]; }
     for (int j = 0; j < k; ++j) wt[p * k + j] = skip[p * k + j] ? 0.0f : wt[p * k + j] * (all / kept);
 }
-void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm) {
-    if (R > 0 && R < k && T * k <= 256) k_q4_tail_skip<<<1, 256, 0, s>>>(ind, wt, slot, T * k, k, R, renorm);
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm, int32_t* list, int layer) {
+    if (R > 0 && R < k && T * k <= 256) k_q4_tail_skip<<<1, 256, 0, s>>>(ind, wt, slot, T * k, k, R, renorm && !list, list, layer);
+}
+__global__ void k_q4_cpu_add(float* out, const float* cy, const int32_t* list, int d) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y, n = list[0];
+    if (i >= d) return;
+    float a = 0;
+    for (int j = 0; j < n; ++j) if (list[2 + 4 * j] == t) a += __int_as_float(list[5 + 4 * j]) * cy[(size_t) j * d + i];
+    out[(size_t) t * d + i] += a;
+}
+void kq4_cpu_add(cudaStream_t s, float* out, const float* cy, const int32_t* list, int d, int T) {
+    k_q4_cpu_add<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(out, cy, list, d);
 }
 
 __global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag) {

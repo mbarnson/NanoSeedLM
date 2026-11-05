@@ -9,6 +9,8 @@
 #pragma once
 #include <stdint.h>
 
+// 1 in a build with this kernel (Clang vectors), 0 in one with nslm/cpu_seed4_none.c (MSVC, GCC)
+int cpu_seed4_on(void);
 // The 65536-entry stream table (lfsr_stream32 of every seed), built once.
 uint32_t* cpu_seed4_table(void);
 
@@ -44,5 +46,5 @@ void cpu_seed4_tiled_matmul_mt(const CpuSeed4Tiled* t, const uint32_t* table, co
 // a vector step is 16 blocks of one row. xt, xs from cpu_seed_xt; y[k * ys + r]
 void cpu_seed3_rows(const uint16_t* seeds, const uint16_t* nibs, int bias, const uint32_t* table, const float* xt,
                     const float* xs, int ntok, int kb, int r0, int r1, float* y, int ys);
-// xt[k][c][b] = x[k][8 b + c] and xs[k][b] = the sum over c, for ntok tokens of kb blocks (kb a multiple of 16)
+// xt[k][c][b] = x[k][8 b + c] and xs[k][b] = the sum over c, for ntok tokens of kb blocks
 void cpu_seed_xt(const float* x, int ntok, int kb, float* xt, float* xs);

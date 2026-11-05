@@ -26,6 +26,7 @@ typedef struct {
     int mtp;                // 1 to Q4E_MAX_DRAFTS: the MTP head (mtp.*) for up to mtp drafts; every forward runs it one row behind
     int tail_skip;          // 1 to top_k - 1, decode with a cache (lossy): a missed expert that every row routes at rank >= tail_skip
                             // is not copied or computed (0: off). CUDA only: Metal holds every expert
+    int cpu_tail;           // the same pairs, but the CPU computes them from the pinned arena (exact; P = 3 seeds; 0: off)
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);

@@ -39,8 +39,8 @@ int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     const char *ref = NULL, *model = NULL, *text = NULL;
     int ntok = 1024, dec = 0;
-    Q4EOpts o = {0, 0, NULL, 0, 0, 0, 0, 0};
-    int tail = 0;   // --tail-skip: the model's run only
+    Q4EOpts o = {0, 0, NULL, 0, 0, 0, 0, 0, 0};
+    int tail = 0, ctail = 0;   // --tail-skip, --cpu-tail: the model's run only
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = argv[++i];
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--vram-experts")) o.vram_experts = 1;
         else if (!strcmp(argv[i], "--stream-experts")) o.stream_experts = 1;
         else if (!strcmp(argv[i], "--tail-skip") && i + 1 < argc) tail = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cpu-tail") && i + 1 < argc) ctail = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N] [--decode N] [--tail-skip R]\n"); return 2; }
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
     if (dec < 0 || dec >= n) dec = 0;
     Q4EOpts om = o;
     om.tail_skip = tail;
+    om.cpu_tail = ctail;
     if (!lr || !lm || run(ref, &o, ids, n, 0, lr, c.vocab) || run(model, &om, ids, n, dec, lm, c.vocab)) return 1;
     float* kl = (float*) malloc(sizeof(float) * (size_t) n);
     double skl = 0, dkl = 0, nll_r = 0, nll_m = 0;
