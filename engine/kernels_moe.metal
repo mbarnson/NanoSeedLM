@@ -297,6 +297,9 @@ kernel void k_gnorm(constant int& d [[buffer(0)]], constant float& eps [[buffer(
     for (int c = (int) tid; c < d; c += 256) y[(ulong) t * d + c] = bfr(bf(w[c]) * (xr[c] * (c < hw ? r0 : r1)));
 }
 
+// The matvecs without fast math: a dense matvec's token 0 is then bit for bit the same for any FC_T (with fast math the
+// compiler contracted the one-token and multi-token sums differently), so an MTP verify matches plain decode.
+#pragma METAL fp math_mode(safe)
 // ---- matvec: one simdgroup per output row, lanes over the 8-weight blocks of the row ------------------------------------
 // The 8 weights of block j of row r (slice s) as f32, for the BF16 / Q8 / Q4 formats (dequantized to BF16).
 static inline void wblock(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, ulong row, int K,
@@ -708,6 +711,8 @@ kernel void k_mv_split(constant MvArgs& a [[buffer(0)]], device const uchar* W [
         *yo = a.add ? bfr(*yo + bfr(s)) : bfr(s);
     }
 }
+
+#pragma METAL fp math_mode(fast)
 
 // ---- GEMM (prefill): Y[n][r] = sum_k W[r][k] X[n][k] for a 32-row x 32-token tile; f32 simdgroup matrices (exact
 // products of the BF16-valued weights and activations, f32 accumulation).  The weight tile is dequantized per format
