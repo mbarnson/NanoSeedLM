@@ -1,7 +1,7 @@
 # Long-prompt prefill of Qwen3.8-Flash-Next by stage, and four kernel changes (2026-11-04)
 
-**Result.** On an RTX PRO 6000, a 15,922-token prompt of the P3 pack went from 1,026 to 1,234 tokens per second
-(+20%). The attention kernel took most of the gain. One block for each KV group and row now reads each key once for
+**Result.** On an RTX PRO 6000, a 15,922-token prompt of the P3 pack went from 1,026 to 1,343 tokens per second
+(+31%). A 29,120-token prompt runs at 1,414. The attention kernel and one pass for the whole context took most of the gain. One block for each KV group and row now reads each key once for
 the group's 12 heads. Before the fixes, the profiler kept only 1,024 events a forward, so it undercounted long prompts
 by 62%. Prefill is now GPU-bound: attention 24%, experts 25%, router and cache 18%, hyper-connections 13%.
 
@@ -32,6 +32,10 @@ Prefill, mean of two runs:
 | `dd10e71` | DeltaNet: q and k normalised once a token | 1,200 | |
 | `89ae78c` | Attention: one softmax step a tile of 16 keys | 1,233 | |
 | `d1cff61` | Attention: 16-byte tile loads | 1,234 | |
+| `6ddfdc7` | One pass holds the context (16,384 rows here, not 8,192) | 1,343 | 682 |
+
+At `6ddfdc7`, a 29,120-token prompt with a 32,768-token context takes one pass: 1,412 tokens per second on the RTX
+PRO 6000 and 745 on the A100.
 
 GPU time by stage at `d1cff61` (RTX PRO 6000, ms for the prompt):
 
@@ -53,5 +57,8 @@ GPU time by stage at `d1cff61` (RTX PRO 6000, ms for the prompt):
   attention stage fell from 4.8 s to 3.1 s.
 - The attention kernel uses 72 registers a thread and fits 2 blocks an SM. It runs at about 8% of the SM's issue rate.
   A further gain needs tensor cores over a tile of rows.
-- On the A100, the router and cache take 35% (9.2 s): about 118 GB of experts at about 13 GB/s.
+- On the A100, the router and cache took 35% (9.2 s) with two passes: about 118 GB of experts at about 13 GB/s. One
+  pass halves it. A pass now costs 40 KB of VRAM for each row: 1.3 GB at a 32,768-token context.
+- At 29,120 tokens on the RTX PRO 6000: experts 28%, attention 28%, hyper-connections 15%, projections 10%, DeltaNet
+  10%, router and cache 6%.
 - Decode is not slower. It keeps the old attention kernel for up to 8 rows.

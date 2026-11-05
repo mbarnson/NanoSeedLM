@@ -97,7 +97,7 @@ Dated measurements. Each page gives the result, its status, the setup and the da
 - [2026-11-04: 3-bit seeds (S3) for the 64 GB class](results/2026-11-04-qwen38-s3-tier.md): S3 alone 0.142, twice
   UD-IQ3_XXS. With the text's own hot third in P3, 0.0765 at 3.35 bits.
 - [2026-11-04: Long-prompt prefill by stage](results/2026-11-04-qwen38-prefill-stages.md): 1,026 to 1,234 tokens per
-  second on a 15,922-token prompt (RTX PRO 6000), mostly from the attention kernel.
+  second on a 15,922-token prompt (RTX PRO 6000), from the attention kernel and one pass for the context.
 - [2026-11-04: A high seed tier that follows the routing](results/2026-11-04-qwen38-tier-sim.md): a simulation. At
   10.4 GB the tier serves 64% to 71% of router choices and loads 3 to 5 experts for each token.
 

@@ -417,3 +417,9 @@ A draft for Matt's go: S3 or P3 for all experts, and P4 for the session's hot se
 A 15,922-token prompt went from 1,026 to 1,234 tokens per
 second on an RTX PRO 6000. `39967ad` fixes `Q4E_PROFILE` for long prompts. Read
 [prefill by stage](results/2026-11-04-qwen38-prefill-stages.md).
+
+## [2026-11-04] result | One layer-major pass for the whole context
+
+`6ddfdc7`: a pass now holds the context (in chunks of 1,024 rows, at most 32,768), not 8,192 rows. A 15,922-token
+prompt copies each layer's experts once, not twice: 1,343 tokens per second on an RTX PRO 6000 (+9%) and 682 on an
+A100 (+15%). A 29,120-token prompt runs at 1,414 and 746. Read [prefill by stage](results/2026-11-04-qwen38-prefill-stages.md).
