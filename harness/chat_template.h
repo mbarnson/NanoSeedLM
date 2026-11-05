@@ -6,12 +6,15 @@
 typedef struct {
     const char* presentation;   // NULL = "markdown"
     const char* call_format;    // NULL = "xml"
-    const char* effort;         // NULL = "high"
+    const char* effort;         // NULL = "high" (K2), "xhigh" (Qwen: xhigh, medium or low)
     int add_generation_prompt;
+    int no_thinking, no_preserve_thinking;   // Qwen: enable_thinking / preserve_thinking false
 } CtOpts;
 
 // The prompt as the template renders it (with BOS), or NULL with the template's error message in err.
 char* ct_render(const Json* messages, const Json* tools, const CtOpts* o, char* err, int errlen);
+// The same for Qwen3.8-Flash-Next's template (harness/chat_qwen.c); no BOS
+char* ct_render_qwen(const Json* messages, const Json* tools, const CtOpts* o, char* err, int errlen);
 
 // OpenAI request messages -> the template's input, in place: developer -> system; text-part lists -> text (not for
 // tool messages); tool_calls[].function.arguments JSON strings -> objects; an assistant message without a thinking

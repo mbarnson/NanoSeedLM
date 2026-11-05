@@ -1,0 +1,460 @@
+[
+ {
+  "name": "user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system low",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  Be brief.\n"
+   },
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "reasoning_effort": "low",
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nBe brief.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system medium",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "reasoning_effort": "medium",
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "no thinking",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "enable_thinking": false,
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "empty system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  "
+   },
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi-turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   },
+   {
+    "role": "assistant",
+    "content": "They hold life.",
+    "reasoning_content": " Think. "
+   },
+   {
+    "role": "user",
+    "content": "And why else?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\nThink.\n</think>\n\nThey hold life.<|im_end|>\n<|im_start|>user\nAnd why else?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi-turn, no preserve",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   },
+   {
+    "role": "assistant",
+    "content": "They hold life.",
+    "reasoning_content": "Think."
+   },
+   {
+    "role": "user",
+    "content": "And why else?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "preserve_thinking": false,
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\nThey hold life.<|im_end|>\n<|im_start|>user\nAnd why else?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "text parts",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Part one. "
+     },
+     {
+      "type": "text",
+      "text": "Two."
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nPart one. Two.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "no generation prompt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   },
+   {
+    "role": "assistant",
+    "content": "Life."
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": false
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLife.<|im_end|>\n"
+ },
+ {
+  "name": "tools",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather.\nMetric by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City, e.g. Paris"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\\nMetric by default.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City, e.g. Paris\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"location\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools and system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather.\nMetric by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City, e.g. Paris"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "reasoning_effort": "medium",
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\\nMetric by default.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City, e.g. Paris\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"location\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nUse tools.<|im_end|>\n<|im_start|>user\nWhy do tide pools matter?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool calls",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 3
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "café ☕ \"quoted\""
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "{\"temp\": 18}"
+   },
+   {
+    "role": "tool",
+    "content": "results"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather.\nMetric by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City, e.g. Paris"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\\nMetric by default.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City, e.g. Paris\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"location\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nParis, FR\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search>\n<parameter=query>\ncafé ☕ \"quoted\"\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 18}\n</tool_response>\n<tool_response>\nresults\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool call after text",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather?"
+   },
+   {
+    "role": "assistant",
+    "content": "Let me check.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "location": "Paris, FR",
+        "days": 3
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny"
+   },
+   {
+    "role": "user",
+    "content": "Thanks!"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather.\nMetric by default.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "City, e.g. Paris"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\\nMetric by default.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City, e.g. Paris\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"location\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nParis, FR\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "bad effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "reasoning_effort": "high",
+   "add_generation_prompt": true
+  },
+  "error": "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."
+ },
+ {
+  "name": "system not first",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why do tide pools matter?"
+   },
+   {
+    "role": "system",
+    "content": "late"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "add_generation_prompt": true
+  },
+  "error": "System message must be at the beginning."
+ }
+]
