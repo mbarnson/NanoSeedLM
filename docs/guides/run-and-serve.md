@@ -109,12 +109,14 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 | Option | Use |
 |---|---|
 | `--vram-experts` | Keep the routed experts in VRAM. The default keeps them in mapped host memory |
-| `--expert-cache-gb N` | Cache N GB of the host experts in VRAM (least recently used). At least one layer's experts |
+| `--expert-cache-gb N` | Cache N GB of the host experts in VRAM (least recently used), at least one layer's. -1: all free VRAM |
 | `--stream-experts` | With a cache: read the missing experts from the model files. Use it when RAM is smaller than the experts |
 | `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
 | `--ctx N` | Context positions (4096) |
 | `--prompt-rows N` | Prompt rows of one forward: 4096, or 16384 on GPUs of 64 GB or more, at most the context. A row takes about 0.25 MB of VRAM |
-| `--raw` | No chat template |
+| `--effort xhigh\|medium\|low` | The template's reasoning effort (xhigh) |
+| `--no-think` | The template's `enable_thinking=False`: no reasoning block |
+| `--raw` | No chat template. Otherwise the prompt is one user turn through the model's chat template |
 
 ## See also
 

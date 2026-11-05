@@ -4,14 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "chat_template.h"
 #include "platform.h"
 #include "qwen4_eng.h"
 #include "tokenizer.h"
 
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
-    const char *model = NULL, *prompt = NULL, *ple = NULL;
-    int max_tokens = 128, ctx = 4096, raw = 0, vram = 0;
+    const char *model = NULL, *prompt = NULL, *ple = NULL, *effort = NULL;
+    int max_tokens = 128, ctx = 4096, raw = 0, vram = 0, no_think = 0;
     double cache_gb = 0;
     int stream = 0, rows = 0;
     for (int i = 1; i < argc; ++i) {
@@ -20,6 +21,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--raw")) raw = 1;
+        else if (!strcmp(argv[i], "--effort") && i + 1 < argc) effort = argv[++i];
+        else if (!strcmp(argv[i], "--no-think")) no_think = 1;
         else if (!strcmp(argv[i], "--vram-experts")) vram = 1;
         else if (!strcmp(argv[i], "--ple-gguf") && i + 1 < argc) ple = argv[++i];
         else if (!strcmp(argv[i], "--expert-cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
@@ -27,16 +30,21 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--prompt-rows") && i + 1 < argc) rows = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw] [--vram-experts]\n"
-                                         "  [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N]\n"); return 2; }
+    if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw | --effort xhigh|medium|low\n"
+                                         "  | --no-think] [--vram-experts] [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N]\n"); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", model);
     Tok* tok = tok_open(path, err, sizeof err);
     if (!tok) { fprintf(stderr, "%s\n", err); return 1; }
-    const size_t tl = strlen(prompt) + 128;
-    char* text = (char*) malloc(tl);
-    if (raw) snprintf(text, tl, "%s", prompt);
-    else snprintf(text, tl, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+    Json* msgs = json_new(J_ARR), *m = json_new(J_OBJ);   // one user turn through the model's chat template
+    json_set(m, "role", json_str("user"));
+    json_set(m, "content", json_str(prompt));
+    json_push(msgs, m);
+    CtOpts co = {NULL, NULL, effort, 1, no_think, 0};
+    char* text = raw ? (char*) malloc(strlen(prompt) + 1) : ct_render_qwen(msgs, NULL, &co, err, sizeof err);
+    json_free(msgs);
+    if (!text) { fprintf(stderr, "chat template: %s\n", err); return 2; }
+    if (raw) strcpy(text, prompt);
     int32_t* ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) ctx);
     const int n = tok_encode(tok, text, 0, ids, ctx);
     if (n < 1 || n + max_tokens > ctx) { fprintf(stderr, "prompt of %d tokens does not fit --ctx %d\n", n, ctx); return 1; }
