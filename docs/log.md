@@ -298,3 +298,15 @@ perplexity went from 2.364 to 2.402, so the rounding cost is not known yet. The 
 now 57% of the time. Read
 [The prompt time of Qwen3.8-Flash-Next on the CUDA engine, by stage](results/2026-11-04-qwen38-prompt-profile.md).
 
+## [2026-11-04] result | Prompt rows of 1,024 and a decode expert prediction for Qwen3.8-Flash-Next on CUDA
+
+- `15b4fab`: forwards without logits take 1,024 rows. On an RTX PRO 6000 with an 8 GB cache, a 3,703-token prompt of P4
+  goes from 151 to 541 tokens per second. The cache misses go from 274k to 64k.
+- `1cd7c57`, removed in `09e04cd`: decode predicted the next layer's experts and copied them on a second stream. The
+  misses went down by 44%, but decode went from 40.6 to 39.0 tokens per second (P3).
+- `6fef57c`: QSA writes its selected blocks in block order. The atomic order made the logits differ from run to run
+  past position 2,048. Now 128 and 1,024 rows give the same text.
+
+Read
+[Prompt rows of 1,024 and a decode expert prediction](results/2026-11-04-qwen38-prompt-rows-and-prediction.md).
+
