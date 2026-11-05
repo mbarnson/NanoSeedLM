@@ -131,7 +131,7 @@ foreach(t nslm-chat nslm-serve nslm-mova-bench nslm-mova-gen nslm-mova-score nsl
 endforeach()
 
 # ---- the compressor's GPU seed search (bit-identical to the C reference: no FMA contraction) -------------------------
-add_library(nslm_search_gpu STATIC nslm/search.cu nslm/search4.cu nslm/searchc.cu nslm/searchp.cu)
+add_library(nslm_search_gpu STATIC nslm/search.cu nslm/search4.cu nslm/searchc.cu nslm/searchp.cu nslm/trellis.cu)
 target_include_directories(nslm_search_gpu PUBLIC nslm)
 target_link_libraries(nslm_search_gpu PUBLIC nslm CUDA::cudart_static)
 target_compile_options(nslm_search_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
@@ -147,7 +147,12 @@ add_test(NAME test_searchc_gpu COMMAND test_searchc_gpu WORKING_DIRECTORY ${CMAK
 add_executable(test_search_gpu tests/test_search_gpu.c)
 target_link_libraries(test_search_gpu nslm_search_gpu)
 add_test(NAME test_search_gpu COMMAND test_search_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-set_tests_properties(test_search_gpu test_search4_gpu test_searchc_gpu test_searchp_gpu PROPERTIES SKIP_RETURN_CODE 77)   # 77: no GPU
+add_executable(test_trellis_gpu tests/test_trellis_gpu.c)   # CUDA only (no Metal kernel yet)
+target_link_libraries(test_trellis_gpu nslm_search_gpu)
+add_test(NAME test_trellis_gpu COMMAND test_trellis_gpu WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_search_gpu test_search4_gpu test_searchc_gpu test_searchp_gpu test_trellis_gpu PROPERTIES SKIP_RETURN_CODE 77)   # 77: no GPU
+add_executable(nslm-trellis-bench harness/nslm-trellis-bench.c)   # the trellis encoder's speed (plan T2)
+target_link_libraries(nslm-trellis-bench nslm_search_gpu nslm_harness)
 
 # the compressor: seed search (nslm-moe, nslm-dense), the packer, the bits probe
 add_executable(nslm-moe nslm/moe.c)
