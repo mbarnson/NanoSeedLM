@@ -35,7 +35,10 @@ enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6
 // k_mv's gather, SEED4 rows of few blocks (K / 8 a multiple of 16, not of 64, at most 256: P3's expert down projection,
 // 80 blocks): two rows a simdgroup, 16 lanes each, so every lane walks the same number of blocks
 #define MV_HALF(fmt, K) ((fmt) == 1 && ((K) / 8) % 16 == 0 && ((K) / 8) % 64 != 0 && (K) / 8 <= 256)
-#define MV_RPT_G(fmt, T, K) ((T) == 0 && MV_HALF(fmt, K) ? 2 * MV_RPT(fmt) : MV_RPT(fmt))   // rows per threadgroup of k_mv
+// k_mv dense, Q4 rows of few blocks (K / 8 a multiple of 8, at most 64, not 64: the hyper-connections' up projection, 40
+// blocks): four rows a simdgroup, 8 lanes each, every lane the same number of blocks (any token count: MTP)
+#define MV_QUARTER(fmt, K) ((fmt) == 3 && ((K) / 8) % 8 == 0 && (K) / 8 < 64)
+#define MV_RPT_G(fmt, T, K) ((T) == 0 && MV_HALF(fmt, K) ? 2 * MV_RPT(fmt) : (T) > 0 && MV_QUARTER(fmt, K) ? 4 * MV_ROWS : MV_RPT(fmt))   // k_mv rows a threadgroup
 #define ATT_SG 4           // simdgroups per attention threadgroup (the 4 query heads of one KV head)
 #define ATT_HD 128
 #ifndef ATT_KU
@@ -554,6 +557,34 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
     threadgroup float xsum[1];
     const bool xsq = FC_FMT == MF_Q4 && FC_T > 1 && FC_T * (a.K / 8) <= 1;
     if (xsq) { xsum[tid] = 0; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    if (FC_T > 0 && MV_QUARTER(FC_FMT, a.K)) {   // dense, Q4 rows of few blocks: four rows a simdgroup, 8 lanes each
+        const int qr = (int) lane / 8, sl = (int) lane % 8, rr = (int) (tg.x * MV_ROWS + sgi) * 4 + qr, nbk = a.K / 8;
+        const ulong row = (ulong) min(rr, a.R - 1);
+        float acc[MV_MAXT];
+        for (int t = 0; t < MV_MAXT; ++t) acc[t] = 0;
+        for (int j = sl; j < nbk; j += 8) {
+            const ulong gi = (row * (ulong) a.K + (ulong) j * 8) / AFF_GS;
+            const float sc = bf(S[gi]), bi = bf(B[gi]);
+            const uint qw = ((device const uint*) W)[(row * (ulong) a.K) / 8 + (ulong) j];
+            const float4 q0 = float4(as_type<float>(0x4B000000u | extract_bits(qw, 0u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 4u, 4u)),
+                                     as_type<float>(0x4B000000u | extract_bits(qw, 8u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 12u, 4u))) - 8388608.0f;
+            const float4 q1 = float4(as_type<float>(0x4B000000u | extract_bits(qw, 16u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 20u, 4u)),
+                                     as_type<float>(0x4B000000u | extract_bits(qw, 24u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 28u, 4u))) - 8388608.0f;
+            for (int t = 0; t < FC_T; ++t) {
+                device const float4* xr = (device const float4*) (x + (ulong) t * a.xs + (ulong) j * 8);
+                acc[t] += q4_term(sc, bi, q0, q1, xr[0], xr[1]);
+            }
+        }
+        for (int t = 0; t < FC_T; ++t) {
+            float v = acc[t];
+            for (ushort o = 4; o > 0; o >>= 1) v += simd_shuffle_xor(v, o);
+            if (sl == 0 && rr < a.R) {
+                device float* yo = y + (ulong) t * a.ys + rr;
+                *yo = a.add ? bfr(*yo + bfr(v)) : bfr(v);
+            }
+        }
+        return;
+    }
     if (FC_T == 0 && MV_HALF(FC_FMT, a.K)) {   // gather, SEED4 rows of few blocks: two rows a simdgroup, 16 lanes each
         static_assert(MV_NR_SEED == 1, "MV_HALF: one row a half-simdgroup");
         const int h = (int) lane / 16, sl = (int) lane % 16, rr = (int) (tg.x * MV_ROWS + sgi) * 2 + h, nbk = a.K / 8;

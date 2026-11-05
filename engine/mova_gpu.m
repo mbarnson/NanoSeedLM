@@ -1355,7 +1355,7 @@ static void encode_head(Eng* e, Cmd* c, int h0, int n) {
     if (n <= MV_MAXT) {
         enc_mv_bind(c, &H, e->xn, g->d, e->logits, g->vocab, n, false, nil, 0, 1);
         [c->enc setBuffer:e->xn offset:(uint64_t) h0 * g->d * 4 atIndex:4];
-        crun(c, (uint64_t) (H.rows + MV_RPT(H.fmt) - 1) / MV_RPT(H.fmt), 1, 1, 32 * MV_ROWS);
+        crun(c, (uint64_t) (H.rows + MV_RPT_G(H.fmt, n, H.cols) - 1) / MV_RPT_G(H.fmt, n, H.cols), 1, 1, 32 * MV_ROWS);
     } else {
         enc_dense(c, &H, e->xn, g->d, e->logits, g->vocab, n, false);
         [c->enc setBuffer:e->xn offset:(uint64_t) h0 * g->d * 4 atIndex:4];

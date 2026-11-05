@@ -327,7 +327,7 @@ static void mv_o(Q4Eng* e, const MW* w, id<MTLBuffer> X, uint64_t xo, int xs, id
         B(e, 6, e->tok, 0);   // unused (no selection)
         B(e, 7, stab_for(e, w), 0);
         bind_codes(e, w, 8);
-        tgs(e, (uint64_t) (w->rows + MV_RPT(w->fmt) - 1) / MV_RPT(w->fmt), 1, 32 * MV_ROWS);
+        tgs(e, (uint64_t) (w->rows + MV_RPT_G(w->fmt, T, w->cols) - 1) / MV_RPT_G(w->fmt, T, w->cols), 1, 32 * MV_ROWS);
         return;
     }
     const MmArgs a = {w->cols, w->rows, T, xs, ys, 1, 0, 0};
