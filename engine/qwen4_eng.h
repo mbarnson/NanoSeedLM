@@ -5,6 +5,7 @@
 
 #define Q4E_MAX_ROWS 1024    // rows of one forward without logits: fewer forwards copy each missing expert fewer times
 #define Q4E_LOGIT_ROWS 128   // rows of one forward with logits (the logits take vocab floats a row)
+#define Q4E_PASS_ROWS 8192   // prompt rows of one layer-major pass: each layer's missing experts cross PCIe once a pass
 
 #include "qwen4_cfg.h"
 

@@ -164,6 +164,29 @@ int main(void) {
         }
         free(lid); free(one); free(three);
     }
+    {   // more than Q4E_MAX_ROWS prompt rows: one layer-major pass of three chunks, or three row-major forwards, bit for bit
+        const int L = 2 * Q4E_MAX_ROWS + 1;
+        const Q4EOpts ol = {L + 8, 0, NULL, 0, 0};
+        int32_t* lid = (int32_t*) malloc(sizeof(int32_t) * (L + 1));
+        for (int i = 0; i <= L; ++i) lid[i] = ids[(i * 7) % n];
+        float* pass = (float*) malloc(sizeof(float) * (size_t) V);
+        float* rows3 = (float*) malloc(sizeof(float) * (size_t) V);
+        e = q4e_open("tests/data/qwen4_tiny", &ol, err, sizeof err);
+        CHECK(e != NULL, "open: %s", err);
+        if (e) {
+            CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, pass) == 0, "a pass of %d rows: %s", L, q4e_error(e));
+            q4e_reset(e);
+            const int a = Q4E_MAX_ROWS - 24, b = Q4E_MAX_ROWS;
+            CHECK(q4e_forward(e, lid, a, NULL) == 0 && q4e_forward(e, lid + a, b, NULL) == 0 && q4e_forward(e, lid + a + b, L - a - b, NULL) == 0 &&
+                  q4e_forward(e, lid + L, 1, rows3) == 0, "three forwards: %s", q4e_error(e));
+            int diff = 0;
+            for (int v = 0; v < V; ++v) diff += pass[v] != rows3[v];
+            printf("a prompt of %d rows in one layer-major pass or three forwards: %d logits differ\n", L, diff);
+            CHECK(diff == 0, "the layer-major pass changes the next token's logits");
+            q4e_close(e);
+        }
+        free(lid); free(pass); free(rows3);
+    }
     free(got);
     free(again);
     free(big);

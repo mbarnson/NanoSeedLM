@@ -17,6 +17,7 @@
 #include "rows.h"
 
 #define MAXT Q4E_MAX_ROWS
+#define XR Q4E_PASS_ROWS
 
 typedef struct {   // a weight: its format and shape, slice 0, and a device table of all its slices
     int fmt, slices, rows, cols;
@@ -56,10 +57,11 @@ struct Q4Eng {
     int32_t* hjobs;        // stream = 1: the admit's jobs, read back (pinned)
     const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
+    float *Hall;   // the hidden streams of a pass, XR rows; H: the current chunk's
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
     float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
-    // A forward's input: hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
+    // A chunk's input: its slot of hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
     // from din, so a CUDA graph of T decode rows serves every position.  emb_h (PLE rows) and hlog (logits) are pinned too.
     int32_t *hin, *din;
     float* hlog;
@@ -366,7 +368,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
 #define F(n) (float*) dmem(e, NULL, sizeof(float) * (n))
 #define I(n) (int32_t*) dmem(e, NULL, sizeof(int32_t) * (n))
-    e->x = F(T * c->d); e->H = F(T * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
+    e->x = F(T * c->d); e->Hall = e->H = F((size_t) XR * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
     e->br = F(T * c->d); e->qp = F(T * c->n_head * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);
     e->vv = F(T * c->n_kv * c->head_dim); e->o = F(T * c->n_head * c->head_dim); e->ixo = F(T * iw); e->sc = F(T * nb);
     e->emb = F(T * c->ple_dim); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d); e->gated = F(T * HD);
@@ -381,8 +383,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 #undef I
     for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     e->nb = (int) nb;
-    e->hin = (int32_t*) pin(e, sizeof(int32_t) * (T + 1));
-    e->emb_h = (float*) pin(e, sizeof(float) * T * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
+    e->hin = (int32_t*) pin(e, sizeof(int32_t) * (XR / MAXT) * (T + 1));   // a slot of T + 1 for each chunk of a pass
+    e->emb_h = (float*) pin(e, sizeof(float) * XR * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
     e->hlog = (float*) pin(e, sizeof(float) * (size_t) Q4E_LOGIT_ROWS * c->vocab);
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL;
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
@@ -471,16 +473,17 @@ static int ple_rows(Q4Eng* e, int T) {
     for (int l = 0; l < c->n_layer; ++l)
         for (int t = 0; c->ple[l] >= 0 && t < T; ++t)
             if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
-                                e->emb_h + ((size_t) c->ple[l] * MAXT + t) * c->ple_dim))
+                                e->emb_h + ((size_t) c->ple[l] * XR + t) * c->ple_dim))
                 return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
     return 0;
 }
 
-static void ple(Q4Eng* e, int l, int T) {
+static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first row in emb_h
     const Qwen4Cfg* c = &e->c;
     Layer* L = &e->L[l];
     const int HD = c->hc * c->d;
-    cudaMemcpyAsync(e->emb, e->emb_h + (size_t) c->ple[l] * MAXT * c->ple_dim, sizeof(float) * (size_t) T * c->ple_dim, cudaMemcpyHostToDevice, e->s);
+    cudaMemcpyAsync(e->emb, e->emb_h + ((size_t) c->ple[l] * XR + row0) * c->ple_dim, sizeof(float) * (size_t) T * c->ple_dim,
+                    cudaMemcpyHostToDevice, e->s);
     mv(e, &L->key, e->emb, e->keys, T);
     kq4_norm1p(e->s, e->keys, HD, c->d, L->nk, c->eps, e->keys, T);
     mv(e, &L->val, e->emb, e->vals, T);
@@ -566,36 +569,73 @@ static void moe(Q4Eng* e, int l, int T) {
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->sgv, e->br, T);
 }
 
-// The device work of T rows, from the pinned input to the pinned logits (want: with the head)
-static int enqueue(Q4Eng* e, int T, int want) {
+// The device work of a chunk of T rows: its input slot to din, the embedding into H, a layer, the head (pinned logits)
+static void rows_in(Q4Eng* e, int slot, int T) {
+    cudaMemcpyAsync(e->din, e->hin + (size_t) slot * (MAXT + 1), sizeof(int32_t) * (size_t) (T + 1), cudaMemcpyHostToDevice, e->s);
+}
+static void embed(Q4Eng* e, int T) {
+    mark(e, ST_EMBED);
+    kc_embed(e->s, e->embed.fmt, e->embed.w, e->c.d, e->din + 1, e->x, T);
+    kq4_tile(e->s, e->c.hc, e->c.d, e->x, e->H, T);
+    mark(e, ST_EMBED);
+}
+static int layer(Q4Eng* e, int l, int T, int row0) {
     const Qwen4Cfg* c = &e->c;
-    mark(e, ST_EMBED);
-    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t) * (size_t) (T + 1), cudaMemcpyHostToDevice, e->s);
-    kc_embed(e->s, e->embed.fmt, e->embed.w, c->d, e->din + 1, e->x, T);
-    kq4_tile(e->s, c->hc, c->d, e->x, e->H, T);
-    mark(e, ST_EMBED);
-    for (int l = 0; l < c->n_layer; ++l) {
-        Layer* L = &e->L[l];
-        if (c->ple[l] >= 0) ple(e, l, T);
-        mark(e, ST_PLE);
-        hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
-        mark(e, ST_HC);
-        if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
-        mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
-        kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
-        hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
-        mark(e, ST_HC);
-        moe(e, l, T);
-        kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
-        mark(e, ST_EXPERT);
-    }
+    Layer* L = &e->L[l];
+    if (c->ple[l] >= 0) ple(e, l, T, row0);
+    mark(e, ST_PLE);
+    hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
+    mark(e, ST_HC);
+    if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
+    mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
+    kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
+    hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
+    mark(e, ST_HC);
+    moe(e, l, T);
+    kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
+    mark(e, ST_EXPERT);
+    return e->err[0] ? -1 : 0;
+}
+static int enqueue(Q4Eng* e, int T, int want) {   // the rows of slot 0 through every layer; want: with the head
+    rows_in(e, 0, T);
+    embed(e, T);
+    for (int l = 0; l < e->c.n_layer; ++l) if (layer(e, l, T, 0)) return -1;
     if (want) {   // prompt rows without logits skip the mixer and the head
         hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
         mv(e, &e->head, e->x, e->logits, T);
-        cudaMemcpyAsync(e->hlog, e->logits, sizeof(float) * (size_t) T * c->vocab, cudaMemcpyDeviceToHost, e->s);
+        cudaMemcpyAsync(e->hlog, e->logits, sizeof(float) * (size_t) T * e->c.vocab, cudaMemcpyDeviceToHost, e->s);
         mark(e, ST_HEAD);
     }
     return e->err[0] ? -1 : 0;
+}
+
+// Prompt rows without logits (n <= XR), layer by layer over chunks of MAXT rows, so the cache brings each layer's
+// experts once a pass, not once a chunk.  Each chunk sees the inputs of the row-major forward: the same logits.
+static int forward_pass(Q4Eng* e, const int32_t* ids, int n) {
+    const int pos0 = e->pos, nc = (n + MAXT - 1) / MAXT, HD = e->c.hc * e->c.d;
+    for (int k = 0; k < nc; ++k) {
+        int32_t* h = e->hin + (size_t) k * (MAXT + 1);
+        h[0] = pos0 + k * MAXT;
+        memcpy(h + 1, ids + (size_t) k * MAXT, sizeof(int32_t) * (size_t) (n - k * MAXT < MAXT ? n - k * MAXT : MAXT));
+    }
+    int rc = ple_rows(e, n);
+    for (int l = -1; !rc && l < e->c.n_layer; ++l)   // l = -1: the embedding
+        for (int k = 0; !rc && k < nc; ++k) {
+            const int T = n - k * MAXT < MAXT ? n - k * MAXT : MAXT;
+            e->H = e->Hall + (size_t) k * MAXT * HD;
+            e->pos = pos0 + k * MAXT;
+            rows_in(e, k, T);
+            if (l < 0) embed(e, T);
+            else rc = layer(e, l, T, k * MAXT);
+        }
+    e->H = e->Hall;
+    e->pos = pos0;
+    if (rc) return -1;
+    if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+        return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
+    prof_collect(e);
+    e->pos += n;
+    return 0;
 }
 
 // Decode rows (up to MV_MAXT) run as a CUDA graph, captured once for each row count, with or without logits
@@ -636,6 +676,10 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
     for (int l = 0; l < e->c.n_layer; ++l)   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
         for (int t = 0; e->c.ple[l] >= 0 && t < n; ++t) qwen4_ple_prefetch(&e->nm, e->table, &e->c, &e->ng[e->c.ple[l]], l, e->ids, e->pos + t);
+    if (!logits && n > MAXT && !e->routes) {   // a long prompt: layer-major passes (Q4E_ROUTES traces chunk by chunk)
+        for (int i = 0; i < n; i += XR) if (forward_pass(e, ids + i, n - i < XR ? n - i : XR)) return -1;
+        return 0;
+    }
     const int step = logits ? Q4E_LOGIT_ROWS : MAXT;
     for (int i = 0; i < n; i += step) {
         const int T = n - i < step ? n - i : step;
