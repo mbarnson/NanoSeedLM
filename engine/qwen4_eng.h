@@ -1,9 +1,10 @@
 // engine/qwen4_eng.h - the qwen4 (qwen4_exp) CUDA engine: an MLX model folder on the GPU, tokens in, logits out.
-// Routed experts in mapped host memory (or VRAM), the rest in VRAM; prompts run in rows of up to Q4E_MAX_ROWS tokens.
+// Routed experts in mapped host memory (or VRAM), the rest in VRAM; prompts run in chunks of Q4EOpts.rows tokens.
 #pragma once
 #include <stdint.h>
 
-#define Q4E_MAX_ROWS 1024    // rows of one forward without logits: fewer forwards copy each missing expert fewer times
+#define Q4E_MAX_ROWS 4096    // default rows of one forward without logits (a chunk): about 0.7 MB of VRAM a row. More rows
+                             // fill the GEMM tiles: each expert gets about rows * top_k / experts of them
 #define Q4E_LOGIT_ROWS 128   // rows of one forward with logits (the logits take vocab floats a row)
 #define Q4E_PASS_ROWS 32768  // most prompt rows of one layer-major pass (the context, rounded up to chunks): each layer's
                              // missing experts cross PCIe once a pass
@@ -18,6 +19,7 @@ typedef struct {
     const char* ple_gguf;   // the PLE n-gram table from this GGUF (Unsloth's engram files), not from the model folder
     double cache_gb;        // > 0: a VRAM cache of host experts (LRU, at least one layer's experts); 0: read host memory
     int stream_experts;     // with cache_gb: misses read from the folder's files, no pinned copy (RAM below the experts)
+    int rows;               // rows of one prompt forward (0: Q4E_MAX_ROWS), from Q4E_LOGIT_ROWS to the context
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);
