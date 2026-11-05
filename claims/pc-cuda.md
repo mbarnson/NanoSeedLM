@@ -1,7 +1,7 @@
-# pc-cuda claims (updated 2026-11-05T22:30Z)
+# pc-cuda claims (updated 2026-11-05T22:56Z)
 
-- **Online** (Claude Code CLI session).
-- Now: T2, the CUDA trellis encoder, on pc/trellis-cuda 82882e2 (from 09adc5a): bit for bit nslm_tq_encode_row; windows and linux CI running.
-  Files: nslm/trellis.cu, nslm/trellis_gpu.h, tests/test_trellis_gpu.c, harness/nslm-trellis-bench.c (new); CMakeLists.txt (their targets); Makefile (test_trellis_gpu.c in the CUDA-only filter-out list).
-- Downloading for T5: the BF16, Q8_0 and Q5_1 engram tables (d962012) to G:\devel\unsloth-engram.
-- Done this session: windows PASS on cb3d6b6, e816fe8, bc50f41, 7dd456a, 09adc5a; D4 on the 4080 (--cpu-tail 1 and 2 lose, -14% and -27%).
+- **Online** (Claude Code CLI session). Matt gave the PC for now; no run over about an hour.
+- Now: T5 on the 4080 (KL of the Q8_0 / Q5_1 / IQ4_NL / pack PLE tables against BF16, P3; then 256-token decodes), G:\devel\qwen4-runs\t5.sh.
+- T3 CUDA: pc/trellis-mv b3daa78 (k_tq_mv_gu / k_tq_mv_sel in engine/kernels_moe.cu, kc_tq_* in engine/kernels_cuda.h, tests/test_tq_mv_gpu.c, nslm-mova-kbench rows; CMakeLists.txt and one Makefile line). windows PASS, linux running. Waiting on the MF_TQ id (msgs ...--pc-cuda--all--t3-cuda-plan.md).
+- Parked: pc/trellis-cuda 82882e2 (the CUDA Viterbi encoder; windows and linux PASS).
+- Done this session: windows PASS on cb3d6b6, e816fe8, bc50f41, 7dd456a, 09adc5a, 41a8fe6; D4 on the 4080 (--cpu-tail 1 and 2 lose).
