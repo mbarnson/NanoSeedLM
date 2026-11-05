@@ -89,7 +89,7 @@ struct Q4Eng {
     Layer M;
     W m_fe, m_fh, m_down, m_up;
     float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog;
-    int mtp, lrow, keep, nkeep;
+    int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and state copies)
     cudaGraphExec_t dgraph[Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
@@ -455,8 +455,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         snprintf(lp, sizeof lp, "language_model.model.layers.%d", l);
         load_layer(e, &e->L[l], lp, c->attn[l], l);
     }
-    if (o && o->mtp && !e->err[0] && !ns_find(&e->nm, "mtp.fc_embedding.weight")) fail(e, "no MTP head (mtp.*) in %s", model_dir);
-    else if (o && o->mtp && !e->err[0]) {   // its experts in VRAM
+    if (o && o->mtp > 0 && !e->err[0] && !ns_find(&e->nm, "mtp.fc_embedding.weight")) fail(e, "no MTP head (mtp.*) in %s", model_dir);
+    else if (o && o->mtp > 0 && !e->err[0]) {   // its experts in VRAM
         e->m_ne = load_v(e, c->d, "mtp.pre_fc_norm_embedding.weight");
         e->m_nh = load_v(e, (int64_t) c->hc * c->d, "mtp.pre_fc_norm_hidden.weight");
         load_w(e, &e->m_fe, 0, "mtp.fc_embedding.weight");
@@ -466,6 +466,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->m_norm = load_v(e, (int64_t) c->hc * c->d, "mtp.hyper_connection_mixer.hc_norm.weight");
         load_layer(e, &e->M, "mtp.layers.0", 1, -1);
         e->mtp = 1;
+        e->ndraft = o->mtp < Q4E_MAX_DRAFTS ? o->mtp : Q4E_MAX_DRAFTS;
     }
     const size_t T = (size_t) e->mt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, kf = (size_t) c->top_k * c->ff_exp;
@@ -499,8 +500,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->Hm = F(T * HD); e->mlog = F((size_t) c->vocab);
         for (int l = 0; l < c->n_layer; ++l) {
             Layer* L = &e->L[l];
-            if (!c->attn[l]) { L->kconv = F(Q4E_MAX_DRAFTS * qwen4_gdn_conv_len(c)); L->kS = F(Q4E_MAX_DRAFTS * qwen4_gdn_state_len(c)); }
-            if (c->ple[l] >= 0) L->khist = F(Q4E_MAX_DRAFTS * qwen4_ple_hist_len(c));
+            if (!c->attn[l]) { L->kconv = F(e->ndraft * qwen4_gdn_conv_len(c)); L->kS = F(e->ndraft * qwen4_gdn_state_len(c)); }
+            if (c->ple[l] >= 0) L->khist = F(e->ndraft * qwen4_ple_hist_len(c));
         }
     }
 #undef F
@@ -977,7 +978,7 @@ static int draft_rows(Q4Eng* e, int k) {
 int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
     const Qwen4Cfg* c = &e->c;
     e->err[0] = 0;
-    if (!e->mtp || e->lrow < 0 || k < 1 || k > Q4E_MAX_DRAFTS || e->pos + k > e->max_pos)
+    if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos)
         return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
     e->hin[0] = e->pos;
     cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t), cudaMemcpyHostToDevice, e->s);
@@ -1006,7 +1007,7 @@ int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
 int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     e->err[0] = 0;
     e->nkeep = 0;
-    if (!e->mtp || n < 1 || n > Q4E_MAX_DRAFTS + 1) return fail(e, "q4e_forward_keep: %s", e->mtp ? "1 to 4 rows" : "no MTP head");
+    if (!e->mtp || n < 1 || n > e->ndraft + 1) return fail(e, "q4e_forward_keep: %s", e->mtp ? "more rows than Q4EOpts.mtp + 1" : "no MTP head");
     e->keep = 1;
     const int rc = q4e_forward(e, ids, n, logits);
     e->keep = 0;

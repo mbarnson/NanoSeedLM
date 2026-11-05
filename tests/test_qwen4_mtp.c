@@ -88,7 +88,7 @@ int main(void) {
     Q4EOpts o;
     memset(&o, 0, sizeof o);
     o.max_pos = 256;
-    o.mtp = 1;
+    o.mtp = Q4E_MAX_DRAFTS;
     CHECK(!q4e_open("tests/data/qwen4_tiny_attn", &o, err, sizeof err) && strstr(err, "no MTP head"), "a folder without mtp.*: %s", err);
     Qwen4Ref* r = qwen4_ref_open(DIR_, err, sizeof err);
     Q4Eng* e = r ? q4e_open(DIR_, &o, err, sizeof err) : NULL;
@@ -120,6 +120,14 @@ int main(void) {
         CHECK(ng && prompt(ng, ids, 45, 8, lg, buf) == 0 && q4e_draft(ng, 3, dn) == 0 && prompt(e, ids, 45, 8, lg, buf) == 0 &&
               q4e_draft(e, 3, d) == 0 && !memcmp(d, dn, sizeof d), "drafts without CUDA graphs differ: %s", ng ? q4e_error(ng) : err);
         q4e_close(ng);
+    }
+    {   // mtp = 1: one draft, one state copy
+        Q4EOpts o1 = o;
+        o1.mtp = 1;
+        Q4Eng* e1 = q4e_open(DIR_, &o1, err, sizeof err);
+        CHECK(e1 && prompt(e1, ids, 16, 0, lg, NULL) == 0 && q4e_draft(e1, 2, d) == -1 && q4e_draft(e1, 1, d) == 0 &&
+              q4e_forward_keep(e1, ids, 3, NULL) == -1, "an engine of one draft: %s", e1 ? q4e_error(e1) : err);
+        q4e_close(e1);
     }
     CHECK(q4e_draft(e, 4, d) == -1 && q4e_forward_keep(e, ids, 5, NULL) == -1 && q4e_accept(e, 1) == -1, "out-of-range calls");
 

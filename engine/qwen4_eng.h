@@ -23,7 +23,7 @@ typedef struct {
     double cache_gb;        // > 0: a VRAM cache of host experts (LRU, at least one layer's); < 0: all free VRAM; 0: none
     int stream_experts;     // with cache_gb: misses read from the folder's files, no pinned copy (RAM below the experts)
     int rows;               // rows of one prompt forward (0: Q4E_MAX_ROWS or Q4E_BIG_ROWS), from Q4E_LOGIT_ROWS to the context
-    int mtp;                // load the MTP head (mtp.*): every forward also runs it, one position behind (q4e_draft)
+    int mtp;                // 1 to Q4E_MAX_DRAFTS: the MTP head (mtp.*) for up to mtp drafts; every forward runs it one row behind
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);
