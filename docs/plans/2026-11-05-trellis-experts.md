@@ -36,6 +36,36 @@ weight of the weight's input column times the squared error.
 - **TB.** The model's mean KL against BF16 lies below Unsloth's curve at the same expert bits.
 - **TC.** On the RTX 4080, decode is faster than P3's at the automatic cache, with the same text from run to run.
 
+## A family of packs
+
+The experts hold 121 G weights, so each bit for each expert weight costs 15.1 GB. The dense weights take about 4 GB
+at 4 bits. The PLE table (32 GB at 4 bits) stays a separate file on the SSD. A token reads only 16 of its rows, and the
+engine already reads Unsloth's engram GGUFs (`--ple-gguf`).
+
+| Pack | Expert bits | Experts | Machine it is for |
+|---|---|---|---|
+| K2 | 2.1 | 32 GB | A 12 GB GPU with 32 GB of RAM (needs T6), or a 48 GB Mac |
+| K2 + K3 by use | about 2.6 | 39 GB | A 16 GB GPU with 48 GB of RAM, or a 64 GB Mac |
+| K3 | 3.1 | 47 GB | A 16 GB GPU with 64 GB of RAM, or a 64 GB Mac |
+| K3 + K4 by use | about 3.6 | 54 GB | A 24 GB GPU with 64 GB of RAM, or a 96 GB Mac |
+| K4 | 4.1 | 62 GB | A 128 GB Mac, or a 24 GB GPU with 96 GB of RAM |
+| K6 | 6.1 | 92 GB | 128 GB of VRAM or more |
+
+- "By use" gives the most used experts the larger K, from a routing trace (as the [hybrid tiers](../results/2026-11-04-qwen38-hybrid-tiers.md)).
+- Each pack gets its own KL row against Unsloth's curve before it is published.
+- The PLE table's own quantization is not measured yet: every KL so far used the BF16 table.
+
+## More steps
+
+| Step | Work | Where | Gate |
+|---|---|---|---|
+| T4 | The family above, each pack with its KL | pc-cuda or mac-metal (search), HF (KL) | TB for each pack |
+| T5 | Packs without the PLE table, a PLE file in several formats, and the KL of each PLE format | cloud, HF (KL) | TP |
+| T6 | Exclusive tiers: an expert held in VRAM has no copy in host RAM, so VRAM and RAM add up | pc-cuda, cloud | T6G |
+
+- **TP.** A PLE format becomes a download if the KL rises by at most 2% against the BF16 table.
+- **T6G.** K2 decodes on a 12 GB GPU with 32 GB of RAM, with the same text from run to run.
+
 ## Hypotheses
 
 | | Hypothesis | Gate |
