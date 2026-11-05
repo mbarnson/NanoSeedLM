@@ -48,12 +48,23 @@ __global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, f
     for (int k = 0; k < K - 1; ++k) conv[(size_t) k * cd + ch] = st[k];
 }
 
+// Block (token, key head), DK threads: the head's q and k L2-normalised in place (q also by dk^-0.5), once a token
+__global__ void k_q4_gdn_qknorm(int cd, int kd, float* cv) {
+    __shared__ float red[32];
+    float* qv = cv + (size_t) blockIdx.x * cd + (size_t) blockIdx.y * blockDim.x, *kv = qv + kd;
+    const float q = qv[threadIdx.x], k = kv[threadIdx.x];
+    const float sq = rsqrtf(block_sum(q * q, red) + 1e-6f) * rsqrtf((float) blockDim.x), sk = rsqrtf(block_sum(k * k, red) + 1e-6f);
+    qv[threadIdx.x] = q * sq;
+    kv[threadIdx.x] = k * sk;
+}
+
 typedef struct {
     int cd, kd, vd, hv, rep, dv;
 } GdnArgs;
 
 // Block = 32 value rows of head hv (grid hv x dv / 32); SPLIT threads hold one row's state column S[hv][.][i] in registers
-// over the T tokens, DK / SPLIT values each.  y gets the raw read S q; k_q4_gdn_norm normalises and gates it.
+// over the T tokens, DK / SPLIT values each.  q and k come normalised (k_q4_gdn_qknorm).  y gets the raw read S q;
+// k_q4_gdn_norm normalises and gates it.
 template <int DK, int SPLIT>
 __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const float* cv, const float* aa, const float* bb,
                                                             const float* A_log, const float* dt_bias, float* S, float* y, int T) {
@@ -70,9 +81,6 @@ __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const flo
         __syncthreads();   // the previous token's reads of q and k are done
         for (int j = threadIdx.x; j < DK; j += blockDim.x) { q[j] = c[kh * DK + j]; k[j] = c[a.kd + kh * DK + j]; }
         __syncthreads();
-        float qq = 0, kk = 0;
-        for (int j = 0; j < DK; ++j) { qq += q[j] * q[j]; kk += k[j] * k[j]; }
-        const float sq = rsqrtf(qq + 1e-6f) * rsqrtf((float) DK), sk = rsqrtf(kk + 1e-6f);   // L2 norms; q also dk^-0.5
         const float ap = aa[(size_t) t * a.hv + hv] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
         const float g = expf(-A * sp), beta = sigm(bb[(size_t) t * a.hv + hv]);
         const float* kp = k + p * DJ;
@@ -81,12 +89,12 @@ __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const flo
 #pragma unroll
         for (int j = 0; j < DJ; ++j) kv += s[j] * kp[j];
         if (SPLIT == 2) kv += __shfl_xor_sync(FULL, kv, 1);
-        const float delta = (c[2 * a.kd + hv * a.dv + i] - g * kv * sk) * beta;
+        const float delta = (c[2 * a.kd + hv * a.dv + i] - g * kv) * beta;
         float yq = 0;
 #pragma unroll
-        for (int j = 0; j < DJ; ++j) { s[j] = g * s[j] + delta * kp[j] * sk; yq += s[j] * qp[j]; }
+        for (int j = 0; j < DJ; ++j) { s[j] = g * s[j] + delta * kp[j]; yq += s[j] * qp[j]; }
         if (SPLIT == 2) yq += __shfl_xor_sync(FULL, yq, 1);
-        if (p == 0) y[(size_t) t * a.vd + (size_t) hv * a.dv + i] = yq * sq;
+        if (p == 0) y[(size_t) t * a.vd + (size_t) hv * a.dv + i] = yq;
     }
 #pragma unroll
     for (int j = 0; j < DJ; ++j) St[(size_t) j * a.dv] = s[j];
@@ -105,6 +113,7 @@ int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, con
     const int kd = c->lin_hk * c->lin_dk, vd = c->lin_hv * c->lin_dv, cd = 2 * kd + vd;
     if (c->lin_conv < 1 || c->lin_conv > 8 || c->lin_dv % 32 || c->lin_dv > 1024) return -1;
     k_q4_gdn_conv<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, conv, cv, T);
+    k_q4_gdn_qknorm<<<dim3((unsigned) T, (unsigned) c->lin_hk), (unsigned) c->lin_dk, 0, s>>>(cd, kd, cv);
     const GdnArgs ga = {cd, kd, vd, c->lin_hv, c->lin_hv / c->lin_hk, c->lin_dv};
     const dim3 grid((unsigned) c->lin_hv, (unsigned) c->lin_dv / 32);
     switch (c->lin_dk) {
