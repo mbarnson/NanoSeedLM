@@ -19,10 +19,9 @@
 #include "qwen4_ops.h"
 #include "rows.h"
 
-#define Q4E_NEV 8192   // Q4E_PROFILE events of one forward
+#define Q4E_NEV 32768   // Q4E_PROFILE events of one forward
 
 #define MAXT Q4E_MAX_ROWS
-#define XR Q4E_PASS_ROWS
 
 typedef struct {   // a weight: its format and shape, slice 0, and a device table of all its slices
     int fmt, slices, rows, cols;
@@ -56,13 +55,14 @@ struct Q4Eng {
     uint32_t *g24, *g32;
     cudaStream_t s;
     int max_pos, pos, host_experts, cache, stream;
+    int xr;                        // rows of a layer-major pass: the context in chunks of MAXT, at most Q4E_PASS_ROWS
     CachePool pool;   // the expert cache (cache = 1)
     uint64_t ulen[3][4];   // bytes of each expert stream in a unit
     uint8_t* stage;        // stream = 1: pinned staging of the units one admit brings
     int32_t* hjobs;        // stream = 1: the admit's jobs, read back (pinned)
     const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
-    float *Hall;   // the hidden streams of a pass, XR rows; H: the current chunk's
+    float *Hall;   // the hidden streams of a pass, xr rows; H: the current chunk's
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *kk, *vv, *o, *ixo, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
     float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb, *zb, *bb, *ab;
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
@@ -79,7 +79,7 @@ struct Q4Eng {
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
     MmTile* tiles;
     int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
-    cudaEvent_t ev[Q4E_NEV];   // a pass of 8,192 rows marks about 2,700 stages
+    cudaEvent_t ev[Q4E_NEV];   // a pass of 32,768 rows marks about 16,000 stages
     int evstage[Q4E_NEV];
     double stage_ms[16];
     void** dev;   // allocations, freed at close
@@ -348,6 +348,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const Qwen4Cfg* c = &e->c;
     if (c->n_exp > BUCKET_MAX_EXPERTS) { snprintf(err, (size_t) errlen, "%d experts, at most %d", c->n_exp, BUCKET_MAX_EXPERTS); ns_close(&e->nm); free(e); return NULL; }
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
+    e->xr = (e->max_pos + MAXT - 1) / MAXT * MAXT;
+    if (e->xr > Q4E_PASS_ROWS) e->xr = Q4E_PASS_ROWS;
     e->host_experts = !(o && o->vram_experts);
     e->cache = e->host_experts && o && o->cache_gb > 0;
     e->stream = e->cache && o->stream_experts;
@@ -377,7 +379,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
 #define F(n) (float*) dmem(e, NULL, sizeof(float) * (n))
 #define I(n) (int32_t*) dmem(e, NULL, sizeof(int32_t) * (n))
-    e->x = F(T * c->d); e->Hall = e->H = F((size_t) XR * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
+    e->x = F(T * c->d); e->Hall = e->H = F((size_t) e->xr * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
     e->br = F(T * c->d); e->qp = F(T * c->n_head * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);
     e->vv = F(T * c->n_kv * c->head_dim); e->o = F(T * c->n_head * c->head_dim); e->ixo = F(T * iw); e->sc = F(T * nb);
     e->emb = F(T * c->ple_dim); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d); e->gated = F(T * HD);
@@ -392,8 +394,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 #undef I
     for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     e->nb = (int) nb;
-    e->hin = (int32_t*) pin(e, sizeof(int32_t) * (XR / MAXT) * (T + 1));   // a slot of T + 1 for each chunk of a pass
-    e->emb_h = (float*) pin(e, sizeof(float) * XR * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
+    e->hin = (int32_t*) pin(e, sizeof(int32_t) * (e->xr / MAXT) * (T + 1));   // a slot of T + 1 for each chunk of a pass
+    e->emb_h = (float*) pin(e, sizeof(float) * e->xr * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
     e->hlog = (float*) pin(e, sizeof(float) * (size_t) Q4E_LOGIT_ROWS * c->vocab);
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL;
     const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -499,7 +501,7 @@ static void* ple_worker(void* arg) {
         for (int t = j->t0; c->ple[l] >= 0 && t < j->t1; ++t) {
             if (j->prefetch) qwen4_ple_prefetch(&e->nm, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t);
             else if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
-                                     e->emb_h + ((size_t) c->ple[l] * XR + t) * c->ple_dim)) { j->bad = l + 1; break; }
+                                     e->emb_h + ((size_t) c->ple[l] * e->xr + t) * c->ple_dim)) { j->bad = l + 1; break; }
         }
     return NULL;
 }
@@ -528,7 +530,7 @@ static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first
     const Qwen4Cfg* c = &e->c;
     Layer* L = &e->L[l];
     const int HD = c->hc * c->d;
-    cudaMemcpyAsync(e->emb, e->emb_h + ((size_t) c->ple[l] * XR + row0) * c->ple_dim, sizeof(float) * (size_t) T * c->ple_dim,
+    cudaMemcpyAsync(e->emb, e->emb_h + ((size_t) c->ple[l] * e->xr + row0) * c->ple_dim, sizeof(float) * (size_t) T * c->ple_dim,
                     cudaMemcpyHostToDevice, e->s);
     mv(e, &L->key, e->emb, e->keys, T);
     kq4_norm1p(e->s, e->keys, HD, c->d, L->nk, c->eps, e->keys, T);
@@ -663,7 +665,7 @@ static int enqueue(Q4Eng* e, int T, int want) {   // the rows of slot 0 through 
     return e->err[0] ? -1 : 0;
 }
 
-// Prompt rows without logits (n <= XR), layer by layer over chunks of MAXT rows, so the cache brings each layer's
+// Prompt rows without logits (n <= xr), layer by layer over chunks of MAXT rows, so the cache brings each layer's
 // experts once a pass, not once a chunk.  Each chunk sees the inputs of the row-major forward: the same logits.
 static int forward_pass(Q4Eng* e, const int32_t* ids, int n) {
     const int pos0 = e->pos, nc = (n + MAXT - 1) / MAXT, HD = e->c.hc * e->c.d;
@@ -730,7 +732,7 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
     ple_run(e, n, 1);   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
     if (!logits && n > MAXT && !e->routes) {   // a long prompt: layer-major passes (Q4E_ROUTES traces chunk by chunk)
-        for (int i = 0; i < n; i += XR) if (forward_pass(e, ids + i, n - i < XR ? n - i : XR)) return -1;
+        for (int i = 0; i < n; i += e->xr) if (forward_pass(e, ids + i, n - i < e->xr ? n - i : e->xr)) return -1;
         return 0;
     }
     const int step = logits ? Q4E_LOGIT_ROWS : MAXT;
