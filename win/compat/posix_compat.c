@@ -141,7 +141,7 @@ int nslm_madvise(void* addr, size_t len, int advice) {
     if (advice == MADV_WILLNEED) {
         WIN32_MEMORY_RANGE_ENTRY r = {addr, len};
         PrefetchVirtualMemory(GetCurrentProcess(), 1, &r, 0);
-    }
+    } else if (advice == MADV_DONTNEED) VirtualUnlock(addr, len);   // on pages not locked: out of the working set
     return 0;
 }
 

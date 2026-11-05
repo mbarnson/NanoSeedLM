@@ -178,6 +178,8 @@ int main(void) {
         const StEntry* e = st_find(&st, "vision.patch_embed.proj.weight");
         CHECK(e && !strcmp(e->dtype, "F32") && e->ndim == 5 && e->shape[4] == 4 && e->end - e->begin == 96, "raw entry");
         if (e) CHECK(st_data(&st, e)[5] == byte_of(0, 0, 5), "raw data");
+        st_dontneed(st.map, st.size);   // the pages leave the process; a read loads them again from the file
+        if (e) CHECK(st_data(&st, e)[5] == byte_of(0, 0, 5) && st_data(&st, e)[95] == byte_of(0, 0, 95), "raw data after st_dontneed");
         CHECK(st_find(&st, "layers.0.mlp.switch_mlp.up_proj.seeds") && st_find(&st, "layers.0.mlp.switch_mlp.up_proj.codes"),
               "seed streams beside a raw tensor");
         st_close_file(&st);

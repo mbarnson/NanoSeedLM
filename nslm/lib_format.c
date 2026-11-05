@@ -131,6 +131,11 @@ void st_willneed(const void* p, uint64_t n) {
     if (n) madvise((void*) a, (size_t) ((uintptr_t) p + n - a), MADV_WILLNEED);
 }
 
+void st_dontneed(const void* p, uint64_t n) {
+    const uintptr_t a = ((uintptr_t) p + 16383) & ~(uintptr_t) 16383, b = ((uintptr_t) p + n) & ~(uintptr_t) 16383;
+    if (b > a) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);   // only pages inside the range: a neighbour's stay
+}
+
 void st_close_file(StFile* s) {
     if (s->map) munmap((void*) s->map, s->size);
     free(s->e);

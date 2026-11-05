@@ -18,6 +18,7 @@ extern "C" {
 #define MADV_WILLNEED 3
 #define MADV_SEQUENTIAL 2
 #define MADV_RANDOM 1
+#define MADV_DONTNEED 4
 
 void* nslm_mmap(void* addr, size_t len, int prot, int flags, int fd, int64_t off);
 int nslm_munmap(void* addr, size_t len);

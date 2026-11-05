@@ -25,3 +25,5 @@ const StEntry* st_find(const StFile* s, const char* name);
 static inline const uint8_t* st_data(const StFile* s, const StEntry* e) { return s->map + s->data + e->begin; }
 // Ask the OS to start reading bytes [p, p + n) of a file mapping (madvise WILLNEED), so a later read does not wait for each page
 void st_willneed(const void* p, uint64_t n);
+// The opposite: the whole pages of [p, p + n) leave the process's memory (madvise DONTNEED); a later read loads them again
+void st_dontneed(const void* p, uint64_t n);

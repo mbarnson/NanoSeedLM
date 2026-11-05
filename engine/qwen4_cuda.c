@@ -365,6 +365,7 @@ static void build_cache(Q4Eng* e, double gb) {
                 if (t->enc == NS_SEED4 || t->enc == NS_SEED4P4) memcpy(&w->eb, t->s[2].p + 4 * (size_t) x, 4);
                 if (t->enc == NS_Q4 || t->enc == NS_Q8) w->gs = t->group == 32 ? 5 : 6;
             }
+            for (int s = 0; s < 4 && host; ++s) st_dontneed(t->s[s].p, t->s[s].len);   // the arena holds them: the file pages go
         }
     p->host = (const uint8_t*) dh;
     p->vram = (uint8_t*) dmem(e, NULL, ub * (uint64_t) p->slots);
