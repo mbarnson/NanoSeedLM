@@ -22,7 +22,9 @@
 #include "qwen4_ops.h"
 #include "rows.h"
 
-#define MAXT Q4E_MAX_ROWS
+// Rows of one forward without logits.  Larger than CUDA's Q4E_MAX_ROWS: unified memory has no copy to amortize, but
+// the grouped expert GEMMs want rows (4,096 rows: about 80 a routed expert, 2.5 GEMM tiles; 1,024: 20, under one).
+#define MAXT 4096
 #define LOGT Q4E_LOGIT_ROWS
 
 typedef struct {   // a tensor of the folder: its streams (nslm/model_st.h), format, shape and affine group
