@@ -943,10 +943,10 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->no_splitk = getenv("Q4E_NO_SPLITK") != NULL;
     e->no_mm64 = getenv("Q4E_NO_MM64") != NULL;
     e->smin = getenv("Q4E_SPLIT_MIN") ? atoi(getenv("Q4E_SPLIT_MIN")) : 1;   // every decode row: k_q4_attend_g (70 -> 16 us at 100 keys)
-    // splits of 32 keys, at most 16: one split walks its tiles serially (a 100-key row: 86 us in one, 39 in four), and
-    // at long context 16 splits of 128 keys beat 32 of 64
+    // splits of 32 keys, at most 32: one split walks its tiles serially (a 100-key row: 86 us in one, 39 in four). With
+    // the QSA top-k fixed, 32 splits beat 16 at 1K to 20K tokens of context (47.7 / 45.3 / 45.2 against 47.0 / 43.5 / 44.4)
     e->skeys = getenv("Q4E_SPLIT_KEYS") ? atoi(getenv("Q4E_SPLIT_KEYS")) : 32;
-    e->smax = getenv("Q4E_SPLIT_MAX") ? atoi(getenv("Q4E_SPLIT_MAX")) : 16;
+    e->smax = getenv("Q4E_SPLIT_MAX") ? atoi(getenv("Q4E_SPLIT_MAX")) : ATG_MAX_SPLIT;
     if (e->smin < 1) e->smin = 1;
     if (e->skeys < 1) e->skeys = 1;
     if (e->smax < 1 || e->smax > ATG_MAX_SPLIT) e->smax = ATG_MAX_SPLIT;
