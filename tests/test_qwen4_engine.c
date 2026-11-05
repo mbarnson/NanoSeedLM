@@ -152,9 +152,10 @@ static int seed_fixture(const char* dir, char* err, int errlen) {
     return rc;
 }
 
-// Plan D4 (Q4EOpts.cpu_tail) on the seed fixture: decode rows with the tail on the CPU against without it (close
-// logits, fewer misses on the GPU), the same logits from run to run, and far from the logits without the tail
-// (tail_skip: the same pairs dropped). Skipped without the CPU seed kernel.
+// Plan D4 (Q4EOpts.cpu_tail) on the seed fixture: decode rows with the tail on the CPU against without it. The first
+// step's logits equal the GPU's (BF16 at the same points; only the sum order differs). Later steps may part by rare
+// BF16 rounding flips that the recurrent state carries, far less than the tail dropped (tail_skip). Fewer misses on
+// the GPU, the same logits from run to run. Skipped without the CPU seed kernel.
 static void cpu_tail_check(void) {
     char dir[512], err[512] = "";
     const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
@@ -199,12 +200,14 @@ static void cpu_tail_check(void) {
                     d[run][st] = fmax(d[run][st], fabs((double) lg[run][i] - lg[0][i]) / m);
                 }
         const int same = !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V * ND);
-        printf("cpu_tail on the seed fixture: logits %.1e / %.1e (first / last step) from the GPU's; the tail dropped %.1e / %.1e; "
-               "the GPU with all experts in VRAM %.1e / %.1e; %llu misses against %llu\n", d[1][0], d[1][1], d[3][0], d[3][1], d[4][0], d[4][1],
-               (unsigned long long) miss[1], (unsigned long long) miss[0]);
-        CHECK(!bad && d[1][1] < 1e-4 && d[3][1] > 1e-2 && same && miss[1] < miss[0],
-              "cpu_tail: logits %.1e from the GPU's (dropped %.1e), runs %s, misses %llu / %llu", d[1][1], d[3][1],
-              same ? "equal" : "differ", (unsigned long long) miss[1], (unsigned long long) miss[0]);
+        int first = -1;   // the first step whose logits differ from the GPU's
+        for (int t = 0; first < 0 && t < ND; ++t) if (memcmp(lg[1] + (size_t) t * V, lg[0] + (size_t) t * V, sizeof(float) * (size_t) V)) first = t;
+        printf("cpu_tail on the seed fixture: logits %.1e / %.1e (first / last step) from the GPU's, equal up to step %d of %d; the tail "
+               "dropped %.1e / %.1e; the GPU with all experts in VRAM %.1e / %.1e; %llu misses against %llu\n", d[1][0], d[1][1],
+               first < 0 ? ND : first, ND, d[3][0], d[3][1], d[4][0], d[4][1], (unsigned long long) miss[1], (unsigned long long) miss[0]);
+        CHECK(!bad && d[1][0] < 1e-5 && d[1][1] < 0.1 * d[3][1] && d[3][0] > 1e-2 && same && miss[1] < miss[0] && d[4][1] == 0,
+              "cpu_tail: logits %.1e / %.1e from the GPU's (dropped %.1e / %.1e), runs %s, misses %llu / %llu", d[1][0], d[1][1], d[3][0],
+              d[3][1], same ? "equal" : "differ", (unsigned long long) miss[1], (unsigned long long) miss[0]);
     }
     for (int i = 0; i < NR; ++i) free(lg[i]);
 }
