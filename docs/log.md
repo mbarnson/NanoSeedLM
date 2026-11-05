@@ -479,7 +479,7 @@ everything in VRAM, llama.cpp leads: 5,130 and 114 against 4,418 and 87.6. Read
 
 ## [2026-11-05] result | Faster decode norms and RoPE, and the expert copy is PCIe-bound
 
-`0233258`: P3 decode with an 8 GB expert cache goes from 54.6 to 56.5 tokens per second on an RTX PRO 6000 (three
-runs each on one node), with the same greedy text. Two norm kernels load a thread's values together, and RoPE reads a
+`0233258`: P3 decode with an 8 GB expert cache goes from 54.6 to 56.5 tokens per second on an RTX PRO 6000. Each
+commit ran three times on one node, and the greedy text is the same. Two norm kernels load a thread's values together, and RoPE reads a
 table of inverse frequencies in place of an f64 `pow`. The decode expert copy is 46% of the GPU time, and 32 to 1,024
 blocks give the same speed. Read [faster decode norms and RoPE](results/2026-11-05-qwen38-decode-small-kernels.md).
