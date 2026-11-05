@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
     }
     if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw | --effort xhigh|medium|low\n"
                                          "  | --no-think] [--vram-experts] [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N] [--drafts 1-3]\n"
-                                         "  [--tail-skip R] [--cpu-tail R]\n"); return 2; }
+                                         "  [--tail-skip R] [--cpu-tail N]\n"); return 2; }
     if (drafts < 0 || drafts > Q4E_MAX_DRAFTS) { fprintf(stderr, "--drafts: 0 to %d\n", Q4E_MAX_DRAFTS); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", model);

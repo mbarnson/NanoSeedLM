@@ -405,21 +405,13 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
     kq4_route_ld(s, c, logits, c->n_exp, ind, wt, T);
 }
 
-__global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R, int renorm,
-                                                      volatile int32_t* list, int layer) {
+__global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int R, int renorm) {
     __shared__ int skip[256];
     const int p = threadIdx.x;
     int sk = p < P && p % k >= R && slot[ind[p]] < 0;
     for (int q = 0; sk && q < P; ++q) sk = !(q % k < R && ind[q] == ind[p]);   // a higher rank brings it anyway
     skip[p] = sk;
     __syncthreads();
-    if (list) {   // the CPU computes the picked pairs: (row, expert, pair, weight bits) in pair order
-        int at = 0;
-        for (int q = 0; q < p; ++q) at += skip[q];
-        if (sk) { list[2 + 4 * at] = p / k; list[3 + 4 * at] = ind[p]; list[4 + 4 * at] = p; list[5 + 4 * at] = __float_as_int(wt[p]); }
-        if (p == 0) { int n = 0; for (int q = 0; q < P; ++q) n += skip[q]; list[0] = n; list[1] = layer; }
-        __threadfence_system();
-    }
     if (sk) ind[p] = ind[p - p % k];
     if (!renorm) { if (sk) wt[p] = 0.0f; return; }
     if (p >= P / k) return;   // renorm: thread p scales row p's kept weights to the row's sum
@@ -427,8 +419,35 @@ __global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, c
     for (int j = 0; j < k; ++j) { all += wt[p * k + j]; kept += skip[p * k + j] ? 0 : wt[p * k + j]; }
     for (int j = 0; j < k; ++j) wt[p * k + j] = skip[p * k + j] ? 0.0f : wt[p * k + j] * (all / kept);
 }
-void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm, int32_t* list, int layer) {
-    if (R > 0 && R < k && T * k <= 256) k_q4_tail_skip<<<1, 256, 0, s>>>(ind, wt, slot, T * k, k, R, renorm && !list, list, layer);
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm) {
+    if (R > 0 && R < k && T * k <= 256) k_q4_tail_skip<<<1, 256, 0, s>>>(ind, wt, slot, T * k, k, R, renorm);
+}
+// One thread: P <= 256 pairs and N <= 16 experts, a few us. Experts by rank from the last, rows in order at each rank
+__global__ void k_q4_cpu_pick(int32_t* ind, float* wt, const int32_t* slot, int P, int k, int N, volatile int32_t* list, int layer) {
+    int ex[16], ne = 0, n = 0;
+    for (int r = k - 1; r > 0 && ne < N; --r)
+        for (int p = r; p < P && ne < N; p += k) {
+            const int x = ind[p];
+            int no = slot[x] >= 0;   // in VRAM
+            for (int q = 0; q < P && !no; q += k) no = ind[q] == x;   // some row's rank 0: the GPU brings it anyway
+            for (int i = 0; i < ne && !no; ++i) no = ex[i] == x;
+            if (!no) ex[ne++] = x;
+        }
+    for (int p = 0; p < P; ++p) {   // the picked experts' pairs in pair order: (row, expert, pair, weight bits)
+        int pick = 0;
+        for (int i = 0; i < ne; ++i) pick |= ind[p] == ex[i];
+        if (!pick) continue;
+        list[2 + 4 * n] = p / k; list[3 + 4 * n] = ind[p]; list[4 + 4 * n] = p; list[5 + 4 * n] = __float_as_int(wt[p]);
+        ++n;
+        ind[p] = ind[p - p % k];
+        wt[p] = 0.0f;
+    }
+    list[0] = n;
+    list[1] = layer;
+    __threadfence_system();
+}
+void kq4_cpu_pick(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int N, int32_t* list, int layer) {
+    k_q4_cpu_pick<<<1, 1, 0, s>>>(ind, wt, slot, T * k, k, N < 16 ? N : 16, list, layer);
 }
 // cy and list are mapped host memory that changes under the kernel's cache: volatile loads read them over PCIe
 __global__ void k_q4_cpu_add(float* out, volatile const float* cy, volatile const int32_t* list, int d) {

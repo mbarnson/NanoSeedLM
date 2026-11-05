@@ -72,7 +72,7 @@ static void tail_skip_check(int rows, int k, int n, int R, int renorm) {
     cudaMalloc((void**) &di, 4 * (size_t) P); cudaMalloc((void**) &ds, 4 * (size_t) n); cudaMalloc((void**) &dw, 4 * (size_t) P);
     cudaMemcpy(di, ind, 4 * (size_t) P, cudaMemcpyHostToDevice); cudaMemcpy(ds, slot, 4 * (size_t) n, cudaMemcpyHostToDevice);
     cudaMemcpy(dw, wt, 4 * (size_t) P, cudaMemcpyHostToDevice);
-    kq4_tail_skip(0, di, dw, ds, rows, k, R, renorm, NULL, 0);
+    kq4_tail_skip(0, di, dw, ds, rows, k, R, renorm);
     cudaMemcpy(got, di, 4 * (size_t) P, cudaMemcpyDeviceToHost); cudaMemcpy(gw, dw, 4 * (size_t) P, cudaMemcpyDeviceToHost);
     int bad = 0, skipped = 0;
     for (int p = 0; p < P; ++p) {
@@ -93,6 +93,49 @@ static void tail_skip_check(int rows, int k, int n, int R, int renorm) {
     CHECK(cudaGetLastError() == cudaSuccess && bad == 0 && skipped > 0, "kq4_tail_skip: %d pairs wrong", bad);
     cudaFree(di); cudaFree(ds); cudaFree(dw);
     free(ind); free(slot); free(got); free(wt); free(gw); free(skip);
+}
+
+// kq4_cpu_pick on rows x k picks over n experts, half of them missing, against the rule on the host (up to N experts)
+static void cpu_pick_check(int rows, int k, int n, int N) {
+    const int P = rows * k;
+    int32_t* ind = (int32_t*) malloc(4 * (size_t) P), *slot = (int32_t*) malloc(4 * (size_t) n), *got = (int32_t*) malloc(4 * (size_t) P);
+    int32_t* list = (int32_t*) malloc(4 * (2 + 4 * (size_t) P));
+    float* wt = (float*) malloc(4 * (size_t) P), *gw = (float*) malloc(4 * (size_t) P);
+    uint32_t x = 4242;
+    for (int i = 0; i < n; ++i) { x = x * 1664525u + 1013904223u; slot[i] = (x >> 9) & 1 ? (int) i : -1; }
+    for (int i = 0; i < P; ++i) { x = x * 1664525u + 1013904223u; ind[i] = (int) ((x >> 8) % (uint32_t) n); wt[i] = 0.5f + (float) (i % k); }
+    int32_t *di, *ds, *dl;
+    float* dw;
+    cudaMalloc((void**) &di, 4 * (size_t) P); cudaMalloc((void**) &ds, 4 * (size_t) n); cudaMalloc((void**) &dw, 4 * (size_t) P);
+    cudaMalloc((void**) &dl, 4 * (2 + 4 * (size_t) P));
+    cudaMemcpy(di, ind, 4 * (size_t) P, cudaMemcpyHostToDevice); cudaMemcpy(ds, slot, 4 * (size_t) n, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw, wt, 4 * (size_t) P, cudaMemcpyHostToDevice);
+    kq4_cpu_pick(0, di, dw, ds, rows, k, N, dl, 7);
+    cudaMemcpy(got, di, 4 * (size_t) P, cudaMemcpyDeviceToHost); cudaMemcpy(gw, dw, 4 * (size_t) P, cudaMemcpyDeviceToHost);
+    cudaMemcpy(list, dl, 4 * (2 + 4 * (size_t) P), cudaMemcpyDeviceToHost);
+    int ex[16], ne = 0, m = 0, bad = 0;
+    for (int r = k - 1; r > 0; --r)
+        for (int p = r; p < P; p += k) {
+            int no = ne == N || slot[ind[p]] >= 0;
+            for (int q = 0; q < P && !no; q += k) no = ind[q] == ind[p];
+            for (int i = 0; i < ne && !no; ++i) no = ex[i] == ind[p];
+            if (!no) ex[ne++] = ind[p];
+        }
+    for (int p = 0; p < P; ++p) {
+        int pick = 0;
+        for (int i = 0; i < ne; ++i) pick |= ind[p] == ex[i];
+        bad += got[p] != (pick ? ind[p - p % k] : ind[p]) || gw[p] != (pick ? 0.0f : wt[p]);
+        if (!pick) continue;
+        float w;
+        memcpy(&w, &list[5 + 4 * m], 4);
+        bad += m >= list[0] || list[2 + 4 * m] != p / k || list[3 + 4 * m] != ind[p] || list[4 + 4 * m] != p || w != wt[p];
+        ++m;
+    }
+    bad += list[0] != m || list[1] != 7;
+    printf("kq4_cpu_pick, %d rows of %d over %d experts, up to %d: %d experts, %d pairs\n", rows, k, n, N, ne, m);
+    CHECK(cudaGetLastError() == cudaSuccess && bad == 0 && ne > 0, "kq4_cpu_pick: %d values wrong", bad);
+    cudaFree(di); cudaFree(ds); cudaFree(dw); cudaFree(dl);
+    free(ind); free(slot); free(got); free(wt); free(gw); free(list);
 }
 
 // The tiny model with random P = 3 seed experts in place of its affine ones (plan D4 computes seed experts on the CPU)
@@ -171,7 +214,7 @@ static void cpu_tail_check(void) {
         memset(&o, 0, sizeof o);
         o.max_pos = 64;
         o.cache_gb = run == 4 ? 0 : 1e-5;   // 1e-5: a cache of one layer's experts, misses in every layer
-        o.cpu_tail = run == 1 || run == 2;   // the tiny model routes 3 of 8 experts
+        o.cpu_tail = run == 1 || run == 2 ? 2 : 0;   // the tiny model routes 3 of 8 experts: ranks 1 and 2 when they miss
         o.tail_skip = run == 3;
         Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
         if (!e && run && strstr(err, "Clang")) { printf("cpu_tail: skipped (%s)\n", err); break; }
@@ -228,6 +271,9 @@ int main(void) {
     bucket_check(512, 128, 10);   // qwen4: 512 experts, top 10, a prompt chunk of 128 rows
     bucket_check(128, 64, 8);     // MoVA
     cpu_tail_check();
+    cpu_pick_check(1, 10, 512, 1);    // one decode row of Qwen3.8-Flash-Next
+    cpu_pick_check(4, 10, 64, 2);     // a verify step of 4 rows: experts shared by rows
+    cpu_pick_check(8, 10, 64, 16);
     for (int rn = 0; rn < 2; ++rn) {
         tail_skip_check(4, 10, 64, 7, rn);   // a verify step of 4 rows, top 10
         tail_skip_check(1, 10, 512, 7, rn);  // one decode row of Qwen3.8-Flash-Next

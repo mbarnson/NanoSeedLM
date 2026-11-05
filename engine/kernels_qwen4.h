@@ -52,9 +52,12 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
 void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
 // Q4EOpts.tail_skip on ind, wt [T][k]: a pair of rank >= R whose expert misses (slot[x] < 0), and that no row routes at a
 // rank below R, takes its row's first expert and weight 0 (so nothing is copied for it). renorm: the row's kept weights
-// scale up to its sum. list (mapped, not NULL: plan D4): the picked pairs for the CPU, [n, layer, (row, expert, pair,
-// weight bits) x n], in pair order. T * k <= 256
-void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm, int32_t* list, int layer);
+// scale up to its sum. T * k <= 256
+void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm);
+// Q4EOpts.cpu_tail (plan D4): up to N (<= 16) missed experts that no row routes at rank 0, lowest rank first, go to the
+// CPU. Their pairs take their row's first expert and weight 0, and list (mapped) gets [n, layer, (row, expert, pair,
+// weight bits) x n] in pair order. T * k <= 256
+void kq4_cpu_pick(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int N, int32_t* list, int layer);
 // out[t] += the weight times cy[j] of each listed pair j of row t, in list order
 void kq4_cpu_add(cudaStream_t s, float* out, const float* cy, const int32_t* list, int d, int T);
 // A GPU-host hand-off that a CUDA graph can replay (plan D4): kq4_signal copies n floats x to hx (mapped host memory),

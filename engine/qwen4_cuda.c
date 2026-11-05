@@ -478,6 +478,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->stream = e->cache && o->stream_experts;
     if (e->cpu_tail && (!e->cache || e->stream || !cpu_seed4_on()))
         fail(e, "--cpu-tail needs --expert-cache-gb, pinned experts and the CPU seed kernel (a Clang build)");
+    if (e->cpu_tail < 0 || e->cpu_tail > 16) fail(e, "--cpu-tail: 0 to 16 experts a layer");
     if (o && o->stream_experts && !e->cache) { snprintf(err, (size_t) errlen, "--stream-experts needs --expert-cache-gb"); ns_close(&e->nm); free(e); return NULL; }
     if (o && o->ple_gguf) {
         if (ple_open(&e->pt, o->ple_gguf, "per_layer_token_embd.weight", err, errlen)) { ns_close(&e->nm); free(e); return NULL; }
@@ -803,7 +804,7 @@ static int pool_run(Q4Eng* e, int n, int (*fn)(Q4Eng*, const void*, int, int), c
 }
 
 // ---- plan D4: the decode tail's missed experts on the CPU --------------------------------------------------------------
-// A layer's list (kq4_tail_skip) groups by expert. Pass 1: each group's gate and up rows; then SwiGLU on the host; pass 2:
+// A layer's list (kq4_cpu_pick) groups by expert. Pass 1: each group's gate and up rows; then SwiGLU on the host; pass 2:
 // the down rows. Items are CT_ROWS-row chunks of one group's matrix, so the pool splits each pass.
 #define CT_ROWS 16   // a P = 3 gate row of 2560 weights is about 2 us: items fine enough to balance 16 threads
 typedef struct { int x, n, j[MV_MAXT]; } CtGroup;   // an expert and the list entries (pairs) that use it
@@ -996,10 +997,10 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     if (e->routes && l >= 0) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
     const int ct = e->cpu_tail && side && l >= 0;   // D4: the tail's misses to the CPU, beside the GPU's work
     if (ct) {
-        kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->cpu_tail, 0, e->cj_d, l);
+        kq4_cpu_pick(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->cpu_tail, e->cj_d, l);
         kq4_signal(e->s, e->dseq, e->hs_d, e->x, e->cx_d, T * c->d, e->prof ? e->dts : NULL);
     } else if (e->tail_skip && e->cache && side && l >= 0)
-        kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm, NULL, 0);
+        kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache && (l >= 0 || e->head_cached)) {   // bring the routed experts missing from VRAM (the pool's tables then point at them)
         kc_cache_admit(e->s, &e->pool, l >= 0 ? l : c->n_layer, e->ind, P, 0);
