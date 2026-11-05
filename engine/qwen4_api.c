@@ -14,18 +14,20 @@ struct Eng {   // Q4Api: hist[0 .. n) committed; the engine holds hist[0 .. at),
     int vocab, max_pos, cap, n, at;
     int drafts;    // Q4E_DRAFTS: eng_generate's MTP drafts a forward (0: none, and no MTP head)
     int lrow;      // last holds the logits of hist[lrow] (-1: none), the engine's last row when lrow == at - 1
+    int lmax;      // the arg max of last's first row (-1: not computed yet)
     int32_t* hist;
     float* last;   // eng_step's logits while at == n; eng_generate's verify rows (drafts + 1 of them)
     char desc[192];
 };
 
-static int fail_reset(Q4Api* e) { q4e_reset(e->q); e->n = e->at = 0; e->lrow = -1; return -1; }
+static int fail_reset(Q4Api* e) { q4e_reset(e->q); e->n = e->at = 0; e->lrow = e->lmax = -1; return -1; }
 // The engine through hist[at .. to)
 static int fwd(Q4Api* e, int to, float* logits) {
     if (to <= e->at) return 0;
     if (q4e_forward(e->q, e->hist + e->at, to - e->at, logits)) return fail_reset(e);
     e->at = to;
     e->lrow = logits == e->last ? to - 1 : -1;
+    if (logits == e->last) e->lmax = -1;
     return 0;
 }
 static int reserve(Q4Api* e, int n) {
@@ -68,7 +70,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->vocab = c->vocab;
     e->max_pos = qo.max_pos;
     e->drafts = drafts;
-    e->lrow = -1;
+    e->lrow = e->lmax = -1;
     if (!(e->last = (float*) malloc(sizeof(float) * (size_t) e->vocab * (size_t) (drafts + 1)))) { eng_close(e); snprintf(err, (size_t) errlen, "out of memory"); return NULL; }
     uint64_t h, m;
     int slots;
@@ -122,7 +124,13 @@ int eng_push(Eng* e, int seq, int32_t tok) {
     return 0;
 }
 int eng_step_batch(Eng* e, const int* seqs, int n, float* logits) { return n == 1 ? eng_step(e, seqs[0], logits) : -1; }
-static int amax(const float* l, int n) { int b = 0; for (int v = 1; v < n; ++v) if (l[v] > l[b]) b = v; return b; }   // ties: the lowest id
+static int amax(const float* l, int n) {   // ties: the lowest id
+    int b = 0;
+    float x = l[0];
+    for (int v = 1; v < n; ++v) if (l[v] > x) { x = l[v]; b = v; }
+    return b;
+}
+static int last_max(Q4Api* e) { if (e->lmax < 0) e->lmax = amax(e->last, e->vocab); return e->lmax; }
 // Greedy decode. Each token is the bonus (the arg max of the logits so far) or an accepted draft. With Q4E_DRAFTS = K,
 // the forward of a pending token that is the bonus of the row before it (an earlier bonus, or eng_push after eng_step)
 // carries up to K drafts of the MTP head; a draft is committed while it equals the arg max of the row before it. Those
@@ -139,11 +147,11 @@ int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t
         if (e->n < 1 || e->at < e->n - 1 || reserve(e, e->n + e->drafts + 1)) { rc = -1; break; }
         if (e->at == e->n) {   // the bonus
             if (e->n >= e->max_pos) { rc = -1; break; }
-            out[j++] = e->hist[e->n++] = amax(e->last, V);
+            out[j++] = e->hist[e->n++] = last_max(e);
             ++bonus;
             continue;
         }
-        int k = e->drafts && e->lrow >= 0 && e->lrow == e->n - 2 && amax(e->last, V) == e->hist[e->n - 1] ? e->drafts : 0;
+        int k = e->drafts && e->lrow >= 0 && e->lrow == e->n - 2 && last_max(e) == e->hist[e->n - 1] ? e->drafts : 0;
         if (k > n_new - j) k = n_new - j;
         if (k > e->max_pos - e->n) k = e->max_pos - e->n;   // the drafts' positions n .. n + k - 1
         if (!k) {   // the pending token alone
@@ -152,10 +160,10 @@ int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t
             continue;
         }
         int32_t row[Q4E_MAX_DRAFTS + 1];
-        int m = 1;
+        int m = 1, am = -1;
         row[0] = e->hist[e->n - 1];
         if (q4e_draft(e->q, k, row + 1) || q4e_forward_keep(e->q, row, k + 1, e->last)) { rc = fail_reset(e); break; }
-        while (m <= k && amax(e->last + (size_t) (m - 1) * V, V) == row[m]) ++m;   // rows 0 .. m - 1 hold
+        while (m <= k && (am = amax(e->last + (size_t) (m - 1) * V, V)) == row[m]) ++m;   // rows 0 .. m - 1 hold
         if (q4e_accept(e->q, m)) { rc = fail_reset(e); break; }
         if (m > 1) memmove(e->last, e->last + (size_t) (m - 1) * V, sizeof(float) * (size_t) V);
         memcpy(e->hist + e->n, row + 1, sizeof(int32_t) * (size_t) (m - 1));
@@ -164,6 +172,7 @@ int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t
         j += m - 1;
         e->at = e->n;
         e->lrow = e->n - 1;
+        e->lmax = m <= k ? am : -1;   // a rejected draft: row m - 1's arg max is known
         ++fw; rows += k + 1; prop += k; acc += m - 1;
     }
     if (st) { st->tokens += j; st->forwards += fw; st->rows += rows; st->cycles += bonus; st->proposals += prop; st->accepted += acc; }

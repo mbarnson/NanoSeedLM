@@ -141,7 +141,8 @@ int main(int argc, char** argv) {
         if (stepped) {
             if (eng_step(e, 0, lg)) { fprintf(stderr, "step failed\n"); return 1; }
             int b = 0;
-            for (int v = 1; v < V; ++v) if (lg[v] > lg[b]) b = v;
+            float x = lg[0];
+            for (int v = 1; v < V; ++v) if (lg[v] > x) { x = lg[v]; b = v; }   // the running max: about half the time of lg[b]
             int pick = b;
             if (temp > 0) {
                 double c = 0;
