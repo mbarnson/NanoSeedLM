@@ -325,3 +325,10 @@ optimum serves 87.6%. So the plan's hot set (S8, V3) does not help, and only a p
 the misses much. Read
 [Expert cache policies for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cache-policies.md).
 
+## [2026-11-04] result | Expert cache misses of MTP verify windows for Qwen3.8-Flash-Next
+
+The routing trace of 1,024 P3 decode tokens went through the LRU simulation in windows of 1 to 4 tokens, as MTP verify
+steps would be. The misses for each token stay at 118 (8 GB) and 94 (10 GB). So MTP drafts do not reduce the PCIe
+traffic, about 290 MB a token for P3 at 8 GB. They can only share the other costs of a step over the accepted tokens.
+Read [Expert cache misses of MTP verify windows](results/2026-11-04-qwen38-verify-windows.md).
+

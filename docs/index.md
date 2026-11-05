@@ -76,6 +76,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   faster on an RTX PRO 6000, with the same text.
 - [2026-11-04: Expert cache policies for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cache-policies.md): LRU
   beats LFU and a hot set. The optimum would halve the misses.
+- [2026-11-04: Expert cache misses of MTP verify windows](results/2026-11-04-qwen38-verify-windows.md): verify windows
+  of 2 to 4 tokens do not reduce the misses for each token.
 
 ## For contributors and agents
 
