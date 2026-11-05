@@ -16,10 +16,11 @@ typedef struct {
 // 128, dv a multiple of 32 up to 1024 and the conv kernel at most 8.
 int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b,
             float* conv, float* S, float* cv, float* y, int T);
-// The same, with the rows of qkv, z, a and b ld floats apart (the columns of one GEMM's output)
+// The same, with the rows of qkv, z, a and b ld floats apart (the columns of one GEMM's output). kconv, kS (not NULL):
+// also the state after each row t < T - 1 at kconv[t], kS[t] (a verify forward's rows)
 int kq4_gdn_ld(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b, int ld,
-               float* conv, float* S, float* cv, float* y, int T);
-#define Q4_ROW_MAX 4096   // the longest group of kq4_norm1p and stream of kq4_hc_add_norm (the engine checks d)
+               float* conv, float* S, float* kconv, float* kS, float* cv, float* y, int T);
+#define Q4_ROW_MAX 4096   // the longest stream of kq4_hc_add_norm (the engine checks d); longer kq4_norm1p groups are slower
 // y[t] = qwen4_norm1p(x[t], len, g, w, eps) for t < T (y may be x)
 void kq4_norm1p(cudaStream_t s, const float* x, int len, int g, const float* w, float eps, float* y, int T);
 // the hyper-connection pointwise steps of qwen4_ops.h for T tokens: lo[T][rank], up and normed [T][hc * d], mixed [T][d],
@@ -51,9 +52,10 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
 void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
 // out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t * sgld]) sh[t]
 void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T);
-// qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated)
+// qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated; khist, not NULL: hist after each row t < T - 1)
 void kq4_ple_gate(cudaStream_t s, const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, int T);
-void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* H, int T);
+void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* khist, float* H,
+                  int T);
 // QSA: the block keys (qwen4_qsa_block) that rows [pos, pos + T) complete, from the raw key cache raw[pos][ix_dim] into
 // blk[j][ix_dim]; done[t] (blocks complete at row t) and nsel[t] (budget / ratio when done[t] exceeds it, else 0)
 void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int pos0, const int32_t* dpos, int T, float* blk);

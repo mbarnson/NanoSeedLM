@@ -46,13 +46,16 @@ __global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, i
         conv[(size_t) (K - 2) * cd + ch] = x;
     }
 }
-// conv keeps the last K - 1 inputs
-__global__ void k_q4_gdn_conv_keep(int cd, int K, const float* qkv, int ld, float* conv, int T) {
+// conv keeps the last K - 1 inputs; kconv (not NULL) also the state after each row t < T - 1, at kconv[t]
+__global__ void k_q4_gdn_conv_keep(int cd, int K, const float* qkv, int ld, float* conv, float* kconv, int T) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= cd) return;
-    float st[7];
-    for (int k = 0, u = T - (K - 1); k < K - 1; ++k, ++u) st[k] = u >= 0 ? qkv[(size_t) u * ld + ch] : conv[(size_t) (K - 1 + u) * cd + ch];
-    for (int k = 0; k < K - 1; ++k) conv[(size_t) k * cd + ch] = st[k];
+    float old[7];
+    for (int k = 0; k < K - 1; ++k) old[k] = conv[(size_t) k * cd + ch];
+    for (int t = kconv ? 0 : T - 1; t < T; ++t) {
+        float* dst = t == T - 1 ? conv : kconv + (size_t) t * (K - 1) * cd;
+        for (int k = 0, u = t + 2 - K; k < K - 1; ++k, ++u) dst[(size_t) k * cd + ch] = u >= 0 ? qkv[(size_t) u * ld + ch] : old[K - 1 + u];
+    }
 }
 
 // Block (token, key head), DK threads: the head's q and k L2-normalised in place (q also by dk^-0.5), once a token
@@ -98,7 +101,7 @@ static __device__ __forceinline__ void gdn_fetch(const GdnArgs& a, const float* 
 }
 template <int DK, int SPLIT>
 __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const float* cv, const float* aa, const float* bb,
-                                                            const float* A_log, const float* dt_bias, float* S, float* y, int T) {
+                                                            const float* A_log, const float* dt_bias, float* S, float* kS, float* y, int T) {
     constexpr int DM = DK / SPLIT / 4, D4 = DK / 4;
     const int hv = blockIdx.x, p = threadIdx.x % SPLIT, r = threadIdx.x / SPLIT, i = blockIdx.y * 32 + r, kh = hv / a.rep;
     __shared__ __align__(16) GdnStage<D4> st[2];
@@ -144,6 +147,12 @@ __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const flo
             float yq = ((y4.x + z4.x) + (y4.y + z4.y)) + ((y4.z + z4.z) + (y4.w + z4.w));
             if (SPLIT == 2) yq += __shfl_xor_sync(FULL, yq, 1);
             if (p == 0) y[(size_t) (t0 + u) * a.vd + (size_t) hv * a.dv + i] = yq;
+            if (kS && t0 + u + 1 < T)   // the state after this row, at kS[t0 + u]
+#pragma unroll
+                for (int m = 0; m < DM; ++m) {
+                    float* c = kS + (size_t) (t0 + u) * a.hv * DK * a.dv + (Sh - S) + (size_t) (m * SPLIT + p) * 4 * a.dv;
+                    c[0] = s[m].x; c[a.dv] = s[m].y; c[2 * a.dv] = s[m].z; c[3 * a.dv] = s[m].w;
+                }
         }
     }
 #pragma unroll
@@ -162,18 +171,18 @@ __global__ void k_q4_gdn_norm(int hv, int dv, float eps, const float* norm_w, co
 }
 
 static int gdn_run(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, int qld, const float* z, int zld, const float* a,
-                   const float* b, int abld, float* conv, float* S, float* cv, float* y, int T) {
+                   const float* b, int abld, float* conv, float* S, float* kconv, float* kS, float* cv, float* y, int T) {
     const int kd = c->lin_hk * c->lin_dk, vd = c->lin_hv * c->lin_dv, cd = 2 * kd + vd;
     if (c->lin_conv < 1 || c->lin_conv > 8 || c->lin_dv % 32 || c->lin_dv > 1024) return -1;
     k_q4_gdn_conv<<<dim3((unsigned) (cd + 255) / 256, (unsigned) T), 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, qld, conv, cv);
-    if (T > 1) k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, qld, conv, T);
+    if (T > 1) k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, qld, conv, kconv, T);
     k_q4_gdn_qknorm<<<dim3((unsigned) T, (unsigned) c->lin_hk), (unsigned) c->lin_dk, 0, s>>>(cd, kd, cv);
     const GdnArgs ga = {cd, kd, vd, c->lin_hv, c->lin_hv / c->lin_hk, c->lin_dv, abld};
     const dim3 grid((unsigned) c->lin_hv, (unsigned) c->lin_dv / 32);
     switch (c->lin_dk) {
-    case 32: k_q4_gdn_step<32, 1><<<grid, 32, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, y, T); break;
-    case 64: k_q4_gdn_step<64, 1><<<grid, 32, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, y, T); break;
-    case 128: k_q4_gdn_step<128, 2><<<grid, 64, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, y, T); break;
+    case 32: k_q4_gdn_step<32, 1><<<grid, 32, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, kS, y, T); break;
+    case 64: k_q4_gdn_step<64, 1><<<grid, 32, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, kS, y, T); break;
+    case 128: k_q4_gdn_step<128, 2><<<grid, 64, 0, s>>>(ga, cv, a, b, w.A_log, w.dt_bias, S, kS, y, T); break;
     default: return -1;
     }
     k_q4_gdn_norm<<<dim3((unsigned) c->lin_hv, (unsigned) T), (unsigned) c->lin_dv, 0, s>>>(c->lin_hv, c->lin_dv, c->eps, w.norm_w, z, zld, y);
@@ -182,11 +191,11 @@ static int gdn_run(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* q
 int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b,
             float* conv, float* S, float* cv, float* y, int T) {
     const int vd = c->lin_hv * c->lin_dv;
-    return gdn_run(s, c, w, qkv, 2 * c->lin_hk * c->lin_dk + vd, z, vd, a, b, c->lin_hv, conv, S, cv, y, T);
+    return gdn_run(s, c, w, qkv, 2 * c->lin_hk * c->lin_dk + vd, z, vd, a, b, c->lin_hv, conv, S, NULL, NULL, cv, y, T);
 }
 int kq4_gdn_ld(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b, int ld,
-               float* conv, float* S, float* cv, float* y, int T) {
-    return gdn_run(s, c, w, qkv, ld, z, ld, a, b, ld, conv, S, cv, y, T);
+               float* conv, float* S, float* kconv, float* kS, float* cv, float* y, int T) {
+    return gdn_run(s, c, w, qkv, ld, z, ld, a, b, ld, conv, S, kconv, kS, cv, y, T);
 }
 
 // ---- RMSNorm (1 + w) and the hyper-connection pointwise steps --------------------------------------------------------
@@ -211,8 +220,19 @@ __global__ void __launch_bounds__(256) k_q4_norm1p(const float* x, int len, int 
     for (int j = 0; j < NR; ++j)
         if (threadIdx.x + j * 256 < g) y[(size_t) t * len + a + threadIdx.x + j * 256] = v[j] * r * (1.0f + wv[j]);
 }
+// Groups longer than Q4_ROW_MAX (the MTP head's norm of all streams): the values read twice
+__global__ void __launch_bounds__(256) k_q4_norm1p_long(const float* x, int len, int g, const float* w, float eps, float* y) {
+    __shared__ float red[32];
+    const int groups = len / g, t = blockIdx.x / groups, a = (blockIdx.x % groups) * g;
+    const float* xi = x + (size_t) t * len + a;
+    float ss = 0;
+    for (int k = threadIdx.x; k < g; k += 256) ss += xi[k] * xi[k];
+    const float r = rsqrtf(block_sum(ss, red) / g + eps);
+    for (int k = threadIdx.x; k < g; k += 256) y[(size_t) t * len + a + k] = xi[k] * r * (1.0f + w[a + k]);
+}
 void kq4_norm1p(cudaStream_t s, const float* x, int len, int g, const float* w, float eps, float* y, int T) {
-    k_q4_norm1p<<<(unsigned) (T * (len / g)), 256, 0, s>>>(x, len, g, w, eps, y);
+    if (g > Q4_ROW_MAX) k_q4_norm1p_long<<<(unsigned) (T * (len / g)), 256, 0, s>>>(x, len, g, w, eps, y);
+    else k_q4_norm1p<<<(unsigned) (T * (len / g)), 256, 0, s>>>(x, len, g, w, eps, y);
 }
 
 // Row t of lo [rows][ld]: the act on its first rank values (in place), the gate of the rest into inj [rows][ld - rank]
@@ -413,7 +433,7 @@ void kq4_ple_gate(cudaStream_t s, const Qwen4Cfg* c, const float* keys, const fl
 }
 
 // One thread per channel, tokens in order; the last (K - 1) * dil inputs in registers (at most 32)
-__global__ void k_q4_ple_conv(int HD, int K, int dil, const float* w, const float* cin, const float* gated, float* hist, float* H, int T) {
+__global__ void k_q4_ple_conv(int HD, int K, int dil, const float* w, const float* cin, const float* gated, float* hist, float* khist, float* H, int T) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= HD) return;
     const int L = (K - 1) * dil;
@@ -426,12 +446,14 @@ __global__ void k_q4_ple_conv(int HD, int K, int dil, const float* w, const floa
         H[(size_t) t * HD + ch] += gated[(size_t) t * HD + ch] + acc * sigm(acc);
         for (int j = 0; j + 1 < L; ++j) st[j] = st[j + 1];
         if (L > 0) st[L - 1] = x;
+        for (int j = 0; khist && t + 1 < T && j < L; ++j) khist[((size_t) t * L + j) * HD + ch] = st[j];
     }
     for (int j = 0; j < L; ++j) hist[(size_t) j * HD + ch] = st[j];
 }
-void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* H, int T) {
+void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* khist, float* H,
+                  int T) {
     const int HD = c->hc * c->d;
-    k_q4_ple_conv<<<(unsigned) (HD + 255) / 256, 256, 0, s>>>(HD, c->ple_conv, c->ngram, w, cin, gated, hist, H, T);
+    k_q4_ple_conv<<<(unsigned) (HD + 255) / 256, 256, 0, s>>>(HD, c->ple_conv, c->ngram, w, cin, gated, hist, khist, H, T);
 }
 
 // ---- QSA ---------------------------------------------------------------------------------------------------------------
@@ -571,8 +593,6 @@ typedef struct {
     float scale;
 } AttArgs;
 
-// Block (head, row), 8 warps: each warp takes every 8th visible key with an online softmax (lanes hold hd / 32 dims of q
-// and of the output), then the warps merge; the output is gated by sigmoid of the query's gate half
 // Prompt rows: block (KV group, row), a warp per query head of the group. The row's keys come in tiles of AT_KT; each
 // key's K and V is read once into shared memory for all heads of the group. Each head takes one online-softmax step a tile
 #define AT_KT 16

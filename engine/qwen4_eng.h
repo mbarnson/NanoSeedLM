@@ -23,6 +23,7 @@ typedef struct {
     double cache_gb;        // > 0: a VRAM cache of host experts (LRU, at least one layer's); < 0: all free VRAM; 0: none
     int stream_experts;     // with cache_gb: misses read from the folder's files, no pinned copy (RAM below the experts)
     int rows;               // rows of one prompt forward (0: Q4E_MAX_ROWS or Q4E_BIG_ROWS), from Q4E_LOGIT_ROWS to the context
+    int mtp;                // load the MTP head (mtp.*): every forward also runs it, one position behind (q4e_draft)
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);
@@ -31,6 +32,14 @@ const Qwen4Cfg* q4e_cfg(const Q4Eng* e);
 // Appends ids[0..n-1] to the context; the logits of each row go to logits[n][vocab] (NULL: none).  0, or -1 (q4e_error).
 int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits);
 void q4e_reset(Q4Eng* e);   // an empty context
+// MTP (Q4EOpts.mtp): k <= Q4E_MAX_DRAFTS greedy drafts. Draft 1: the head on the bonus (the last row's arg max, ties to the
+// lowest id) and that row's streams; draft i + 1 on draft i and the head's own streams. The caller commits the bonus.
+#define Q4E_MAX_DRAFTS 3
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts);
+// q4e_forward of n <= Q4E_MAX_DRAFTS + 1 rows that keeps the recurrent state (DeltaNet, conv, PLE) after each row;
+// q4e_accept(e, m) then keeps rows [0, m) of it: the position and the state of row m - 1. 0, or -1.
+int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits);
+int q4e_accept(Q4Eng* e, int m);
 void q4e_cache_stats(Q4Eng* e, uint64_t* hits, uint64_t* misses, int* slots);   // zeros without a cache
 int q4e_pos(const Q4Eng* e);
 const char* q4e_error(const Q4Eng* e);

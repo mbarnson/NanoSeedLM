@@ -36,7 +36,7 @@ TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench n
                              nslm-qwen4-gen)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c tests/test_searchc_gpu.c tests/test_searchp_gpu.c \
                             tests/test_mova_kernels.c tests/test_qwen4_kernels.c \
-                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_engine_dispatch.c tests/test_qwen4_metal.c,$(wildcard tests/test_*.c))
+                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_qwen4_mtp.c tests/test_engine_dispatch.c tests/test_qwen4_metal.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
              $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels $(BIN)/test_qwen4_metal
 

@@ -39,6 +39,7 @@ typedef struct {
     W gate, sh_g, sh_u, sh_d, eg, eu, ed;   // MoE: gate = the router rows, then the shared expert gate row
     W key, val;                                 // PLE
     float *nk, *nq, *nc, *pw, *hist;
+    float *kconv, *kS, *khist;   // q4e_forward_keep: the state after each row but the last (MTP)
 } Layer;
 
 struct Q4Eng {
@@ -82,7 +83,13 @@ struct Q4Eng {
     int nb, nple, cap, no_graph;   // QSA block slots; PLE layers; capturing a graph; NSLM_NO_GRAPH
     int ple_threads;               // Q4E_PLE_THREADS: threads for the PLE rows of 64 rows or more
     double host_ms[2];             // Q4E_PROFILE: host time of the PLE prefetch and the PLE rows
-    cudaGraphExec_t graph[2][MV_MAXT + 1];   // [with logits][rows]
+    cudaGraphExec_t graph[4][MV_MAXT + 1];   // [with logits + 2 keep][rows]
+    // The MTP head (Q4EOpts.mtp): it runs one row behind each forward. Hm: its streams; Hall[-1]: the last main row's
+    // streams (its next input); lrow: the last row's logits in logits (-1: none); keep: a q4e_forward_keep of nkeep rows
+    Layer M;
+    W m_fe, m_fh, m_down, m_up;
+    float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog;
+    int mtp, lrow, keep, nkeep;
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
@@ -447,12 +454,24 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         snprintf(lp, sizeof lp, "language_model.model.layers.%d", l);
         load_layer(e, &e->L[l], lp, c->attn[l], l);
     }
+    if (o && o->mtp && !e->err[0] && !ns_find(&e->nm, "mtp.fc_embedding.weight")) fail(e, "no MTP head (mtp.*) in %s", model_dir);
+    else if (o && o->mtp && !e->err[0]) {   // its experts in VRAM
+        e->m_ne = load_v(e, c->d, "mtp.pre_fc_norm_embedding.weight");
+        e->m_nh = load_v(e, (int64_t) c->hc * c->d, "mtp.pre_fc_norm_hidden.weight");
+        load_w(e, &e->m_fe, 0, "mtp.fc_embedding.weight");
+        load_w(e, &e->m_fh, 0, "mtp.fc_hidden.weight");
+        load_w(e, &e->m_down, 0, "mtp.hyper_connection_mixer.input_mix_weight_down.weight");
+        load_w(e, &e->m_up, 0, "mtp.hyper_connection_mixer.input_mix_weight_up.weight");
+        e->m_norm = load_v(e, (int64_t) c->hc * c->d, "mtp.hyper_connection_mixer.hc_norm.weight");
+        load_layer(e, &e->M, "mtp.layers.0", 1, -1);
+        e->mtp = 1;
+    }
     const size_t T = (size_t) e->mt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, kf = (size_t) c->top_k * c->ff_exp;
     const size_t nb = (size_t) e->max_pos / c->ix_ratio + 1;
 #define F(n) (float*) dmem(e, NULL, sizeof(float) * (n))
 #define I(n) (int32_t*) dmem(e, NULL, sizeof(int32_t) * (n))
-    e->x = F(T * c->d); e->Hall = e->H = F((size_t) e->xr * HD); e->inj = F(T * c->hc); e->br = F(T * c->d);
+    e->x = F(T * c->d); e->Hall = e->H = F((size_t) (e->xr + 1) * HD) + HD; e->inj = F(T * c->hc); e->br = F(T * c->d);
     e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab);
     // Each stage's buffers live only inside the stage (x, br and inj carry between stages), so the stages share one region
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
@@ -471,6 +490,18 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->din = I(T + 1); e->ind = I(T * c->top_k); e->sel = I(T * (c->ix_budget / c->ix_ratio)); e->done = I(T); e->nsel = I(T); e->zero = I(T);
     e->perm = I(T * c->top_k); e->ntiles = I(2 * (size_t) c->n_exp + 3);
     e->tiles = (MmTile*) dmem(e, NULL, sizeof(MmTile) * (T * c->top_k / MMT_BN + (size_t) c->n_exp));
+    if (e->mtp) {
+        float* one = (float*) malloc(sizeof(float) * T * c->hc);
+        for (size_t i = 0; i < T * c->hc; ++i) one[i] = 1.0f;
+        e->ones = (float*) dmem(e, one, sizeof(float) * T * c->hc);
+        free(one);
+        e->Hm = F(T * HD); e->mlog = F((size_t) c->vocab);
+        for (int l = 0; l < c->n_layer; ++l) {
+            Layer* L = &e->L[l];
+            if (!c->attn[l]) { L->kconv = F(Q4E_MAX_DRAFTS * qwen4_gdn_conv_len(c)); L->kS = F(Q4E_MAX_DRAFTS * qwen4_gdn_state_len(c)); }
+            if (c->ple[l] >= 0) L->khist = F(Q4E_MAX_DRAFTS * qwen4_ple_hist_len(c));
+        }
+    }
 #undef F
 #undef I
     if (e->cache && !e->err[0]) {   // after the buffers: cache_gb < 0 takes the free VRAM less NSLM_VRAM_RESERVE_MB (512)
@@ -512,6 +543,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     for (int i = 0; e->prof && i < Q4E_NEV; ++i) cudaEventCreate(&e->ev[i]);
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
+    e->lrow = -1;
     if (!e->err[0] && cudaDeviceSynchronize() != cudaSuccess) fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     if (e->err[0]) { snprintf(err, (size_t) errlen, "%s", e->err); q4e_close(e); return NULL; }
     return e;
@@ -534,7 +566,7 @@ void q4e_close(Q4Eng* e) {
     }
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
-    for (int w = 0; w < 2; ++w) for (int t = 0; t <= MV_MAXT; ++t) if (e->graph[w][t]) cudaGraphExecDestroy(e->graph[w][t]);
+    for (int w = 0; w < 4; ++w) for (int t = 0; t <= MV_MAXT; ++t) if (e->graph[w][t]) cudaGraphExecDestroy(e->graph[w][t]);
     free(e->dev); free(e->host); free(e->ids);
     if (e->routes) fclose(e->routes);
     if (e->s) cudaStreamDestroy(e->s);
@@ -562,6 +594,8 @@ void q4e_reset(Q4Eng* e) {
     }
     cudaStreamSynchronize(e->s);
     e->pos = 0;
+    e->lrow = -1;
+    e->nkeep = 0;
 }
 
 // ---- the stage profiler (Q4E_PROFILE=1): an event after each stage, the time to the previous event added to it -------
@@ -646,29 +680,29 @@ static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first
     kq4_norm1p(e->s, e->H, HD, c->d, L->nq, c->eps, e->qs, T);
     kq4_ple_gate(e->s, c, e->keys, e->qs, e->vals, e->gated, T);
     kq4_norm1p(e->s, e->gated, HD, c->d, L->nc, c->eps, e->keys, T);   // keys now holds the conv input
-    kq4_ple_conv(e->s, c, L->pw, e->keys, e->gated, L->hist, e->H, T);
+    kq4_ple_conv(e->s, c, L->pw, e->keys, e->gated, L->hist, e->keep ? L->khist : NULL, e->H, T);
 }
 
-static int attention(Q4Eng* e, Layer* L, int T) {
+static int attention(Q4Eng* e, Layer* L, int p0, int T) {   // row t at *din + p0 + t
     const Qwen4Cfg* c = &e->c;
     const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio;
     const int ld = att_ld(c);   // a row of qp: q, k, v, the indexer's q heads and key
     float* kk = e->qp + (size_t) c->n_head * 2 * hd, *vv = kk + kvw, *ixo = vv + kvw;
     mv(e, &L->qkvi, e->x, e->qp, T);
     mark(e, ST_PROJ);
-    kq4_head_norm_rope_inv(e->s, c, e->qp, ld, c->n_head, 2 * hd, hd, L->qn, e->inv, 0, e->din, T);
-    kq4_head_norm_rope_inv(e->s, c, kk, ld, c->n_kv, hd, hd, L->kn, e->inv, 0, e->din, T);
-    kq4_store(e->s, L->K, kvw, kk, ld, 0, e->din, T);
-    kq4_store(e->s, L->V, kvw, vv, ld, 0, e->din, T);
-    kq4_store(e->s, L->raw, D, ixo + (size_t) c->ix_heads * D, ld, 0, e->din, T);
-    kq4_head_norm_rope_inv(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, e->inv, 0, e->din, T);
+    kq4_head_norm_rope_inv(e->s, c, e->qp, ld, c->n_head, 2 * hd, hd, L->qn, e->inv, p0, e->din, T);
+    kq4_head_norm_rope_inv(e->s, c, kk, ld, c->n_kv, hd, hd, L->kn, e->inv, p0, e->din, T);
+    kq4_store(e->s, L->K, kvw, kk, ld, p0, e->din, T);
+    kq4_store(e->s, L->V, kvw, vv, ld, p0, e->din, T);
+    kq4_store(e->s, L->raw, D, ixo + (size_t) c->ix_heads * D, ld, p0, e->din, T);
+    kq4_head_norm_rope_inv(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, e->inv, p0, e->din, T);
     mark(e, ST_ROPE);
-    kq4_qsa_blocks_inv(e->s, c, L->raw, L->ikn, e->inv, 0, e->din, T, L->blk);
-    kq4_qsa_rows(e->s, c, 0, e->din, e->done, e->nsel, T);
+    kq4_qsa_blocks_inv(e->s, c, L->raw, L->ikn, e->inv, p0, e->din, T, L->blk);
+    kq4_qsa_rows(e->s, c, p0, e->din, e->done, e->nsel, T);
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
-    kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
+    kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + p0 + T) / R, e->sc, e->sel, T);
     mark(e, ST_QSA);
-    if (kq4_attend_part(e->s, c, e->qp, ld, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, e->part, T))
+    if (kq4_attend_part(e->s, c, e->qp, ld, L->K, L->V, p0, e->din, e->sel, e->nsel, e->o, e->part, T))
         return fail(e, "attention of head_dim %d, %d heads a KV head: not supported", hd, c->n_head / c->n_kv);
     mark(e, ST_ATTN);
     mv(e, &L->o, e->o, e->br, T);
@@ -682,16 +716,16 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
     const float* z = e->qkvb + cd, *b = z + (size_t) c->lin_hv * c->lin_dv, *a = b + c->lin_hv;   // the columns of a row of qkvb
     mv(e, &L->in, e->x, e->qkvb, T);
     mark(e, ST_PROJ);
-    if (kq4_gdn_ld(e->s, c, L->gw, e->qkvb, z, a, b, gdn_ld(c), L->conv, L->S, e->cv, e->y, T)) return fail(e, "Gated DeltaNet head widths not supported");
+    if (kq4_gdn_ld(e->s, c, L->gw, e->qkvb, z, a, b, gdn_ld(c), L->conv, L->S, e->keep ? L->kconv : NULL, e->keep ? L->kS : NULL, e->cv, e->y, T))
+        return fail(e, "Gated DeltaNet head widths not supported");
     mark(e, ST_GDN);
     mv(e, &L->out, e->y, e->br, T);
     mark(e, ST_PROJ);
     return 0;
 }
 
-static void moe(Q4Eng* e, int l, int T) {
+static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's layer (experts in VRAM)
     const Qwen4Cfg* c = &e->c;
-    Layer* L = &e->L[l];
     const int k = c->top_k, P = T * k, side = T <= MV_MAXT;
     if (side) {   // decode: the shared expert on s2 while the router and the expert copy run on s; joined before the combine
         cudaEventRecord(e->ev_x, e->s);
@@ -702,9 +736,9 @@ static void moe(Q4Eng* e, int l, int T) {
     }
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route_ld(e->s, c, e->lg, c->n_exp + 1, e->ind, e->wt, T);
-    if (e->routes) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
+    if (e->routes && l >= 0) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
-    if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
+    if (e->cache && l >= 0) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
         kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
         if (!e->stream) kc_cache_copy(e->s, &e->pool, 64);
         else {   // the admit's (unit, slot) jobs back to the host, the units from the files, then to their slots
@@ -749,22 +783,50 @@ static void embed(Q4Eng* e, int T) {
     kq4_tile(e->s, e->c.hc, e->c.d, e->x, e->H, T);
     mark(e, ST_EMBED);
 }
-static int layer(Q4Eng* e, int l, int T, int row0) {
+// Layer L on the streams H: main layer l (row0: its first row in the pass), or the MTP head's (l < 0, rows at p0 = -1)
+static int run_layer(Q4Eng* e, Layer* L, int l, int attn, int T, int row0, int p0) {
     const Qwen4Cfg* c = &e->c;
-    Layer* L = &e->L[l];
-    if (c->ple[l] >= 0) ple(e, l, T, row0);
+    if (l >= 0 && c->ple[l] >= 0) ple(e, l, T, row0);
     mark(e, ST_PLE);
     hc_mix(e, L->hc_norm[0], &L->hc_di[0], &L->hc_up[0], 1, T);
     mark(e, ST_HC);
-    if (c->attn[l] ? attention(e, L, T) : gdn(e, L, T)) return -1;
-    mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
+    if (attn ? attention(e, L, p0, T) : gdn(e, L, T)) return -1;
+    mark(e, attn ? ST_ATTN : ST_GDN);
     kq4_hc_add_norm(e->s, c->hc, c->d, e->H, e->br, e->inj, L->hc_norm[1], c->eps, e->normed, T);
     hc_mix(e, NULL, &L->hc_di[1], &L->hc_up[1], 1, T);
     mark(e, ST_HC);
-    moe(e, l, T);
+    moe(e, L, l, T);
     kq4_hc_add(e->s, c->hc, c->d, e->H, e->br, e->inj, T);
     mark(e, ST_EXPERT);
     return e->err[0] ? -1 : 0;
+}
+static int layer(Q4Eng* e, int l, int T, int row0) { return run_layer(e, &e->L[l], l, e->c.attn[l], T, row0, 0); }
+
+// The MTP head's input streams Hm[n]: fc_embedding(norm(embed(tok))) added to each stream of fc_hidden(norm(Hin))
+static void head_in(Q4Eng* e, const int32_t* tok, const float* Hin, int n) {
+    const Qwen4Cfg* c = &e->c;
+    const int HD = c->hc * c->d;
+    kc_embed(e->s, e->embed.fmt, e->embed.w, c->d, tok, e->x, n);
+    kq4_norm1p(e->s, e->x, c->d, c->d, e->m_ne, c->eps, e->x, n);
+    mv(e, &e->m_fe, e->x, e->br, n);
+    kq4_norm1p(e->s, Hin, HD, HD, e->m_nh, c->eps, e->normed, n);
+    mv(e, &e->m_fh, e->normed, e->Hm, n * c->hc);   // a stream a row
+    kq4_hc_add(e->s, c->hc, c->d, e->Hm, e->br, e->ones, n);
+}
+// The head's rows of a chunk after its last layer: row t on token din[1 + s + t] and the main streams of row t - 1 + s
+// (Hall[-1] before the first chunk), at *din - 1 + s + t. s = 1 at position 0, where no row comes before.
+static int head_rows(Q4Eng* e, int T, int s) {
+    float* H = e->H;
+    if (!e->mtp || T - s <= 0) return 0;
+    head_in(e, e->din + 1 + s, H + (ptrdiff_t) (s - 1) * e->c.hc * e->c.d, T - s);
+    e->H = e->Hm;
+    const int rc = run_layer(e, &e->M, -1, 1, T - s, 0, s - 1);
+    e->H = H;
+    return rc;
+}
+static void keep_last(Q4Eng* e, int row) {   // Hall[-1] = Hall[row]: the head's next input
+    const size_t HD = (size_t) e->c.hc * e->c.d;
+    if (e->mtp) cudaMemcpyAsync(e->Hall - HD, e->Hall + (size_t) row * HD, sizeof(float) * HD, cudaMemcpyDeviceToDevice, e->s);
 }
 // Admit every expert of layer l on the main stream (after the last reader of the slots it may replace), copy the
 // misses on the copy stream; ev_ready[l] when they are in VRAM
@@ -798,6 +860,8 @@ static int enqueue(Q4Eng* e, int T, int want) {   // the rows of slot 0 through 
         cudaMemcpyAsync(e->hlog, e->logits, sizeof(float) * (size_t) T * e->c.vocab, cudaMemcpyDeviceToHost, e->s);
         mark(e, ST_HEAD);
     }
+    if (head_rows(e, T, e->pos == 0)) return -1;
+    keep_last(e, T - 1);
     return e->err[0] ? -1 : 0;
 }
 
@@ -811,24 +875,27 @@ static int forward_pass(Q4Eng* e, const int32_t* ids, int n) {
         memcpy(h + 1, ids + (size_t) k * e->mt, sizeof(int32_t) * (size_t) (n - k * e->mt < e->mt ? n - k * e->mt : e->mt));
     }
     int rc = ple_rows(e, n);
-    for (int l = -1; !rc && l < e->c.n_layer; ++l) {   // l = -1: the embedding
-        if (l >= 0) layer_start(e, l, prefetch_on(e, n));
+    for (int l = -1; !rc && l < e->c.n_layer + e->mtp; ++l) {   // l = -1: the embedding; l = n_layer: the MTP head
+        if (l >= 0 && l < e->c.n_layer) layer_start(e, l, prefetch_on(e, n));
         for (int k = 0; !rc && k < nc; ++k) {
             const int T = n - k * e->mt < e->mt ? n - k * e->mt : e->mt;
             e->H = e->Hall + (size_t) k * e->mt * HD;
             e->pos = pos0 + k * e->mt;
             rows_in(e, k, T);
             if (l < 0) embed(e, T);
-            else rc = layer(e, l, T, k * e->mt);
+            else if (l < e->c.n_layer) rc = layer(e, l, T, k * e->mt);
+            else rc = head_rows(e, T, e->pos == 0);
         }
     }
     e->H = e->Hall;
     e->pos = pos0;
     if (rc) return -1;
+    keep_last(e, n - 1);
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     prof_collect(e);
     e->pos += n;
+    e->lrow = -1;
     return 0;
 }
 
@@ -837,8 +904,8 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     e->hin[0] = e->pos;
     memcpy(e->hin + 1, ids, sizeof(int32_t) * (size_t) T);
     if (ple_rows(e, T)) return -1;
-    const int want = logits != NULL, graph = T <= MV_MAXT && !e->prof && !e->stream && !e->no_graph;
-    cudaGraphExec_t* ge = &e->graph[want][T];
+    const int want = logits != NULL, graph = T <= MV_MAXT && !e->prof && !e->stream && !e->no_graph && !(e->mtp && !e->pos);
+    cudaGraphExec_t* ge = &e->graph[want | e->keep << 1][T];
     if (graph && !*ge) {
         cudaGraph_t gr = NULL;
         if (cudaStreamBeginCapture(e->s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return fail(e, "CUDA graph capture failed");
@@ -860,6 +927,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         return fail(e, "Q4E_ROUTES: write failed");
     prof_collect(e);
     e->pos += T;
+    e->lrow = want ? T - 1 : -1;
     return 0;
 }
 
@@ -878,5 +946,70 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
         const int T = n - i < step ? n - i : step;
         if (forward_rows(e, ids + i, T, logits ? logits + (size_t) i * e->c.vocab : NULL)) return -1;
     }
+    return 0;
+}
+
+// ---- MTP: drafts, and verify forwards that keep each row's state -----------------------------------------------------
+
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
+    const Qwen4Cfg* c = &e->c;
+    float* H = e->H;
+    e->err[0] = 0;
+    if (!e->mtp || e->lrow < 0 || k < 1 || k > Q4E_MAX_DRAFTS || e->pos + k > e->max_pos)
+        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
+    e->hin[0] = e->pos;   // din: the position, the bonus, then the drafts
+    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t), cudaMemcpyHostToDevice, e->s);
+    kc_argmax(e->s, e->logits + (size_t) e->lrow * c->vocab, e->din + 1, c->vocab, 1);
+    for (int j = 0; j < k && !e->err[0]; ++j) {   // head row j at pos - 1 + j: token din[1 + j], streams Hall[-1] then its own
+        head_in(e, e->din + 1 + j, j ? e->Hm : e->Hall - (size_t) c->hc * c->d, 1);
+        e->H = e->Hm;
+        if (run_layer(e, &e->M, -1, 1, 1, 0, j - 1)) break;
+        hc_mix(e, e->m_norm, &e->m_down, &e->m_up, 0, 1);
+        mv(e, &e->head, e->x, e->mlog, 1);
+        kc_argmax(e->s, e->mlog, e->din + 2 + j, c->vocab, 1);
+        mark(e, ST_HEAD);
+    }
+    e->H = H;
+    if (e->err[0]) return -1;
+    cudaMemcpyAsync(e->hin + 1, e->din + 2, sizeof(int32_t) * (size_t) k, cudaMemcpyDeviceToHost, e->s);
+    if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+        return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
+    memcpy(drafts, e->hin + 1, sizeof(int32_t) * (size_t) k);
+    prof_collect(e);
+    return 0;
+}
+
+int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits) {
+    e->err[0] = 0;
+    e->nkeep = 0;
+    if (!e->mtp || n < 1 || n > Q4E_MAX_DRAFTS + 1) return fail(e, "q4e_forward_keep: %s", e->mtp ? "1 to 4 rows" : "no MTP head");
+    e->keep = 1;
+    const int rc = q4e_forward(e, ids, n, logits);
+    e->keep = 0;
+    if (!rc) e->nkeep = n;
+    return rc;
+}
+
+int q4e_accept(Q4Eng* e, int m) {
+    const Qwen4Cfg* c = &e->c;
+    const int n = e->nkeep;
+    e->err[0] = 0;
+    e->nkeep = 0;
+    if (m < 1 || m > n) return fail(e, "q4e_accept: %d of %d kept rows", m, n);
+    if (m == n) return 0;
+    const size_t nc = qwen4_gdn_conv_len(c), ns = qwen4_gdn_state_len(c), nh = qwen4_ple_hist_len(c);
+    for (int l = 0; l < c->n_layer; ++l) {   // row m - 1's state: its snapshot
+        Layer* L = &e->L[l];
+        if (L->kS) {
+            cudaMemcpyAsync(L->conv, L->kconv + (size_t) (m - 1) * nc, sizeof(float) * nc, cudaMemcpyDeviceToDevice, e->s);
+            cudaMemcpyAsync(L->S, L->kS + (size_t) (m - 1) * ns, sizeof(float) * ns, cudaMemcpyDeviceToDevice, e->s);
+        }
+        if (L->khist) cudaMemcpyAsync(L->hist, L->khist + (size_t) (m - 1) * nh, sizeof(float) * nh, cudaMemcpyDeviceToDevice, e->s);
+    }
+    keep_last(e, m - 1);
+    if (e->lrow >= 0) e->lrow = m - 1;
+    e->pos -= n - m;
+    if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+        return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     return 0;
 }

@@ -48,6 +48,19 @@ static void gdn_case(int hk, int hv, int dk, int dv, int T) {
     free(cw); free(al); free(dt); free(nw); free(qkv); free(z); free(a); free(b); free(conv); free(S); free(conv_k); free(S_k); free(y); free(y_k);
 }
 
+// One group longer than Q4_ROW_MAX: the MTP head's norm of all hc streams (4 x 2560)
+static void norm_long_case(int g, int T) {
+    float *x = rnd((size_t) g * T, -3, 3), *w = rnd((size_t) g, -0.3f, 0.3f), *y = rnd((size_t) g * T, 0, 0), *y_k = rnd((size_t) g * T, 0, 0);
+    for (int t = 0; t < T; ++t) qwen4_norm1p(x + (size_t) g * t, g, g, w, 1e-6f, y + (size_t) g * t);
+    const int rc = kt_q4_norm1p(x, g, g, w, 1e-6f, y_k, T);
+    if (rc == 1) printf("  norm1p: not on %s\n", kt_name());
+    else {
+        printf("  norm1p one group of %d, %d tokens: %.1e\n", g, T, rel(y_k, y, (size_t) g * T));
+        CHECK(rc == 0 && rel(y_k, y, (size_t) g * T) < 1e-5, "norm1p of a group of %d differs", g);
+    }
+    free(x); free(w); free(y); free(y_k);
+}
+
 static void hc_case(int hc, int d, int rank, int T) {
     Qwen4Cfg c;
     memset(&c, 0, sizeof c);
@@ -231,6 +244,7 @@ int main(void) {
     gdn_case(2, 4, 32, 32, 9);       // tests/data/qwen4_tiny
     hc_case(4, 2560, 320, 3);        // Qwen3.8-Flash-Next
     hc_case(4, 64, 32, 5);
+    norm_long_case(10240, 3);
     q4g32_case(96, 2560);
     norm_rope_route_case();
     ple_case();
