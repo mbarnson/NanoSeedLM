@@ -288,9 +288,9 @@ embedding are not on Metal yet.
 `Q4E_PROFILE=1` showed where 1,024 prompt tokens of P4 spent 15.4 s (RTX PRO 6000, 8 GB expert cache). Two changes
 bring this to 7.5 s, 2.1 times faster:
 
-- `68c66bc`: the PLE prefetch. `q4e_forward` asks the OS to read all PLE rows of the call first (`madvise` WILLNEED).
+- `9d144b8`: the PLE prefetch. `q4e_forward` asks the OS to read all PLE rows of the call first (`madvise` WILLNEED).
   The PLE stage goes from 5,415 ms to 4 ms. The logits do not change.
-- `5134f0f`: prompt rows of more than 8 run the routed experts as grouped GEMMs (`kc_bucket`, `kc_mm_grouped_dev`). The
+- `3bec003`: prompt rows of more than 8 run the routed experts as grouped GEMMs (`kc_bucket`, `kc_mm_grouped_dev`). The
   expert stage goes from 3,820 ms to 1,118 ms. `kc_bucket` now takes up to 1,024 experts.
 
 The grouped GEMMs round their inputs to BF16. The KL against the 4-bit model went from 0.179 to 0.176. The reference's
@@ -300,11 +300,11 @@ now 57% of the time. Read
 
 ## [2026-11-04] result | Prompt rows of 1,024 and a decode expert prediction for Qwen3.8-Flash-Next on CUDA
 
-- `eff8a7e`: forwards without logits take 1,024 rows. On an RTX PRO 6000 with an 8 GB cache, a 3,703-token prompt of P4
+- `e6efe3f`: forwards without logits take 1,024 rows. On an RTX PRO 6000 with an 8 GB cache, a 3,703-token prompt of P4
   goes from 151 to 541 tokens per second. The cache misses go from 274k to 64k.
-- `103da13`, removed in `187b565`: decode predicted the next layer's experts and copied them on a second stream. The
+- `382af70`, removed in `8afd74d`: decode predicted the next layer's experts and copied them on a second stream. The
   misses went down by 44%, but decode went from 40.6 to 39.0 tokens per second (P3).
-- `b7a1697`: QSA writes its selected blocks in block order. The atomic order made the logits differ from run to run
+- `cd976f1`: QSA writes its selected blocks in block order. The atomic order made the logits differ from run to run
   past position 2,048. Now 128 and 1,024 rows give the same text.
 
 Read
@@ -312,7 +312,7 @@ Read
 
 ## [2026-11-04] engine | CUDA graphs for Qwen3.8-Flash-Next decode
 
-`6a470c0`: decode rows (up to 8) of the qwen4 engine run as CUDA graphs. The kernels read the position from device
+`10ea8df`: decode rows (up to 8) of the qwen4 engine run as CUDA graphs. The kernels read the position from device
 memory, so one graph serves every position. On an RTX PRO 6000 with an 8 GB cache, P3 decodes at 46.5 tokens per second,
 against 42.1 without graphs. The text is the same. `NSLM_NO_GRAPH=1` turns the graphs off. Read
 [CUDA graphs for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cuda-graphs.md).
@@ -334,7 +334,7 @@ Read [Expert cache misses of MTP verify windows](results/2026-11-04-qwen38-verif
 
 ## [2026-11-04] result | The decode expert prediction on PCIe 4, with CUDA graphs
 
-The next-layer expert prediction of `103da13`, on top of the CUDA graphs (local commit `3390402`), on an HF Jobs A100
+The next-layer expert prediction of `382af70`, on top of the CUDA graphs (local commit `3390402`), on an HF Jobs A100
 (PCIe 4, job `6aebdb82c78863f9c63314d5`): P3 decodes 161 tokens at 18.64 and 18.86 tokens per second with it, and at
 20.40 and 20.52 without it (8 GB cache). The misses go from 25.6k to 14.4k, and the text is the same. So the prediction
 stays out. Its wrong guesses also cost PCIe traffic, and decode is bound by that bandwidth. The A100 decodes slower than
@@ -349,7 +349,7 @@ On an RTX PRO 6000 with an 8 GB cache and CUDA graphs, P3 decodes at 46.1 tokens
 
 ## [2026-11-04] result | Layer-major prompt passes for Qwen3.8-Flash-Next on CUDA
 
-`4044f5e`: prompt rows without logits run in layer-major passes of up to 8,192 rows. Each layer's experts cross PCIe
+`87ef68a`: prompt rows without logits run in layer-major passes of up to 8,192 rows. Each layer's experts cross PCIe
 once a pass, not once for each chunk of 1,024 rows. On an RTX PRO 6000 with an 8 GB cache, a 3,703-token P4 prompt goes
 from 536 to 833 tokens per second, and a 15,922-token prompt from 549 to 977. The text does not change. Read
 [Layer-major prompt passes for Qwen3.8-Flash-Next](results/2026-11-04-qwen38-prompt-passes.md).

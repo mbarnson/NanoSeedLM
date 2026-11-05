@@ -10,7 +10,7 @@ seed packs may gain more there. That is not measured.
 ## Setup
 
 - Machine: HF Jobs `rtx-pro-6000` (RTX PRO 6000 Blackwell, 96 GB, PCIe 5), job `6aebdf6ac78863f9c6331627`, commit
-  `2de4513` (CUDA graphs). The load average was 5.5 to 11.2 during the runs.
+  `3adfba7` (CUDA graphs). The load average was 5.5 to 11.2 during the runs.
 - Models: mlx-community/Qwen3.8-Flash-Next-4bit-mtp at `825df62` (affine Q4, group 32),
   [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4) and
   [Qwen3.8-Flash-Next-NanoSeedLM-P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3). The three differ

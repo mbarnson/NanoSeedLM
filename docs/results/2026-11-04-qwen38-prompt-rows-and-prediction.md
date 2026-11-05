@@ -16,10 +16,10 @@ tokens per second (log entry of 2026-11-04, "The decode expert prediction on PCI
   prompt rows, [Qwen3.8-Flash-Next-NanoSeedLM-P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3) for
   the prediction.
 - Prompt rows: the first 16,000 characters of the wikitext-2 test set (3,703 tokens), raw, then 32 or 48 greedy tokens.
-  The source of `eff8a7e`, with `Q4E_MAX_ROWS` set to 128, 512 or 1,024. Jobs `6aebc7b90e0338d1bb804990` and, after the
-  QSA order fix of `b7a1697`, `6aebcbe3c78863f9c6330e3b`.
+  The source of `e6efe3f`, with `Q4E_MAX_ROWS` set to 128, 512 or 1,024. Jobs `6aebc7b90e0338d1bb804990` and, after the
+  QSA order fix of `cd976f1`, `6aebcbe3c78863f9c6330e3b`.
 - Prediction: "Why do tide pools matter? Answer in three sentences." with the chat template, 161 greedy tokens. Commit
-  `103da13`, with and without `NSLM_NO_PREDICT=1`. Job `6aebc860c78863f9c6330c64`.
+  `382af70`, with and without `NSLM_NO_PREDICT=1`. Job `6aebc860c78863f9c6330c64`.
 
 ```bash
 nslm-qwen4-gen --model PACK --prompt "$(cat prompt.txt)" --raw --max-tokens 32 --ctx 8192 --expert-cache-gb 8
@@ -43,7 +43,7 @@ P3 decode of 161 tokens, two runs each:
 
 | Prediction | Decode, tokens/s | Hits / misses | Router and cache, ms | Experts, ms | Hyper-connections, ms |
 |---|---|---|---|---|---|
-| On (`103da13`) | 38.91 / 39.01 | 67,461 / 14,396 | 1,220 / 1,218 | 1,250 / 1,246 | 992 / 996 |
+| On (`382af70`) | 38.91 / 39.01 | 67,461 / 14,396 | 1,220 / 1,218 | 1,250 / 1,246 | 992 / 996 |
 | Off | 40.56 / 40.58 | 56,223 / 25,634 | 1,366 / 1,364 | 1,131 / 1,133 | 882 / 878 |
 
 ## Notes
@@ -54,10 +54,10 @@ P3 decode of 161 tokens, two runs each:
   does not get that VRAM.
 - **Prediction.** The next layer's router ran on this layer's state, and a second stream copied the experts that it
   chose. The copies and the extra router slowed the other stages by 8% to 13%, more than the miss time that they saved.
-  PCIe 5 makes a miss cheap on this GPU. Commit `103da13` keeps the code for a test on the RTX 4080.
+  PCIe 5 makes a miss cheap on this GPU. Commit `382af70` keeps the code for a test on the RTX 4080.
 - **The empty run.** The first run of 1,024 rows stopped at the first token. QSA wrote its selected blocks in the order
   of an atomic counter, and attention sums the keys in that order. So the logits differed in their last bits from run to
-  run past position 2,048, and a near tie can change a greedy token. `b7a1697` writes the blocks in block order. After
+  run past position 2,048, and a near tie can change a greedy token. `cd976f1` writes the blocks in block order. After
   it, the four texts of 128 and 1,024 rows were the same (MD5 `2411721d`).
 - Strata's own numbers, on another PC (RX 9070, ISTA IQ3_XXS, MTP on), are 586 to 833 tokens per second for prompts.
   Plan step S0.3 measures Strata on the RTX 4080. Until then, the two sets of numbers are not comparable.
