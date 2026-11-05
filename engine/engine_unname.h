@@ -21,3 +21,10 @@
 #undef eng_kv_read
 #undef eng_kv_write
 #undef eng_score
+#undef eng_mova_routes
+#undef eng_mova_routes_read
+#undef eng_mla_capture
+#undef eng_mla_capture_read
+#undef eng_mla_capture_xtx
+#undef eng_mova_timing
+#undef eng_mova_timing_read

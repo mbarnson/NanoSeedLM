@@ -1,14 +1,15 @@
 // engine/engine.c - engine_api.h for every model: eng_open takes the qwen4 engine (engine/qwen4_api.c) when config.json
-// is a qwen4_exp configuration, else the MoVA engine. engine_mova.h and engine_qwen4.h give each engine its own names.
+// is a qwen4_exp configuration, else the MoVA engine (mova_ext.h too). engine_mova.h and engine_qwen4.h rename each.
 #include <stdlib.h>
 
 #include "engine_api.h"
 #include "qwen4_cfg.h"
 
-struct MovaEng;
+typedef struct MovaEng MovaEng;
 struct Q4Api;
 #include "engine_mova.h"
 #include "engine_api_fns.h"
+#include "mova_ext.h"
 #include "engine_unname.h"
 #include "engine_qwen4.h"
 #include "engine_api_fns.h"
@@ -20,6 +21,7 @@ struct Eng {
 };
 #define CALL(f, ...) (e->qwen ? q4_##f(e->h, __VA_ARGS__) : mova_##f(e->h, __VA_ARGS__))
 #define CALL0(f) (e->qwen ? q4_##f(e->h) : mova_##f(e->h))
+#define MOVA(f, ...) (e->qwen ? -1 : mova_##f(e->h, __VA_ARGS__))   // mova_ext.h: the qwen4 engine has none
 
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     Qwen4Cfg c;
@@ -64,3 +66,15 @@ int eng_kv_write(Eng* e, int seq, const int32_t* ids, int p0, int p1, const void
 int eng_score(Eng* e, int seq, const int32_t* ids, int from, int count, float* logits) {
     return CALL(eng_score, seq, ids, from, count, logits);
 }
+
+int eng_mova_routes(Eng* e, int on, int max_rows) { return MOVA(eng_mova_routes, on, max_rows); }
+int eng_mova_routes_read(Eng* e, int rows, int32_t* mlp, int32_t* val, float* mlp_sel, float* val_sel) {
+    return MOVA(eng_mova_routes_read, rows, mlp, val, mlp_sel, val_sel);
+}
+int eng_mla_capture(Eng* e, int on) { return MOVA(eng_mla_capture, on); }
+int eng_mla_capture_read(Eng* e, int l, double* x, double* v, double* q, double* o, int64_t* rows) {
+    return MOVA(eng_mla_capture_read, l, x, v, q, o, rows);
+}
+int eng_mla_capture_xtx(Eng* e, int l, int site, float* h) { return MOVA(eng_mla_capture_xtx, l, site, h); }
+int eng_mova_timing(Eng* e, int on) { return MOVA(eng_mova_timing, on); }
+int eng_mova_timing_read(Eng* e, double* seconds) { return MOVA(eng_mova_timing_read, seconds); }
