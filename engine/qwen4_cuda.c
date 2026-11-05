@@ -470,11 +470,11 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->host_experts = !(o && o->vram_experts);
     e->tail_skip = o ? o->tail_skip : 0;
     e->cpu_tail = o ? o->cpu_tail : 0;
-    if (e->cpu_tail && (!e->cache || e->stream || !cpu_seed4_on()))
-        fail(e, "--cpu-tail needs --expert-cache-gb, pinned experts and the CPU seed kernel (a Clang build)");
     e->tail_renorm = getenv("Q4E_TAIL_RENORM") && atoi(getenv("Q4E_TAIL_RENORM")) > 0;
     e->cache = e->host_experts && o && o->cache_gb != 0;
     e->stream = e->cache && o->stream_experts;
+    if (e->cpu_tail && (!e->cache || e->stream || !cpu_seed4_on()))
+        fail(e, "--cpu-tail needs --expert-cache-gb, pinned experts and the CPU seed kernel (a Clang build)");
     if (o && o->stream_experts && !e->cache) { snprintf(err, (size_t) errlen, "--stream-experts needs --expert-cache-gb"); ns_close(&e->nm); free(e); return NULL; }
     if (o && o->ple_gguf) {
         if (ple_open(&e->pt, o->ple_gguf, "per_layer_token_embd.weight", err, errlen)) { ns_close(&e->nm); free(e); return NULL; }
