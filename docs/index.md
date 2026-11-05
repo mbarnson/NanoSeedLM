@@ -114,6 +114,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   4,222 and 53.8 tokens per second against 793 and 9.9. All in VRAM, 4,418 and 87.6 against 5,130 and 114.
 - [2026-11-05: Faster decode norms and RoPE; the expert copy is PCIe-bound](results/2026-11-05-qwen38-decode-small-kernels.md):
   P3 decode 54.6 to 56.5 tokens per second (8 GB cache, RTX PRO 6000), the same text. More copy blocks do not help.
+- [2026-11-05: Long-context decode 34% faster](results/2026-11-05-qwen38-long-context-decode.md): after 15,975
+  tokens, P3 decode 43.8 to 58.8 tokens per second (split-key attention, 8-bit QSA top-k). Decode-row KL unchanged.
 
 ## For contributors and agents
 

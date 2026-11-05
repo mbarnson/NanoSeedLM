@@ -483,3 +483,11 @@ everything in VRAM, llama.cpp leads: 5,130 and 114 against 4,418 and 87.6. Read
 commit ran three times on one node, and the greedy text is the same. Two norm kernels load a thread's values together, and RoPE reads a
 table of inverse frequencies in place of an f64 `pow`. The decode expert copy is 46% of the GPU time, and 32 to 1,024
 blocks give the same speed. Read [faster decode norms and RoPE](results/2026-11-05-qwen38-decode-small-kernels.md).
+
+## [2026-11-05] result | Long-context decode 34% faster, the shared expert beside the copies
+
+`fe32045` to `d6c0606`: after a 15,975-token prompt, P3 decode goes from 43.8 to 58.8 tokens per second on an RTX PRO
+6000 (8 GB cache). Decode attention splits a row's keys over 32 blocks of a KV group. The QSA top-k selects in 8-bit
+passes. The shared expert runs on a second stream in decode (+2.5% at short prompts). The decode rows' KL against the
+prompt rows is the same (0.0271 and 0.0272). Read [long-context decode](results/2026-11-05-qwen38-long-context-decode.md).
+
