@@ -1190,8 +1190,10 @@ int main(int argc, char** argv) {
     if (!g_eng) { fprintf(stderr, "engine: %s\n", err); return 1; }
     EngMem m;
     eng_mem(g_eng, &m);
-    fprintf(stderr, "nslm-serve: loaded in %.1f s: %s; weights %.2f GB, KV %.2f GB, GPU %.2f GB\n", now_s() - t0,
-            eng_describe(g_eng), (m.weights + m.lut) / 1e9, m.kv / 1e9, m.gpu_allocated / 1e9);
+    fprintf(stderr, "nslm-serve: loaded in %.1f s: %s", now_s() - t0, eng_describe(g_eng));
+    if (m.weights || m.kv || m.gpu_allocated)   // the qwen4 engine reports none
+        fprintf(stderr, "; weights %.2f GB, KV %.2f GB, GPU %.2f GB", (m.weights + m.lut) / 1e9, m.kv / 1e9, m.gpu_allocated / 1e9);
+    fprintf(stderr, "\n");
     {   // build the pipelines before the first request: prompts, and decode steps of 1 .. 8 slots
         int32_t w[256], out[8];
         const char* hi = "[{\"role\":\"user\",\"content\":\"Hi\"}]";
