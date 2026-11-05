@@ -347,3 +347,17 @@ On an RTX PRO 6000 with an 8 GB cache and CUDA graphs, P3 decodes at 46.1 tokens
 (P3) and 2.6 ms (P4) a token slower than affine. On this PCIe 5 GPU, that eats all of P4's byte saving. Read
 [Qwen3.8-Flash-Next decode with affine, P4 and P3 experts](results/2026-11-04-qwen38-decode-by-format.md).
 
+## [2026-11-04] result | Layer-major prompt passes for Qwen3.8-Flash-Next on CUDA
+
+`25c90ed`: prompt rows without logits run in layer-major passes of up to 8,192 rows. Each layer's experts cross PCIe
+once a pass, not once for each chunk of 1,024 rows. On an RTX PRO 6000 with an 8 GB cache, a 3,703-token P4 prompt goes
+from 536 to 833 tokens per second, and a 15,922-token prompt from 549 to 977. The text does not change. Read
+[Layer-major prompt passes for Qwen3.8-Flash-Next](results/2026-11-04-qwen38-prompt-passes.md).
+
+## [2026-11-04] plan | Three seed packs of Qwen3.8-Flash-Next by RAM size
+
+Matt approved a plan for three packs: for 64, 96 and 128 GB of RAM, each with a 12 GB GPU and the BF16 PLE table on
+NVMe. Seeds encode every routed expert, in a mix of a new 3-bit tier (C = 12, P = 4), P3, P4 and P8. All new searches
+weight the error by Unsloth's imatrix. Read
+[Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md).
+
