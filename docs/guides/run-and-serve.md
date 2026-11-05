@@ -131,7 +131,7 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 | `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
 | `--ctx N` | Context positions (4096) |
 | `--prompt-rows N` | Prompt rows of one forward: 4096, or 16384 on GPUs of 64 GB or more, at most the context. A row takes about 0.25 MB of VRAM |
-| `--drafts K` | The MTP head drafts K tokens (1 to 3), and one forward verifies them. The text does not change. VRAM: about 1.6 GB, and 115 MB a draft. On an RTX 4080 it is not faster ([results](../results/2026-11-05-qwen38-mtp-4080.md)) |
+| `--drafts K` | The MTP head drafts K tokens (1 to 3), and one forward verifies them. The text does not change. VRAM: 115 MB a draft, and the head's routed experts share the expert cache (else 1.4 GB). On an RTX 4080 it is not faster ([results](../results/2026-11-05-qwen38-mtp-4080-rerun.md)) |
 | `--tail-skip R` | Lossy, with an expert cache: a missed expert that every decode row ranks at R or later (rank 0 is the top choice) is not copied or computed. 0, the default, turns it off. Its KL gate is not measured yet |
 | `--effort xhigh\|medium\|low` | The template's reasoning effort (xhigh) |
 | `--no-think` | The template's `enable_thinking=False`: no reasoning block |

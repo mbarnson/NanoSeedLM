@@ -120,6 +120,20 @@ int main(void) {
               q4e_draft(e, 3, d) == 0 && !memcmp(d, dn, sizeof d), "drafts without CUDA graphs differ: %s", ng ? q4e_error(ng) : err);
         q4e_close(ng);
     }
+    {   // the head's experts through a small expert cache (its sparse layer n_layer): the same drafts
+        Q4EOpts oc = o;
+        oc.cache_gb = 1e-5;
+        Q4Eng* ec = q4e_open(DIR_, &oc, err, sizeof err);
+        int32_t dc[3];
+        uint64_t h = 0, m = 0;
+        int slots = 0;
+        CHECK(ec && prompt(ec, ids, 45, 8, lg, buf) == 0 && q4e_draft(ec, 3, dc) == 0 && prompt(e, ids, 45, 8, lg, buf) == 0 &&
+              q4e_draft(e, 3, d) == 0 && !memcmp(d, dc, sizeof d), "drafts through the expert cache differ: %s", ec ? q4e_error(ec) : err);
+        if (ec) q4e_cache_stats(ec, &h, &m, &slots);
+        printf("drafts through a cache of %d slots: %llu misses\n", slots, (unsigned long long) m);
+        CHECK(m > 0, "the cache never missed");
+        q4e_close(ec);
+    }
     {   // mtp = 1: one draft, one state copy
         Q4EOpts o1 = o;
         o1.mtp = 1;

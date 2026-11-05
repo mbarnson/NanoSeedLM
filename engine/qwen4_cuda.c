@@ -293,8 +293,8 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
         char name[160];
         snprintf(name, sizeof name, "%s.mlp.switch_mlp.%s.weight", lp, proj[i]);
         const NsTensor* t = ns_find(&e->nm, name);
-        if (l >= 0) e->et[l][i] = t;
-        if (!e->cache || l < 0) load_w(e, ex[i], e->host_experts && l >= 0, "%s", name);
+        e->et[l >= 0 ? l : c->n_layer][i] = t;   // the MTP head's: sparse layer n_layer of the cache
+        if (!e->cache) load_w(e, ex[i], e->host_experts && l >= 0, "%s", name);
         else if (!t || t->enc == NS_SEED6P8 || t->slices != c->n_exp) fail(e, "%s: missing, P = 8, or not %d experts", name, c->n_exp);
         else { memset(ex[i], 0, sizeof *ex[i]); ex[i]->fmt = t->enc; ex[i]->slices = t->slices; ex[i]->rows = t->rows; ex[i]->cols = t->cols; }
     }
@@ -323,7 +323,7 @@ static const uint8_t* unit_bytes(Q4Eng* e, int u, uint8_t* dst) {
 static void build_cache(Q4Eng* e, double gb) {
     const Qwen4Cfg* c = &e->c;
     CachePool* p = &e->pool;
-    const int E = c->n_exp, units = c->n_layer * E;
+    const int E = c->n_exp, NL = c->n_layer + e->mtp, units = NL * E;   // the MTP head's experts: sparse layer n_layer
     if (E > CACHE_MAX_PER_LAYER) { fail(e, "expert cache: %d experts per layer, at most %d", E, CACHE_MAX_PER_LAYER); return; }
     memset(p, 0, sizeof *p);
     p->per_layer = E;
@@ -354,7 +354,7 @@ static void build_cache(Q4Eng* e, double gb) {
         return;
     } else track(&e->host, &e->nhost, &e->chost, host);
     WSlice* tab = (WSlice*) calloc((size_t) units * 3, sizeof(WSlice));
-    for (int l = 0; l < c->n_layer; ++l)
+    for (int l = 0; l < NL; ++l)
         for (int i = 0; i < 3; ++i) {
             const NsTensor* t = e->et[l][i];
             if (!t || t->enc != e->et[0][i]->enc || t->s[0].len != e->et[0][i]->s[0].len) { fail(e, "layer %d: experts differ from layer 0's", l); free(tab); return; }
@@ -374,7 +374,7 @@ static void build_cache(Q4Eng* e, double gb) {
     int32_t* su = (int32_t*) malloc(4 * (size_t) p->slots);
     for (int u = 0; u < units; ++u) us[u] = -1;
     for (int s = 0, x = 0; x < E && s < p->slots; ++x)   // round-robin: every layer starts with the same share
-        for (int l = 0; l < c->n_layer && s < p->slots; ++l, ++s) {
+        for (int l = 0; l < NL && s < p->slots; ++l, ++s) {
             const int u = l * E + x;
             us[u] = s;
             su[s] = u;
@@ -392,10 +392,11 @@ static void build_cache(Q4Eng* e, double gb) {
     p->jobs = (int32_t*) dmem(e, NULL, 8 * (size_t) E);
     p->njobs = (int32_t*) dmem(e, NULL, 16);
     p->tab = (WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) units * 3);
-    for (int l = 0; l < c->n_layer && p->tab; ++l) {
-        e->L[l].eg.tab = p->tab + ((size_t) l * 3 + 0) * E;
-        e->L[l].eu.tab = p->tab + ((size_t) l * 3 + 1) * E;
-        e->L[l].ed.tab = p->tab + ((size_t) l * 3 + 2) * E;
+    for (int l = 0; l < NL && p->tab; ++l) {
+        Layer* L = l < c->n_layer ? &e->L[l] : &e->M;
+        L->eg.tab = p->tab + ((size_t) l * 3 + 0) * E;
+        L->eu.tab = p->tab + ((size_t) l * 3 + 1) * E;
+        L->ed.tab = p->tab + ((size_t) l * 3 + 2) * E;
     }
     free(us); free(su); free(tab);
 }
@@ -787,7 +788,7 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
     return 0;
 }
 
-static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's layer (experts in VRAM)
+static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's layer (the cache's sparse layer n_layer)
     const Qwen4Cfg* c = &e->c;
     const int k = c->top_k, P = T * k, side = T <= MV_MAXT;
     if (side) {   // decode: the shared expert on s2 while the router and the expert copy run on s; joined before the combine
@@ -802,8 +803,8 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     if (e->routes && l >= 0) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
     if (e->tail_skip && e->cache && side && l >= 0) kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
-    if (e->cache && l >= 0) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
-        kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
+    if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
+        kc_cache_admit(e->s, &e->pool, l >= 0 ? l : c->n_layer, e->ind, P, 0);
         if (!e->stream) kc_cache_copy(e->s, &e->pool, 64);
         else {   // the admit's (unit, slot) jobs back to the host, the units from the files, then to their slots
             cudaMemcpyAsync(e->hjobs, e->pool.njobs, 4, cudaMemcpyDeviceToHost, e->s);
