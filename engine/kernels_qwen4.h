@@ -69,10 +69,8 @@ void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, 
 // serves at most 32 heads.
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T);
-// The same, with the rows of q qld floats apart
-int kq4_attend_ld(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
-                  const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, int T);
-// kq4_attend_ld with part, the scratch of decode rows (T <= 8): kq4_attend_part_len floats. kq4_attend_ld makes its own.
+// The same with the rows of q qld floats apart, and part, the scratch of decode rows (T <= 8): kq4_attend_part_len
+// floats. kq4_attend makes its own.
 int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
                     const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, float* part, int T);
 size_t kq4_attend_part_len(const Qwen4Cfg* c);

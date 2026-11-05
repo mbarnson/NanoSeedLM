@@ -788,10 +788,6 @@ void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks) {   // the promp
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, f, nt, sm) != cudaSuccess) *blocks = -1;
 }
 
-int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
-               const int32_t* sel, const int32_t* nsel, float* o, int T) {
-    return kq4_attend_ld(s, c, q, c->n_head * 2 * c->head_dim, K, V, pos0, dpos, sel, nsel, o, T);
-}
 // Decode rows: block (KV group, split, row), a warp per head of the group. Split sp takes keys [n sp / AD_S, n (sp + 1) / AD_S)
 // of the row's n. Their K and V come in tiles of AT_KT through shared memory, once for all heads. part: m, l, acc[hd].
 #define AD_S 32
@@ -874,11 +870,11 @@ __global__ void k_q4_attend_dc(AttArgs a, const float* q, const float* part, flo
     }
 }
 size_t kq4_attend_part_len(const Qwen4Cfg* c) { return (size_t) 8 * c->n_head * AD_S * (c->head_dim + 2); }
-int kq4_attend_ld(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
-                  const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, int T) {
+int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
+               const int32_t* sel, const int32_t* nsel, float* o, int T) {
     float* part = NULL;
     if (T <= 8 && cudaMalloc(&part, sizeof(float) * kq4_attend_part_len(c)) != cudaSuccess) return -1;
-    const int rc = kq4_attend_part(s, c, q, qld, K, V, pos0, dpos, sel, nsel, o, part, T);
+    const int rc = kq4_attend_part(s, c, q, c->n_head * 2 * c->head_dim, K, V, pos0, dpos, sel, nsel, o, part, T);
     cudaFree(part);
     return rc;
 }
