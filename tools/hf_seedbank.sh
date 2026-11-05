@@ -39,7 +39,8 @@ if [ ! -d "$MODEL" ]; then
         hf download "${MODEL%@*}" --revision "${MODEL#*@}" --include "*.json" --local-dir /model >/dev/null
         mapfile -t INCLUDE < <(python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["weight_map"]; print("*.json"); [print(f) for f in sorted({f for k,f in m.items() if sys.argv[2] in k})]' \
             /model/model.safetensors.index.json "$ONLY")
-        INCLUDE=(--include "${INCLUDE[@]}")
+        INC=("${INCLUDE[@]}"); INCLUDE=()   # one --include for each pattern: more words after one would be positional files
+        for f in "${INC[@]}"; do INCLUDE+=(--include "$f"); done
     fi
     hf download "${MODEL%@*}" --revision "${MODEL#*@}" "${INCLUDE[@]}" --local-dir /model --max-workers 16 >/dev/null
     echo "model download: $(( $(date +%s) - t0 )) s, $(du -sh /model | cut -f1)"
