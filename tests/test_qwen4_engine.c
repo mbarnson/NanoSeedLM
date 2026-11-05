@@ -164,8 +164,9 @@ int main(void) {
         }
         free(lid); free(one); free(three);
     }
-    {   // more than Q4E_MAX_ROWS prompt rows: one layer-major pass of three chunks, or three row-major forwards, bit for bit
-        const int L = 2 * Q4E_MAX_ROWS + 1;
+    {   // more than Q4E_MAX_ROWS prompt rows: one layer-major pass of three chunks, or the three chunks as row-major
+        // forwards, bit for bit (a chunk of 8 rows or fewer would take the matvecs, so the last one has 40)
+        const int L = 2 * Q4E_MAX_ROWS + 40;
         const Q4EOpts ol = {L + 8, 0, NULL, 0, 0};
         int32_t* lid = (int32_t*) malloc(sizeof(int32_t) * (L + 1));
         for (int i = 0; i <= L; ++i) lid[i] = ids[(i * 7) % n];
@@ -176,7 +177,7 @@ int main(void) {
         if (e) {
             CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, pass) == 0, "a pass of %d rows: %s", L, q4e_error(e));
             q4e_reset(e);
-            const int a = Q4E_MAX_ROWS - 24, b = Q4E_MAX_ROWS;
+            const int a = Q4E_MAX_ROWS, b = Q4E_MAX_ROWS;
             CHECK(q4e_forward(e, lid, a, NULL) == 0 && q4e_forward(e, lid + a, b, NULL) == 0 && q4e_forward(e, lid + a + b, L - a - b, NULL) == 0 &&
                   q4e_forward(e, lid + L, 1, rows3) == 0, "three forwards: %s", q4e_error(e));
             int diff = 0;
