@@ -110,6 +110,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   tokens per second at 29,120 tokens (RTX PRO 6000), 1,879 on an A100. KL against the 4-bit model unchanged.
 - [2026-11-05: Prompt chunks of 16,384 rows on large GPUs](results/2026-11-05-qwen38-rows-by-vram.md): 4,222 tokens
   per second at 29,120 tokens and 4,165 at 15,922 (RTX PRO 6000), the default on GPUs of 64 GB or more.
+- [2026-11-05: P3 against llama.cpp UD-Q3_K_XL](results/2026-11-05-qwen38-vs-llamacpp.md): experts in host memory,
+  4,222 and 53.8 tokens per second against 793 and 9.9. All in VRAM, 4,418 and 87.6 against 5,130 and 114.
 
 ## For contributors and agents
 

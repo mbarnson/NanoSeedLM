@@ -469,3 +469,10 @@ with strong attention. Read [one-pass prompt attention](results/2026-11-05-qwen3
 `957a0f0`: on GPUs of 64 GB or more, the CUDA engine takes 16,384 prompt rows a forward by default (4,096 below). On
 an RTX PRO 6000, 29,120 tokens of P3 run at 4,222 tokens per second (3,606 at 4,096 rows), and 15,922 tokens at 4,165.
 It costs about 3 GB of VRAM. Read [chunks of 16,384 rows](results/2026-11-05-qwen38-rows-by-vram.md).
+
+## [2026-11-05] result | P3 against llama.cpp UD-Q3_K_XL on one RTX PRO 6000
+
+The two packs have about the same KL against BF16 (0.0600 and 0.0593). With the experts in host memory, P3 prefills
+29,120 tokens at 4,222 tokens per second and decodes at 53.8. llama.cpp (`-ot exps=CPU`) does 793 and 9.9. With
+everything in VRAM, llama.cpp leads: 5,130 and 114 against 4,418 and 87.6. Read
+[P3 against llama.cpp](results/2026-11-05-qwen38-vs-llamacpp.md).
