@@ -423,6 +423,9 @@ void q4e_close(Q4Eng* e) {
         for (int i = 0; i < ST_N; ++i)
             if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
         fprintf(stderr, "Q4E_PROFILE: host PLE prefetch %.0f ms, PLE rows %.0f ms (%d threads)\n", e->host_ms[0], e->host_ms[1], e->ple_threads);
+        int regs = 0, blocks = 0;
+        kq4_attend_info(&e->c, &regs, &blocks);
+        fprintf(stderr, "Q4E_PROFILE: prompt attention kernel %d registers a thread, %d blocks an SM\n", regs, blocks);
         for (int i = 0; i < Q4E_NEV; ++i) cudaEventDestroy(e->ev[i]);
     }
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);

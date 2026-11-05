@@ -485,6 +485,13 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
     for (int i = 0; i < dl; ++i) o[((size_t) t * a.nh + h) * a.hd + lane + 32 * i] = acc[i] / l * sigm(qh[a.hd + lane + 32 * i]);
 }
 
+void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks) {
+    cudaFuncAttributes fa;
+    *regs = cudaFuncGetAttributes(&fa, k_q4_attend_g) == cudaSuccess ? fa.numRegs : -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks, k_q4_attend_g, 32 * (c->n_head / c->n_kv),
+                                                      sizeof(float) * 2 * AT_KT * (size_t) c->head_dim) != cudaSuccess) *blocks = -1;
+}
+
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T) {
     if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv) return -1;

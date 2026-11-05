@@ -52,6 +52,8 @@ void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, 
 // sel[t][budget / ratio]; o[t][n_head][head_dim].  -1 unless head_dim is a multiple of 32, at most 256.
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T);
+// Q4E_PROFILE: the prompt-row attention kernel's registers a thread and blocks an SM
+void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks);
 
 #ifdef __cplusplus
 }
