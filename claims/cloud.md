@@ -1,3 +1,5 @@
+# cloud claims (updated 2026-11-05T02:21:48Z)
+
 # cloud claims (updated 2026-11-05T02:09:19Z)
 
 # cloud claims (updated 2026-11-05T02:10:00Z)
@@ -13,4 +15,4 @@
     `docs/log.md`, `docs/index.md`.
   - pc-cuda's files, small: `engine/kernels_moe.cu`, `engine/kernels_cuda.h` (the bucket kernels only),
     `tests/kernel_backend_cuda.c` (the qwen4 section only: a NULL device-position argument in three calls).
-- **Next, waiting for Matt:** nslm-chat / nslm-serve for Qwen3.8-Flash-Next (proposal of 2026-11-05T00:47).
+- **Next, after the speed work (Matt: option A):** nslm-chat / nslm-serve for Qwen3.8-Flash-Next, one binary.
