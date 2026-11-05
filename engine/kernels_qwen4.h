@@ -57,9 +57,9 @@ void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld
 void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm, int32_t* list, int layer);
 // out[t] += the weight times cy[j] of each listed pair j of row t, in list order
 void kq4_cpu_add(cudaStream_t s, float* out, const float* cy, const int32_t* list, int d, int T);
-// A GPU-host hand-off that a CUDA graph can replay (plan D4): kq4_signal adds 1 to the device count seq and writes it to
-// flag (mapped host memory); kq4_wait spins until the host's ack (mapped) reaches seq
-void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag);
+// A GPU-host hand-off that a CUDA graph can replay (plan D4): kq4_signal copies n floats x to hx (mapped host memory),
+// adds 1 to the device count seq and writes it to flag (mapped); kq4_wait spins until the host's ack (mapped) reaches seq
+void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag, const float* x, float* hx, int n);
 void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack);
 // out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t * sgld]) sh[t]
 void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T);

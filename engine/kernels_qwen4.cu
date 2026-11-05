@@ -430,7 +430,8 @@ __global__ void __launch_bounds__(256) k_q4_tail_skip(int32_t* ind, float* wt, c
 void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot, int T, int k, int R, int renorm, int32_t* list, int layer) {
     if (R > 0 && R < k && T * k <= 256) k_q4_tail_skip<<<1, 256, 0, s>>>(ind, wt, slot, T * k, k, R, renorm && !list, list, layer);
 }
-__global__ void k_q4_cpu_add(float* out, const float* cy, const int32_t* list, int d) {
+// cy and list are mapped host memory that changes under the kernel's cache: volatile loads read them over PCIe
+__global__ void k_q4_cpu_add(float* out, volatile const float* cy, volatile const int32_t* list, int d) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y, n = list[0];
     if (i >= d) return;
     float a = 0;
@@ -441,16 +442,22 @@ void kq4_cpu_add(cudaStream_t s, float* out, const float* cy, const int32_t* lis
     k_q4_cpu_add<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(out, cy, list, d);
 }
 
-__global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag) {
+__global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag, const float* x, volatile float* hx, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) hx[i] = x[i];
+    __threadfence_system();   // each thread's copies, then the flag
+    __syncthreads();
+    if (threadIdx.x) return;
     const uint32_t v = ++*seq;
-    __threadfence_system();
     *flag = v;
 }
 __global__ void k_q4_wait(const uint32_t* seq, volatile const uint32_t* ack) {
     const uint32_t v = *seq;
     while (*ack < v) __nanosleep(100);
+    __threadfence_system();   // the host's outputs after its ack
 }
-void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag) { k_q4_signal<<<1, 1, 0, s>>>(seq, flag); }
+void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag, const float* x, float* hx, int n) {
+    k_q4_signal<<<1, 256, 0, s>>>(seq, flag, x, hx, n);
+}
 void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack) { k_q4_wait<<<1, 1, 0, s>>>(seq, ack); }
 
 __global__ void k_q4_moe_combine(int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out) {

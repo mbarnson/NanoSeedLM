@@ -98,6 +98,8 @@ struct Q4Eng {
     int pgen, pnw, pndone, pquit, nth;
     PoolJob pj[16];
     double host_ms[2];             // Q4E_PROFILE: host time of the PLE prefetch and the PLE rows
+    double ct_ms;                  // Q4E_PROFILE: the D4 thread's work, its layers and pairs
+    long ct_layers, ct_pairs;
     cudaGraphExec_t graph[4][MV_MAXT + 1];   // [with logits + 2 keep][rows]
     // The MTP head (Q4EOpts.mtp): it runs one row behind each forward. Hm: its streams; Hall[-1]: the last main row's
     // streams (its next input); lrow: the last row's logits in logits (-1: none); keep: a q4e_forward_keep of nkeep rows
@@ -658,6 +660,8 @@ void q4e_close(Q4Eng* e) {
         for (int i = 0; i < ST_N; ++i)
             if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
         fprintf(stderr, "Q4E_PROFILE: host PLE prefetch %.0f ms, PLE rows %.0f ms (%d threads)\n", e->host_ms[0], e->host_ms[1], e->ple_threads);
+        if (e->ct_layers) fprintf(stderr, "Q4E_PROFILE: CPU tail %.0f ms, %ld layers, %ld pairs (%.0f us a layer, %.0f us a pair)\n", e->ct_ms,
+                                  e->ct_layers, e->ct_pairs, 1e3 * e->ct_ms / e->ct_layers, e->ct_pairs ? 1e3 * e->ct_ms / e->ct_pairs : 0.0);
         int regs = 0, blocks = 0;
         kq4_attend_info(&e->c, &regs, &blocks);
         fprintf(stderr, "Q4E_PROFILE: prompt attention kernel %d registers a thread, %d blocks an SM\n", regs, blocks);
@@ -797,7 +801,7 @@ static int pool_run(Q4Eng* e, int n, int (*fn)(Q4Eng*, const void*, int, int), c
 typedef struct { int x, n, j[MV_MAXT]; } CtGroup;   // an expert and the list entries (pairs) that use it
 // The scratch of G = MV_MAXT * top_k groups of MV_MAXT rows: x transposed (xt, xs), gate and up (gu), the SwiGLU
 // transposed (act, axs), the down outputs (down), and tmp (a group's rows before a transpose)
-typedef struct { const CtGroup* g; int pass, nitems; int item[3 * MV_MAXT * 32 * 40]; float *xt, *xs, *gu, *act, *axs, *down, *tmp; } CtJob;
+typedef struct { const CtGroup* g; int pass, nitems; atomic_int next; int item[3 * MV_MAXT * 32 * 40]; float *xt, *xs, *gu, *act, *axs, *down, *tmp; } CtJob;
 static size_t ct_floats(const Qwen4Cfg* c) {
     const size_t G = (size_t) MV_MAXT * c->top_k, M = MV_MAXT, D = c->d, F = c->ff_exp;
     return G * M * (D + D / 8 + 2 * F + F + F / 8 + D) + M * D;
@@ -811,12 +815,14 @@ static void ct_bufs(CtJob* j, float* b, const Qwen4Cfg* c) {
 static const uint8_t* ct_unit(Q4Eng* e, int l, int x, int i, int s) {
     return e->arena_h + ((uint64_t) l * e->c.n_exp + (uint64_t) x) * e->pool.unit_bytes + e->pool.off[i][s];
 }
+// Each pool worker claims items until none are left: a worker the OS stops holds back one item, not a share
 static int ct_items(Q4Eng* e, const void* ctx, int i0, int i1) {   // item: group << 16 | matrix << 8 | 64-row chunk
-    const CtJob* j = (const CtJob*) ctx;
+    CtJob* j = (CtJob*) ctx;
     const Qwen4Cfg* c = &e->c;
     const size_t M = MV_MAXT, D = c->d, F = c->ff_exp;
     const int l = e->cj_h[1];
-    for (int it = i0; it < i1; ++it) {
+    (void) i0; (void) i1;
+    for (int it; (it = atomic_fetch_add(&j->next, 1)) < j->nitems;) {
         const int g = j->item[it] >> 16, m = j->item[it] >> 8 & 255, r0 = (j->item[it] & 255) * CT_ROWS, i = j->pass ? 2 : m;
         const int rows = (int) (j->pass ? D : F), kb = (int) (j->pass ? F : D) / 8, r1 = r0 + CT_ROWS < rows ? r0 + CT_ROWS : rows;
         const CtGroup* G = &j->g[g];
@@ -835,6 +841,7 @@ static void ct_layer(Q4Eng* e) {
     static CtGroup g[MV_MAXT * 32];
     static CtJob j;
     int ng = 0;
+    if (!n) return;   // no pair: the pool sleeps
     for (int p = 0; p < n; ++p) {   // the groups, in list order
         const int x = e->cj_h[3 + 4 * p];
         int k = 0;
@@ -849,7 +856,8 @@ static void ct_layer(Q4Eng* e) {
         cpu_seed_xt(j.tmp, g[k].n, (int) D / 8, j.xt + k * M * D, j.xs + k * M * (D / 8));
         for (int m = 0; m < 2; ++m) for (int ch = 0; ch * CT_ROWS < (int) F; ++ch) j.item[j.nitems++] = k << 16 | m << 8 | ch;
     }
-    pool_run(e, j.nitems, ct_items, &j);
+    atomic_store(&j.next, 0);
+    pool_run(e, e->nth + 1, ct_items, &j);
     j.pass = 1; j.nitems = 0;
     for (int k = 0; k < ng; ++k) {
         for (int r = 0; r < g[k].n; ++r)
@@ -860,7 +868,8 @@ static void ct_layer(Q4Eng* e) {
         cpu_seed_xt(j.tmp, g[k].n, (int) F / 8, j.act + k * M * F, j.axs + k * M * (F / 8));
         for (int ch = 0; ch * CT_ROWS < (int) D; ++ch) j.item[j.nitems++] = k << 16 | ch;
     }
-    pool_run(e, j.nitems, ct_items, &j);
+    atomic_store(&j.next, 0);
+    pool_run(e, e->nth + 1, ct_items, &j);
     for (int k = 0; k < ng; ++k)
         for (int r = 0; r < g[k].n; ++r) memcpy(e->cy_h + (size_t) g[k].j[r] * D, j.down + (k * M + r) * D, sizeof(float) * D);
 }
@@ -876,7 +885,10 @@ static void* ct_thread(void* arg) {   // answers each layer's signal (kq4_signal
             pthread_mutex_unlock(&e->cmu);
         }
         if (v == done) continue;
+        atomic_thread_fence(memory_order_acquire);   // the GPU's list and rows after its flag
+        const double t0 = e->prof ? host_ms() : 0;
         ct_layer(e);
+        if (e->prof) { e->ct_ms += host_ms() - t0; e->ct_layers++; e->ct_pairs += e->cj_h[0]; }
         done = v;
         atomic_thread_fence(memory_order_seq_cst);   // the outputs before the ack
         hs[16] = v;
@@ -968,8 +980,7 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     const int ct = e->cpu_tail && side && l >= 0;   // D4: the tail's misses to the CPU, beside the GPU's work
     if (ct) {
         kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->cpu_tail, 0, e->cj_d, l);
-        cudaMemcpyAsync(e->cx_d, e->x, sizeof(float) * (size_t) T * c->d, cudaMemcpyDeviceToDevice, e->s);
-        kq4_signal(e->s, e->dseq, e->hs_d);
+        kq4_signal(e->s, e->dseq, e->hs_d, e->x, e->cx_d, T * c->d);
     } else if (e->tail_skip && e->cache && side && l >= 0)
         kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm, NULL, 0);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache

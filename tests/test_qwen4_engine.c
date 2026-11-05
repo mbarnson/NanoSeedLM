@@ -100,11 +100,13 @@ typedef struct { const StFile* st; const StEntry** e; int nraw; uint32_t r; } Se
 static int seed_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) {
     SeedFix* f = (SeedFix*) ctx;
     if (t < f->nraw) { memcpy(dst, st_data(f->st, f->e[t]), len); return 0; }
-    for (uint64_t i = 0; s == 2 && i + 4 <= len; i += 4) { const int32_t b = -22; memcpy(dst + i, &b, 4); }   // the exponent biases
+    // Weights of rms about 0.14 (bias -13, exponent code 8): the experts' outputs are as large as the residual's
+    for (uint64_t i = 0; s == 2 && i + 4 <= len; i += 4) { const int32_t b = -13; memcpy(dst + i, &b, 4); }
     for (uint64_t i = 0; s != 2 && i + 2 <= len; i += 2) {   // seeds (never 0) and nibble words
         f->r = f->r * 1664525u + 1013904223u;
         uint16_t v = (uint16_t) (f->r >> 16);
         if (s == 0 && !v) v = 1;
+        if (s == 1) v = (uint16_t) ((v & 0xFFF0u) | 8u);
         memcpy(dst + i, &v, 2);
     }
     return 0;
@@ -151,21 +153,23 @@ static int seed_fixture(const char* dir, char* err, int errlen) {
 }
 
 // Plan D4 (Q4EOpts.cpu_tail) on the seed fixture: decode rows with the tail on the CPU against without it (close
-// logits, fewer misses on the GPU), and the same logits from run to run. Skipped without the CPU seed kernel.
+// logits, fewer misses on the GPU), the same logits from run to run, and far from the logits without the tail
+// (tail_skip: the same pairs dropped). Skipped without the CPU seed kernel.
 static void cpu_tail_check(void) {
     char dir[512], err[512] = "";
     const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
     snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_seeds", tmp);
     if (seed_fixture(dir, err, sizeof err)) { CHECK(0, "seed fixture: %s", err); return; }
     int32_t ids[40];
-    float* lg[3] = {NULL, NULL, NULL};
-    uint64_t miss[3] = {0, 0, 0};
-    for (int run = 0; run < 3; ++run) {
+    float* lg[4] = {NULL, NULL, NULL, NULL};
+    uint64_t miss[4] = {0, 0, 0, 0};
+    for (int run = 0; run < 4; ++run) {   // the GPU, the CPU tail twice, the tail dropped
         Q4EOpts o;
         memset(&o, 0, sizeof o);
         o.max_pos = 64;
         o.cache_gb = 1e-5;   // a cache of one layer's experts: misses in every layer
-        o.cpu_tail = run ? 1 : 0;   // the tiny model routes 3 of 8 experts
+        o.cpu_tail = run == 1 || run == 2;   // the tiny model routes 3 of 8 experts
+        o.tail_skip = run == 3;
         Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
         if (!e && run && strstr(err, "Clang")) { printf("cpu_tail: skipped (%s)\n", err); break; }
         CHECK(e != NULL, "open the seed fixture (cpu_tail %d): %s", o.cpu_tail, err);
@@ -179,19 +183,25 @@ static void cpu_tail_check(void) {
         uint64_t h;
         int slots;
         q4e_cache_stats(e, &h, &miss[run], &slots);
-        if (run == 2) {
-            double d = 0, m = 1e-30;
+        if (run == 3) {
+            double d = 0, dd = 0, m = 1e-30;
             int bad = 0;
-            for (int v = 0; v < V; ++v) { bad += !isfinite(lg[1][v]); d = fmax(d, fabs((double) lg[1][v] - lg[0][v])); m = fmax(m, fabs((double) lg[0][v])); }
-            printf("cpu_tail on the seed fixture: logits within %.1e of the GPU's, %llu misses against %llu\n", d / m,
-                   (unsigned long long) miss[1], (unsigned long long) miss[0]);
-            CHECK(!bad && d / m < 1e-3 && !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V) && miss[1] < miss[0],
-                  "cpu_tail: logits %.1e from the GPU's, runs %s, misses %llu / %llu", d / m,
-                  memcmp(lg[1], lg[2], sizeof(float) * (size_t) V) ? "differ" : "equal", (unsigned long long) miss[1], (unsigned long long) miss[0]);
+            for (int v = 0; v < V; ++v) {
+                bad += !isfinite(lg[1][v]);
+                d = fmax(d, fabs((double) lg[1][v] - lg[0][v]));
+                dd = fmax(dd, fabs((double) lg[3][v] - lg[0][v]));
+                m = fmax(m, fabs((double) lg[0][v]));
+            }
+            const int same = !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V);
+            printf("cpu_tail on the seed fixture: logits within %.1e of the GPU's (the tail dropped: %.1e), %llu misses against %llu\n",
+                   d / m, dd / m, (unsigned long long) miss[1], (unsigned long long) miss[0]);
+            CHECK(!bad && d / m < 1e-4 && dd / m > 1e-2 && same && miss[1] < miss[0],
+                  "cpu_tail: logits %.1e from the GPU's (dropped %.1e), runs %s, misses %llu / %llu", d / m, dd / m,
+                  same ? "equal" : "differ", (unsigned long long) miss[1], (unsigned long long) miss[0]);
         }
         q4e_close(e);
     }
-    free(lg[0]); free(lg[1]); free(lg[2]);
+    for (int i = 0; i < 4; ++i) free(lg[i]);
 }
 
 int main(void) {

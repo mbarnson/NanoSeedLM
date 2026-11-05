@@ -50,8 +50,8 @@ int main(int argc, char** argv) {
         cudaGraph_t g;
         cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
         for (int l = 0; l < layers; ++l) {
-            if (w == 0) { kq4_signal(s, seq, df); kq4_wait(s, seq, df + 16); }
-            else { kq4_signal(s, seq + 0, df + 32); kq4_signal(s, seq, df + 32); }
+            if (w == 0) { kq4_signal(s, seq, df, NULL, NULL, 0); kq4_wait(s, seq, df + 16); }
+            else { kq4_signal(s, seq + 0, df + 32, NULL, NULL, 0); kq4_signal(s, seq, df + 32, NULL, NULL, 0); }
         }
         cudaStreamEndCapture(s, &g);
         if (cudaGraphInstantiate(&ge[w], g, 0) != cudaSuccess) { fprintf(stderr, "graph failed\n"); return 1; }
