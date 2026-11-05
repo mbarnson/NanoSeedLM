@@ -11,7 +11,7 @@ from 270k to 50k. The generated text does not change.
 - Machine: HF Jobs `rtx-pro-6000` (RTX PRO 6000 Blackwell, 96 GB), job `6aebe75dc78863f9c63318ec`. The 1-minute load average
   was 3.0 to 8.6 during the runs.
 - Model: [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4).
-- Builds: A is `25ae5f9` (forwards of up to 1,024 rows). B is `4e6d2d7` (layer-major passes of up to 8,192 rows).
+- Builds: A is `bfe4929` (forwards of up to 1,024 rows). B is `979740d` (layer-major passes of up to 8,192 rows).
 - Prompts: the first 16,000 and 64,000 characters of the wikitext-2 test set, raw. Two runs of A and B in turn.
 
 ```bash

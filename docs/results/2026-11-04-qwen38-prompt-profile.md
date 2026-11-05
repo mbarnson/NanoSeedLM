@@ -23,8 +23,8 @@ nslm-qwen4-kld --ref /ref --model /model --text /text.txt --tokens 1024 --expert
 | Run | Commit | Job |
 |---|---|---|
 | Baseline | `5ed8d1b` | `6aebbe5e0e0338d1bb8046c5` |
-| PLE prefetch | `8ba5c38` on `5ed8d1b` (rebased: `d5cd048`) | `6aebc2bbc78863f9c63309b3` |
-| Grouped expert GEMMs | `cafb3a2` | `6aebc4720e0338d1bb8048ee` |
+| PLE prefetch | `8ba5c38` on `5ed8d1b` (rebased: `68c66bc`) | `6aebc2bbc78863f9c63309b3` |
+| Grouped expert GEMMs | `5134f0f` | `6aebc4720e0338d1bb8048ee` |
 
 ## Results
 

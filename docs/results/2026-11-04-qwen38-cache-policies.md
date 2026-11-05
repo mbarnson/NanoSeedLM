@@ -41,6 +41,6 @@ The engine counted 371,253 hits and 126,208 misses. The simulated LRU counted 37
 - Recent use predicts the next use better than total use does. So the plan's static hot set (S8, V3) does not help.
 - At 74.6%, a token misses 123 experts: about 303 MB over PCIe. That is about 6 ms of a 22 ms token on PCIe 5 (this
   GPU), and about 12 ms on PCIe 4 (the RTX 4080).
-- The next-layer prediction of `1cd7c57` raised the hit rate of the 161-token test to 82%, but its copies slowed decode.
+- The next-layer prediction of `103da13` raised the hit rate of the 161-token test to 82%, but its copies slowed decode.
   See [Prompt rows of 1,024 and a decode expert prediction](2026-11-04-qwen38-prompt-rows-and-prediction.md).
 - Fewer bytes per expert help twice: each miss is smaller, and the same VRAM holds more slots.
