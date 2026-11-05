@@ -455,3 +455,11 @@ second, and a 29,120-token prompt from 2,782 to 3,423. Decode went from 44.0 to 
 
 `0708c6b` changed the greedy text of the decode prompt (a near-tie on its first token). Read
 [merged GEMMs](results/2026-11-05-qwen38-merged-gemms.md).
+
+## [2026-11-05] result | One-pass prompt attention, a faster DeltaNet step, and the same quality
+
+`d525c44` to `b93125c`: a 29,120-token prompt of the P3 pack runs at 3,660 tokens per second on an RTX PRO 6000 and
+1,879 on an A100. Prompt attention runs in one pass with an online softmax, and P V runs on mma.sync. On 4,096 tokens
+against the 4-bit MLX model, P3's mean KL is 0.161 (0.164 with the engine of `364b9ad`). The expert prefetch now waits
+for 64 router picks an expert: below that, prompts were up to 2.6 times slower. The engine test gained a tiny model
+with strong attention. Read [one-pass prompt attention](results/2026-11-05-qwen38-one-pass-attention.md).

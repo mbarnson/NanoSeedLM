@@ -4,7 +4,7 @@
 29,120-token prompt went from 2,782 to 3,423, and from 1,571 to 1,691 on an A100. Decode went from 44.0 to 54.2 tokens
 per second. Weights of the same input now run as one GEMM, and the router keeps its logits in registers.
 
-**Status.** Current. One prompt text, one pack. The RTX 4080 is not measured.
+**Status.** Replaced by [one-pass prompt attention](2026-11-05-qwen38-one-pass-attention.md).
 
 ## Setup
 
