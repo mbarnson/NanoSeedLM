@@ -310,3 +310,10 @@ now 57% of the time. Read
 Read
 [Prompt rows of 1,024 and a decode expert prediction](results/2026-11-04-qwen38-prompt-rows-and-prediction.md).
 
+## [2026-11-04] engine | CUDA graphs for Qwen3.8-Flash-Next decode
+
+`03e10ff`: decode rows (up to 8) of the qwen4 engine run as CUDA graphs. The kernels read the position from device
+memory, so one graph serves every position. On an RTX PRO 6000 with an 8 GB cache, P3 decodes at 46.5 tokens per second,
+against 42.1 without graphs. The text is the same. `NSLM_NO_GRAPH=1` turns the graphs off. Read
+[CUDA graphs for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cuda-graphs.md).
+

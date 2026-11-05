@@ -72,6 +72,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   the PLE prefetch and the grouped expert GEMMs. 1,024 tokens take 7.5 s, not 15.4 s.
 - [2026-11-04: Prompt rows of 1,024 and a decode expert prediction](results/2026-11-04-qwen38-prompt-rows-and-prediction.md):
   151 to 541 tokens per second on a 3,703-token prompt. The prediction made decode 4% slower.
+- [2026-11-04: CUDA graphs for Qwen3.8-Flash-Next decode](results/2026-11-04-qwen38-cuda-graphs.md): P3 decode 10.6%
+  faster on an RTX PRO 6000, with the same text.
 
 ## For contributors and agents
 
