@@ -19,6 +19,7 @@ int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, con
 // The same, with the rows of qkv, z, a and b ld floats apart (the columns of one GEMM's output)
 int kq4_gdn_ld(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, const float* z, const float* a, const float* b, int ld,
                float* conv, float* S, float* cv, float* y, int T);
+#define Q4_ROW_MAX 4096   // the longest group of kq4_norm1p and stream of kq4_hc_add_norm (the engine checks d)
 // y[t] = qwen4_norm1p(x[t], len, g, w, eps) for t < T (y may be x)
 void kq4_norm1p(cudaStream_t s, const float* x, int len, int g, const float* w, float eps, float* y, int T);
 // the hyper-connection pointwise steps of qwen4_ops.h for T tokens: lo[T][rank], up and normed [T][hc * d], mixed [T][d],
@@ -38,6 +39,11 @@ void kq4_tile(cudaStream_t s, int hc, int d, const float* x, float* H, int T);
 // qwen4_head_norm_rope on row t of x (row stride rs): nh heads of hd at hs apart; w [hd]
 void kq4_head_norm_rope(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w, int pos0,
                         const int32_t* dpos, int T);
+// The rot_dim / 2 inverse frequencies of RoPE as the C reference computes them (f32 from an f64 pow): the _inv calls'
+// table. kq4_head_norm_rope and kq4_qsa_blocks make a temporary one (the kernel tests).
+void kq4_rope_inv(const Qwen4Cfg* c, float* inv);
+void kq4_head_norm_rope_inv(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int nh, int hs, int hd, const float* w,
+                            const float* inv, int pos0, const int32_t* dpos, int T);
 // dst[(pos + t) * w + i] = src[t * ss + i]: rows into a cache at their positions
 void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T);
 // qwen4_route of logits[T][n_exp] into ind, wt [T][top_k] (top_k <= 32, n_exp <= 1024); _ld: logits rows ld apart
@@ -51,6 +57,8 @@ void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float
 // QSA: the block keys (qwen4_qsa_block) that rows [pos, pos + T) complete, from the raw key cache raw[pos][ix_dim] into
 // blk[j][ix_dim]; done[t] (blocks complete at row t) and nsel[t] (budget / ratio when done[t] exceeds it, else 0)
 void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int pos0, const int32_t* dpos, int T, float* blk);
+void kq4_qsa_blocks_inv(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, const float* inv, int pos0,
+                        const int32_t* dpos, int T, float* blk);
 void kq4_qsa_rows(cudaStream_t s, const Qwen4Cfg* c, int pos0, const int32_t* dpos, int32_t* done, int32_t* nsel, int T);
 // qwen4_qsa_select for row t (iq[t][ix_heads][ix_dim] at row stride rs, done[t] blocks) into sel[t][budget / ratio];
 // sc is scratch of T x maxdone floats.  Rows with done[t] <= budget / ratio are left as they are.

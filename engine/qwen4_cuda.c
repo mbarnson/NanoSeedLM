@@ -71,7 +71,7 @@ struct Q4Eng {
     const NsTensor* et[QWEN4_MAX_LAYERS][3];   // the layers' gate, up and down experts
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *Hall;   // the hidden streams of a pass, xr rows; H: the current chunk's
-    float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
+    float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated, *inv;   // inv: RoPE's
     float *lg, *wt, *A, *Dx, *sh, *logits, *y, *cv, *qkvb;
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
     // A chunk's input: its slot of hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
@@ -402,7 +402,11 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
     const Qwen4Cfg* c = &e->c;
-    if (c->n_exp > BUCKET_MAX_EXPERTS) { snprintf(err, (size_t) errlen, "%d experts, at most %d", c->n_exp, BUCKET_MAX_EXPERTS); ns_close(&e->nm); free(e); return NULL; }
+    if (c->n_exp > BUCKET_MAX_EXPERTS || c->d > Q4_ROW_MAX || c->rot_dim > 1024) {
+        snprintf(err, (size_t) errlen, "%d experts (at most %d), hidden size %d (at most %d), RoPE width %d (at most 1024)", c->n_exp,
+                 BUCKET_MAX_EXPERTS, c->d, Q4_ROW_MAX, c->rot_dim);
+        ns_close(&e->nm); free(e); return NULL;
+    }
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
     size_t vfree = 0, vtotal = 0;
     cudaMemGetInfo(&vfree, &vtotal);
@@ -428,6 +432,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     load_w(e, &e->mix_down, 0, "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight");
     load_w(e, &e->mix_up, 0, "language_model.model.hyper_connection_mixer.input_mix_weight_up.weight");
     e->mix_norm = load_v(e, (int64_t) c->hc * c->d, "language_model.model.hyper_connection_mixer.hc_norm.weight");
+    float inv[512];
+    kq4_rope_inv(c, inv);
+    e->inv = (float*) dmem(e, inv, sizeof(float) * (size_t) (c->rot_dim / 2));
     for (int l = 0; l < c->n_layer && !e->err[0]; ++l) {
         if (c->ple[l] >= 0) qwen4_ngram_init(c, c->ple[l], &e->ng[c->ple[l]]);
         if (c->ple[l] >= 0 && e->table && (c->ple[l] > 0 || e->table->rows != e->ng[0].rows))
@@ -640,14 +647,14 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     float* kk = e->qp + (size_t) c->n_head * 2 * hd, *vv = kk + kvw, *ixo = vv + kvw;
     mv(e, &L->qkvi, e->x, e->qp, T);
     mark(e, ST_PROJ);
-    kq4_head_norm_rope(e->s, c, e->qp, ld, c->n_head, 2 * hd, hd, L->qn, 0, e->din, T);
-    kq4_head_norm_rope(e->s, c, kk, ld, c->n_kv, hd, hd, L->kn, 0, e->din, T);
+    kq4_head_norm_rope_inv(e->s, c, e->qp, ld, c->n_head, 2 * hd, hd, L->qn, e->inv, 0, e->din, T);
+    kq4_head_norm_rope_inv(e->s, c, kk, ld, c->n_kv, hd, hd, L->kn, e->inv, 0, e->din, T);
     kq4_store(e->s, L->K, kvw, kk, ld, 0, e->din, T);
     kq4_store(e->s, L->V, kvw, vv, ld, 0, e->din, T);
     kq4_store(e->s, L->raw, D, ixo + (size_t) c->ix_heads * D, ld, 0, e->din, T);
-    kq4_head_norm_rope(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, 0, e->din, T);
+    kq4_head_norm_rope_inv(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, e->inv, 0, e->din, T);
     mark(e, ST_ROPE);
-    kq4_qsa_blocks(e->s, c, L->raw, L->ikn, 0, e->din, T, L->blk);
+    kq4_qsa_blocks_inv(e->s, c, L->raw, L->ikn, e->inv, 0, e->din, T, L->blk);
     kq4_qsa_rows(e->s, c, 0, e->din, e->done, e->nsel, T);
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
     kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
