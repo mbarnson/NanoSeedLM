@@ -84,6 +84,13 @@ void kc_mv_sel(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const fl
 // Routed experts' gate + up + SwiGLU in one pass over the selected pairs: a[p][r]
 void kc_mv_gu(cudaStream_t s, int fmt, const WSlice* wg, const WSlice* wu, int K, int R, const float* x, int xs, float* a,
               int ys, const int32_t* sel, int P, int xdiv, const uint32_t* G);
+// Trellis-coded experts (nslm/trellis.h format v0, plan T3): kc_mv_gu and kc_mv_sel's gathers for slices of words
+// (WSlice p[0], [R][row_words]) and BF16 block scales (p[1], [R][K / T]).  L 12 or 16 state bits, KB 2 to 4 bits a
+// weight, T 256 or 320 (T divides K).  0, or -1 for a trellis or shape without a kernel.
+int kc_tq_mv_gu(cudaStream_t s, int L, int KB, int T, const WSlice* wg, const WSlice* wu, int K, int R, const float* x, int xs,
+                float* a, int ys, const int32_t* sel, int P, int xdiv);
+int kc_tq_mv_sel(cudaStream_t s, int L, int KB, int T, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
+                 const int32_t* sel, int P, int xdiv);
 // GEMM: dense (T tokens) or grouped (ntiles entries of the tile table; pairs perm[])
 // prefill GEMM: seed weights exact in f32 (three BF16 terms) instead of rounded to BF16 (see kernels_moe.cu)
 void kc_seed_gemm_f32(int on);

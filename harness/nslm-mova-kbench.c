@@ -16,6 +16,7 @@
 #include "kernels_cuda.h"
 #include "lfsr.h"
 #include "platform.h"
+#include "trellis.h"
 
 static void* dev_rand(size_t bytes, unsigned seed) {
     uint8_t* h = (uint8_t*) malloc(bytes);
@@ -52,6 +53,7 @@ typedef struct {
     WSlice* d;
     WSlice h0;
     double bytes_per_slice;
+    void* mem[4];   // make_tq's buffers (free_tensor)
 } Tensor;
 // group: the affine group of Q4 / Q8 (64 or 32)
 static Tensor make_tensor_g(int fmt, int slices, int R, int K, unsigned seed, int group) {
@@ -86,6 +88,27 @@ static Tensor make_tensor_g(int fmt, int slices, int R, int K, unsigned seed, in
     return t;
 }
 static Tensor make_tensor(int fmt, int slices, int R, int K, unsigned seed) { return make_tensor_g(fmt, slices, R, K, seed, 64); }
+// Trellis slices (format v0): random words (every bit stream is a code) and BF16 block scales
+static Tensor make_tq(int slices, int R, int C, int L, int KB, int T, unsigned seed) {
+    Tensor t;
+    memset(&t, 0, sizeof t);
+    const size_t nw = nslm_tq_row_words(C, T, L, KB), nb = (size_t) (C / T);
+    uint8_t* w = (uint8_t*) dev_rand(nw * 4 * R * slices, seed), *sc = (uint8_t*) dev_scales(nb * R * slices);
+    WSlice* h = (WSlice*) calloc((size_t) slices, sizeof(WSlice));
+    for (int i = 0; i < slices; ++i) { h[i].p[0] = w + nw * 4 * R * i; h[i].p[1] = sc + nb * 2 * R * i; }
+    cudaMalloc((void**) &t.d, sizeof(WSlice) * (size_t) slices);
+    cudaMemcpy(t.d, h, sizeof(WSlice) * (size_t) slices, cudaMemcpyHostToDevice);
+    t.h0 = h[0];
+    t.mem[0] = w; t.mem[1] = sc;
+    t.bytes_per_slice = (double) R * (nw * 4 + nb * 2);
+    free(h);
+    return t;
+}
+static void free_tensor(Tensor* t) {   // the slice table, and make_tq's buffers (make_tensor_g's are kept)
+    cudaFree(t->d);
+    for (int i = 0; i < 4; ++i) cudaFree(t->mem[i]);
+    memset(t, 0, sizeof *t);
+}
 
 typedef void (*Body)(void* ctx, int it);
 static double time_us(Body f, void* ctx, int iters) {
@@ -114,6 +137,7 @@ typedef struct {
     float *x, *y;
     int32_t* sel;   // [64][P]: rotating selections
     const uint32_t* G;
+    int tl, tk, tt;   // trellis: L, K bits a weight, T
 } Case;
 static void run_dense(void* c_, int it) {
     Case* c = (Case*) c_;
@@ -127,6 +151,14 @@ static void run_gather(void* c_, int it) {
 static void run_gu(void* c_, int it) {
     Case* c = (Case*) c_;
     kc_mv_gu(0, c->fmt, c->w.d, c->u.d, c->K, c->R, c->x, c->K, c->y, c->R, c->sel + (it % 64) * c->P, c->P, c->xdiv, c->G);
+}
+static void run_tq_gu(void* c_, int it) {
+    Case* c = (Case*) c_;
+    kc_tq_mv_gu(0, c->tl, c->tk, c->tt, c->w.d, c->u.d, c->K, c->R, c->x, c->K, c->y, c->R, c->sel + (it % 64) * c->P, c->P, c->xdiv);
+}
+static void run_tq_sel(void* c_, int it) {
+    Case* c = (Case*) c_;
+    kc_tq_mv_sel(0, c->tl, c->tk, c->tt, c->w.d, c->K, c->R, c->x, c->K, c->y, c->R, c->sel + (it % 64) * c->P, c->P, c->xdiv);
 }
 static void run_mm(void* c_, int it) {
     Case* c = (Case*) c_;
@@ -275,6 +307,48 @@ int main(int argc, char** argv) {
             snprintf(nm, sizeof nm, "qwen4 k_mv down %s (10 x 2560 x 640)", fm[f].name);
             printf("%-44s %10.2f %10.1f\n", nm, us, 10 * d.w.bytes_per_slice / us / 1e3);
         }
+    }
+    {   // trellis-coded experts (nslm/trellis.h format v0, plan T3) against P3, both at 10 and 30 (token, expert) pairs
+        // of 512 experts (1 and 3 tokens): gate + up fused (640 x 2560, T 256), then down (2560 x 640, T 320).  L = 16.
+        uint32_t* g24h = (uint32_t*) malloc(65536 * 4);
+        for (uint32_t s = 0; s < 65536; ++s) g24h[s] = lfsr_stream24((uint16_t) s);
+        uint32_t* G24 = NULL;
+        cudaMalloc((void**) &G24, 65536 * 4);
+        cudaMemcpy(G24, g24h, 65536 * 4, cudaMemcpyHostToDevice);
+        free(g24h);
+        int32_t* selh = (int32_t*) malloc(64 * 30 * 4), *sel30 = NULL;
+        for (int i = 0; i < 64 * 30; ++i) selh[i] = (i * 97 + i / 10 * 13) % 512;
+        cudaMalloc((void**) &sel30, 64 * 30 * 4);
+        cudaMemcpy(sel30, selh, 64 * 30 * 4, cudaMemcpyHostToDevice);
+        free(selh);
+        printf("\n%-44s %10s %10s %10s\n", "qwen4 decode experts, 512 of them", "us/call", "GB/s", "MB/call");
+        for (int f = 0; f < 4; ++f) {   // f = 0: P3 seeds; 1 .. 3: trellis K = 2 .. 4
+            Case c;
+            memset(&c, 0, sizeof c);
+            c.fmt = MF_SEED4; c.R = 640; c.K = 2560; c.slices = 512; c.xdiv = 10; c.x = x; c.y = y; c.sel = sel30; c.G = G24;
+            c.tl = f ? 16 : 0; c.tk = f + 1; c.tt = 256;
+            c.w = f ? make_tq(512, 640, 2560, 16, f + 1, 256, 70 + (unsigned) f) : make_tensor_g(MF_SEED4, 512, 640, 2560, 70, 64);
+            c.u = f ? make_tq(512, 640, 2560, 16, f + 1, 256, 80 + (unsigned) f) : make_tensor_g(MF_SEED4, 512, 640, 2560, 80, 64);
+            Case d = c;
+            d.R = 2560; d.K = 640; d.xdiv = 10; d.tt = 320;
+            d.w = f ? make_tq(512, 2560, 640, 16, f + 1, 320, 90 + (unsigned) f) : make_tensor_g(MF_SEED4, 512, 2560, 640, 90, 64);
+            char fn[32];
+            if (f) snprintf(fn, sizeof fn, "trellis K %d", f + 1); else snprintf(fn, sizeof fn, "seed4 (P3)");
+            for (int P = 10; P <= 30; P += 20) {
+                char nm[64];
+                c.P = P; d.P = P;
+                double us = time_us(f ? run_tq_gu : run_gu, &c, iters);
+                double mb = 2.0 * P * c.w.bytes_per_slice / 1e6;
+                snprintf(nm, sizeof nm, "gate+up %s, %d pairs", fn, P);
+                printf("%-44s %10.2f %10.1f %10.2f\n", nm, us, mb * 1e3 / us, mb);
+                us = time_us(f ? run_tq_sel : run_gather, &d, iters);
+                mb = P * d.w.bytes_per_slice / 1e6;
+                snprintf(nm, sizeof nm, "down %s, %d pairs", fn, P);
+                printf("%-44s %10.2f %10.1f %10.2f\n", nm, us, mb * 1e3 / us, mb);
+            }
+            free_tensor(&c.w); free_tensor(&c.u); free_tensor(&d.w);
+        }
+        cudaFree(sel30); cudaFree(G24);
     }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(e)); return 1; }

@@ -2136,6 +2136,83 @@ PACKED_MM(MF_SEED4P4, seed4p4)
 static const MmKernel PACKED_MM_K[] = {k_mm_packed_bf16, k_mm_packed_seed4, k_mm_packed_q8, k_mm_packed_q4, k_mm_packed_seed4p4};
 
 // ---- launchers ---------------------------------------------------------------------------------------------------------
+// ---- trellis-coded experts (nslm/trellis.h format v0, plan T3): decode gathers ------------------------------------
+// A row of C weights is C / T blocks; block b is a stream of NB = KB T + L - KB bits from bit b NB of the row's words
+// (little-endian 32-bit words, row_words = ceil(C / T NB / 32) + 1 with the spare word).  Weight t of a block is
+// scale_b q(s_t), s_t the L bits from bit KB t of the block, q(s) = the byte sum of 34038481 s + 76625530 - 510.
+// As k_mv_gu / k_mv: a warp a row, a warp step a block, lane l the W = T / 32 weights from l W: it reads 3 words once,
+// shifts them to its first bit, and takes each state at a compile-time shift.  q as an f32 without I2F:
+// __dp4a(x, 0x01010101, 0x4B000000) is the bits of 2^23 + the byte sum, so q = that float - (2^23 + 510), exact.
+// WSlice: p[0] words [R][row_words], p[1] BF16 scales [R][C / T].
+template <int L, int KB, int T>
+static __device__ __forceinline__ void tq_load_x(const float* xp, float* xv) {
+    constexpr int W = T / 32;
+    if (W % 4 == 0) {
+#pragma unroll
+        for (int i = 0; i < W / 4; ++i) { const float4 v = ((const float4*) xp)[i]; xv[4 * i] = v.x; xv[4 * i + 1] = v.y; xv[4 * i + 2] = v.z; xv[4 * i + 3] = v.w; }
+    } else {
+#pragma unroll
+        for (int i = 0; i < W / 2; ++i) { const float2 v = ((const float2*) xp)[i]; xv[2 * i] = v.x; xv[2 * i + 1] = v.y; }
+    }
+}
+template <int L, int KB, int T>
+static __device__ __forceinline__ float tq_block(const uint32_t* row, int b, int lane, const float* xv) {
+    constexpr int W = T / 32, NB = KB * T + L - KB;
+    const uint32_t o = (uint32_t) b * NB + (uint32_t) (KB * W) * (uint32_t) lane, sh = o & 31u;
+    const uint32_t* p = row + (o >> 5);
+    const uint32_t w0 = p[0], w1 = p[1], w2 = p[2];
+    const uint64_t v = (uint64_t) __funnelshift_r(w0, w1, sh) | (uint64_t) __funnelshift_r(w1, w2, sh) << 32;
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < W; ++i) {
+        const uint32_t st = (uint32_t) (v >> (KB * i)) & ((1u << L) - 1u);
+        const float q = __uint_as_float(__dp4a(st * 34038481u + 76625530u, 0x01010101u, 0x4B000000u)) - 8389118.0f;
+        s += q * xv[i];
+    }
+    return s;
+}
+static __device__ __forceinline__ size_t tq_row_words(int C, int T, int NB) { return (size_t) (((size_t) (C / T) * NB + 31) / 32) + 1; }
+
+template <int L, int KB, int T>
+__global__ void __launch_bounds__(32 * MV_ROWS) k_tq_mv_gu(MvArgs a, const WSlice* wg, const WSlice* wu, const float* x, float* y,
+                                                          const int32_t* sel) {
+    constexpr int W = T / 32, NB = KB * T + L - KB;
+    const int lane = threadIdx.x & 31, r = (int) (blockIdx.x * MV_ROWS + (threadIdx.x >> 5));
+    if (r >= a.R) return;
+    const int p0 = (int) blockIdx.y, slice = sel[p0], nb = a.K / T;
+    const float* xb = x + (size_t) (p0 / a.xdiv) * a.xs;
+    const size_t nw = tq_row_words(a.K, T, NB);
+    const uint32_t* gr = (const uint32_t*) wg[slice].p[0] + (size_t) r * nw, *ur = (const uint32_t*) wu[slice].p[0] + (size_t) r * nw;
+    const uint16_t* gsc = (const uint16_t*) wg[slice].p[1] + (size_t) r * nb, *usc = (const uint16_t*) wu[slice].p[1] + (size_t) r * nb;
+    float ga = 0.0f, ua = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        float xv[W];
+        tq_load_x<L, KB, T>(xb + (size_t) b * T + (size_t) lane * W, xv);
+        ga += bf(gsc[b]) * tq_block<L, KB, T>(gr, b, lane, xv);
+        ua += bf(usc[b]) * tq_block<L, KB, T>(ur, b, lane, xv);
+    }
+    const float gs = warp_sum(ga), us = warp_sum(ua);
+    if (lane == 0) y[(size_t) p0 * a.ys + r] = bfr(silu_bf(bfr(gs)) * bfr(us));
+}
+template <int L, int KB, int T>
+__global__ void __launch_bounds__(32 * MV_ROWS) k_tq_mv_sel(MvArgs a, const WSlice* ws, const float* x, float* y, const int32_t* sel) {
+    constexpr int W = T / 32, NB = KB * T + L - KB;
+    const int lane = threadIdx.x & 31, r = (int) (blockIdx.x * MV_ROWS + (threadIdx.x >> 5));
+    if (r >= a.R) return;
+    const int p0 = (int) blockIdx.y, slice = sel[p0], nb = a.K / T;
+    const float* xb = x + (size_t) (p0 / a.xdiv) * a.xs;
+    const uint32_t* row = (const uint32_t*) ws[slice].p[0] + (size_t) r * tq_row_words(a.K, T, NB);
+    const uint16_t* sc = (const uint16_t*) ws[slice].p[1] + (size_t) r * nb;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        float xv[W];
+        tq_load_x<L, KB, T>(xb + (size_t) b * T + (size_t) lane * W, xv);
+        acc += bf(sc[b]) * tq_block<L, KB, T>(row, b, lane, xv);
+    }
+    const float s = warp_sum(acc);
+    if (lane == 0) store_y(y + (size_t) p0 * a.ys + r, s, a.add);
+}
+
 extern "C" {
 
 void kc_embed(cudaStream_t s, int fmt, WSlice w, int d, const int32_t* ids, float* x, int T) {
@@ -2165,6 +2242,30 @@ void kc_mv_gu(cudaStream_t s, int fmt, const WSlice* wg, const WSlice* wu, int K
     MvArgs a = {K, R, P, xdiv, xs, ys, 0, 0};
     MVGU_K[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P), 32 * MV_ROWS, 0, s>>>(a, wg, wu, x, a_, sel, G);
 }
+// (L, KB, T) index: L 12 / 16, KB 2 / 3 / 4, T 256 / 320
+#define TQ_CASES(X) X(12, 2, 256) X(12, 3, 256) X(12, 4, 256) X(12, 2, 320) X(12, 3, 320) X(12, 4, 320) \
+                    X(16, 2, 256) X(16, 3, 256) X(16, 4, 256) X(16, 2, 320) X(16, 3, 320) X(16, 4, 320)
+int kc_tq_mv_gu(cudaStream_t s, int L, int KB, int T, const WSlice* wg, const WSlice* wu, int K, int R, const float* x, int xs,
+                float* a_, int ys, const int32_t* sel, int P, int xdiv) {
+    if (K % T || R < 1 || P < 1) return -1;
+    MvArgs a = {K, R, P, xdiv, xs, ys, 0, 0};
+    const dim3 grid((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P);
+#define TQ_GU(l, k, t) if (L == l && KB == k && T == t) { k_tq_mv_gu<l, k, t><<<grid, 32 * MV_ROWS, 0, s>>>(a, wg, wu, x, a_, sel); return 0; }
+    TQ_CASES(TQ_GU)
+#undef TQ_GU
+    return -1;
+}
+int kc_tq_mv_sel(cudaStream_t s, int L, int KB, int T, const WSlice* ws, int K, int R, const float* x, int xs, float* y, int ys,
+                 const int32_t* sel, int P, int xdiv) {
+    if (K % T || R < 1 || P < 1) return -1;
+    MvArgs a = {K, R, P, xdiv, xs, ys, 0, 0};
+    const dim3 grid((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P);
+#define TQ_SEL(l, k, t) if (L == l && KB == k && T == t) { k_tq_mv_sel<l, k, t><<<grid, 32 * MV_ROWS, 0, s>>>(a, ws, x, y, sel); return 0; }
+    TQ_CASES(TQ_SEL)
+#undef TQ_SEL
+    return -1;
+}
+
 static int g_seed_exact;
 void kc_seed_gemm_f32(int on) { g_seed_exact = on; }
 static MmKernel mm_kernel(int fmt) { return (g_seed_exact ? MM3_K : MM_K)[fmt]; }
