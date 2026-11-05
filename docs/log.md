@@ -499,10 +499,20 @@ bound by its loads. Read [shared key tiles](results/2026-11-05-qwen38-shared-til
 
 ## [2026-11-05] engine | Qwen3.8-Flash-Next on the Metal engine
 
-`3a6d2b8`, `f7b902a`: `engine/qwen4_gpu.m` runs `engine/qwen4_eng.h` on Metal, so `nslm-qwen4-gen` builds on macOS.
+`bdb6c5f`, `c036c9c`: `engine/qwen4_gpu.m` runs `engine/qwen4_eng.h` on Metal, so `nslm-qwen4-gen` builds on macOS.
 The weights, the routed experts included, are mapped from the folder without a copy, so the Mac needs no expert cache.
 On the M4 Max the P3 pack decodes the tide-pools prompt at 38.4 tokens/s warm and 33.0 cold. mlx-vlm 0.7.12 decodes it
 at 40.1 (greedy). Both runs give the same text. `test_qwen4_metal` checks the engine against mlx-vlm on the tiny model,
 with the CUDA test's limits. The QSA top-k now writes its blocks in block order on Metal too, so the logits do not
 depend on timing. One difference from CUDA: decode rows split differently move the logits by BF16 steps, because
 Metal's `k_mv` sums one token's row in another order than several tokens' rows.
+
+## [2026-11-05] engine | Qwen3.8-Flash-Next on Metal: faster decode and prompt, and nslm-chat
+
+`9272957`, `03fe673`, `8717cf2`, `6b6bfc3`, `39b8b97`, `fc30da2`, `8c301fe`: on the M4 Max the P3 pack now decodes the
+tide-pools prompt at 42 to 43 tokens/s, against 38.4 before and mlx-vlm 0.7.12's 40.1. It reads a 5,639-token prompt at
+414 to 439 tokens/s, against 288 before and mlx-vlm's 457 to 500. The router's top-k now uses a threadgroup for each
+row. Matvecs with few rows and a long input (`k_mv_split`) now spread each row over a threadgroup. Prompt forwards are
+4,096 rows (`--prompt-rows`). Prompt attention (`k_q4_attend_g`) treats a KV group's 12 heads as the rows of simdgroup
+matrices, so each key tile is loaded once for all of them. `nslm-chat` and `nslm-serve` now reach the Metal engine
+through `engine/engine.c`. `test_qwen4_metal` also checks `qwen4_tiny_attn` against the C reference.
