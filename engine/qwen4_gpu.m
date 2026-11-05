@@ -539,7 +539,7 @@ static void attention(Q4Eng* e, Layer* L, int T) {
     mark(e, ST_QSA);
     const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, e->pos, 1.0f / sqrtf((float) hd), 0};
     // prompt rows: a KV group's heads as the rows of simdgroup matrices, each key tile loaded once for all of them
-    const int grouped = T > MV_MAXT && c->n_head / c->n_kv <= 16 && hd % 8 == 0 && !e->no_attg;
+    const int grouped = T > MV_MAXT && c->n_head / c->n_kv <= 16 && hd % (8 * ATG_NQ) == 0 && !e->no_attg;
     [e->enc setComputePipelineState:pipe4(e, grouped ? "k_q4_attend_g" : "k_q4_attend")];
     A_(e, &aa, sizeof aa);
     B(e, 1, e->qp, 0);
@@ -548,7 +548,7 @@ static void attention(Q4Eng* e, Layer* L, int T) {
     B(e, 4, e->sel, 0);
     B(e, 5, e->nsel, 0);
     B(e, 6, e->o, 0);
-    if (grouped) tgs(e, (uint64_t) c->n_kv, (uint64_t) T, 64);
+    if (grouped) tgs(e, (uint64_t) c->n_kv, (uint64_t) T, 64 * ATG_NQ);
     else tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
     mark(e, ST_ATTEND);
     mv(e, &L->o, e->o, e->br, T);

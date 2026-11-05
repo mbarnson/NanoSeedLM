@@ -945,7 +945,7 @@ int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float*
     const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), 0};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob]);
-            if (grouped) [e dispatchThreadgroups:TGS(c->n_kv, T) threadsPerThreadgroup:TGS(64, 1)];
+            if (grouped) [e dispatchThreadgroups:TGS(c->n_kv, T) threadsPerThreadgroup:TGS(64 * ATG_NQ, 1)];
             else [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
         }))
         return -1;
