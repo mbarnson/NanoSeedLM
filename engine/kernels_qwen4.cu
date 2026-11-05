@@ -80,7 +80,7 @@ static __device__ __forceinline__ float4 mad4(float4 a, float4 b, float4 c) {
 template <int D4> struct GdnStage {   // a stage's q and k of head kh, v of the block's 32 rows, raw a and b of head hv
     float4 q[GDN_TS][D4], k[GDN_TS][D4];
     float4 v[GDN_TS][8];
-    float a[GDN_TS], b[GDN_TS];
+    float a[GDN_TS], b[GDN_TS];   // raw, then (each stage, by GDN_TS threads) the decay g and beta
 };
 template <int D4>
 static __device__ __forceinline__ void gdn_fetch(const GdnArgs& a, const float* cv, const float* aa, const float* bb, int hv, int kh, int t0,
@@ -118,23 +118,32 @@ __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const flo
         __pipeline_wait_prior(0);
         __syncthreads();   // this stage is in, and every thread is done with the other buffer
         if (t0 + GDN_TS < T) gdn_fetch<D4>(a, cv, aa, bb, hv, kh, t0 + GDN_TS, min(GDN_TS, T - t0 - GDN_TS), &st[cur ^ 1]);
-        const GdnStage<D4>* g4 = &st[cur];
+        GdnStage<D4>* g4 = &st[cur];
+        if (threadIdx.x < nt) {   // the stage's g and beta, off the tokens' chain
+            const float ap = g4->a[threadIdx.x] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
+            g4->a[threadIdx.x] = expf(-A * sp);
+            g4->b[threadIdx.x] = sigm(g4->b[threadIdx.x]);
+        }
+        __syncthreads();
         for (int u = 0; u < nt; ++u) {
-            const float ap = g4->a[u] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
-            const float g = expf(-A * sp), beta = sigm(g4->b[u]);
-            float4 kv4 = make_float4(0, 0, 0, 0), y4 = kv4;
+            const float g = g4->a[u], beta = g4->b[u];
+            float4 kv4 = make_float4(0, 0, 0, 0), kw4 = kv4, y4 = kv4, z4 = kv4;   // two chains each
 #pragma unroll
-            for (int m = 0; m < DM; ++m) kv4 = mad4(s[m], g4->k[u][m * SPLIT + p], kv4);
-            float kv = (kv4.x + kv4.y) + (kv4.z + kv4.w);
+            for (int m = 0; m < DM; m += 2) {
+                kv4 = mad4(s[m], g4->k[u][m * SPLIT + p], kv4);
+                if (m + 1 < DM) kw4 = mad4(s[m + 1], g4->k[u][(m + 1) * SPLIT + p], kw4);
+            }
+            float kv = ((kv4.x + kw4.x) + (kv4.y + kw4.y)) + ((kv4.z + kw4.z) + (kv4.w + kw4.w));
             if (SPLIT == 2) kv += __shfl_xor_sync(FULL, kv, 1);
             const float delta = (((const float*) g4->v[u])[r] - g * kv) * beta;
 #pragma unroll
             for (int m = 0; m < DM; ++m) {
                 const float4 kk = g4->k[u][m * SPLIT + p];
                 s[m] = make_float4(g * s[m].x + delta * kk.x, g * s[m].y + delta * kk.y, g * s[m].z + delta * kk.z, g * s[m].w + delta * kk.w);
-                y4 = mad4(s[m], g4->q[u][m * SPLIT + p], y4);
+                if (m & 1) z4 = mad4(s[m], g4->q[u][m * SPLIT + p], z4);
+                else y4 = mad4(s[m], g4->q[u][m * SPLIT + p], y4);
             }
-            float yq = (y4.x + y4.y) + (y4.z + y4.w);
+            float yq = ((y4.x + z4.x) + (y4.y + z4.y)) + ((y4.z + z4.z) + (y4.w + z4.w));
             if (SPLIT == 2) yq += __shfl_xor_sync(FULL, yq, 1);
             if (p == 0) y[(size_t) (t0 + u) * a.vd + (size_t) hv * a.dv + i] = yq;
         }
