@@ -119,6 +119,7 @@ struct Q4Eng {
     int32_t *cj_h, *cj_d;
     float *cx_h, *cx_d, *cy_h, *cy_d, *cbuf;
     uint32_t *hs_h, *hs_d, *dseq;
+    unsigned long long* dts;   // Q4E_PROFILE: the hand-off's GPU times (kq4_signal, kq4_wait)
     const uint8_t* arena_h;
     int32_t* ebias;   // [units][3]: each unit's exponent biases
     pthread_t cth;
@@ -578,6 +579,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
             cudaHostGetDevicePointer((void**) &e->cj_d, m[0], 0); cudaHostGetDevicePointer((void**) &e->cx_d, m[1], 0);
             cudaHostGetDevicePointer((void**) &e->cy_d, m[2], 0); cudaHostGetDevicePointer((void**) &e->hs_d, m[3], 0);
             e->dseq = (uint32_t*) dmem(e, NULL, 4);
+            e->dts = (unsigned long long*) dmem(e, NULL, 32);
             e->cbuf = (float*) malloc(sizeof(float) * ct_floats(c));
             cpu_seed4_table();
             pthread_mutex_init(&e->cmu, NULL);
@@ -660,8 +662,14 @@ void q4e_close(Q4Eng* e) {
         for (int i = 0; i < ST_N; ++i)
             if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
         fprintf(stderr, "Q4E_PROFILE: host PLE prefetch %.0f ms, PLE rows %.0f ms (%d threads)\n", e->host_ms[0], e->host_ms[1], e->ple_threads);
-        if (e->ct_layers) fprintf(stderr, "Q4E_PROFILE: CPU tail %.0f ms, %ld layers, %ld pairs (%.0f us a layer, %.0f us a pair)\n", e->ct_ms,
-                                  e->ct_layers, e->ct_pairs, 1e3 * e->ct_ms / e->ct_layers, e->ct_pairs ? 1e3 * e->ct_ms / e->ct_pairs : 0.0);
+        if (e->ct_layers) {
+            unsigned long long t[4] = {0};
+            cudaMemcpy(t, e->dts, sizeof t, cudaMemcpyDeviceToHost);
+            fprintf(stderr, "Q4E_PROFILE: CPU tail %.0f ms, %ld layers, %ld pairs (%.0f us a layer, %.0f us a pair)\n", e->ct_ms,
+                    e->ct_layers, e->ct_pairs, 1e3 * e->ct_ms / e->ct_layers, e->ct_pairs ? 1e3 * e->ct_ms / e->ct_pairs : 0.0);
+            if (t[3]) fprintf(stderr, "Q4E_PROFILE: GPU signal to ack %.0f us a layer, of which the GPU waited %.0f us (%llu layers)\n",
+                              1e-3 * (double) t[1] / (double) t[3], 1e-3 * (double) t[2] / (double) t[3], t[3]);
+        }
         int regs = 0, blocks = 0;
         kq4_attend_info(&e->c, &regs, &blocks);
         fprintf(stderr, "Q4E_PROFILE: prompt attention kernel %d registers a thread, %d blocks an SM\n", regs, blocks);
@@ -989,7 +997,7 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     const int ct = e->cpu_tail && side && l >= 0;   // D4: the tail's misses to the CPU, beside the GPU's work
     if (ct) {
         kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->cpu_tail, 0, e->cj_d, l);
-        kq4_signal(e->s, e->dseq, e->hs_d, e->x, e->cx_d, T * c->d);
+        kq4_signal(e->s, e->dseq, e->hs_d, e->x, e->cx_d, T * c->d, e->prof ? e->dts : NULL);
     } else if (e->tail_skip && e->cache && side && l >= 0)
         kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm, NULL, 0);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
@@ -1027,7 +1035,7 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     }
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->lg + c->n_exp, c->n_exp + 1, e->br, T);
     if (ct) {
-        kq4_wait(e->s, e->dseq, e->hs_d + 16);
+        kq4_wait(e->s, e->dseq, e->hs_d + 16, e->prof ? e->dts : NULL);
         kq4_cpu_add(e->s, e->br, e->cy_d, e->cj_d, c->d, T);
     }
 }

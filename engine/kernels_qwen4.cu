@@ -442,23 +442,31 @@ void kq4_cpu_add(cudaStream_t s, float* out, const float* cy, const int32_t* lis
     k_q4_cpu_add<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(out, cy, list, d);
 }
 
-__global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag, const float* x, volatile float* hx, int n) {
+static __device__ __forceinline__ unsigned long long gtime() {   // ns
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void k_q4_signal(uint32_t* seq, volatile uint32_t* flag, const float* x, volatile float* hx, int n, unsigned long long* ts) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) hx[i] = x[i];
     __threadfence_system();   // each thread's copies, then the flag
     __syncthreads();
     if (threadIdx.x) return;
+    if (ts) ts[0] = gtime();
     const uint32_t v = ++*seq;
     *flag = v;
 }
-__global__ void k_q4_wait(const uint32_t* seq, volatile const uint32_t* ack) {
+__global__ void k_q4_wait(const uint32_t* seq, volatile const uint32_t* ack, unsigned long long* ts) {
     const uint32_t v = *seq;
+    const unsigned long long t0 = ts ? gtime() : 0;
     while (*ack < v) __nanosleep(100);
     __threadfence_system();   // the host's outputs after its ack
+    if (ts) { const unsigned long long t1 = gtime(); ts[1] += t1 - ts[0]; ts[2] += t1 - t0; ts[3]++; }
 }
-void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag, const float* x, float* hx, int n) {
-    k_q4_signal<<<1, 256, 0, s>>>(seq, flag, x, hx, n);
+void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag, const float* x, float* hx, int n, unsigned long long* ts) {
+    k_q4_signal<<<1, 256, 0, s>>>(seq, flag, x, hx, n, ts);
 }
-void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack) { k_q4_wait<<<1, 1, 0, s>>>(seq, ack); }
+void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack, unsigned long long* ts) { k_q4_wait<<<1, 1, 0, s>>>(seq, ack, ts); }
 
 __global__ void k_q4_moe_combine(int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;

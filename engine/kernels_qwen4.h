@@ -58,9 +58,10 @@ void kq4_tail_skip(cudaStream_t s, int32_t* ind, float* wt, const int32_t* slot,
 // out[t] += the weight times cy[j] of each listed pair j of row t, in list order
 void kq4_cpu_add(cudaStream_t s, float* out, const float* cy, const int32_t* list, int d, int T);
 // A GPU-host hand-off that a CUDA graph can replay (plan D4): kq4_signal copies n floats x to hx (mapped host memory),
-// adds 1 to the device count seq and writes it to flag (mapped); kq4_wait spins until the host's ack (mapped) reaches seq
-void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag, const float* x, float* hx, int n);
-void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack);
+// adds 1 to the device count seq and writes it to flag (mapped); kq4_wait spins until the host's ack (mapped) reaches seq.
+// ts (device, or NULL): the signal's time, and sums of signal-to-ack and of the wait (ns), and the count
+void kq4_signal(cudaStream_t s, uint32_t* seq, volatile uint32_t* flag, const float* x, float* hx, int n, unsigned long long* ts);
+void kq4_wait(cudaStream_t s, const uint32_t* seq, volatile const uint32_t* ack, unsigned long long* ts);
 // out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t * sgld]) sh[t]
 void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T);
 // qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated). _keep: also hist after each row t < T - 1 at
