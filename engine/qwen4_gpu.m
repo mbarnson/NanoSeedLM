@@ -356,7 +356,7 @@ static void mv_sel(Q4Eng* e, const MW* w, id<MTLBuffer> X, int xs, id<MTLBuffer>
     B(e, 6, sel, 0);
     B(e, 7, stab_for(e, w), 0);
     bind_codes(e, w, 8);
-    tgs(e, (uint64_t) (w->rows + MV_RPT(w->fmt) - 1) / MV_RPT(w->fmt), (uint64_t) P, 32 * MV_ROWS);
+    tgs(e, (uint64_t) (w->rows + MV_RPT_G(w->fmt, 0, w->cols) - 1) / MV_RPT_G(w->fmt, 0, w->cols), (uint64_t) P, 32 * MV_ROWS);
 }
 // P pairs: A[p] = silu(Wg[sel[p]] x) * (Wu[sel[p]] x), x = row p / xdiv (k_mv_gu)
 static void mv_gu(Q4Eng* e, const MW* wg, const MW* wu, id<MTLBuffer> X, int xs, id<MTLBuffer> Out, int ys, id<MTLBuffer> sel, int P, int xdiv) {

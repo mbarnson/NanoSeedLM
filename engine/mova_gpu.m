@@ -825,13 +825,13 @@ static void enc_mv_bind(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuff
 static void enc_mv(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuffer> Y, int ys, int T, bool add, id<MTLBuffer> sel, int P,
                    int xdiv) {
     enc_mv_bind(c, W, X, xs, Y, ys, T, add, sel, P, xdiv);
-    crun(c, (uint64_t) (W->rows + MV_RPT(W->fmt) - 1) / MV_RPT(W->fmt), sel ? (uint64_t) P : 1, 1, 32 * MV_ROWS);
+    crun(c, (uint64_t) (W->rows + MV_RPT_G(W->fmt, sel ? 0 : T, W->cols) - 1) / MV_RPT_G(W->fmt, sel ? 0 : T, W->cols), sel ? (uint64_t) P : 1, 1, 32 * MV_ROWS);
 }
 static void enc_mv_sel(Cmd* c, const MW* W, id<MTLBuffer> X, int xs, id<MTLBuffer> Y, int ys, id<MTLBuffer> sel, uint64_t soff, int P,
                        int xdiv) {
     enc_mv_bind(c, W, X, xs, Y, ys, 0, false, sel, P, xdiv);
     [c->enc setBuffer:sel offset:soff atIndex:6];
-    crun(c, (uint64_t) (W->rows + MV_RPT(W->fmt) - 1) / MV_RPT(W->fmt), (uint64_t) P, 1, 32 * MV_ROWS);
+    crun(c, (uint64_t) (W->rows + MV_RPT_G(W->fmt, 0, W->cols) - 1) / MV_RPT_G(W->fmt, 0, W->cols), (uint64_t) P, 1, 32 * MV_ROWS);
 }
 // Routed experts' gate + up + SwiGLU over the selected (token, expert) pairs in one dispatch (k_mv_gu): A[p] = the MLP
 // activation of pair p.  Gate and up share the format (they come from the same packed configuration).

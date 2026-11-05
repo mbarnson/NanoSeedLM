@@ -97,7 +97,7 @@ static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuf
         [e setBuffer:m.W offset:0 atIndex:1]; [e setBuffer:m.S offset:0 atIndex:2]; [e setBuffer:m.B offset:0 atIndex:3];
         [e setBuffer:xb offset:0 atIndex:4]; [e setBuffer:yb offset:0 atIndex:5]; [e setBuffer:sel offset:0 atIndex:6];
         [e setBuffer:m.G offset:0 atIndex:7]; [e setBuffer:m.N offset:0 atIndex:8];
-        [e dispatchThreadgroups:MTLSizeMake((w->R + MV_RPT(w->fmt) - 1) / MV_RPT(w->fmt), groups, 1)
+        [e dispatchThreadgroups:MTLSizeMake((w->R + MV_RPT_G(w->fmt, T, w->K) - 1) / MV_RPT_G(w->fmt, T, w->K), groups, 1)
           threadsPerThreadgroup:MTLSizeMake(32 * MV_ROWS, 1, 1)];
     });
 }
