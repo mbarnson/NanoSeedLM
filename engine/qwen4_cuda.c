@@ -65,6 +65,8 @@ struct Q4Eng {
     float* hlog;
     int nb, nple, cap, no_graph;   // QSA block slots; PLE layers; capturing a graph; NSLM_NO_GRAPH
     cudaGraphExec_t graph[2][MV_MAXT + 1];   // [with logits][rows]
+    FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
+    int32_t *droute, *hroute;
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
     MmTile* tiles;
     int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
@@ -384,6 +386,11 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->hlog = (float*) pin(e, sizeof(float) * (size_t) Q4E_LOGIT_ROWS * c->vocab);
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL;
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
+    if (getenv("Q4E_ROUTES") && !(e->routes = fopen(getenv("Q4E_ROUTES"), "wb"))) fail(e, "cannot write %s", getenv("Q4E_ROUTES"));
+    if (e->routes) {
+        e->droute = (int32_t*) dmem(e, NULL, sizeof(int32_t) * (size_t) c->n_layer * T * c->top_k);
+        e->hroute = (int32_t*) pin(e, sizeof(int32_t) * (size_t) c->n_layer * T * c->top_k);
+    }
     for (int i = 0; e->prof && i < 1024; ++i) cudaEventCreate(&e->ev[i]);
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     if (!e->err[0] && cudaDeviceSynchronize() != cudaSuccess) fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
@@ -406,6 +413,7 @@ void q4e_close(Q4Eng* e) {
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
     for (int w = 0; w < 2; ++w) for (int t = 0; t <= MV_MAXT; ++t) if (e->graph[w][t]) cudaGraphExecDestroy(e->graph[w][t]);
     free(e->dev); free(e->host); free(e->ids);
+    if (e->routes) fclose(e->routes);
     if (e->s) cudaStreamDestroy(e->s);
     if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
@@ -520,6 +528,7 @@ static void moe(Q4Eng* e, int l, int T) {
     const int k = c->top_k, P = T * k;
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route(e->s, c, e->lg, e->ind, e->wt, T);
+    if (e->routes) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
         kc_cache_admit(e->s, &e->pool, l, e->ind, P, 0);
@@ -611,6 +620,10 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     if (logits) memcpy(logits, e->hlog, sizeof(float) * (size_t) T * e->c.vocab);
+    const size_t nr = (size_t) e->c.n_layer * T * e->c.top_k;
+    if (e->routes && (cudaMemcpy(e->hroute, e->droute, sizeof(int32_t) * nr, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                      fwrite(&T, sizeof T, 1, e->routes) != 1 || fwrite(e->hroute, sizeof(int32_t), nr, e->routes) != nr))
+        return fail(e, "Q4E_ROUTES: write failed");
     prof_collect(e);
     e->pos += T;
     return 0;
