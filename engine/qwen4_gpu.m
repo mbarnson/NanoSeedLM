@@ -611,7 +611,7 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
             kprof(e);
         } else tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
     }
-    if (split) {
+    if (split && zmax > 1) {   // a row of one split is k_q4_attend_g's output already
         [e->enc setComputePipelineState:pipe4(e, "k_q4_attend_comb")];
         A_(e, &aa, sizeof aa);
         B(e, 1, e->qp, 0);
@@ -932,7 +932,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
     e->no_attg = getenv("Q4E_NO_ATTG") != NULL;
     e->no_splitk = getenv("Q4E_NO_SPLITK") != NULL;
-    e->smin = getenv("Q4E_SPLIT_MIN") ? atoi(getenv("Q4E_SPLIT_MIN")) : 512;
+    e->smin = getenv("Q4E_SPLIT_MIN") ? atoi(getenv("Q4E_SPLIT_MIN")) : 1;   // every decode row: k_q4_attend_g (70 -> 16 us at 100 keys)
     e->skeys = getenv("Q4E_SPLIT_KEYS") ? atoi(getenv("Q4E_SPLIT_KEYS")) : 128;
     if (e->smin < 1) e->smin = 1;
     if (e->skeys < 1) e->skeys = 1;
