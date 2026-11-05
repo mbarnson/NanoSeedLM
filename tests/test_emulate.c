@@ -1,0 +1,132 @@
+// tests/test_emulate.c - emulated packs (nslm/emulate.h): f32 -> f16 rounding, Q8_0 rows as llama.cpp quantizes them,
+// and a pack's experts written over the Q8_0 expert tensors of a small GGUF, in place.
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#include "emulate.h"
+#include "gguf.h"
+#include "rows.h"
+
+static int fails = 0;
+#define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+static void put(FILE* f, const void* p, size_t n) { fwrite(p, 1, n, f); }
+static void put_u32(FILE* f, uint32_t v) { put(f, &v, 4); }
+static void put_u64(FILE* f, uint64_t v) { put(f, &v, 8); }
+static void put_str(FILE* f, const char* s) { put_u64(f, strlen(s)); put(f, s, strlen(s)); }
+
+static float h2f(uint16_t h) {   // IEEE half, by its definition
+    const int e = h >> 10 & 31, m = h & 0x3FF;
+    const float v = e ? ldexpf(1.0f + m / 1024.0f, e - 15) : ldexpf(m / 1024.0f, -14);
+    return h & 0x8000 ? -v : v;
+}
+
+static uint32_t rng = 12345;
+static uint32_t next(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
+
+enum { E = 2, R = 4, CG = 64, CD = 32 };   // experts, rows; gate and down columns
+static int fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) {
+    (void) ctx;
+    if (s == 2) { for (uint64_t i = 0; i < len / 4; ++i) { const int32_t b = -12 - t; memcpy(dst + 4 * i, &b, 4); } return 0; }
+    for (uint64_t i = 0; i < len; ++i) dst[i] = (uint8_t) next();
+    return 0;
+}
+
+// Tensors in GGUF order: gate (Q8_0, CG x R x E), a norm (F32, kept), down (Q8_0, CD x R x E) at aligned offsets.
+static const uint64_t kOff[3] = {0, 576, 640};
+static void write_gguf(const char* path, int rows) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { printf("FAIL: cannot write %s\n", path); exit(1); }
+    put(f, "GGUF", 4); put_u32(f, 3); put_u64(f, 3); put_u64(f, 1);
+    put_str(f, "general.alignment"); put_u32(f, 4); put_u32(f, 32);
+    put_str(f, "blk.0.ffn_gate_exps.weight"); put_u32(f, 3); put_u64(f, CG); put_u64(f, rows); put_u64(f, E); put_u32(f, 8); put_u64(f, kOff[0]);
+    put_str(f, "blk.0.attn_norm.weight"); put_u32(f, 1); put_u64(f, 16); put_u32(f, 0); put_u64(f, kOff[1]);
+    put_str(f, "blk.0.ffn_down_exps.weight"); put_u32(f, 3); put_u64(f, CD); put_u64(f, rows); put_u64(f, E); put_u32(f, 8); put_u64(f, kOff[2]);
+    while (ftell(f) % 32) fputc(0, f);
+    for (int i = 0; i < 640 + E * R * 34; ++i) fputc(0xAB, f);   // 544 + 32 pad, 64 norm, 272 down
+    fclose(f);
+}
+
+int main(void) {
+    mkdir("out", 0755);
+    // f16: nearest, ties to even, subnormals, overflow
+    static const struct { float f; uint16_t h; } kH[] = {
+        {1.0f, 0x3C00}, {-2.0f, 0xC000}, {65504.0f, 0x7BFF}, {1.0f / 3, 0x3555}, {0.0f, 0}, {1e-7f, 0x0002},
+        {0x1p-24f, 0x0001}, {0x1p-25f, 0x0000}, {0x1.8p-24f, 0x0002}, {0x1.002p0f, 0x3C00}, {0x1.006p0f, 0x3C02},
+        {65520.0f, 0x7C00}, {0x1p-14f, 0x0400}, {0x1.ff8p-15f, 0x03FF}, {0x1.ffcp-15f, 0x0400}, {-0x1p-30f, 0x8000}};
+    for (size_t i = 0; i < sizeof kH / sizeof kH[0]; ++i)
+        CHECK(ns_f32_to_f16(kH[i].f) == kH[i].h, "f16(%g) = %04x, not %04x", kH[i].f, ns_f32_to_f16(kH[i].f), kH[i].h);
+
+    // Q8_0: d = amax / 127 as f16, q = round(x / d); a zero block has d = 0
+    float x[64];
+    for (int i = 0; i < 64; ++i) x[i] = i < 32 ? sinf(0.37f * i) * 0.01f : 0.0f;
+    x[5] = -0.02f;
+    uint8_t q[68];
+    ns_q8_0_row(x, 64, q);
+    const uint16_t d = (uint16_t) (q[0] | q[1] << 8);
+    CHECK(d == ns_f32_to_f16(0.02f / 127), "d %04x", d);
+    CHECK((int8_t) q[2 + 5] == -127, "amax code %d", (int8_t) q[7]);
+    const float id = 1.0f / (0.02f / 127);   // as llama.cpp: the inverse of the f32 step
+    for (int i = 0; i < 32; ++i) CHECK((int8_t) q[2 + i] == (int8_t) roundf(x[i] * id), "q[%d] = %d", i, (int8_t) q[2 + i]);
+    CHECK(q[34] == 0 && q[35] == 0 && q[36] == 0, "zero block");
+
+    // A pack: gate in SEED4 (P = 3), down in SEED4P4 (P = 4)
+    const char* dir = "out/test_emulate_pack";
+    mkdir(dir, 0755);
+    const NsSpec sp[2] = {{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight", NS_SEED4, E, R, CG},
+                          {"language_model.model.layers.0.mlp.switch_mlp.down_proj.weight", NS_SEED4P4, E, R, CD}};
+    char err[512] = "";
+    CHECK(ns_write(dir, sp, 2, 1u << 20, NULL, fill, NULL, err, sizeof err) == 0, "pack: %s", err);
+    NsModel m;
+    CHECK(ns_open(&m, dir, err, sizeof err) == 0, "open pack: %s", err);
+    NsRows* nr = (NsRows*) malloc(sizeof *nr);
+    ns_rows_init(nr);
+
+    const char* path = "out/test_emulate.gguf";
+    write_gguf(path, R);
+    int nt = 0;
+    CHECK(ns_emulate_gguf(&m, path, 2, &nt, err, sizeof err) == 0 && nt == 2, "emulate: %d tensors, %s", nt, err);
+    Gguf g;
+    CHECK(gguf_open(&g, path, err, sizeof err) == 0, "reopen: %s", err);
+    for (int k = 0; k < 2; ++k) {
+        const int cols = k ? CD : CG;
+        const NsTensor* t = ns_find(&m, sp[k].name);
+        const uint8_t* got = g.map + g.data + kOff[k ? 2 : 0];
+        float w[64], back;
+        uint8_t want[68];
+        double maxerr = 0;
+        for (int e = 0; e < E; ++e)
+            for (int r = 0; r < R; ++r) {
+                ns_row_f32(nr, t, e, r, 0, w);
+                ns_q8_0_row(w, cols, want);
+                const uint8_t* row = got + ((size_t) e * R + r) * (cols / 32) * 34;
+                CHECK(!memcmp(row, want, (size_t) (cols / 32) * 34), "tensor %d expert %d row %d", k, e, r);
+                for (int c = 0; c < cols; ++c) {   // near the decoded weight
+                    const uint8_t* b = row + (c / 32) * 34;
+                    const float dd = h2f((uint16_t) (b[0] | b[1] << 8));
+                    back = dd * (int8_t) b[2 + c % 32];
+                    const double rel = fabs(back - w[c]) / (dd > 0 ? dd : 1);
+                    if (rel > maxerr) maxerr = rel;
+                }
+            }
+        CHECK(maxerr <= 0.5 + 127.0 / 2048, "tensor %d: error %.3f steps", k, maxerr);   // half a step, and d in f16
+    }
+    const uint8_t* norm = g.map + g.data + kOff[1];
+    int kept = 1;
+    for (int i = 0; i < 64; ++i) kept &= norm[i] == 0xAB;
+    CHECK(kept, "a tensor that is not an expert changed");
+    gguf_close(&g);
+
+    write_gguf(path, R - 1);   // shape mismatch: nothing is written
+    CHECK(ns_emulate_gguf(&m, path, 1, &nt, err, sizeof err) != 0, "a [%d] x %d tensor accepted", R - 1, CG);
+    CHECK(gguf_open(&g, path, err, sizeof err) == 0 && g.map[g.data] == 0xAB, "a failed file changed");
+    gguf_close(&g);
+
+    ns_close(&m);
+    free(nr);
+    printf("%s\n", fails ? "FAIL" : "PASS");
+    return fails != 0;
+}

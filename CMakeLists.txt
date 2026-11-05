@@ -65,7 +65,7 @@ target_link_libraries(nslm PUBLIC ${PLATFORM_LIBS})
 
 # ---- tests (pure C) -------------------------------------------------------------------------------------------------
 enable_testing()
-foreach(t affine gguf kvq lfsr linalg model_st moe ple qwen4_ref search search4 searchc searchp sha256)
+foreach(t affine emulate gguf kvq lfsr linalg model_st moe ple qwen4_ref search search4 searchc searchp sha256)
   add_executable(test_${t} tests/test_${t}.c)
   target_link_libraries(test_${t} nslm)
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
@@ -143,6 +143,8 @@ add_executable(nslm-mova-pack nslm/mova_pack.c)
 target_link_libraries(nslm-mova-pack nslm)
 add_executable(nslm-qwen4-pack nslm/qwen4_pack.c)
 target_link_libraries(nslm-qwen4-pack nslm)
+add_executable(nslm-qwen4-emulate nslm/qwen4_emulate.c)
+target_link_libraries(nslm-qwen4-emulate nslm)
 add_executable(nslm-bits-probe nslm/bits_probe.c)
 target_link_libraries(nslm-bits-probe nslm)
 
