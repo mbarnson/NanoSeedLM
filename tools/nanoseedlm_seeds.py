@@ -14,7 +14,7 @@ except ImportError:   # mlx-vlm without mlx-lm
 
 # (token, expert) pairs at or below this use the fused mat-vec; above it, the pairs are sorted by expert and go
 # through the seeded tile GEMM (weight tiles rebuilt in threadgroup memory; no BF16 expert tensor).
-MATVEC_MAX_PAIRS = 32
+MATVEC_MAX_PAIRS = 64
 # GEMM tile: BM weight rows x BN pairs, BK inputs per step.
 BM, BN, BK = 64, 64, 16
 
@@ -408,9 +408,12 @@ class SeedSwitchLinear(nn.Module):
         if indices.size * x.shape[-2] <= MATVEC_MAX_PAIRS:
             return self.matvec(x, indices)
         if x.shape[-2] != 1:
-            raise ValueError("SeedSwitchLinear: one row per token above the mat-vec limit")
-        xs, idx, order = _sort_pairs(x, indices)
-        return _unsort(self.gemm(xs, idx), order, indices.shape).reshape(indices.shape + (1, self.output_dims))
+            raise ValueError("SeedSwitchLinear: one row per token or pair above the mat-vec limit")
+        # one row per (token, expert) pair: x may hold one per token (..., 1, 1, cols) or one per pair (..., k, 1, cols)
+        xs = mx.broadcast_to(x, indices.shape + x.shape[-2:]).reshape(-1, self.input_dims)
+        idx = indices.reshape(-1).astype(mx.uint32)
+        order = mx.argsort(idx)
+        return _unsort(self.gemm(xs[order], idx[order]), order, indices.shape).reshape(indices.shape + (1, self.output_dims))
 
 
 class SeedLinear(nn.Module):

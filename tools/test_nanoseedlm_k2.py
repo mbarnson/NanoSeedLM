@@ -144,16 +144,17 @@ def test_matvec():
 
 
 def test_switch_linear():
-    for tokens in (1, 3, 40):
+    for tokens in (1, 3, 40):   # 40 x 2 pairs: above the mat-vec limit
         rng = np.random.default_rng(tokens)
         parts = random_seeds((6, 32, 64), rng, -20)
         layer = ns.SeedSwitchLinear(64, 32, 6)
         layer.seeds, layer.coefs, layer.codes, layer.exp_bias = map(mx.array, parts)
-        x = mx.array(rng.standard_normal((tokens, 1, 1, 64)).astype(np.float32))
         idx = mx.array(rng.integers(0, 6, (tokens, 2)).astype(np.uint32))
-        want = mx.gather_mm(x, mx.array(ref_decode(*parts)).swapaxes(-1, -2), rhs_indices=idx)
-        got = layer(x, idx)
-        assert got.shape == want.shape and rel_err(want, got) < 1e-2, tokens
+        for rows in (1, 2):   # x per token, or per (token, expert) pair as down_proj gets it (mlx-vlm's MTP verify)
+            x = mx.array(rng.standard_normal((tokens, rows, 1, 64)).astype(np.float32))
+            want = mx.gather_mm(x, mx.array(ref_decode(*parts)).swapaxes(-1, -2), rhs_indices=idx)
+            got = layer(x, idx)
+            assert got.shape == want.shape and rel_err(want, got) < 1e-2, (tokens, rows)
 
 
 def sorted_pairs(rng, pairs, experts, empty=()):
