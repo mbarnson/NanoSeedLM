@@ -1,7 +1,7 @@
 // nslm/qwen4_emulate.c - nslm-qwen4-emulate: a seed pack's routed experts written into the Q8_0 expert tensors of
 // Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them (an emulated pack, nslm/emulate.h).  With several
 // packs, MAP (uint8 [layer][gate, up, down][expert], tools/qwen4_tier_map.py) names the pack of each expert.  A pack is a
-// model folder or an S3 seed bank folder (nslm-moe --codec s3).
+// model folder, or a folder of S3 seed banks or trellis banks (nslm-moe --codec s3 or tq).
 //   nslm-qwen4-emulate --pack DIR [--pack DIR ...] [--map FILE] [--workers 8] SHARD.gguf [SHARD.gguf ...]
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +28,7 @@ static double slice_bytes(const NsTensor* t, int* lp) {
         return 0;
     while (p < 3 && strcmp(proj, (const char*[]) {"gate", "up", "down"}[p])) ++p;
     double b = 0;
-    for (int s = 0; s < 4; ++s) b += (double) ns_stream_len(t->enc, t->slices, t->rows, t->cols, s);
+    for (int s = 0; s < 4; ++s) b += (double) t->s[s].len;
     *lp = 3 * l + p;
     return p < 3 ? b / t->slices : 0;
 }

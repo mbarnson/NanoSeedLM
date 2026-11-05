@@ -25,6 +25,7 @@
 enum { NS_BF16 = 0, NS_SEED4 = 1, NS_Q8 = 2, NS_Q4 = 3, NS_SEED4P4 = 4, NS_SEED6P8 = 5 };   // = MF_* (engine/kernels_moe.metal)
 #define NS_RAW 6   // writer only: a tensor copied as it is (ns_write_raw)
 #define NS_SEEDS3 7   // reader only: a C = 12, P = 4 seed bank (ns_open_bank, nslm/moe.h); no pack or engine format yet
+#define NS_TCQ 8      // reader only: trellis-coded rows (ns_open_bank, nslm/trellis.h); group = L | K << 8 | T << 16
 #define NS_PAGE 16384
 
 typedef struct {

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "json.h"
+#include "trellis.h"
 
 int nslm_qwen_experts(const char* config_json, int* d, int* ff, int* n_exp, int* n_layer) {
     char err[128];
@@ -107,38 +108,62 @@ int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int 
 
 static int bank_cmp(const void* a, const void* b) { return strcmp(((const NsTensor*) a)->name, ((const NsTensor*) b)->name); }
 
+// One bank file mapped: S3 seeds (.blks) or trellis-coded rows (.blkt, nslm-moe --codec tq). NULL, with *len = 0 when
+// there is no file
+static const MoeBlkHeader* map_bank(const char* path, int tcq, size_t* len) {
+    const int fd = open(path, O_RDONLY);
+    struct stat sb;
+    *len = 0;
+    if (fd < 0) return NULL;
+    *len = fstat(fd, &sb) || !sb.st_size ? 1 : (size_t) sb.st_size;   // an empty file is a wrong one
+    const MoeBlkHeader* h = *len >= sizeof *h ? (const MoeBlkHeader*) mmap(NULL, *len, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
+    close(fd);
+    if (h == (const void*) MAP_FAILED) return NULL;
+    if (h && !memcmp(h->magic, tcq ? "NSLMBLKT" : "NSLMBLKS", 8)) return h;
+    if (h) munmap((void*) h, *len);
+    return NULL;
+}
+
 int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen) {
     static const char* kp[3] = {"gate_proj", "up_proj", "down_proj"};
     memset(m, 0, sizeof *m);
     int cap = 0;
     for (int l = 0; l < 256; ++l)
-        for (int p = 0; p < 3; ++p) {
-            char path[2048];
-            snprintf(path, sizeof path, "%s/L%d_%s.blks", dir, l, kp[p]);
-            const int fd = open(path, O_RDONLY);
-            struct stat sb;
-            if (fd < 0) continue;
-            const size_t len = fstat(fd, &sb) ? 0 : (size_t) sb.st_size;
-            const MoeBlkHeader* h = len >= sizeof *h ? (const MoeBlkHeader*) mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0) : NULL;
-            close(fd);
-            if (h == (const void*) MAP_FAILED) h = NULL;
-            const size_t E = h ? h->n_experts : 0, nb = h ? (size_t) h->rows * ((h->cols + 11) / 12) : 0;
-            if (!h || memcmp(h->magic, "NSLMBLKS", 8) || len != sizeof *h + 12 * E + 5 * nb * E) {
-                snprintf(err, (size_t) errlen, "%s: not an S3 seed bank", path);
-                free(m->t);
-                memset(m, 0, sizeof *m);
-                return -1;
+        for (int p = 0; p < 3; ++p)
+            for (int tcq = 0; tcq < 2; ++tcq) {
+                char path[2048];
+                snprintf(path, sizeof path, "%s/L%d_%s.%s", dir, l, kp[p], tcq ? "blkt" : "blks");
+                size_t len;
+                const MoeBlkHeader* h = map_bank(path, tcq, &len);
+                if (!h && !len) continue;
+                const size_t E = h ? h->n_experts : 0, R = h ? h->rows : 0;
+                const int L = h ? (int) h->n_seeds : 0, K = h ? (int) h->n_exp : 0, T = h ? (int) h->refit : 0;
+                const size_t nb = h ? (tcq ? (h->cols + (uint32_t) T - 1) / (uint32_t) (T ? T : 1) : R * ((h->cols + 11) / 12)) : 0;
+                const size_t nw = tcq && h && T && K > 0 && K < L && L <= NSLM_TQ_MAXL ? nslm_tq_row_words((int) h->cols, T, L, K) : 0;
+                const size_t want = tcq ? sizeof *h + 8 * E + (4 * nw + 2 * nb) * R * E : sizeof *h + 12 * E + 5 * nb * E;
+                if (!h || (tcq && !nw) || len != want) {
+                    snprintf(err, (size_t) errlen, "%s: not a %s bank", path, tcq ? "trellis" : "S3 seed");
+                    free(m->t);
+                    memset(m, 0, sizeof *m);
+                    return -1;
+                }
+                if (m->n == cap) m->t = (NsTensor*) realloc(m->t, sizeof(NsTensor) * (size_t) (cap = cap ? 2 * cap : 64));
+                NsTensor* t = &m->t[m->n++];
+                memset(t, 0, sizeof *t);
+                snprintf(t->name, sizeof t->name, "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, kp[p]);
+                t->slices = (int) E; t->rows = (int) R; t->cols = (int) h->cols;
+                const uint8_t* b = (const uint8_t*) (h + 1);
+                if (tcq) {   // rel[E], wrel[E], words [E][rows][nw], BF16 scales [E][rows][nb]
+                    t->enc = NS_TCQ; t->group = L | K << 8 | T << 16;
+                    t->s[0] = (NsStream) {b + 8 * E, 4 * nw * R * E, 0, 0};
+                    t->s[1] = (NsStream) {b + 8 * E + 4 * nw * R * E, 2 * nb * R * E, 0, 0};
+                } else {     // bias[E], rel[E], wrel[E], seeds, coefficients, codes
+                    t->enc = NS_SEEDS3;
+                    const uint8_t* at[4] = {b + 12 * E, b + 12 * E + 2 * nb * E, b, b + 12 * E + 4 * nb * E};
+                    for (int s = 0; s < 4; ++s) { t->s[s].p = at[s]; t->s[s].len = ns_stream_len(NS_SEEDS3, t->slices, t->rows, t->cols, s); }
+                }
             }
-            if (m->n == cap) m->t = (NsTensor*) realloc(m->t, sizeof(NsTensor) * (size_t) (cap = cap ? 2 * cap : 64));
-            NsTensor* t = &m->t[m->n++];
-            memset(t, 0, sizeof *t);
-            snprintf(t->name, sizeof t->name, "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, kp[p]);
-            t->enc = NS_SEEDS3; t->slices = (int) E; t->rows = (int) h->rows; t->cols = (int) h->cols;
-            const uint8_t* b = (const uint8_t*) (h + 1);   // bias[E], rel[E], wrel[E], seeds, coefficients, codes
-            const uint8_t* at[4] = {b + 12 * E, b + 12 * E + 2 * nb * E, b, b + 12 * E + 4 * nb * E};
-            for (int s = 0; s < 4; ++s) { t->s[s].p = at[s]; t->s[s].len = ns_stream_len(NS_SEEDS3, t->slices, t->rows, t->cols, s); }
-        }
-    if (!m->n) { snprintf(err, (size_t) errlen, "%s: no S3 seed banks (L*_*.blks)", dir); return -1; }
+    if (!m->n) { snprintf(err, (size_t) errlen, "%s: no seed or trellis banks (L*_*.blks, L*_*.blkt)", dir); return -1; }
     qsort(m->t, (size_t) m->n, sizeof(NsTensor), bank_cmp);
     return 0;
 }

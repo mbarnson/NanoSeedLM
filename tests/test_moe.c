@@ -11,6 +11,7 @@
 #include "moe.h"
 #include "rows.h"
 #include "searchc.h"
+#include "trellis.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -165,6 +166,57 @@ int main(void) {
         ns_close(&m);
         free(nr);
         CHECK(ns_open_bank(&m, "out/test_moe_pack", berr, sizeof berr) != 0, "a folder without banks opened");
+    }
+
+    // ---- a trellis bank (.blkt: nslm-moe --codec tq) read as a model: rows equal to the encoder's own output ----
+    {
+        mkdir("out", 0755);
+        mkdir("out/test_moe_tbank", 0755);
+        enum { E = 2, R = 3, C = 300, L = 8, K = 3, T = 256, NB = 2 };   // 300 columns: a short last block
+        const size_t nw = nslm_tq_row_words(C, T, L, K);
+        MoeBlkHeader h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, "NSLMBLKT", 8);
+        h.rows = R; h.cols = C; h.n_experts = E; h.n_seeds = L; h.n_exp = K; h.refit = T;
+        uint32_t* words = (uint32_t*) calloc(nw * E * R, 4);
+        uint16_t sc[E * R * NB];
+        float* y = (float*) malloc(sizeof(float) * E * R * C), w[C];
+        const float rel[2 * E] = {0};
+        NsTqScratch z;
+        nslm_tq_scratch_init(&z, T, L, K);
+        uint32_t x = 7;
+        for (int k = 0; k < E * R; ++k) {
+            for (int c = 0; c < C; ++c) { x = x * 1664525u + 1013904223u; w[c] = ((float) (x >> 8) / 16777216.0f - 0.5f) * 0.04f; }
+            nslm_tq_encode_row(w, NULL, C, T, &z, words + nw * k, sc + NB * k, y + (size_t) C * k);
+        }
+        nslm_tq_scratch_free(&z);
+        FILE* f = fopen("out/test_moe_tbank/L3_up_proj.blkt", "wb");
+        fwrite(&h, sizeof h, 1, f); fwrite(rel, 4, 2 * E, f); fwrite(words, 4, nw * E * R, f); fwrite(sc, 2, E * R * NB, f);
+        fclose(f);
+        f = fopen("out/test_moe_tbank/L4_up_proj.blkt", "wb");   // short: refused
+        fwrite(&h, sizeof h, 1, f);
+        fclose(f);
+        NsModel m;
+        char berr[256] = "";
+        CHECK(ns_open_bank(&m, "out/test_moe_tbank", berr, sizeof berr) != 0, "a short .blkt accepted");
+        remove("out/test_moe_tbank/L4_up_proj.blkt");
+        CHECK(ns_open_bank(&m, "out/test_moe_tbank", berr, sizeof berr) == 0 && m.n == 1, "trellis bank: %s", berr);
+        const NsTensor* t = ns_find(&m, "language_model.model.layers.3.mlp.switch_mlp.up_proj.weight");
+        CHECK(t && t->enc == NS_TCQ && t->slices == E && t->rows == R && t->cols == C && t->group == (L | K << 8 | T << 16),
+              "trellis bank tensor");
+        CHECK(t && t->s[0].len == 4 * nw * E * R && t->s[1].len == 2 * NB * E * R, "trellis stream sizes");
+        NsRows* nr = (NsRows*) malloc(sizeof *nr);
+        ns_rows_init(nr);
+        int same = 1;
+        for (int e = 0; t && e < E; ++e)
+            for (int r = 0; r < R; ++r) {
+                float out[C];
+                ns_row_f32(nr, t, e, r, 1, out);
+                same &= !memcmp(out, y + (size_t) C * (e * R + r), sizeof out);
+            }
+        CHECK(same, "trellis rows differ from the encoder's output");
+        ns_close(&m);
+        free(nr); free(words); free(y);
     }
 
     // ---- 3-D BF16 safetensors round trip ----

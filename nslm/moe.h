@@ -8,9 +8,9 @@
 
 // The header of nslm-moe's .blk / .blk4 / .blk8 / .blks block files.
 typedef struct {
-    char magic[8];   // "NSLMBLKM", "NSLMBLK4", "NSLMBLK8", "NSLMBLKS" (S3: C = 12, P = 4)
+    char magic[8];   // "NSLMBLKM", "NSLMBLK4", "NSLMBLK8", "NSLMBLKS" (S3: C = 12, P = 4), "NSLMBLKT" (trellis)
     uint32_t rows, cols, n_experts;
-    uint32_t n_seeds, n_exp, refit;
+    uint32_t n_seeds, n_exp, refit;   // .blkt: L, K, T (nslm/trellis.h)
     int32_t exp_delta[3];
     float n0;
     double seconds;
@@ -20,9 +20,9 @@ typedef struct {
 // (.blk4, SEED4P4, exponent codes low nibble first).  -1 when blk is not that file.
 int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int cols, int s, uint8_t* dst);
 
-// The S3 seed banks of a folder (nslm-moe --codec s3: L{l}_{gate,up,down}_proj.blks, as .blk4 with blocks of 12, a row's
-// last block padded) as NS_SEEDS3 tensors language_model.model.layers.L.mlp.switch_mlp.PROJ.weight, mapped for the
-// process.  0, or -1 with err (no bank, or a file of the wrong size).
+// The banks of a folder as tensors language_model.model.layers.L.mlp.switch_mlp.PROJ.weight, mapped for the process:
+// S3 seeds as NS_SEEDS3 (nslm-moe --codec s3: L{l}_{gate,up,down}_proj.blks, as .blk4 with blocks of 12, a row's last
+// block padded), trellis-coded rows as NS_TCQ (--codec tq: .blkt).  0, or -1 with err (no bank, or a wrong file).
 int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen);
 
 // Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.
