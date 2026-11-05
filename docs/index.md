@@ -130,6 +130,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   to 33.17 tokens per second, and 37.69 with the automatic cache and the display reserve.
 - [2026-11-05: MTP drafts on the M4 Max](results/2026-11-05-qwen38-mtp-m4max.md): P3 code 31% to 37% faster with 1 to 3
   drafts, chat 1% to 20%, the same text.
+- [2026-11-05: MTP drafts on the M4 Max, again](results/2026-11-05-qwen38-mtp-m4max-rerun.md): after the day's Metal
+  kernels, P3 code 48.9 -> 61.5 tokens per second with 1 draft, chat 47.2 -> 57.5, the same text.
 - [2026-11-05: MTP drafts on the RTX 4080, again](results/2026-11-05-qwen38-mtp-4080-rerun.md): after the PLE and RAM
   fixes, drafts are 14% to 27% slower. Each verify row pays the PCIe copies of its missed experts.
 - [2026-11-05: Strata on the RTX 4080 PC](results/2026-11-05-strata-4080-probe.md): IQ3_S at 85 tokens per second with

@@ -695,3 +695,9 @@ where one thread walked back from the last block for the scores equal to the k-t
 and the k-th score comes from four 8-bit histogram passes, as on CUDA: 49 us a call, with the same blocks in the same
 order. With that fixed, up to 32 key splits a row (was 16) are faster at 1K to 20K tokens (47.7, 45.3 and 45.2
 tokens/s at 1K, 5.6K and 20K). MTP verify rows still equal decode rows bit for bit.
+
+## [2026-11-05] result | MTP drafts on the M4 Max, again
+
+`e53d81c`: after the day's Metal decode kernels, P3 decodes code at 61.5 tokens per second with 1 draft, against 48.9
+without drafts, and chat at 57.5 against 47.2. The text is the same at every K. Read
+[MTP drafts on the M4 Max, again](results/2026-11-05-qwen38-mtp-m4max-rerun.md).
