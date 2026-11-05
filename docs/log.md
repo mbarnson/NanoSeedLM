@@ -409,10 +409,10 @@ A draft for Matt's go: S3 or P3 for all experts, and P4 for the session's hot se
 
 `ac11534` to `d1cff61` change four things:
 
-- the PLE rows on 16 threads;
-- attention, a block for each KV group and row;
-- DeltaNet q and k normalised once a token;
-- attention, a softmax step a tile of keys.
+- The PLE rows run on 16 threads.
+- Attention runs a block for each KV group and row.
+- DeltaNet normalises q and k once a token.
+- Attention takes one softmax step a tile of keys.
 
 A 15,922-token prompt went from 1,026 to 1,234 tokens per
 second on an RTX PRO 6000. `39967ad` fixes `Q4E_PROFILE` for long prompts. Read
