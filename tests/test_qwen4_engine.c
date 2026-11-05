@@ -12,6 +12,7 @@
 #include "format.h"
 #include "kernels_cuda.h"
 #include "qwen4_eng.h"
+#include "qwen4_ref.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -120,6 +121,42 @@ int main(void) {
     CHECK(wbig < 6e-2 * scale && argmax_big <= n / 16, "GEMM-row logits differ from mlx-vlm beyond the BF16 rounding");
     CHECK(same < 1e-5 * scale, "the row split changes the logits");
     q4e_close(e);
+    {   // qwen4_tiny_attn (tools/qwen4_tiny_attn.py): attention strong enough that zero keys move the C reference's
+        // logits by about 1.7 of 1.7. The engine against the reference, in decode rows and in one prompt forward.
+        Qwen4Ref* r = qwen4_ref_open("tests/data/qwen4_tiny_attn", err, sizeof err);
+        CHECK(r != NULL, "reference: %s", err);
+        Q4Eng* ea = r ? q4e_open("tests/data/qwen4_tiny_attn", &o, err, sizeof err) : NULL;
+        CHECK(!r || ea != NULL, "open qwen4_tiny_attn: %s", err);
+        float* ref = (float*) malloc(sizeof(float) * (size_t) n * V);
+        if (r && ea && qwen4_ref_forward(r, ids, n, ref) == 0) {
+            for (int i = 0, at = 0; i < 8; at += rows[i++]) CHECK(q4e_forward(ea, ids + at, rows[i], again + (size_t) at * V) == 0, "attn rows: %s", q4e_error(ea));
+            q4e_reset(ea);
+            CHECK(q4e_forward(ea, ids, n, big) == 0, "attn, one row of %d: %s", n, q4e_error(ea));
+            double wr = 0, wg = 0, sr = 0;
+            int ar = 0, ag = 0;
+            for (int t = 0; t < n; ++t) {
+                int a0 = 0, a1 = 0, a2 = 0;
+                for (int v = 0; v < V; ++v) {
+                    const size_t i = (size_t) t * V + v;
+                    wr = fmax(wr, fabs((double) again[i] - ref[i]));
+                    wg = fmax(wg, fabs((double) big[i] - ref[i]));
+                    sr = fmax(sr, fabs((double) ref[i]));
+                    if (ref[i] > ref[(size_t) t * V + a0]) a0 = v;
+                    if (again[i] > again[(size_t) t * V + a1]) a1 = v;
+                    if (big[i] > big[(size_t) t * V + a2]) a2 = v;
+                }
+                ar += a0 != a1;
+                ag += a0 != a2;
+            }
+            printf("strong attention: max |CUDA - C reference| %.2e (rows), %.2e (one GEMM row) of max |logit| %.3f; argmax differs in %d, %d of %d\n",
+                   wr, wg, sr, ar, ag, n);
+            CHECK(wr < 3e-2 * sr && ar <= n / 16, "strong-attention logits differ from the C reference beyond the BF16 matvec rounding");
+            CHECK(wg < 6e-2 * sr && ag <= n / 16, "strong-attention GEMM-row logits differ from the C reference beyond the BF16 rounding");
+        } else CHECK(!r || !ea, "reference forward: %s", r ? qwen4_ref_error(r) : "");
+        free(ref);
+        q4e_close(ea);
+        qwen4_ref_close(r);
+    }
     for (int stream = 0; stream < 2; ++stream) {   // the smallest cache (one layer's experts for all), pinned or from the files
     const Q4EOpts oc = {256, 0, NULL, 1e-9, stream};
     e = q4e_open("tests/data/qwen4_tiny", &oc, err, sizeof err);

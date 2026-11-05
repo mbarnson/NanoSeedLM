@@ -43,6 +43,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `nanoseedlm_qwen4.py` | The MLX loader for Qwen3.8-Flash-Next (mlx-vlm) |
 | `nanoseedlm_seeds.py` | The seed kernels and modules that the MLX loaders share |
 | `qwen4_golden.py` | A tiny random Qwen3.8-Flash-Next model and its mlx-vlm logits, for `tests/test_qwen4_ref.c` |
+| `qwen4_tiny_attn.py` | The tiny model with strong attention (`tests/data/qwen4_tiny_attn`), so engine tests see attention bugs |
 | `qwen4_cache_sim.py` | Replays a routing trace (`Q4E_ROUTES`) through expert cache policies: LRU, LFU, a hot set and the optimum |
 | `hf_cuda_test.sh` | Build and run CUDA tests on an HF Jobs GPU node |
 | `hf_qwen4_gen.sh` | Run a Qwen3.8-Flash-Next pack through `nslm-qwen4-gen` on an HF Jobs GPU node |
