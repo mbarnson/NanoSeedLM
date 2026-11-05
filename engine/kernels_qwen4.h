@@ -52,10 +52,12 @@ void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* 
 void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
 // out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t * sgld]) sh[t]
 void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T);
-// qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated; khist, not NULL: hist after each row t < T - 1)
+// qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated). _keep: also hist after each row t < T - 1 at
+// khist[t] (a verify forward's rows)
 void kq4_ple_gate(cudaStream_t s, const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, int T);
-void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* khist, float* H,
-                  int T);
+void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* H, int T);
+void kq4_ple_conv_keep(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* khist,
+                       float* H, int T);
 // QSA: the block keys (qwen4_qsa_block) that rows [pos, pos + T) complete, from the raw key cache raw[pos][ix_dim] into
 // blk[j][ix_dim]; done[t] (blocks complete at row t) and nsel[t] (budget / ratio when done[t] exceeds it, else 0)
 void kq4_qsa_blocks(cudaStream_t s, const Qwen4Cfg* c, const float* raw, const float* w, int pos0, const int32_t* dpos, int T, float* blk);

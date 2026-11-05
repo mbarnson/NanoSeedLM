@@ -680,7 +680,7 @@ static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first
     kq4_norm1p(e->s, e->H, HD, c->d, L->nq, c->eps, e->qs, T);
     kq4_ple_gate(e->s, c, e->keys, e->qs, e->vals, e->gated, T);
     kq4_norm1p(e->s, e->gated, HD, c->d, L->nc, c->eps, e->keys, T);   // keys now holds the conv input
-    kq4_ple_conv(e->s, c, L->pw, e->keys, e->gated, L->hist, e->keep ? L->khist : NULL, e->H, T);
+    kq4_ple_conv_keep(e->s, c, L->pw, e->keys, e->gated, L->hist, e->keep ? L->khist : NULL, e->H, T);
 }
 
 static int attention(Q4Eng* e, Layer* L, int p0, int T) {   // row t at *din + p0 + t

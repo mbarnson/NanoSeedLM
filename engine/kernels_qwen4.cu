@@ -450,10 +450,13 @@ __global__ void k_q4_ple_conv(int HD, int K, int dil, const float* w, const floa
     }
     for (int j = 0; j < L; ++j) hist[(size_t) j * HD + ch] = st[j];
 }
-void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* khist, float* H,
-                  int T) {
+void kq4_ple_conv_keep(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* khist,
+                       float* H, int T) {
     const int HD = c->hc * c->d;
     k_q4_ple_conv<<<(unsigned) (HD + 255) / 256, 256, 0, s>>>(HD, c->ple_conv, c->ngram, w, cin, gated, hist, khist, H, T);
+}
+void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* H, int T) {
+    kq4_ple_conv_keep(s, c, w, cin, gated, hist, NULL, H, T);
 }
 
 // ---- QSA ---------------------------------------------------------------------------------------------------------------
