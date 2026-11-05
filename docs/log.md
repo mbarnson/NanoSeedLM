@@ -710,3 +710,17 @@ BF16 fix) gives 0.030: rounding noise, not a gain. It halves decode on this mach
 The hand-off adds about 30 us. One P3 expert takes 1.6 ms of one core, and the GPU's own work to overlap is about
 150 us a layer. `068617c` caps the CPU at N experts a layer (`--cpu-tail N`). Read
 [The tail skip and the CPU tail on an RTX PRO 6000](results/2026-11-05-qwen38-tail-hf.md).
+
+## [2026-11-05] engine | MTP drafts in nslm-chat
+
+`72316d9` and `ba71ba8`: `Q4E_DRAFTS=K` opens the MTP head in `engine/qwen4_api.c`, and `eng_generate` verifies up
+to K drafts a forward. It drafts on a pending token when that token is the arg max of the logits it holds, so its calls
+can be short. At temperature 0, `nslm-chat` takes the tokens after the first from `eng_generate`, K + 1 a call. The
+text does not change: `test_qwen4_api_mtp` checks the tokens, the history and the next logits against K = 0, bit for
+bit. Drafts stay off by default.
+
+## [2026-11-05] result | MTP drafts in nslm-chat on the M4 Max
+
+`ba71ba8`: P3 decodes code at 69.6 tokens per second with 2 drafts, against 47.8 without drafts (+46%). A short chat
+answer is 8.5% faster with 1 draft, and 0.5% and 13% slower with 2 and 3. The text is the same at every K. Read
+[MTP drafts in nslm-chat on the M4 Max](results/2026-11-05-qwen38-mtp-chat-m4max.md).
