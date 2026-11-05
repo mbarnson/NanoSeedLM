@@ -163,10 +163,12 @@ struct NslmTqGpu {
     int smem_optin;
 };
 
+// The shared-memory limit is the kernel's, for every thread of the process: set the device's maximum, the same value from
+// every caller, so one thread's smaller block (T 256) cannot cut another's launch (T 320) short
 template <int QPT>
-static cudaError_t launch(const TqArgs& a, int ctas, size_t smem, cudaStream_t st, const float* W, const float* Hm, unsigned char* back,
-                          unsigned short* path, float* aout) {
-    const cudaError_t e = cudaFuncSetAttribute(k_tq_encode<QPT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+static cudaError_t launch(const TqArgs& a, int ctas, size_t smem, int smem_max, cudaStream_t st, const float* W, const float* Hm,
+                          unsigned char* back, unsigned short* path, float* aout) {
+    const cudaError_t e = cudaFuncSetAttribute(k_tq_encode<QPT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
     if (e != cudaSuccess) return e;
     k_tq_encode<QPT><<<(unsigned) ctas, TQ_TPB, smem, st>>>(a, W, Hm, back, path, aout);
     return cudaGetLastError();
@@ -221,13 +223,13 @@ int nslm_tq_gpu_encode(NslmTqGpu* g, const float* w, const float* h, int rows, i
         const int ctas = (int) (total - i0 < chunk ? total - i0 : chunk);
         const TqArgs a = {cols, T, L, K, nb, (int) i0, h != NULL};
         switch (qpt) {
-            case 1: ce = launch<1>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
-            case 2: ce = launch<2>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
-            case 4: ce = launch<4>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
-            case 8: ce = launch<8>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
-            case 16: ce = launch<16>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
-            case 32: ce = launch<32>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
-            default: ce = launch<64>(a, ctas, smem, g->st, W, Hd, B, P, Ad); break;
+            case 1: ce = launch<1>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
+            case 2: ce = launch<2>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
+            case 4: ce = launch<4>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
+            case 8: ce = launch<8>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
+            case 16: ce = launch<16>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
+            case 32: ce = launch<32>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
+            default: ce = launch<64>(a, ctas, smem, g->smem_optin, g->st, W, Hd, B, P, Ad); break;
         }
     }
     if (ce == cudaSuccess) {
