@@ -102,6 +102,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   second on a 15,922-token prompt (RTX PRO 6000), from the attention kernel and one pass for the context.
 - [2026-11-04: A high seed tier that follows the routing](results/2026-11-04-qwen38-tier-sim.md): a simulation. At
   10.4 GB the tier serves 64% to 71% of router choices and loads 3 to 5 experts for each token.
+- [2026-11-05: Prefill with larger chunks and an expert prefetch](results/2026-11-05-qwen38-prefill-chunks.md): 1,343
+  to 2,801 tokens per second on a 15,922-token prompt (RTX PRO 6000), 1,571 on an A100 at 29,120 tokens.
 
 ## For contributors and agents
 

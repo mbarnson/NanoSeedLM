@@ -429,3 +429,15 @@ A100 (+15%). A 29,120-token prompt runs at 1,414 and 746. Read [prefill by stage
 A draft for Matt's go. On the M4 Max, mac-metal measured the P3 pack with MTP: code 39.6 to 51.8 tokens per second at
 2 drafts, chat 40.1 to 43.1. The plan adds the MTP head and a state snapshot to the CUDA engine. Read
 [the MTP plan](plans/2026-11-04-qwen38-mtp.md).
+
+## [2026-11-05] result | Prefill with larger chunks and an expert prefetch
+
+`f2caa8b` to `d8e8a63`: a 15,922-token prompt of the P3 pack went from 1,343 to 2,801 tokens per second on an RTX PRO
+6000. A 29,120-token prompt runs at 2,782 there and 1,571 on an A100. The changes:
+
+- Prompt chunks of 4,096 rows (`--prompt-rows`), and one VRAM region for the stages' buffers.
+- The next layer's experts come over PCIe on a second stream (`Q4E_NO_PREFETCH=1` turns it off).
+- Attention: all tile loads before the stores, padded tile rows, a wider softmax, and two blocks an SM.
+- DeltaNet: the conv computes all tokens at once, and the step stages 16 tokens.
+
+Decode did not change. Read [prefill with larger chunks](results/2026-11-05-qwen38-prefill-chunks.md).

@@ -5,7 +5,7 @@
 the group's 12 heads. Before the fixes, the profiler kept only 1,024 events a forward, so it undercounted long prompts
 by 62%. Prefill is now GPU-bound: attention 24%, experts 25%, router and cache 18%, hyper-connections 13%.
 
-**Status.** Current. One prompt, one machine type. The RTX 4080 is not measured.
+**Status.** Replaced by [prefill with larger chunks and an expert prefetch](2026-11-05-qwen38-prefill-chunks.md).
 
 ## Setup
 
