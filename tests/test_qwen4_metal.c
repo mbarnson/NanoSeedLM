@@ -32,7 +32,9 @@ int main(void) {
     const int n = (int) ei->shape[0], V = (int) el->shape[1];
     const int32_t* ids = (const int32_t*) st_data(&st, ei);
     const float* want = (const float*) st_data(&st, el);
-    const Q4EOpts o = {256, 0, NULL, 0, 0, 0, 0};
+    Q4EOpts o;   // zeroed, so a new field needs no change here
+    memset(&o, 0, sizeof o);
+    o.max_pos = 256;
     Q4Eng* e = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
     if (!e) { printf("FAIL: open: %s\n", err); return 1; }
     float* got = (float*) malloc(sizeof(float) * (size_t) n * V);
