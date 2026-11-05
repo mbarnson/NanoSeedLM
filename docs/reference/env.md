@@ -23,10 +23,12 @@
 | `NSLM_CACHE_STATS=1` | off | Write the expert cache hits at exit |
 | `NSLM_NO_GRAPH=1` | off | Do not use CUDA graphs for decode (K2-Horizon-MoVA and Qwen3.8-Flash-Next) |
 | `NSLM_NO_PREDICT=1` | off | Do not predict the experts of the next layer during decode (K2-Horizon-MoVA) |
-| `Q4E_PROFILE=1` | off | Qwen3.8-Flash-Next: write the GPU time of each forward stage at exit |
+| `Q4E_PROFILE=1` | off | Qwen3.8-Flash-Next: write the GPU time of each forward stage at exit, and the CPU tail's times |
 | `Q4E_ROUTES=FILE` | off | Qwen3.8-Flash-Next: write the routed experts of each forward, for `tools/qwen4_cache_sim.py` |
 | `Q4E_NO_PREFETCH=1` | off | Qwen3.8-Flash-Next: do not copy the next layer's experts while a prompt layer computes |
-| `Q4E_PLE_THREADS=N` | CPU cores, at most 16 | Qwen3.8-Flash-Next: host threads for the PLE rows. Decode rows split by head |
+| `Q4E_PLE_THREADS=N` | CPU cores, at most 16 | Qwen3.8-Flash-Next: host threads for the PLE rows. Decode rows split by head. The CPU tail uses one fewer |
+| `Q4E_TAIL_RENORM=1` | off | Qwen3.8-Flash-Next `--tail-skip`: scale the kept weights of a row up to its sum |
+| `Q4E_CPU_TAIL=N` | 0 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --cpu-tail N` |
 | `Q4E_VRAM_EXPERTS=1` | off | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --vram-experts` |
 | `Q4E_STREAM_EXPERTS=1` | off | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --stream-experts` |
 | `Q4E_PLE_GGUF=FILE` | | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --ple-gguf FILE` |

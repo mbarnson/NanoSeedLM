@@ -132,7 +132,8 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 | `--ctx N` | Context positions (4096) |
 | `--prompt-rows N` | Prompt rows of one forward: 4096, or 16384 on GPUs of 64 GB or more, at most the context. A row takes about 0.25 MB of VRAM |
 | `--drafts K` | The MTP head drafts K tokens (1 to 3), and one forward verifies them. The text does not change. VRAM: 115 MB a draft, and the head's routed experts share the expert cache (else 1.4 GB). On an RTX 4080 it is not faster ([results](../results/2026-11-05-qwen38-mtp-4080-rerun.md)) |
-| `--tail-skip R` | Lossy, with an expert cache: a missed expert that every decode row ranks at R or later (rank 0 is the top choice) is not copied or computed. 0, the default, turns it off. Its KL gate is not measured yet |
+| `--tail-skip R` | Lossy, with an expert cache: a missed expert that every decode row ranks at R or later (rank 0 is the top choice) is not copied or computed. 0, the default, turns it off. It fails its KL gate at R = 7 to 9 ([results](../results/2026-11-05-qwen38-tail-hf.md)) |
+| `--cpu-tail N` | With an expert cache, pinned P = 3 experts and a Clang build: the CPU computes up to N missed experts a decode layer (lowest rank first) beside the PCIe copies. Exact up to the order of sums, so the text can change at the rounding level. 0, the default, turns it off. Not faster on an RTX PRO 6000 ([results](../results/2026-11-05-qwen38-tail-hf.md)) |
 | `--effort xhigh\|medium\|low` | The template's reasoning effort (xhigh) |
 | `--no-think` | The template's `enable_thinking=False`: no reasoning block |
 | `--raw` | No chat template. Otherwise the prompt is one user turn through the model's chat template |

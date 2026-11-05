@@ -21,7 +21,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-mova-refcheck` | The GPU engine against a C reference forward on the CPU (KL, argmax, router choices) |
 | `nslm-mova-routes` | Router choices for a prompt and a generation, for expert-cache studies |
 | `nslm-qwen4-gen` | Greedy generation of one prompt through the Qwen3.8-Flash-Next CUDA engine, with prompt and decode speed |
-| `nslm-qwen4-kld` | KL divergence, top-1 agreement and perplexity of a Qwen3.8-Flash-Next model against a reference, on one text. `--decode N`: the last N rows through the decode kernels. `--tail-skip R`: the model's run with the tail skip |
+| `nslm-qwen4-kld` | KL divergence, top-1 agreement and perplexity of a Qwen3.8-Flash-Next model against a reference, on one text. `--decode N`: the last N rows through the decode kernels. `--tail-skip R`, `--cpu-tail N`: the model's run with the tail skip or the CPU tail |
 | `nslm-handoff-bench` | CUDA: the time of a GPU-host hand-off inside a CUDA graph, 48 a forward (plan step D4). `--work US`: the host work of each |
 
 ## Make models

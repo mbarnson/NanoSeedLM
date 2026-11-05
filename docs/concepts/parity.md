@@ -56,6 +56,7 @@ same results as the engine.
 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve` (`engine/engine.c`) | Yes | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next MTP drafts (`q4e_draft`, `nslm-qwen4-gen --drafts`) | Yes (`qwen4_gpu.m`) | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next tail skip of missed experts (`Q4EOpts.tail_skip`, `--tail-skip`) | Not needed: every expert is in memory | Yes | No |
+| Qwen3.8-Flash-Next missed experts on the CPU (`Q4EOpts.cpu_tail`, `--cpu-tail`) | Not needed: every expert is in memory | Yes (Clang builds) | No |
 | Affine Q4 with group 32 (the 4-bit MLX packs) | Matvec, GEMM | Yes (matvec, GEMM, embedding) | Yes |
 | Qwen3.8-Flash-Next kernels (`test_qwen4_kernels`) | Yes (`kernels_qwen4.metal`) | Yes (`kernels_qwen4.cu`) | Yes (mlx-vlm) |
 | Fused kernel for MLA prompts | `k_mla_prefill` | `k_mla_prefill` | `_MLA_PREFILL` |
