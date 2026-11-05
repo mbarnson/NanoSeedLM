@@ -1,6 +1,7 @@
 // harness/nslm-mova-kbench.c - micro-benchmark of the CUDA MoVA kernels (engine/kernels_moe.cu) at MoVA's shapes: GPU
 // time per call and effective bandwidth (weight bytes read per second).  Random weights; timing only.  The Metal build
-// has its own (harness/nslm-mova-kbench.m): the kernels differ, the shapes and the report are the same.
+// has its own (harness/nslm-mova-kbench.m): the kernels differ, the shapes and the report are the same.  The CUDA build
+// also times the decode expert gathers at Qwen3.8-Flash-Next's shapes, in its three expert formats.
 //
 //   nslm-mova-kbench [--iters 200] [--pos 4096]
 //
@@ -52,12 +53,17 @@ typedef struct {
     WSlice h0;
     double bytes_per_slice;
 } Tensor;
-static Tensor make_tensor(int fmt, int slices, int R, int K, unsigned seed) {
+// group: the affine group of Q4 / Q8 (64 or 32)
+static Tensor make_tensor_g(int fmt, int slices, int R, int K, unsigned seed, int group) {
     Tensor t;
     memset(&t, 0, sizeof t);
     WSlice* h = (WSlice*) calloc((size_t) slices, sizeof(WSlice));
-    const size_t n = (size_t) R * K;
-    if (fmt == MF_SEED4P4) {
+    const size_t n = (size_t) R * K, ng = n / (size_t) group;
+    if (fmt == MF_SEED4) {   // P = 3: seeds, nibble words, an exponent bias for each slice
+        uint8_t* s = (uint8_t*) dev_rand(n / 8 * 2 * slices, seed), *c = (uint8_t*) dev_rand(n / 8 * 2 * slices, seed + 1);
+        for (int i = 0; i < slices; ++i) { h[i].p[0] = s + n / 8 * 2 * i; h[i].p[1] = c + n / 8 * 2 * i; h[i].eb = -24; }
+        t.bytes_per_slice = (double) n / 8 * 4;
+    } else if (fmt == MF_SEED4P4) {
         uint8_t* s = (uint8_t*) dev_rand(n / 8 * 2 * slices, seed), *c = (uint8_t*) dev_rand(n / 8 * 2 * slices, seed + 1);
         uint8_t* e = (uint8_t*) dev_rand(n / 16 * slices, seed + 2);
         for (int i = 0; i < slices; ++i) {
@@ -67,9 +73,11 @@ static Tensor make_tensor(int fmt, int slices, int R, int K, unsigned seed) {
     } else if (fmt == MF_Q4 || fmt == MF_Q8) {
         const size_t wb = fmt == MF_Q4 ? n / 2 : n;
         uint8_t* w = (uint8_t*) dev_rand(wb * slices, seed);
-        uint8_t* sc = (uint8_t*) dev_scales(n / 64 * slices), *bi = (uint8_t*) dev_scales(n / 64 * slices);
-        for (int i = 0; i < slices; ++i) { h[i].p[0] = w + wb * i; h[i].p[1] = sc + n / 64 * 2 * i; h[i].p[2] = bi + n / 64 * 2 * i; }
-        t.bytes_per_slice = (double) wb + (double) n / 64 * 4;
+        uint8_t* sc = (uint8_t*) dev_scales(ng * slices), *bi = (uint8_t*) dev_scales(ng * slices);
+        for (int i = 0; i < slices; ++i) {
+            h[i].p[0] = w + wb * i; h[i].p[1] = sc + ng * 2 * i; h[i].p[2] = bi + ng * 2 * i; h[i].gs = group == 32 ? 5 : 6;
+        }
+        t.bytes_per_slice = (double) wb + (double) ng * 4;
     }
     cudaMalloc((void**) &t.d, sizeof(WSlice) * (size_t) slices);
     cudaMemcpy(t.d, h, sizeof(WSlice) * (size_t) slices, cudaMemcpyHostToDevice);
@@ -77,6 +85,7 @@ static Tensor make_tensor(int fmt, int slices, int R, int K, unsigned seed) {
     free(h);
     return t;
 }
+static Tensor make_tensor(int fmt, int slices, int R, int K, unsigned seed) { return make_tensor_g(fmt, slices, R, K, seed, 64); }
 
 typedef void (*Body)(void* ctx, int it);
 static double time_us(Body f, void* ctx, int iters) {
@@ -233,6 +242,39 @@ int main(int argc, char** argv) {
         const double us = time_us(run_mm, &c, iters / 4 > 10 ? iters / 4 : 10);
         printf("%-44s %10.2f %10.1f  (%.1f TFLOPS)\n", "k_mm q8 q_proj, 512 tokens (4096 x 2560)", us, c.w.bytes_per_slice / us / 1e3,
                2.0 * 512 * 4096 * 2560 / us / 1e6);
+    }
+    {   // Qwen3.8-Flash-Next decode: 10 (token, expert) pairs of 512 experts, gate + up fused (640 x 2560), then down
+        uint32_t* g24h = (uint32_t*) malloc(65536 * 4);
+        for (uint32_t s = 0; s < 65536; ++s) g24h[s] = lfsr_stream24((uint16_t) s);
+        uint32_t* G24 = NULL;
+        cudaMalloc((void**) &G24, 65536 * 4);
+        cudaMemcpy(G24, g24h, 65536 * 4, cudaMemcpyHostToDevice);
+        free(g24h);
+        int32_t* s10h = (int32_t*) malloc(64 * 10 * 4);
+        for (int i = 0; i < 64 * 10; ++i) s10h[i] = (i * 97 + i / 10 * 13) % 512;
+        int32_t* sel10 = NULL;
+        cudaMalloc((void**) &sel10, 64 * 10 * 4);
+        cudaMemcpy(sel10, s10h, 64 * 10 * 4, cudaMemcpyHostToDevice);
+        free(s10h);
+        const struct { const char* name; int fmt, group; } fm[] = {{"q4 g32", MF_Q4, 32}, {"seed4 (P3)", MF_SEED4, 0}, {"seed4p4 (P4)", MF_SEED4P4, 0}};
+        for (int f = 0; f < 3; ++f) {
+            Case c;
+            memset(&c, 0, sizeof c);
+            c.fmt = fm[f].fmt; c.R = 640; c.K = 2560; c.P = 10; c.slices = 512; c.xdiv = 10; c.x = x; c.y = y; c.sel = sel10;
+            c.G = fm[f].fmt == MF_SEED4 ? G24 : G;
+            c.w = make_tensor_g(c.fmt, 512, 640, 2560, 40 + (unsigned) f, fm[f].group ? fm[f].group : 64);
+            c.u = make_tensor_g(c.fmt, 512, 640, 2560, 50 + (unsigned) f, fm[f].group ? fm[f].group : 64);
+            char nm[64];
+            double us = time_us(run_gu, &c, iters);
+            snprintf(nm, sizeof nm, "qwen4 k_mv_gu %s (10 x 640 x 2560)", fm[f].name);
+            printf("%-44s %10.2f %10.1f\n", nm, us, 2 * 10 * c.w.bytes_per_slice / us / 1e3);
+            Case d = c;
+            d.R = 2560; d.K = 640; d.xdiv = 1;
+            d.w = make_tensor_g(d.fmt, 512, 2560, 640, 60 + (unsigned) f, fm[f].group ? fm[f].group : 64);
+            us = time_us(run_gather, &d, iters);
+            snprintf(nm, sizeof nm, "qwen4 k_mv down %s (10 x 2560 x 640)", fm[f].name);
+            printf("%-44s %10.2f %10.1f\n", nm, us, 10 * d.w.bytes_per_slice / us / 1e3);
+        }
     }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(e)); return 1; }
