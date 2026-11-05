@@ -1,6 +1,6 @@
 // tests/test_qwen4_engine.c - the qwen4 CUDA engine on tests/data/qwen4_tiny against mlx-vlm's float32 logits: matvec
-// rows (any split, the same logits) and one GEMM row of 48, with and without the smallest expert cache.  Also kc_bucket
-// for qwen4's 512 experts (the tiny model has 8).  Skipped without a GPU.
+// rows (any split, the same logits) and one GEMM row of 48, with and without the smallest expert cache (and its decode
+// prediction).  Also kc_bucket for qwen4's 512 experts (the tiny model has 8).  Skipped without a GPU.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +111,12 @@ int main(void) {
         printf("expert cache of %d slots%s: %llu hits, %llu misses; logits against no cache %.1e\n", slots, stream ? ", streamed" : "",
                (unsigned long long) hits, (unsigned long long) misses, dc);
         CHECK(dc == 0 && misses > 0 && slots == q4e_cfg(e)->n_exp, "the expert cache changes the logits, or never misses");
+        q4e_reset(e);   // decode rows: the prediction's copies (second stream) must not change them either
+        for (int i = 0, at = 0; i < 8; at += rows[i++]) CHECK(q4e_forward(e, ids + at, rows[i], again + (size_t) at * V) == 0, "rows with a cache: %s", q4e_error(e));
+        double dr = 0;
+        for (size_t i = 0; i < (size_t) n * V; ++i) dr = fmax(dr, fabs((double) got[i] - again[i]));
+        printf("decode rows with the cache%s: logits against no cache %.1e\n", stream ? ", streamed" : "", dr);
+        CHECK(dr == 0, "the expert cache (or its prediction) changes the logits of decode rows");
         q4e_close(e);
     }
     }
