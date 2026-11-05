@@ -90,10 +90,11 @@ struct Q4Eng {
 };
 
 // the stages of a forward, for Q4E_PROFILE
-// PROJ: attention and DeltaNet projections; QSA: the indexer's block keys, scores and top-k
-enum { ST_EMBED, ST_PLE, ST_HC, ST_PROJ, ST_QSA, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
-static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "projections", "qsa select", "attention",
-                                         "gated deltanet", "router + cache", "experts", "head"};
+// PROJ: attention and DeltaNet projections; ROPE: the head norms, RoPE and K / V stores; QSA: the indexer's block keys,
+// scores and top-k; ATTN: the attention itself
+enum { ST_EMBED, ST_PLE, ST_HC, ST_PROJ, ST_ROPE, ST_QSA, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
+static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "projections", "norm + rope + store",
+                                         "qsa select", "attention", "gated deltanet", "router + cache", "experts", "head"};
 
 static int fail(Q4Eng* e, const char* fmt, ...) {
     if (!e->err[0]) {
@@ -541,15 +542,15 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     mv(e, &L->q, e->x, e->qp, T);
     mv(e, &L->k, e->x, e->kk, T);
     mv(e, &L->v, e->x, e->vv, T);
+    mv(e, &L->ix, e->x, e->ixo, T);
+    mark(e, ST_PROJ);
     kq4_head_norm_rope(e->s, c, e->qp, c->n_head * 2 * hd, c->n_head, 2 * hd, hd, L->qn, 0, e->din, T);
     kq4_head_norm_rope(e->s, c, e->kk, kvw, c->n_kv, hd, hd, L->kn, 0, e->din, T);
     kq4_store(e->s, L->K, kvw, e->kk, kvw, 0, e->din, T);
     kq4_store(e->s, L->V, kvw, e->vv, kvw, 0, e->din, T);
-    mv(e, &L->ix, e->x, e->ixo, T);
-    mark(e, ST_PROJ);
     kq4_store(e->s, L->raw, D, e->ixo + (size_t) c->ix_heads * D, iw, 0, e->din, T);
     kq4_head_norm_rope(e->s, c, e->ixo, iw, c->ix_heads, D, D, L->iqn, 0, e->din, T);
-    mark(e, ST_ATTN);
+    mark(e, ST_ROPE);
     kq4_qsa_blocks(e->s, c, L->raw, L->ikn, 0, e->din, T, L->blk);
     kq4_qsa_rows(e->s, c, 0, e->din, e->done, e->nsel, T);
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
