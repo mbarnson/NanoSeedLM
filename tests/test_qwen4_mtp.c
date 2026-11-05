@@ -1,11 +1,9 @@
-// tests/test_qwen4_mtp.c - the qwen4 CUDA engine's MTP head (Q4EOpts.mtp) on tests/data/qwen4_tiny: drafts against the
-// C reference, verify forwards that keep each row's state, and greedy decode with drafts. Skipped without a GPU.
+// tests/test_qwen4_mtp.c - the qwen4 engine's MTP head (Q4EOpts.mtp, CUDA or Metal) on tests/data/qwen4_tiny: drafts
+// against the C reference, verify forwards that keep each row's state, and greedy decode with drafts. Skipped without a GPU.
 #define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c99 (Windows: _putenv_s)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <cuda_runtime_api.h>
 
 #include "format.h"
 #include "qwen4_eng.h"
@@ -77,8 +75,6 @@ static int decode(Q4Eng* e, const int32_t* ids, int n, int k, int nt, int32_t* o
 }
 
 int main(void) {
-    int ndev = 0;
-    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { printf("SKIP: no CUDA device\n"); return 77; }
     char err[512] = "";
     StFile st;
     if (st_open_file(&st, "tests/data/qwen4_tiny_golden.safetensors", err, sizeof err)) { printf("FAIL: %s\n", err); return 1; }
@@ -88,6 +84,9 @@ int main(void) {
     Q4EOpts o;
     memset(&o, 0, sizeof o);
     o.max_pos = 256;
+    Q4Eng* probe = q4e_open(DIR_, &o, err, sizeof err);   // the engine's own open fails without a GPU
+    if (!probe && strstr(err, "device")) { printf("SKIP: %s\n", err); return 77; }
+    q4e_close(probe);
     o.mtp = Q4E_MAX_DRAFTS;
     CHECK(!q4e_open("tests/data/qwen4_tiny_attn", &o, err, sizeof err) && strstr(err, "no MTP head"), "a folder without mtp.*: %s", err);
     Qwen4Ref* r = qwen4_ref_open(DIR_, err, sizeof err);

@@ -445,7 +445,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     ns_rows_init(&e->rows);
     if (cudaStreamCreate(&e->s) || cudaStreamCreateWithFlags(&e->s2, cudaStreamNonBlocking) ||
         cudaEventCreateWithFlags(&e->ev_x, cudaEventDisableTiming) || cudaEventCreateWithFlags(&e->ev_sh, cudaEventDisableTiming))
-        fail(e, "CUDA streams: setup failed");
+        fail(e, "CUDA streams: %s", cudaGetErrorString(cudaGetLastError()));   // e.g. no CUDA-capable device
     e->g24 = (uint32_t*) dmem(e, e->rows.g24, sizeof e->rows.g24);
     e->g32 = (uint32_t*) dmem(e, e->rows.g32, sizeof e->rows.g32);
     load_w(e, &e->embed, 0, "language_model.model.embed_tokens.weight");
