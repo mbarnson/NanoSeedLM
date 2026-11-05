@@ -35,6 +35,31 @@
   E8 lattice codebooks and BlockLDLQ. QTIP replaces the lattice with a trellis.
 - [BCJR-QAT](https://arxiv.org/abs/2605.10655), Iyengar, 2026. The trellis search made differentiable (BCJR
   forward-backward) for quantization-aware training.
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3). Its EXL3 format is a variant of QTIP, in an inference library
+  for consumer GPUs.
+- [CCQ](https://arxiv.org/abs/2507.07145), Baidu, 2025. Convolutional codes with scalar quantization at 2.0 to 2.75 bits,
+  with bit-shift decoding and no codebook table. Tested on DeepSeek-V3 and ERNIE-4.5-300B-A47B (MoE models).
+
+## Trellis codes from recursions and shift registers
+
+We found no other work that uses an LFSR or SeedLM's seeds as the code of a trellis. These are the nearest.
+
+- [The design of trellis waveform coders](https://doi.org/10.1109/TCOM.1982.1095515), Stewart, Gray and Linde, IEEE
+  Transactions on Communications, 1982. The decoder is a shift register and a function of its contents. A bitshift
+  trellis has this structure.
+- [Linear congruential trellis source codes: design and analysis](https://doi.org/10.1109/TCOMM.2007.904375), Eriksson,
+  Anderson and Goertz, IEEE Transactions on Communications, 2007. A trellis quantizer whose values come from a linear
+  congruential recursion. A 2005 letter by Anderson and Eriksson reports 0.24 dB from the bound for a Gaussian source
+  at 1 bit, with 512 states. These are the ancestors of QTIP's computed codes.
+- [Viterbi-based efficient test data compression](https://doi.org/10.1109/TCAD.2011.2172609), Lee and Roy, IEEE
+  Transactions on Computer-Aided Design, 2012. The Viterbi algorithm, not linear equations, picks the inputs of a test
+  decompressor. It is the trellis form of a seed search.
+- [Viterbi-based pruning](https://iclr.cc/virtual/2018/poster/256), Lee, Ahn, Kim, Chuang and Kim, ICLR 2018, and
+  [Double Viterbi](https://iclr.cc/virtual/2019/poster/1103), Ahn, Lee, Kim and Kim, ICLR 2019. Viterbi encoders of
+  XOR gates and flip-flops give sparse and quantized weights of CNNs and LSTMs.
+- [Structured compression by weight encryption](https://arxiv.org/abs/1905.10138), Kwon et al., 2019, and
+  [encoding weights of irregular sparsity](https://arxiv.org/abs/2105.01869), Park et al., 2021. XOR-gate decoders for
+  pruned and quantized weights.
 
 ## Discussion
 
