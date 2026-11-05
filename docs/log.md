@@ -499,7 +499,7 @@ bound by its loads. Read [shared key tiles](results/2026-11-05-qwen38-shared-til
 
 ## [2026-11-05] engine | Qwen3.8-Flash-Next on the Metal engine
 
-`66999b7`, `afef13f`: `engine/qwen4_gpu.m` runs `engine/qwen4_eng.h` on Metal, so `nslm-qwen4-gen` builds on macOS.
+`fd49f5e`, `30810a6`: `engine/qwen4_gpu.m` runs `engine/qwen4_eng.h` on Metal, so `nslm-qwen4-gen` builds on macOS.
 The weights, the routed experts included, are mapped from the folder without a copy, so the Mac needs no expert cache.
 On the M4 Max the P3 pack decodes the tide-pools prompt at 38.4 tokens/s warm and 33.0 cold. mlx-vlm 0.7.12 decodes it
 at 40.1 (greedy). Both runs give the same text. `test_qwen4_metal` checks the engine against mlx-vlm on the tiny model,
@@ -509,7 +509,7 @@ Metal's `k_mv` sums one token's row in another order than several tokens' rows.
 
 ## [2026-11-05] engine | Qwen3.8-Flash-Next on Metal: faster decode and prompt, and nslm-chat
 
-`9dbb63d`, `218ffd1`, `f33b757`, `41f6419`, `e1e1735`, `78cd7f4`, `930bd5a`: on the M4 Max the P3 pack now decodes the
+`0c51ae1`, `2a3e88d`, `5dfc9b4`, `36f84db`, `6789f01`, `8e5b9de`, `c842a26`: on the M4 Max the P3 pack now decodes the
 tide-pools prompt at 42 to 43 tokens/s, against 38.4 before and mlx-vlm 0.7.12's 40.1. It reads a 5,639-token prompt at
 414 to 439 tokens/s, against 288 before and mlx-vlm's 457 to 500. The router's top-k now uses a threadgroup for each
 row. Matvecs with few rows and a long input (`k_mv_split`) now spread each row over a threadgroup. Prompt forwards are
@@ -517,7 +517,7 @@ row. Matvecs with few rows and a long input (`k_mv_split`) now spread each row o
 matrices, so each key tile is loaded once for all of them. `nslm-chat` and `nslm-serve` now reach the Metal engine
 through `engine/engine.c`. `test_qwen4_metal` also checks `qwen4_tiny_attn` against the C reference.
 
-`70a2c2f`: after a 19,768-token prompt the Metal engine decoded at 25 tokens/s, because its decode attention loaded
+`af4e645`: after a 19,768-token prompt the Metal engine decoded at 25 tokens/s, because its decode attention loaded
 each key once for each of a KV group's 12 heads. Rows with 512 keys or more now split their keys over
 threadgroups for the whole group, and a second kernel merges the splits, as CUDA's `5ce032e` does. Decode there is
 36 to 38 tokens/s.
