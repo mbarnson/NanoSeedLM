@@ -651,6 +651,6 @@ still equal decode rows.
 `3f570f3`, pc-cuda's RTX 4080, P3, pinned experts, 6 GB cache: decode is 33.17 tokens per second against 30.30, with the
 same text. The host PLE prefetch took 1,075 ms of a 256-token run, and now takes 2 ms. The automatic cache picks about
 8.1 GB beside the 2,560 MB display reserve, and decodes at 37.69 tokens per second. With 2 drafts, the PLE rows took
-4,315 ms on `ecd552f` and take 403 ms now, so the MTP measurement on the 4080 gets a rerun. `3f570f3` also drops the
+4,315 ms on `ecd552f` and take 403 ms now. So the MTP measurement on the 4080 gets a rerun. `3f570f3` also drops the
 experts' file pages after the pinned copy: the load peak fell from more than 111 GB to 59.7 GB. Read
 [PLE rows on a thread pool](results/2026-11-05-qwen38-4080-ple-pool.md).
