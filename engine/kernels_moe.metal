@@ -369,7 +369,8 @@ static inline float seed4_dot(thread const float (&v)[32], uint cw, int e, float
 static inline int seed4_ecode(device const uchar* EN, ulong k) { return (EN[k >> 1] >> ((k & 1) * 4)) & 15; }
 // SEED6P8, 6.5-bit P = 8 blocks (nslm/searchp.h): 64 states; states 33..64 are states 1..32 of the seed s2 = state 32
 // = G[s] >> 16, so two stream-table words give them all.  seed8_dot as seed4_dot with 8 coefficients (32-bit word).
-static inline void seed8_states(uint s, device const uint* G, thread float (&v)[64]) {
+template <typename GT>
+static inline void seed8_states(uint s, GT G, thread float (&v)[64]) {
     const uint g = G[s], s2 = g >> 16, g2 = G[s2], lo = s | (g << 16), lo2 = s2 | (g2 << 16);
     for (short k = 1; k <= 16; ++k) v[k - 1] = as_type<float>(insert_bits(0x3F800000u, lo >> k, 7u, 16u));
     for (short k = 17; k <= 32; ++k) v[k - 1] = as_type<float>(insert_bits(0x3F800000u, g >> (k - 16), 7u, 16u));
@@ -388,9 +389,33 @@ static inline float seed8_dot(thread const float (&v)[64], uint cw, int e, float
     return e2 * (r + qs * xm);
 }
 
+// One Q4 block's term in MLX's qmv form: s (q . x) + b sum(x), q exact via or / subtract.  The one-token matvec adds
+// exactly this, and k_mv's multi-token loop the same arithmetic, so a token's sums are the same for any token count (MTP
+// verify rows equal decode rows bit for bit).
+static inline float q4_term(float s, float b, float4 q0, float4 q1, float4 x0, float4 x1) {
+    const float xs = dot(x0 + x1, float4(1.0f));
+    const float qx = dot(q0, x0) + dot(q1, x1);
+    return s * qx + b * xs;
+}
+
+// The stream table G[s] (lfsr_stream24 / 32) from two 256-entry halves in threadgroup memory: the LFSR streams are linear
+// over GF(2), so G[s] = G[s & 255] ^ G[s & 0xFF00] for every s, bit for bit.  Each seed block's lookup then reads
+// threadgroup memory, not a random word of a 256 KB table through the caches.  split_g_load fills Gt (512 words) from G.
+struct SplitG {
+    threadgroup const uint* t;
+    uint operator[](uint s) const { return t[s & 255u] ^ t[256u + (s >> 8)]; }
+};
+static inline void split_g_load(threadgroup uint* Gt, device const uint* G, uint tid, uint nthr) {
+    for (uint i = tid; i < 512u; i += nthr) Gt[i] = G[i < 256u ? i : (i - 256u) << 8];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+#define FC_SEED (FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8)
+
 // One lane's share of row `row` . x for one token (T = 1), every format: the k_mv arithmetic (seed4 two-op states,
-// Q4 in MLX's qmv form, BF16 / Q8 dequantized as mx.dequantize).  The caller sums the lanes.
-static inline float mv_lane(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, device const uint* G,
+// Q4 in MLX's qmv form, BF16 / Q8 dequantized as mx.dequantize).  The caller sums the lanes.  G: the stream table
+// (device memory, or SplitG)
+template <typename GT>
+static inline float mv_lane(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, GT G,
                             int eb, ulong row, int K, device const float* xb, uint lane, device const uchar* EN) {
     const int nbk = K / 8;
     float acc = 0;
@@ -491,7 +516,7 @@ static inline float mv_lane(short fmt, device const uchar* W, device const ushor
                                          as_type<float>(0x4B000000u | extract_bits(qw, 24u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 28u, 4u))) - 8388608.0f;
                 device const float4* xr = (device const float4*) (xb + (ulong) (j0 + k) * 8);
                 const float4 x0 = xr[0], x1 = xr[1];
-                acc += s * (dot(q0, x0) + dot(q1, x1)) + b * dot(x0 + x1, float4(1.0f));
+                acc += q4_term(s, b, q0, q1, x0, x1);
             }
         }
         return acc;
@@ -514,7 +539,17 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
                  device const ushort* B [[buffer(3)]], device const float* x [[buffer(4)]], device float* y [[buffer(5)]],
                  device const int* sel [[buffer(6)]], device const uint* G [[buffer(7)]], device const uchar* EN [[buffer(8)]],
                  uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-                 uint sgi [[simdgroup_index_in_threadgroup]]) {
+                 uint sgi [[simdgroup_index_in_threadgroup]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint Gt[512];
+    if (FC_SEED) split_g_load(Gt, G, tid, 32 * MV_ROWS);
+    const SplitG Gs = {Gt};
+    // Q4 with T > 1: a path that would take the sums of x's blocks from threadgroup memory, taken only when T * K / 8 <= 1,
+    // so never (reading them there is slower). It stays because compiling the multi-token loop with it makes that loop 20
+    // to 35% faster at 2 to 4 tokens: an effect of Apple's Metal compiler, found by A/B on the M4 Max, not understood. P3
+    // decode with 2 MTP drafts: 51.9 -> 55.7 tokens/s. Its value would be the inline sum, so token rows stay T-invariant.
+    threadgroup float xsum[1];
+    const bool xsq = FC_FMT == MF_Q4 && FC_T > 1 && FC_T * (a.K / 8) <= 1;
+    if (xsq) { xsum[tid] = 0; threadgroup_barrier(mem_flags::mem_threadgroup); }
     const int NR = FC_FMT == MF_SEED4 ? MV_NR_SEED : MV_NR_AFF;   // folded when the pipeline is specialised
     const int r0 = (int) (tg.x * MV_ROWS + sgi) * NR;
     if (r0 >= a.R) return;
@@ -530,7 +565,7 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
     device const float* xb = x + (ulong) (gather ? p0 / a.xdiv : 0) * a.xs;
     if (nt == 1 && NR == 1) {   // one token (decode, gather): the shared per-lane arithmetic
         const int ebs = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[slice] : 0;
-        const float s = simd_sum(mv_lane(FC_FMT, W, S, B, G, ebs, row[0], a.K, xb, lane, EN));
+        const float s = simd_sum(mv_lane(FC_FMT, W, S, B, Gs, ebs, row[0], a.K, xb, lane, EN));
         if (lane == 0) {
             device float* yo = y + (ulong) p0 * a.ys + r0;
             *yo = a.add ? bfr(*yo + bfr(s)) : bfr(s);
@@ -550,7 +585,7 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
                     sv[u] = seeds[row[i] * (ulong) nbk + j];
                     nbv[u] = (int) S[row[i] * (ulong) nbk + j];
                 }
-                for (int u = 0; u < MV_SEED_U; ++u) gv[u] = G[sv[u]];
+                for (int u = 0; u < MV_SEED_U; ++u) gv[u] = Gs[sv[u]];
                 for (int u = 0; u < MV_SEED_U; ++u) {
                     const int j = j0 + 32 * u;
                     if (j >= nbk) break;
@@ -573,7 +608,7 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
             for (int i = 0; i < NR; ++i) {
                 const ulong k = row[i] * (ulong) nbk + j;
                 float v[64];
-                seed8_states(seeds[k], G, v);
+                seed8_states(seeds[k], Gs, v);
                 const int e = eb + seed4_ecode(EN, k);
                 for (int t = 0; t < nt; ++t) {
                     device const float4* xr = (device const float4*) (xb + (ulong) t * a.xs + (ulong) j * 8);
@@ -590,7 +625,7 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
                 const ulong k = row[i] * (ulong) nbk + j;
                 const uint s = seeds[k];
                 float v[32];
-                seed4_states(s, G[s], v);
+                seed4_states(s, Gs[s], v);
                 const int e = eb + seed4_ecode(EN, k);
                 for (int t = 0; t < nt; ++t) {
                     device const float4* xr = (device const float4*) (xb + (ulong) t * a.xs + (ulong) j * 8);
@@ -619,7 +654,8 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
                     for (int t = 0; t < nt; ++t) {
                         device const float4* xr = (device const float4*) (xb + (ulong) t * a.xs + (ulong) (j0 + k) * 8);
                         const float4 x0 = xr[0], x1 = xr[1];
-                        acc[i][t] += s * (dot(q0, x0) + dot(q1, x1)) + b * dot(x0 + x1, float4(1.0f));
+                        const float xs8 = xsq ? xsum[t * nbk + j0 + k] : dot(x0 + x1, float4(1.0f));
+                        acc[i][t] += s * (dot(q0, x0) + dot(q1, x1)) + b * xs8;   // q4_term's arithmetic
                     }
                 }
             }
@@ -663,8 +699,11 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
                     device const ushort* Su [[buffer(9)]], device const ushort* Bu [[buffer(10)]],
                     device const uchar* EN [[buffer(11)]], device const uchar* ENu [[buffer(12)]],
                     uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-                    uint sgi [[simdgroup_index_in_threadgroup]]) {
+                    uint sgi [[simdgroup_index_in_threadgroup]], uint tid [[thread_index_in_threadgroup]]) {
     static_assert(MV_NR_SEED == 1 && MV_NR_AFF == 1, "k_mv_gu: one row per simdgroup");
+    threadgroup uint Gt[512];
+    if (FC_SEED) split_g_load(Gt, G, tid, 32 * MV_ROWS);
+    const SplitG Gs = {Gt};
     const int r = (int) (tg.x * MV_ROWS + sgi);
     if (r >= a.R) return;
     const int p0 = (int) tg.y, slice = sel[p0];
@@ -673,8 +712,8 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
     const bool sd = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4;
     const int ebg = sd ? ((device const int*) B)[slice] : 0;
     const int ebu = sd ? ((device const int*) Bu)[slice] : 0;
-    const float g = simd_sum(mv_lane(FC_FMT, W, S, B, G, ebg, row, a.K, xb, lane, EN));
-    const float u = simd_sum(mv_lane(FC_FMT, Wu, Su, Bu, G, ebu, row, a.K, xb, lane, ENu));
+    const float g = simd_sum(mv_lane(FC_FMT, W, S, B, Gs, ebg, row, a.K, xb, lane, EN));
+    const float u = simd_sum(mv_lane(FC_FMT, Wu, Su, Bu, Gs, ebu, row, a.K, xb, lane, ENu));
     if (lane == 0) y[(ulong) p0 * a.ys + r] = bfr(silu_bf(bfr(g)) * bfr(u));
 }
 
