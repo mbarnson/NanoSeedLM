@@ -6,9 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <sys/stat.h>
+
 #include <cuda_runtime_api.h>
 
 #include "format.h"
+#include "model_st.h"
 #include "kernels_cuda.h"
 #include "kernels_qwen4.h"
 #include "qwen4_eng.h"
@@ -92,11 +95,111 @@ static void tail_skip_check(int rows, int k, int n, int R, int renorm) {
     free(ind); free(slot); free(got); free(wt); free(gw); free(skip);
 }
 
+// The tiny model with random P = 3 seed experts in place of its affine ones (plan D4 computes seed experts on the CPU)
+typedef struct { const StFile* st; const StEntry** e; int nraw; uint32_t r; } SeedFix;
+static int seed_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) {
+    SeedFix* f = (SeedFix*) ctx;
+    if (t < f->nraw) { memcpy(dst, st_data(f->st, f->e[t]), len); return 0; }
+    for (uint64_t i = 0; s == 2 && i + 4 <= len; i += 4) { const int32_t b = -22; memcpy(dst + i, &b, 4); }   // the exponent biases
+    for (uint64_t i = 0; s != 2 && i + 2 <= len; i += 2) {   // seeds (never 0) and nibble words
+        f->r = f->r * 1664525u + 1013904223u;
+        uint16_t v = (uint16_t) (f->r >> 16);
+        if (s == 0 && !v) v = 1;
+        memcpy(dst + i, &v, 2);
+    }
+    return 0;
+}
+static int seed_fixture(const char* dir, char* err, int errlen) {
+    StFile st;
+    if (st_open_file(&st, "tests/data/qwen4_tiny/model.safetensors", err, errlen)) return -1;
+    const Qwen4Cfg* c = NULL;
+    Qwen4Cfg cfg;
+    if (qwen4_cfg_load(&cfg, "tests/data/qwen4_tiny", err, errlen)) { st_close_file(&st); return -1; }
+    c = &cfg;
+    NsSpec* spec = (NsSpec*) calloc((size_t) st.n + 3 * (size_t) c->n_layer, sizeof(NsSpec));
+    NsRaw* raw = (NsRaw*) calloc((size_t) st.n + 3 * (size_t) c->n_layer, sizeof(NsRaw));
+    const StEntry** ent = (const StEntry**) calloc((size_t) st.n, sizeof(StEntry*));
+    static char names[64][160];
+    int n = 0;
+    for (int i = 0; i < st.n; ++i) {
+        if (strstr(st.e[i].name, ".mlp.switch_mlp.")) continue;   // the affine experts: replaced below
+        spec[n] = (NsSpec) {st.e[i].name, NS_RAW, 1, 1, 1};
+        raw[n] = (NsRaw) {st.e[i].dtype, st.e[i].ndim, {0}, st.e[i].end - st.e[i].begin};
+        memcpy(raw[n].shape, st.e[i].shape, sizeof raw[n].shape);
+        ent[n++] = &st.e[i];
+    }
+    SeedFix f = {&st, ent, n, 12345};
+    const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+    for (int l = 0; l < c->n_layer; ++l)
+        for (int p = 0; p < 3; ++p) {
+            snprintf(names[3 * l + p], sizeof names[0], "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, proj[p]);
+            spec[n++] = (NsSpec) {names[3 * l + p], NS_SEED4, c->n_exp, p == 2 ? c->d : c->ff_exp, p == 2 ? c->ff_exp : c->d};
+        }
+    mkdir(dir, 0755);
+    int rc = ns_write_raw(dir, spec, raw, n, 1ull << 30, NULL, seed_fill, &f, err, errlen);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    FILE* in = fopen("tests/data/qwen4_tiny/config.json", "rb"), *out = rc ? NULL : fopen(path, "wb");
+    char buf[4096];
+    size_t got;
+    while (in && out && (got = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, got, out);
+    if (in) fclose(in);
+    if (out) fclose(out); else rc = -1;
+    free(spec); free(raw); free(ent);
+    st_close_file(&st);
+    return rc;
+}
+
+// Plan D4 (Q4EOpts.cpu_tail) on the seed fixture: decode rows with the tail on the CPU against without it (close
+// logits, fewer misses on the GPU), and the same logits from run to run. Skipped without the CPU seed kernel.
+static void cpu_tail_check(void) {
+    char dir[512], err[512] = "";
+    const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
+    snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_seeds", tmp);
+    if (seed_fixture(dir, err, sizeof err)) { CHECK(0, "seed fixture: %s", err); return; }
+    int32_t ids[40];
+    float* lg[3] = {NULL, NULL, NULL};
+    uint64_t miss[3] = {0, 0, 0};
+    for (int run = 0; run < 3; ++run) {
+        Q4EOpts o;
+        memset(&o, 0, sizeof o);
+        o.max_pos = 64;
+        o.cache_gb = 1e-5;   // a cache of one layer's experts: misses in every layer
+        o.cpu_tail = run ? 1 : 0;   // the tiny model routes 3 of 8 experts
+        Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
+        if (!e && run && strstr(err, "Clang")) { printf("cpu_tail: skipped (%s)\n", err); break; }
+        CHECK(e != NULL, "open the seed fixture (cpu_tail %d): %s", o.cpu_tail, err);
+        if (!e) break;
+        const int V = q4e_cfg(e)->vocab;
+        for (int i = 0; i < 40; ++i) ids[i] = (i * 37 + 11) % V;
+        lg[run] = (float*) malloc(sizeof(float) * (size_t) V);
+        int rc = q4e_forward(e, ids, 20, NULL);
+        for (int t = 20; !rc && t < 40; ++t) rc = q4e_forward(e, ids + t, 1, lg[run]);
+        CHECK(rc == 0, "decode with cpu_tail %d: %s", o.cpu_tail, q4e_error(e));
+        uint64_t h;
+        int slots;
+        q4e_cache_stats(e, &h, &miss[run], &slots);
+        if (run == 2) {
+            double d = 0, m = 1e-30;
+            int bad = 0;
+            for (int v = 0; v < V; ++v) { bad += !isfinite(lg[1][v]); d = fmax(d, fabs((double) lg[1][v] - lg[0][v])); m = fmax(m, fabs((double) lg[0][v])); }
+            printf("cpu_tail on the seed fixture: logits within %.1e of the GPU's, %llu misses against %llu\n", d / m,
+                   (unsigned long long) miss[1], (unsigned long long) miss[0]);
+            CHECK(!bad && d / m < 1e-3 && !memcmp(lg[1], lg[2], sizeof(float) * (size_t) V) && miss[1] < miss[0],
+                  "cpu_tail: logits %.1e from the GPU's, runs %s, misses %llu / %llu", d / m,
+                  memcmp(lg[1], lg[2], sizeof(float) * (size_t) V) ? "differ" : "equal", (unsigned long long) miss[1], (unsigned long long) miss[0]);
+        }
+        q4e_close(e);
+    }
+    free(lg[0]); free(lg[1]); free(lg[2]);
+}
+
 int main(void) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { printf("SKIP: no CUDA device\n"); return 77; }
     bucket_check(512, 128, 10);   // qwen4: 512 experts, top 10, a prompt chunk of 128 rows
     bucket_check(128, 64, 8);     // MoVA
+    cpu_tail_check();
     for (int rn = 0; rn < 2; ++rn) {
         tail_skip_check(4, 10, 64, 7, rn);   // a verify step of 4 rows, top 10
         tail_skip_check(1, 10, 512, 7, rn);  // one decode row of Qwen3.8-Flash-Next
