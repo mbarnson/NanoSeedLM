@@ -13,7 +13,10 @@ Seeds also encode other weights where a gate shows no loss.
   search of T3 runs anyway, so that the KLD of G7 decides T64.
 - T4 step 1 is done: the hot experts depend on the text domain
   ([expert use by domain](../results/2026-11-04-qwen38-routing-domains.md)).
-- T5 has its first P3 / P4 hybrids ([hybrid tiers](../results/2026-11-04-qwen38-hybrid-tiers.md)).
+- T3 step 1 is done: the S3 banks ([3-bit seeds](../results/2026-11-04-qwen38-s3-tier.md)).
+- T5 has P3 / P4 and S3 / P3 hybrids ([hybrid tiers](../results/2026-11-04-qwen38-hybrid-tiers.md)). A static pack
+  does not reach its target at 3.3 bits (0.112 against 0.0735). A tier that follows each session's hot set may: with
+  the text's own hot third, S3 / P3 gives 0.0765.
 
 ## Key numbers
 

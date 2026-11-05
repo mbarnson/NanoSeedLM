@@ -387,3 +387,9 @@ for each expert weight, on Unsloth's curve. P3 has 0.0600 at 4.00 bits, and UD-I
 `2009d76`: the emulator takes each expert from one of several packs by a map (`tools/qwen4_tier_map.py`). At 4.17
 bits, a random third, every `down_proj` and the chat and code hot third in P4 all give 0.054. The wiki hot third gives
 0.0450 on wikitext. Read [hybrid tiers](results/2026-11-04-qwen38-hybrid-tiers.md).
+
+## [2026-11-04] result | 3-bit seeds (S3) for the 64 GB class of Qwen3.8-Flash-Next
+
+`e8426e0`, `047ad9f`: `nslm-moe --codec s3` searched all experts at C = 12, P = 4 on CUDA (12.9 GPU-hours). S3 alone
+has a KLD of 0.142 against BF16, and UD-IQ3_XXS has 0.0735. A random third in P3 gives 0.116 at 3.35 bits. The text's
+own hot third in P3 gives 0.0765. Read [3-bit seeds for the 64 GB class](results/2026-11-04-qwen38-s3-tier.md).

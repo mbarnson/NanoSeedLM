@@ -92,6 +92,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   4.50 bits is on Unsloth's curve. P3 0.0600 at 4.00 bits is 18% above it. Gate G5 passes.
 - [2026-11-04: Hybrid P3 / P4 seed packs](results/2026-11-04-qwen38-hybrid-tiers.md): at 4.17 bits, 0.054 with a
   random or `down_proj` third in P4, 0.0450 with the in-domain hot third.
+- [2026-11-04: 3-bit seeds (S3) for the 64 GB class](results/2026-11-04-qwen38-s3-tier.md): S3 alone 0.142, twice
+  UD-IQ3_XXS. With the text's own hot third in P3, 0.0765 at 3.35 bits.
 
 ## For contributors and agents
 
