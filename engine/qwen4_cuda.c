@@ -52,7 +52,8 @@ struct Q4Eng {
     W embed, head, mix_down, mix_up;
     float* mix_norm;
     uint32_t *g24, *g32;
-    cudaStream_t s;
+    cudaStream_t s, s2;          // s2: decode's shared expert, beside the router and the expert copy
+    cudaEvent_t ev_x, ev_sh;
     int max_pos, pos, host_experts, cache, stream;
     int mt;                        // rows of one prompt forward (a chunk): Q4EOpts.rows
     int xr;                        // rows of a layer-major pass: the context in chunks of mt, at most Q4E_PASS_ROWS
@@ -72,7 +73,7 @@ struct Q4Eng {
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *Hall;   // the hidden streams of a pass, xr rows; H: the current chunk's
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated, *inv;   // inv: RoPE's
-    float *lg, *wt, *A, *Dx, *sh, *logits, *y, *cv, *qkvb;
+    float *lg, *wt, *A, *As, *Dx, *sh, *logits, *y, *cv, *qkvb;   // As: the shared expert's activations (decode)
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
     // A chunk's input: its slot of hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
     // from din, so a CUDA graph of T decode rows serves every position.  emb_h (PLE rows) and hlog (logits) are pinned too.
@@ -210,10 +211,11 @@ static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
 
 static const uint32_t* G(const Q4Eng* e, const W* w) { return w->fmt == MF_SEED4P4 ? e->g32 : e->g24; }
 // y[T][rows] = W x[T][cols]: the matvec for up to MV_MAXT rows, the tensor-core GEMM (BF16 inputs) for more
-static void mvx(Q4Eng* e, const W* w, const float* x, int xs, float* y, int T) {   // x rows xs apart
-    if (T <= MV_MAXT) kc_mv(e->s, w->fmt, w->w, w->cols, w->rows, x, xs, y, w->rows, T, 0, G(e, w));
-    else kc_mm(e->s, w->fmt, w->w, w->cols, w->rows, x, xs, y, w->rows, T, 0, G(e, w));
+static void mv_on(Q4Eng* e, cudaStream_t s, const W* w, const float* x, int xs, float* y, int T) {   // x rows xs apart
+    if (T <= MV_MAXT) kc_mv(s, w->fmt, w->w, w->cols, w->rows, x, xs, y, w->rows, T, 0, G(e, w));
+    else kc_mm(s, w->fmt, w->w, w->cols, w->rows, x, xs, y, w->rows, T, 0, G(e, w));
 }
+static void mvx(Q4Eng* e, const W* w, const float* x, int xs, float* y, int T) { mv_on(e, e->s, w, x, xs, y, T); }
 static void mv(Q4Eng* e, const W* w, const float* x, float* y, int T) { mvx(e, w, x, w->cols, y, T); }
 
 static void load_layer(Q4Eng* e, int l) {
@@ -424,7 +426,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->table = &e->pt;
     }
     ns_rows_init(&e->rows);
-    cudaStreamCreate(&e->s);
+    if (cudaStreamCreate(&e->s) || cudaStreamCreateWithFlags(&e->s2, cudaStreamNonBlocking) ||
+        cudaEventCreateWithFlags(&e->ev_x, cudaEventDisableTiming) || cudaEventCreateWithFlags(&e->ev_sh, cudaEventDisableTiming))
+        fail(e, "CUDA streams: setup failed");
     e->g24 = (uint32_t*) dmem(e, e->rows.g24, sizeof e->rows.g24);
     e->g32 = (uint32_t*) dmem(e, e->rows.g32, sizeof e->rows.g32);
     load_w(e, &e->embed, 0, "language_model.model.embed_tokens.weight");
@@ -455,9 +459,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const Buf att[] = {{&e->qp, T * att_ld(c)}, {&e->o, T * c->n_head * c->head_dim}, {&e->sc, T * nb}};
     const Buf lin[] = {{&e->y, T * vd}, {&e->cv, T * cd}, {&e->qkvb, T * gdn_ld(c)}};
     const Buf ffn[] = {{&e->lg, T * (c->n_exp + 1)}, {&e->wt, T * c->top_k}, {&e->A, T * ka}, {&e->Gb, T * ka}, {&e->Ub, T * ka},
-                       {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}};
+                       {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}, {&e->As, MV_MAXT * (size_t) c->ff_shared}};
     const Buf* grp[] = {mix, pl, att, lin, ffn};
-    const int ng[] = {3, 5, 3, 3, 7};
+    const int ng[] = {3, 5, 3, 3, 8};
     size_t most = 0;
     for (int i = 0; i < 5; ++i) if (bufs_len(grp[i], ng[i]) > most) most = bufs_len(grp[i], ng[i]);
     float* work = F(most);
@@ -532,6 +536,9 @@ void q4e_close(Q4Eng* e) {
     free(e->dev); free(e->host); free(e->ids);
     if (e->routes) fclose(e->routes);
     if (e->s) cudaStreamDestroy(e->s);
+    if (e->s2) cudaStreamDestroy(e->s2);
+    if (e->ev_x) cudaEventDestroy(e->ev_x);
+    if (e->ev_sh) cudaEventDestroy(e->ev_sh);
     if (e->cs) cudaStreamDestroy(e->cs);
     if (e->ev_admit) cudaEventDestroy(e->ev_admit);
     for (int l = 0; l < e->c.n_layer; ++l) if (e->ev_ready[l]) cudaEventDestroy(e->ev_ready[l]);
@@ -682,7 +689,14 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
 static void moe(Q4Eng* e, int l, int T) {
     const Qwen4Cfg* c = &e->c;
     Layer* L = &e->L[l];
-    const int k = c->top_k, P = T * k;
+    const int k = c->top_k, P = T * k, side = T <= MV_MAXT;
+    if (side) {   // decode: the shared expert on s2 while the router and the expert copy run on s; joined before the combine
+        cudaEventRecord(e->ev_x, e->s);
+        cudaStreamWaitEvent(e->s2, e->ev_x, 0);
+        kc_mv_gu(e->s2, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->As, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
+        mv_on(e, e->s2, &L->sh_d, e->As, c->ff_shared, e->sh, T);
+        cudaEventRecord(e->ev_sh, e->s2);
+    }
     mv(e, &L->gate, e->x, e->lg, T);
     kq4_route_ld(e->s, c, e->lg, c->n_exp + 1, e->ind, e->wt, T);
     if (e->routes) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
@@ -713,12 +727,12 @@ static void moe(Q4Eng* e, int l, int T) {
         mv(e, &L->sh_g, e->x, e->Gb, T);
         mv(e, &L->sh_u, e->x, e->Ub, T);
         kc_swiglu(e->s, e->Gb, e->Ub, e->A, T * c->ff_shared);
+        mv(e, &L->sh_d, e->A, e->sh, T);
     } else {
         kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
         kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
-        kc_mv_gu(e->s, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->A, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
+        cudaStreamWaitEvent(e->s, e->ev_sh, 0);
     }
-    mv(e, &L->sh_d, e->A, e->sh, T);
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->lg + c->n_exp, c->n_exp + 1, e->br, T);
 }
 
