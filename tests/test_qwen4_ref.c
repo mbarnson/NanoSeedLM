@@ -19,6 +19,38 @@ static const int64_t* i64(const StFile* f, const char* name, int64_t n) {
     return e && !strcmp(e->dtype, "I64") && e->end - e->begin == (uint64_t) n * 8 ? (const int64_t*) st_data(f, e) : NULL;
 }
 
+static int argmax(const float* l, int V) { int b = 0; for (int v = 1; v < V; ++v) if (l[v] > l[b]) b = v; return b; }
+// The MTP head (plan M1, gate MA) against mlx-vlm: its logits over the prompt, then 3 greedy drafts. Skipped without a golden.
+static void mtp_case(Qwen4Ref* ref, const int32_t* ids, int n, int V) {
+    StFile g;
+    char err[256];
+    if (st_open_file(&g, "tests/data/qwen4_tiny_mtp_golden.safetensors", err, sizeof err)) { printf("MTP: no golden yet\n"); return; }
+    const StEntry *el = st_find(&g, "logits"), *ed = st_find(&g, "drafts");
+    const float* want = (const float*) st_data(&g, el);
+    const int32_t* wd = (const int32_t*) st_data(&g, ed);
+    const int HD = qwen4_ref_cfg(ref)->hc * qwen4_ref_cfg(ref)->d, nd = (int) ed->shape[0];
+    float *lg = (float*) malloc(sizeof(float) * (size_t) (n + nd) * V), *H = (float*) malloc(sizeof(float) * (size_t) (n + nd) * HD);
+    float* Hm = (float*) malloc(sizeof(float) * (size_t) (n + nd) * HD);
+    int32_t* tok = (int32_t*) malloc(sizeof(int32_t) * (size_t) (n + nd));
+    CHECK(qwen4_ref_forward_h(ref, ids, n, lg, H) == 0, "forward_h: %s", qwen4_ref_error(ref));
+    for (int t = 0; t + 1 < n; ++t) tok[t] = ids[t + 1];
+    tok[n - 1] = argmax(lg + (size_t) (n - 1) * V, V);   // the bonus: the main model's next token
+    double worst = 0, scale = 0;
+    int same = 1;
+    for (int j = 0; j < nd; ++j) {   // each draft: the head over the prompt and the drafts so far, its streams fed forward
+        CHECK(qwen4_ref_mtp(ref, tok, H, n + j, lg, Hm) == 0, "mtp: %s", qwen4_ref_error(ref));
+        if (!j)
+            for (size_t x = 0; x < (size_t) n * V; ++x) { worst = fmax(worst, fabs((double) lg[x] - want[x])); scale = fmax(scale, fabs(want[x])); }
+        tok[n + j] = argmax(lg + (size_t) (n + j - 1) * V, V);
+        memcpy(H + (size_t) (n + j) * HD, Hm + (size_t) (n + j - 1) * HD, sizeof(float) * (size_t) HD);
+        same &= tok[n + j] == wd[j];
+    }
+    printf("MTP: logits max |C - mlx-vlm| %.2e of %.3f; drafts %s\n", worst, scale, same ? "equal" : "differ");
+    CHECK(worst < 1e-5 * scale && same, "MTP head differs from mlx-vlm");
+    free(lg); free(H); free(Hm); free(tok);
+    st_close_file(&g);
+}
+
 int main(void) {
     char err[512] = "";
     Qwen4Cfg c;
@@ -98,6 +130,7 @@ int main(void) {
                scale, argmax_diff, n);
         CHECK(worst < 1e-5 * scale && argmax_diff == 0, "logits differ from mlx-vlm");
         free(got);
+        mtp_case(ref, ids, n, V);
         qwen4_ref_close(ref);
     }
     st_close_file(&st);

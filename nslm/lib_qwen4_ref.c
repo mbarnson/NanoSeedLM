@@ -126,11 +126,11 @@ static void gdn(Qwen4Ref* r, int l, const float* x, int n, float* out) {
 
 // ---- QSA attention: dense within the budget; past it, each query sees the indexer's top blocks and its own tail -------
 
-static void attention(Qwen4Ref* r, int l, const float* x, int n, float* out) {
+static void attention(Qwen4Ref* r, const char* lp, const float* x, int n, float* out) {   // lp: the layer's name
     const Qwen4Cfg* c = &r->c;
     const int Hq = c->n_head, Hkv = c->n_kv, hd = c->head_dim, D = c->ix_dim, R = c->ix_ratio, iw = (c->ix_heads + 1) * D;
-    char pre[96];
-    snprintf(pre, sizeof pre, "language_model.model.layers.%d.self_attn", l);
+    char pre[112];
+    snprintf(pre, sizeof pre, "%s.self_attn", lp);
     float* qp = (float*) zalloc(sizeof(float) * (size_t) n * Hq * 2 * hd);
     float* kp = (float*) zalloc(sizeof(float) * (size_t) n * Hkv * hd);
     float* vp = (float*) zalloc(sizeof(float) * (size_t) n * Hkv * hd);
@@ -177,11 +177,11 @@ static void glu(Qwen4Ref* r, const char* pre, int slice, int ff, const float* x,
     free(g); free(u);
 }
 
-static void moe(Qwen4Ref* r, int l, const float* x, int n, float* out) {
+static void moe(Qwen4Ref* r, const char* lp, const float* x, int n, float* out) {
     const Qwen4Cfg* c = &r->c;
     const int E = c->n_exp, D = c->d;
-    char pre[96], sw[112], sh[112];
-    snprintf(pre, sizeof pre, "language_model.model.layers.%d.mlp", l);
+    char pre[112], sw[128], sh[128];
+    snprintf(pre, sizeof pre, "%s.mlp", lp);
     snprintf(sw, sizeof sw, "%s.switch_mlp", pre);
     snprintf(sh, sizeof sh, "%s.shared_expert", pre);
     float* lg = (float*) zalloc(sizeof(float) * (size_t) n * E);
@@ -253,7 +253,29 @@ void qwen4_ref_close(Qwen4Ref* r) {
 const Qwen4Cfg* qwen4_ref_cfg(const Qwen4Ref* r) { return &r->c; }
 const char* qwen4_ref_error(const Qwen4Ref* r) { return r->err; }
 
-int qwen4_ref_forward(Qwen4Ref* r, const int32_t* ids, int n, float* logits) {
+// One decoder layer named lp on the streams H: the attention (or DeltaNet layer l) and the MoE, each through its HC
+static void decoder(Qwen4Ref* r, const char* lp, int attn, int l, float* H, int n, float* x, float* b, float* inj) {
+    char pre[128];
+    snprintf(pre, sizeof pre, "%s.attn_hyper_connection", lp);
+    hc_mix(r, pre, H, n, x, inj);
+    if (attn) attention(r, lp, x, n, b);
+    else gdn(r, l, x, n, b);
+    hc_add(&r->c, H, n, b, inj);
+    snprintf(pre, sizeof pre, "%s.mlp_hyper_connection", lp);
+    hc_mix(r, pre, H, n, x, inj);
+    moe(r, lp, x, n, b);
+    hc_add(&r->c, H, n, b, inj);
+}
+static int embed(Qwen4Ref* r, const int32_t* ids, int n, float* x) {
+    const NsTensor* E = tens(r, "language_model.model.embed_tokens.weight");
+    for (int t = 0; E && t < n; ++t) {
+        if (ids[t] < 0 || ids[t] >= E->rows) { snprintf(r->err, sizeof r->err, "token %d out of range", ids[t]); return -1; }
+        ns_row_f32(&r->rows, E, 0, ids[t], 0, x + (size_t) t * r->c.d);
+    }
+    return E ? 0 : -1;
+}
+
+int qwen4_ref_forward_h(Qwen4Ref* r, const int32_t* ids, int n, float* logits, float* Hout) {
     const Qwen4Cfg* c = &r->c;
     const int D = c->d, HD = c->hc * D;
     r->err[0] = 0;
@@ -261,29 +283,52 @@ int qwen4_ref_forward(Qwen4Ref* r, const int32_t* ids, int n, float* logits) {
     float* x = (float*) zalloc(sizeof(float) * (size_t) n * D);
     float* b = (float*) zalloc(sizeof(float) * (size_t) n * D);
     float* inj = (float*) zalloc(sizeof(float) * (size_t) n * c->hc);
-    const NsTensor* E = tens(r, "language_model.model.embed_tokens.weight");
-    for (int t = 0; E && t < n; ++t) {
-        if (ids[t] < 0 || ids[t] >= E->rows) { snprintf(r->err, sizeof r->err, "token %d out of range", ids[t]); break; }
-        ns_row_f32(&r->rows, E, 0, ids[t], 0, x);
-        for (int s = 0; s < c->hc; ++s) memcpy(H + (size_t) t * HD + (size_t) s * D, x, sizeof(float) * (size_t) D);
-    }
-    char pre[112];
+    if (!embed(r, ids, n, x))
+        for (int t = 0; t < n; ++t)
+            for (int s = 0; s < c->hc; ++s) memcpy(H + (size_t) t * HD + (size_t) s * D, x + (size_t) t * D, sizeof(float) * (size_t) D);
+    char lp[64];
     for (int l = 0; l < c->n_layer && !r->err[0]; ++l) {
         if (c->ple[l] >= 0) ple(r, l, ids, H, n);
-        snprintf(pre, sizeof pre, "language_model.model.layers.%d.attn_hyper_connection", l);
-        hc_mix(r, pre, H, n, x, inj);
-        if (c->attn[l]) attention(r, l, x, n, b);
-        else gdn(r, l, x, n, b);
-        hc_add(c, H, n, b, inj);
-        snprintf(pre, sizeof pre, "language_model.model.layers.%d.mlp_hyper_connection", l);
-        hc_mix(r, pre, H, n, x, inj);
-        moe(r, l, x, n, b);
-        hc_add(c, H, n, b, inj);
+        snprintf(lp, sizeof lp, "language_model.model.layers.%d", l);
+        decoder(r, lp, c->attn[l], l, H, n, x, b, inj);
     }
     if (!r->err[0]) {
+        if (Hout) memcpy(Hout, H, sizeof(float) * (size_t) n * HD);
         hc_mix(r, "language_model.model.hyper_connection_mixer", H, n, x, NULL);
         lin(r, tens(r, "language_model.lm_head.weight"), 0, x, n, logits);
     }
     free(H); free(x); free(b); free(inj);
+    return r->err[0] ? -1 : 0;
+}
+int qwen4_ref_forward(Qwen4Ref* r, const int32_t* ids, int n, float* logits) { return qwen4_ref_forward_h(r, ids, n, logits, NULL); }
+
+int qwen4_ref_mtp(Qwen4Ref* r, const int32_t* tok, const float* Hin, int n, float* logits, float* Hout) {
+    const Qwen4Cfg* c = &r->c;
+    const int D = c->d, HD = c->hc * D;
+    r->err[0] = 0;
+    float* H = (float*) zalloc(sizeof(float) * (size_t) n * HD);
+    float* x = (float*) zalloc(sizeof(float) * (size_t) n * D);
+    float* b = (float*) zalloc(sizeof(float) * (size_t) n * D);
+    float* inj = (float*) zalloc(sizeof(float) * (size_t) n * c->hc);
+    float* we = vec(r, tens(r, "mtp.pre_fc_norm_embedding.weight"), D);
+    float* wh = vec(r, tens(r, "mtp.pre_fc_norm_hidden.weight"), HD);
+    if (!embed(r, tok, n, x) && we && wh) {   // fc_embedding(norm(embed)) + fc_hidden(each stream of norm(H)): the layer's streams
+        norm1p(x, n, D, D, we, c->eps, x);
+        lin(r, tens(r, "mtp.fc_embedding.weight"), 0, x, n, b);
+        norm1p(Hin, n, HD, HD, wh, c->eps, H);
+        float* hp = (float*) zalloc(sizeof(float) * (size_t) n * HD);
+        lin(r, tens(r, "mtp.fc_hidden.weight"), 0, H, n * c->hc, hp);
+        for (int t = 0; t < n; ++t)
+            for (int s = 0; s < c->hc; ++s)
+                for (int i = 0; i < D; ++i) H[(size_t) t * HD + (size_t) s * D + i] = b[(size_t) t * D + i] + hp[(size_t) t * HD + (size_t) s * D + i];
+        free(hp);
+        decoder(r, "mtp.layers.0", 1, -1, H, n, x, b, inj);
+    }
+    if (!r->err[0]) {
+        if (Hout) memcpy(Hout, H, sizeof(float) * (size_t) n * HD);
+        hc_mix(r, "mtp.hyper_connection_mixer", H, n, x, NULL);
+        lin(r, tens(r, "language_model.lm_head.weight"), 0, x, n, logits);
+    }
+    free(H); free(x); free(b); free(inj); free(we); free(wh);
     return r->err[0] ? -1 : 0;
 }

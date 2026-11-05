@@ -1,5 +1,6 @@
 # tools/qwen4_golden.py - a tiny random qwen4_exp model in the 4-bit pack formats, and its mlx-vlm float32 logits.
-#   python tools/qwen4_golden.py tests/data/qwen4_tiny   (the logits go to tests/data/qwen4_tiny_golden.safetensors)
+#   python tools/qwen4_golden.py tests/data/qwen4_tiny [--mtp]   (--mtp: only its MTP head, model-mtp.safetensors, and
+#   the head's mlx-vlm logits and 3 greedy drafts in tests/data/qwen4_tiny_mtp_golden.safetensors)
 import json
 import os
 import sys
@@ -78,5 +79,37 @@ def main(out):
     print(f"{out}: {len(w)} tensors, logits {logits.shape}, argmax {mx.argmax(logits, axis=-1).tolist()[:12]} ...")
 
 
+def mtp_main(out):
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
+    from mlx_vlm.utils import load_model
+
+    model = load_model(__import__("pathlib").Path(out), strict=True)
+    model.update(tree_map(lambda v: v.astype(mx.float32) if v.dtype == mx.bfloat16 else v, model.parameters()))
+    mx.random.seed(6)
+    mtp = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig.from_dict({"text_config": dict(TEXT, mtp_num_hidden_layers=1)}))
+    params = dict(tree_flatten(mtp.parameters()))
+    for k, v in params.items():
+        scale = 0.3 if v.ndim == 1 else 1.0 / max(1, v.shape[-1]) ** 0.5
+        params[k] = (mx.random.normal(v.shape) * scale).astype(mx.bfloat16)
+    mtp.update(tree_unflatten(list(params.items())))
+    nn.quantize(mtp, group_size=32, bits=4,   # as the released head: the experts and hyper-connections in 4 bits
+                class_predicate=lambda p, m: hasattr(m, "to_quantized") and ("switch_mlp" in p or "hyper_connection" in p))
+    w = {"mtp." + k: (v if v.dtype == mx.uint32 else v.astype(mx.bfloat16)) for k, v in tree_flatten(mtp.parameters())}
+    mx.save_safetensors(f"{out}/model-mtp.safetensors", w, metadata={"format": "mlx"})
+    mtp.update(tree_map(lambda v: v.astype(mx.bfloat16).astype(mx.float32) if mx.issubdtype(v.dtype, mx.floating) else v,
+                        mtp.parameters()))   # the values the file holds
+    o = model.language_model(mx.array([IDS]), return_hidden=True)
+    H, bonus = o.hidden_states[0], int(mx.argmax(o.logits[0, -1]))   # the streams before the final mixer
+    mtp.reset(model)
+    tok = mx.array([IDS[1:] + [bonus]], dtype=mx.int32)
+    lh, pre = mtp._forward_tokens(tok, H, mx.int32)
+    logits = mtp._lm_head_fn(lh)[0].astype(mx.float32)
+    mtp._seed_token, mtp._seed_hidden = mx.argmax(logits[-1:], axis=-1)[None], pre[:, -1:, :]
+    drafts = mtp.draft_block(bonus, None, None, 4, None, greedy=True)[0].astype(mx.int32)
+    mx.save_safetensors(f"{out}_mtp_golden.safetensors", {"tok": tok[0], "logits": logits, "drafts": drafts})
+    print(f"{out}: MTP {len(w)} tensors, bonus {bonus}, drafts {drafts.tolist()}")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1])
+    (mtp_main if "--mtp" in sys.argv[2:] else main)(sys.argv[1])
