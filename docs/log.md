@@ -686,3 +686,12 @@ gate, up, SwiGLU and the down output to BF16, and the CPU tail did not. Now it d
 error, because its seed experts were about 1e-5 of the residual. Its experts are now as large as the residual
 (`38ef15e`). On an RTX PRO 6000, the first decode step then equals the GPU's bit for bit. After 20 steps the logits
 differ by 1.1e-3, against 9.6e-2 with the tail dropped. A thrashing cache equals every expert in VRAM at all 20 steps.
+
+## [2026-11-05] kernel | Metal long-context decode: the QSA top-k
+
+`a00dbde`, `0a6f0a9`: after a 20K-token prompt, P3 decode on the M4 Max goes from about 40.5 to 45.2 tokens/s. At that
+context the QSA top-k (512 of about 5,000 blocks a row) took 206 us a call, 10% of decode. Most of it was the end,
+where one thread walked back from the last block for the scores equal to the k-th. That pass now runs in parallel,
+and the k-th score comes from four 8-bit histogram passes, as on CUDA: 49 us a call, with the same blocks in the same
+order. With that fixed, up to 32 key splits a row (was 16) are faster at 1K to 20K tokens (47.7, 45.3 and 45.2
+tokens/s at 1K, 5.6K and 20K). MTP verify rows still equal decode rows bit for bit.
