@@ -463,3 +463,9 @@ second, and a 29,120-token prompt from 2,782 to 3,423. Decode went from 44.0 to 
 against the 4-bit MLX model, P3's mean KL is 0.161 (0.164 with the engine of `364b9ad`). The expert prefetch now waits
 for 64 router picks an expert: below that, prompts were up to 2.6 times slower. The engine test gained a tiny model
 with strong attention. Read [one-pass prompt attention](results/2026-11-05-qwen38-one-pass-attention.md).
+
+## [2026-11-05] result | Prompt chunks of 16,384 rows on large GPUs
+
+`957a0f0`: on GPUs of 64 GB or more, the CUDA engine takes 16,384 prompt rows a forward by default (4,096 below). On
+an RTX PRO 6000, 29,120 tokens of P3 run at 4,222 tokens per second (3,606 at 4,096 rows), and 15,922 tokens at 4,165.
+It costs about 3 GB of VRAM. Read [chunks of 16,384 rows](results/2026-11-05-qwen38-rows-by-vram.md).

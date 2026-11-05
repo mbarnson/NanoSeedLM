@@ -108,6 +108,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   2,801 to 3,403 tokens per second on 15,922 tokens, 3,423 at 29,120, and decode 44.0 to 54.2 (RTX PRO 6000).
 - [2026-11-05: One-pass prompt attention and the same quality](results/2026-11-05-qwen38-one-pass-attention.md): 3,660
   tokens per second at 29,120 tokens (RTX PRO 6000), 1,879 on an A100. KL against the 4-bit model unchanged.
+- [2026-11-05: Prompt chunks of 16,384 rows on large GPUs](results/2026-11-05-qwen38-rows-by-vram.md): 4,222 tokens
+  per second at 29,120 tokens and 4,165 at 15,922 (RTX PRO 6000), the default on GPUs of 64 GB or more.
 
 ## For contributors and agents
 

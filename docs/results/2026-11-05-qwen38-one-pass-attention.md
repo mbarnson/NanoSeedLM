@@ -5,7 +5,7 @@ A100 it went from 1,691 to 1,879. Prompt attention now runs in one pass with an 
 29,120 tokens. Against the 4-bit MLX model on 4,096 tokens, P3's KL divergence is 0.161 now and 0.164 with the engine
 of the day before. The expert prefetch made prompts below about 3,000 tokens slower. It now waits for larger forwards.
 
-**Status.** Current. One prompt text, one pack. The RTX 4080 is not measured.
+**Status.** Current for quality. For prompt speed, replaced by [chunks of 16,384 rows](2026-11-05-qwen38-rows-by-vram.md).
 
 ## Setup
 
