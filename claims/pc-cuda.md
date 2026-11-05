@@ -1,9 +1,7 @@
-# pc-cuda claims (updated 2026-11-05T02:03:51Z)
+# pc-cuda claims (updated 2026-11-05T02:49:10Z)
 
-- **Now (2026-11-04, Matt's go):** the fp4 MLA decode gap on CUDA, branch `pc/fp4-decode-gap` from main db0ea15.
-  Decode rows at positions >= 12288 (NSLM_MLA_DEC_LONG) take 32 heads a block and 64 splits, so each FP4 key is decoded
-  once for all heads; shorter rows keep today's path. Files: engine/kernels_moe.cu, engine/kernels_cuda.h,
-  engine/mova_cuda.c (mine); **tests/test_mova_kernels.c (shared)**: two latent-attention cases with 40 splits and
-  MlaArgs.pad[2] = 150. Metal ignores pad[2] for MLA attention, so on macOS they run the normal split path.
-- Queue (CUDA files): SEED6P8 reader for the CUDA engine; Windows VRAM reserve default; KV VRAM rows by active slot;
-  full-model GPTQ capture when Matt is around.
+- Nothing open. Done: the fp4 MLA decode gap is on main a085dce (rows >= 12288 positions take 32-head blocks).
+- Next for others: windows on cloud's rebased claude/sleepy-brown-k67z9u head when posted.
+- Queue (CUDA files): P4 down-projection gather (K = 640 misses mv_lane's paired SEED4P4 path; 75.5 GB/s on the 4080);
+  SEED6P8 reader for the CUDA engine; Windows VRAM reserve default (WDDM over-commit); KV VRAM rows by active slot;
+  plan S0.3 baselines (Strata, llama.cpp on UD-Q4_K_XL) and S0.2 STREAM triad; full-model GPTQ capture when Matt is around.
