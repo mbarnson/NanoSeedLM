@@ -36,7 +36,7 @@ typedef struct {
     float *conv, *S;
     W qkvi, o;   // QSA attention: qkvi = the rows of q, k, v and the indexer's qk (one GEMM of x)
     float *qn, *kn, *iqn, *ikn, *K, *V, *raw, *blk;
-    W gate, sg, sh_g, sh_u, sh_d, eg, eu, ed;   // MoE
+    W gate, sh_g, sh_u, sh_d, eg, eu, ed;   // MoE: gate = the router rows, then the shared expert gate row
     W key, val;                                 // PLE
     float *nk, *nq, *nc, *pw, *hist;
 } Layer;
@@ -71,7 +71,7 @@ struct Q4Eng {
     int32_t* ids;   // the context (host), for the PLE n-grams
     float *Hall;   // the hidden streams of a pass, xr rows; H: the current chunk's
     float *x, *H, *normed, *lo, *up, *inj, *br, *qp, *o, *sc, *emb, *emb_h, *keys, *qs, *vals, *gated;
-    float *lg, *wt, *A, *Dx, *sh, *sgv, *logits, *y, *cv, *qkvb;
+    float *lg, *wt, *A, *Dx, *sh, *logits, *y, *cv, *qkvb;
     int32_t *ind, *sel, *done, *nsel, *zero, *perm, *ntiles;
     // A chunk's input: its slot of hin (pinned) = {pos, ids[T]}, copied to din on the device first.  The kernels read the position
     // from din, so a CUDA graph of T decode rows serves every position.  emb_h (PLE rows) and hlog (logits) are pinned too.
@@ -260,8 +260,11 @@ static void load_layer(Q4Eng* e, int l) {
         L->conv = (float*) dmem(e, NULL, sizeof(float) * qwen4_gdn_conv_len(c));
         L->S = (float*) dmem(e, NULL, sizeof(float) * qwen4_gdn_state_len(c));
     }
-    load_w(e, &L->gate, 0, "%s.%d.mlp.gate.weight", p, l);
-    load_w(e, &L->sg, 0, "%s.%d.mlp.shared_expert_gate.weight", p, l);
+    char gn[2][192];   // the router's rows, then the shared expert's gate row: one GEMM of x
+    snprintf(gn[0], sizeof gn[0], "%s.%d.mlp.gate.weight", p, l);
+    snprintf(gn[1], sizeof gn[1], "%s.%d.mlp.shared_expert_gate.weight", p, l);
+    load_cat(e, &L->gate, (const char* const[]) {gn[0], gn[1]}, 2);
+    if (!e->err[0] && L->gate.rows != c->n_exp + 1) fail(e, "layer %d: router of %d rows, not %d + 1", l, L->gate.rows, c->n_exp);
     load_w(e, &L->sh_g, 0, "%s.%d.mlp.shared_expert.gate_proj.weight", p, l);
     load_w(e, &L->sh_u, 0, "%s.%d.mlp.shared_expert.up_proj.weight", p, l);
     load_w(e, &L->sh_d, 0, "%s.%d.mlp.shared_expert.down_proj.weight", p, l);
@@ -442,10 +445,10 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const Buf pl[] = {{&e->emb, T * c->ple_dim}, {&e->keys, T * HD}, {&e->qs, T * HD}, {&e->vals, T * c->d}, {&e->gated, T * HD}};
     const Buf att[] = {{&e->qp, T * att_ld(c)}, {&e->o, T * c->n_head * c->head_dim}, {&e->sc, T * nb}};
     const Buf lin[] = {{&e->y, T * vd}, {&e->cv, T * cd}, {&e->qkvb, T * gdn_ld(c)}};
-    const Buf ffn[] = {{&e->lg, T * c->n_exp}, {&e->wt, T * c->top_k}, {&e->A, T * ka}, {&e->Gb, T * ka}, {&e->Ub, T * ka},
-                       {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}, {&e->sgv, T}};
+    const Buf ffn[] = {{&e->lg, T * (c->n_exp + 1)}, {&e->wt, T * c->top_k}, {&e->A, T * ka}, {&e->Gb, T * ka}, {&e->Ub, T * ka},
+                       {&e->Dx, T * c->top_k * c->d}, {&e->sh, T * c->d}};
     const Buf* grp[] = {mix, pl, att, lin, ffn};
-    const int ng[] = {3, 5, 3, 3, 8};
+    const int ng[] = {3, 5, 3, 3, 7};
     size_t most = 0;
     for (int i = 0; i < 5; ++i) if (bufs_len(grp[i], ng[i]) > most) most = bufs_len(grp[i], ng[i]);
     float* work = F(most);
@@ -562,10 +565,9 @@ static void hc_mix(Q4Eng* e, const float* norm, const W* down, const W* upw, int
     const int HD = c->hc * c->d, ld = down->rows;
     kq4_norm1p(e->s, e->H, HD, c->d, norm, c->eps, e->normed, T);
     mv(e, down, e->normed, e->lo, T);
-    kq4_hc_act_rows(e->s, c->hc, e->lo, T, c->hc_rank, ld);
+    kq4_hc_lo(e->s, c->hc, e->lo, T, c->hc_rank, ld, inj ? e->inj : NULL);
     mvx(e, upw, e->lo, ld, e->up, T);
     kq4_hc_mix(e->s, c->hc, c->d, e->normed, e->up, e->x, T);
-    if (inj) kq4_hc_gate_rows(e->s, c->hc, e->lo + c->hc_rank, ld, e->inj, T);
 }
 
 static double host_ms(void) {
@@ -667,7 +669,7 @@ static void moe(Q4Eng* e, int l, int T) {
     Layer* L = &e->L[l];
     const int k = c->top_k, P = T * k;
     mv(e, &L->gate, e->x, e->lg, T);
-    kq4_route(e->s, c, e->lg, e->ind, e->wt, T);
+    kq4_route_ld(e->s, c, e->lg, c->n_exp + 1, e->ind, e->wt, T);
     if (e->routes) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
     if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
@@ -702,8 +704,7 @@ static void moe(Q4Eng* e, int l, int T) {
         kc_mv_gu(e->s, L->sh_g.fmt, L->sh_g.tab, L->sh_u.tab, c->d, c->ff_shared, e->x, c->d, e->A, c->ff_shared, e->zero, T, 1, G(e, &L->sh_g));
     }
     mv(e, &L->sh_d, e->A, e->sh, T);
-    mv(e, &L->sg, e->x, e->sgv, T);
-    kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->sgv, e->br, T);
+    kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->lg + c->n_exp, c->n_exp + 1, e->br, T);
 }
 
 // The device work of a chunk of T rows: its input slot to din, the embedding into H, a layer, the head (pinned logits)

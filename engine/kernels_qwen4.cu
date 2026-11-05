@@ -33,12 +33,18 @@ static __device__ __forceinline__ float warp_max(float v) {
 // ---- Gated DeltaNet ---------------------------------------------------------------------------------------------------
 
 // Thread (channel, token): cv = silu(causal conv of the last K inputs); inputs before the chunk come from conv.
-__global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, int ld, const float* conv, float* cv) {   // qkv rows ld apart
+// One row (gridDim.y = 1): the thread also keeps its channel's last K - 1 inputs, so k_q4_gdn_conv_keep is not needed.
+__global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, int ld, float* conv, float* cv) {   // qkv rows ld apart
     const int ch = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (ch >= cd) return;
-    float acc = w[(size_t) ch * K + K - 1] * qkv[(size_t) t * ld + ch];
+    const float x = qkv[(size_t) t * ld + ch];
+    float acc = w[(size_t) ch * K + K - 1] * x;
     for (int k = 0, u = t - (K - 1); k < K - 1; ++k, ++u) acc += w[(size_t) ch * K + k] * (u >= 0 ? qkv[(size_t) u * ld + ch] : conv[(size_t) (K - 1 + u) * cd + ch]);
     cv[(size_t) t * cd + ch] = acc * sigm(acc);
+    if (gridDim.y == 1 && K > 1) {
+        for (int k = 0; k + 1 < K - 1; ++k) conv[(size_t) k * cd + ch] = conv[(size_t) (k + 1) * cd + ch];
+        conv[(size_t) (K - 2) * cd + ch] = x;
+    }
 }
 // conv keeps the last K - 1 inputs
 __global__ void k_q4_gdn_conv_keep(int cd, int K, const float* qkv, int ld, float* conv, int T) {
@@ -153,7 +159,7 @@ static int gdn_run(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* q
     const int kd = c->lin_hk * c->lin_dk, vd = c->lin_hv * c->lin_dv, cd = 2 * kd + vd;
     if (c->lin_conv < 1 || c->lin_conv > 8 || c->lin_dv % 32 || c->lin_dv > 1024) return -1;
     k_q4_gdn_conv<<<dim3((unsigned) (cd + 255) / 256, (unsigned) T), 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, qld, conv, cv);
-    k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, qld, conv, T);
+    if (T > 1) k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, qld, conv, T);
     k_q4_gdn_qknorm<<<dim3((unsigned) T, (unsigned) c->lin_hk), (unsigned) c->lin_dk, 0, s>>>(cd, kd, cv);
     const GdnArgs ga = {cd, kd, vd, c->lin_hv, c->lin_hv / c->lin_hk, c->lin_dv, abld};
     const dim3 grid((unsigned) c->lin_hv, (unsigned) c->lin_dv / 32);
@@ -191,13 +197,14 @@ void kq4_norm1p(cudaStream_t s, const float* x, int len, int g, const float* w, 
     k_q4_norm1p<<<(unsigned) (T * (len / g)), 256, 0, s>>>(x, len, g, w, eps, y);
 }
 
-__global__ void k_q4_hc_act(float inv_hc, float* lo, int cols, int ld, int n) {   // n = rows * cols, rows ld apart
+// Row t of lo [rows][ld]: the act on its first rank values (in place), the gate of the rest into inj [rows][ld - rank]
+__global__ void k_q4_hc_lo(float inv_hc, float* lo, int rank, int ld, float* inj, int n) {   // n = rows * ld
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { float* p = lo + (size_t) (i / cols) * ld + i % cols; const float x = *p * inv_hc; *p = x * sigm(x); }
-}
-__global__ void k_q4_hc_gate(float inv_hc, const float* src, int ld, int hc, float* inj, int n) {   // n = rows * hc
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) inj[i] = 2.0f * sigm(src[(size_t) (i / hc) * ld + i % hc] * inv_hc);
+    if (i >= n) return;
+    const int t = i / ld, j = i % ld;
+    const float x = lo[i] * inv_hc;
+    if (j < rank) lo[i] = x * sigm(x);
+    else inj[(size_t) t * (ld - rank) + j - rank] = 2.0f * sigm(x);
 }
 __global__ void k_q4_hc_mix(int hc, int d, const float* normed, const float* up, float* mixed) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -213,14 +220,11 @@ __global__ void k_q4_hc_add(int hc, int d, float* H, const float* branch, const 
     const float b = branch[(size_t) t * d + i];
     for (int s = 0; s < hc; ++s) H[((size_t) t * hc + s) * d + i] += b * inj[t * hc + s];
 }
-void kq4_hc_act_rows(cudaStream_t s, int hc, float* lo, int rows, int cols, int ld) {
-    k_q4_hc_act<<<(unsigned) (rows * cols + 255) / 256, 256, 0, s>>>(1.0f / hc, lo, cols, ld, rows * cols);
+void kq4_hc_lo(cudaStream_t s, int hc, float* lo, int rows, int rank, int ld, float* inj) {
+    k_q4_hc_lo<<<(unsigned) (rows * ld + 255) / 256, 256, 0, s>>>(1.0f / hc, lo, rank, ld, inj, rows * ld);
 }
-void kq4_hc_gate_rows(cudaStream_t s, int hc, const float* src, int ld, float* inj, int rows) {
-    k_q4_hc_gate<<<(unsigned) (rows * hc + 255) / 256, 256, 0, s>>>(1.0f / hc, src, ld, hc, inj, rows * hc);
-}
-void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n) { kq4_hc_act_rows(s, hc, lo, 1, n, n); }
-void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n) { kq4_hc_gate_rows(s, hc, inj, hc, inj, n / hc); }
+void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n) { kq4_hc_lo(s, hc, lo, 1, n, n, NULL); }
+void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n) { kq4_hc_lo(s, hc, inj, n / hc, 0, hc, inj); }
 void kq4_hc_mix(cudaStream_t s, int hc, int d, const float* normed, const float* up, float* mixed, int T) {
     k_q4_hc_mix<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(hc, d, normed, up, mixed);
 }
@@ -278,46 +282,54 @@ void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int 
 }
 
 // One warp per row: k rounds of a warp arg max of the logits (ties to the higher expert); weights exp(l - max) renormalised
-__global__ void k_q4_route(int E, int k, const float* logits, int32_t* ind, float* wt) {
+// Row t: one warp, a lane's logits in registers (E at most 32 RT_PER). k rounds of a warp arg-max (ties: the higher
+// index); the weights are the softmax over all E, renormalised over the k picked.
+#define RT_PER 32
+__global__ void k_q4_route(int E, int k, const float* logits, int ld, int32_t* ind, float* wt) {
     const int t = blockIdx.x, lane = threadIdx.x;
-    const float* l = logits + (size_t) t * E;
-    float mx = -INFINITY;
-    for (int e = lane; e < E; e += 32) mx = fmaxf(mx, l[e]);
+    const float* l = logits + (size_t) t * ld;
+    float v[RT_PER], mx = -INFINITY, top = 0, w[32];
+#pragma unroll
+    for (int j = 0; j < RT_PER; ++j) {
+        v[j] = lane + 32 * j < E ? l[lane + 32 * j] : -INFINITY;
+        mx = fmaxf(mx, v[j]);
+    }
     mx = warp_max(mx);
-    float top = 0, w[32];
     for (int r = 0; r < k; ++r) {
         float bv = -INFINITY;
         int bi = -1;
-        for (int e = lane; e < E; e += 32) {
-            bool taken = false;
-            for (int q = 0; q < r; ++q) taken |= ind[(size_t) t * k + q] == e;
-            if (!taken && (l[e] > bv || (l[e] == bv && e > bi))) { bv = l[e]; bi = e; }
-        }
+#pragma unroll
+        for (int j = 0; j < RT_PER; ++j)
+            if (lane + 32 * j < E && (v[j] > bv || (v[j] == bv && lane + 32 * j > bi))) { bv = v[j]; bi = lane + 32 * j; }
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(FULL, bv, o);
             const int oi = __shfl_xor_sync(FULL, bi, o);
             if (ov > bv || (ov == bv && oi > bi)) { bv = ov; bi = oi; }
         }
+#pragma unroll
+        for (int j = 0; j < RT_PER; ++j) if (lane + 32 * j == bi) v[j] = -INFINITY;   // taken
         if (lane == 0) ind[(size_t) t * k + r] = bi;
-        __syncwarp();
         w[r] = expf(bv - mx);
         top += w[r];
     }
     if (lane == 0) for (int r = 0; r < k; ++r) wt[(size_t) t * k + r] = w[r] / top;
 }
+void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T) {
+    k_q4_route<<<(unsigned) T, 32, 0, s>>>(c->n_exp, c->top_k, logits, ld, ind, wt);
+}
 void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T) {
-    k_q4_route<<<(unsigned) T, 32, 0, s>>>(c->n_exp, c->top_k, logits, ind, wt);
+    kq4_route_ld(s, c, logits, c->n_exp, ind, wt, T);
 }
 
-__global__ void k_q4_moe_combine(int d, int k, const float* D, const float* wt, const float* sh, const float* sg, float* out) {
+__global__ void k_q4_moe_combine(int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= d) return;
-    float a = sigm(sg[t]) * sh[(size_t) t * d + i];
+    float a = sigm(sg[(size_t) t * sgld]) * sh[(size_t) t * d + i];
     for (int j = 0; j < k; ++j) a += wt[t * k + j] * D[((size_t) t * k + j) * d + i];
     out[(size_t) t * d + i] = a;
 }
-void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, float* out, int T) {
-    k_q4_moe_combine<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(d, k, D, wt, sh, sg, out);
+void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T) {
+    k_q4_moe_combine<<<dim3((unsigned) (d + 255) / 256, (unsigned) T), 256, 0, s>>>(d, k, D, wt, sh, sg, sgld, out);
 }
 
 // ---- PLE ---------------------------------------------------------------------------------------------------------------

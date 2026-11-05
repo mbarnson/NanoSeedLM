@@ -27,9 +27,8 @@ void kq4_hc_act(cudaStream_t s, int hc, float* lo, int n);
 void kq4_hc_mix(cudaStream_t s, int hc, int d, const float* normed, const float* up, float* mixed, int T);
 void kq4_hc_gate(cudaStream_t s, int hc, float* inj, int n);
 void kq4_hc_add(cudaStream_t s, int hc, int d, float* H, const float* branch, const float* inj, int T);
-// The same act on rows of cols values ld apart, and the gate of hc values a row (src rows ld apart) into inj [rows][hc]
-void kq4_hc_act_rows(cudaStream_t s, int hc, float* lo, int rows, int cols, int ld);
-void kq4_hc_gate_rows(cudaStream_t s, int hc, const float* src, int ld, float* inj, int rows);
+// Both on lo [rows][ld]: the act on a row's first rank values in place, the gate of the rest into inj [rows][ld - rank]
+void kq4_hc_lo(cudaStream_t s, int hc, float* lo, int rows, int rank, int ld, float* inj);
 
 // H[t][s][i] = x[t][i] for each of hc streams
 void kq4_tile(cudaStream_t s, int hc, int d, const float* x, float* H, int T);
@@ -39,10 +38,11 @@ void kq4_head_norm_rope(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs, int
                         const int32_t* dpos, int T);
 // dst[(pos + t) * w + i] = src[t * ss + i]: rows into a cache at their positions
 void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T);
-// qwen4_route of logits[T][n_exp] into ind, wt [T][top_k] (top_k <= 32)
+// qwen4_route of logits[T][n_exp] into ind, wt [T][top_k] (top_k <= 32, n_exp <= 1024); _ld: logits rows ld apart
 void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
-// out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t]) sh[t]
-void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, float* out, int T);
+void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
+// out[t] = sum_k wt[t][k] D[t * top_k + k] + sigmoid(sg[t * sgld]) sh[t]
+void kq4_moe_combine(cudaStream_t s, int d, int k, const float* D, const float* wt, const float* sh, const float* sg, int sgld, float* out, int T);
 // qwen4_ple_gate and qwen4_ple_conv for T tokens in order (hist updated)
 void kq4_ple_gate(cudaStream_t s, const Qwen4Cfg* c, const float* keys, const float* qs, const float* vals, float* gated, int T);
 void kq4_ple_conv(cudaStream_t s, const Qwen4Cfg* c, const float* w, const float* cin, const float* gated, float* hist, float* H, int T);
