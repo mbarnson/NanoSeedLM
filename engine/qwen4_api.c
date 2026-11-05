@@ -12,17 +12,20 @@
 struct Eng {   // Q4Api: hist[0 .. n) committed; the engine holds hist[0 .. at), at = n - 1, or n after eng_step
     Q4Eng* q;
     int vocab, max_pos, cap, n, at;
+    int drafts;    // Q4E_DRAFTS: eng_generate's MTP drafts a forward (0: none, and no MTP head)
+    int lrow;      // last holds the logits of hist[lrow] (-1: none), the engine's last row when lrow == at - 1
     int32_t* hist;
-    float* last;   // eng_step's logits while at == n
+    float* last;   // eng_step's logits while at == n; eng_generate's verify rows (drafts + 1 of them)
     char desc[192];
 };
 
-static int fail_reset(Q4Api* e) { q4e_reset(e->q); e->n = e->at = 0; return -1; }
+static int fail_reset(Q4Api* e) { q4e_reset(e->q); e->n = e->at = 0; e->lrow = -1; return -1; }
 // The engine through hist[at .. to)
 static int fwd(Q4Api* e, int to, float* logits) {
     if (to <= e->at) return 0;
     if (q4e_forward(e->q, e->hist + e->at, to - e->at, logits)) return fail_reset(e);
     e->at = to;
+    e->lrow = logits == e->last ? to - 1 : -1;
     return 0;
 }
 static int reserve(Q4Api* e, int n) {
@@ -51,20 +54,28 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
         snprintf(err, (size_t) errlen, "Qwen3.8-Flash-Next: one sequence slot and the f32 KV cache only (max_seqs %d, kv %d)", o->max_seqs, o->kv_format);
         return NULL;
     }
+    const int drafts = env_int("Q4E_DRAFTS");   // the MTP head opens only for drafts: every forward runs it
+    if (drafts < 0 || drafts > Q4E_MAX_DRAFTS) {
+        snprintf(err, (size_t) errlen, "Q4E_DRAFTS: 0 to %d MTP drafts a forward, not %d", Q4E_MAX_DRAFTS, drafts);
+        return NULL;
+    }
     const char* mb = getenv("NSLM_EXPERT_VRAM_MB");   // else the expert cache takes the free VRAM
     Q4EOpts qo = {(int) (o->kv_tokens > 0 ? o->kv_tokens : 4096), env_int("Q4E_VRAM_EXPERTS"), getenv("Q4E_PLE_GGUF"),
-                  mb ? atof(mb) * 1048576.0 / 1e9 : -1, env_int("Q4E_STREAM_EXPERTS"), env_int("Q4E_ROWS"), 0, 0, env_int("Q4E_CPU_TAIL")};   // no MTP head
+                  mb ? atof(mb) * 1048576.0 / 1e9 : -1, env_int("Q4E_STREAM_EXPERTS"), env_int("Q4E_ROWS"), drafts, 0, env_int("Q4E_CPU_TAIL")};
     Q4Api* e = (Q4Api*) calloc(1, sizeof *e);
     if (!e || !(e->q = q4e_open(o->model_dir, &qo, err, errlen))) { free(e); return NULL; }
     const Qwen4Cfg* c = q4e_cfg(e->q);
     e->vocab = c->vocab;
     e->max_pos = qo.max_pos;
-    if (!(e->last = (float*) malloc(sizeof(float) * (size_t) e->vocab))) { eng_close(e); snprintf(err, (size_t) errlen, "out of memory"); return NULL; }
+    e->drafts = drafts;
+    e->lrow = -1;
+    if (!(e->last = (float*) malloc(sizeof(float) * (size_t) e->vocab * (size_t) (drafts + 1)))) { eng_close(e); snprintf(err, (size_t) errlen, "out of memory"); return NULL; }
     uint64_t h, m;
     int slots;
     q4e_cache_stats(e->q, &h, &m, &slots);
-    snprintf(e->desc, sizeof e->desc, "Qwen3.8-Flash-Next: %d layers, %d experts, %d cache slots, one sequence of %d positions",
-             c->n_layer, c->n_exp, slots, e->max_pos);
+    snprintf(e->desc, sizeof e->desc, "Qwen3.8-Flash-Next: %d layers, %d experts, %d cache slots, one sequence of %d positions%s",
+             c->n_layer, c->n_exp, slots, e->max_pos, drafts == 1 ? ", 1 MTP draft a forward" : drafts == 2 ? ", 2 MTP drafts a forward" :
+             drafts == 3 ? ", 3 MTP drafts a forward" : "");
     return e;
 }
 void eng_close(Eng* e) {
@@ -111,18 +122,52 @@ int eng_push(Eng* e, int seq, int32_t tok) {
     return 0;
 }
 int eng_step_batch(Eng* e, const int* seqs, int n, float* logits) { return n == 1 ? eng_step(e, seqs[0], logits) : -1; }
+static int amax(const float* l, int n) { int b = 0; for (int v = 1; v < n; ++v) if (l[v] > l[b]) b = v; return b; }   // ties: the lowest id
+// Greedy decode. Each token is the bonus (the arg max of the logits so far) or an accepted draft. With Q4E_DRAFTS = K,
+// the forward of a pending token that is the bonus of the row before it (an earlier bonus, or eng_push after eng_step)
+// carries up to K drafts of the MTP head; a draft is committed while it equals the arg max of the row before it. Those
+// are greedy decode's tokens, bit for bit (gate MB): a verify row's logits are a one-row forward's. Other pending tokens
+// (a prompt's last, a token not greedy) forward alone. The last bonus waits uncomputed (at == n - 1), as after eng_push,
+// so the next call drafts on it.
 int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t* out, EngStats* st) {
-    (void) mode;   // every mode commits greedy decode's tokens: here, plain greedy
-    if (nseq != 1 || seqs[0]) return -1;
-    for (int j = 0; j < n_new; ++j) {
-        if (eng_step(e, 0, e->last)) return -1;
-        int b = 0;
-        for (int v = 1; v < e->vocab; ++v) if (e->last[v] > e->last[b]) b = v;
-        if (eng_push(e, 0, b)) return -1;
-        out[j] = b;
+    (void) mode;   // every mode commits greedy decode's tokens: here, greedy decode with Q4E_DRAFTS drafts a forward
+    if (nseq != 1 || seqs[0] || n_new < 0) return -1;
+    const int V = e->vocab;
+    int64_t fw = 0, rows = 0, bonus = 0, prop = 0, acc = 0;
+    int j = 0, rc = 0;
+    while (j < n_new) {
+        if (e->n < 1 || e->at < e->n - 1 || reserve(e, e->n + e->drafts + 1)) { rc = -1; break; }
+        if (e->at == e->n) {   // the bonus
+            if (e->n >= e->max_pos) { rc = -1; break; }
+            out[j++] = e->hist[e->n++] = amax(e->last, V);
+            ++bonus;
+            continue;
+        }
+        int k = e->drafts && e->lrow >= 0 && e->lrow == e->n - 2 && amax(e->last, V) == e->hist[e->n - 1] ? e->drafts : 0;
+        if (k > n_new - j) k = n_new - j;
+        if (k > e->max_pos - e->n) k = e->max_pos - e->n;   // the drafts' positions n .. n + k - 1
+        if (!k) {   // the pending token alone
+            if (fwd(e, e->n, e->last)) { rc = -1; break; }
+            ++fw; ++rows;
+            continue;
+        }
+        int32_t row[Q4E_MAX_DRAFTS + 1];
+        int m = 1;
+        row[0] = e->hist[e->n - 1];
+        if (q4e_draft(e->q, k, row + 1) || q4e_forward_keep(e->q, row, k + 1, e->last)) { rc = fail_reset(e); break; }
+        while (m <= k && amax(e->last + (size_t) (m - 1) * V, V) == row[m]) ++m;   // rows 0 .. m - 1 hold
+        if (q4e_accept(e->q, m)) { rc = fail_reset(e); break; }
+        if (m > 1) memmove(e->last, e->last + (size_t) (m - 1) * V, sizeof(float) * (size_t) V);
+        memcpy(e->hist + e->n, row + 1, sizeof(int32_t) * (size_t) (m - 1));
+        memcpy(out + j, row + 1, sizeof(int32_t) * (size_t) (m - 1));
+        e->n += m - 1;
+        j += m - 1;
+        e->at = e->n;
+        e->lrow = e->n - 1;
+        ++fw; rows += k + 1; prop += k; acc += m - 1;
     }
-    if (st) { st->tokens += n_new; st->forwards += n_new; st->rows += n_new; st->cycles += n_new; }
-    return 0;
+    if (st) { st->tokens += j; st->forwards += fw; st->rows += rows; st->cycles += bonus; st->proposals += prop; st->accepted += acc; }
+    return rc;
 }
 
 int64_t eng_kv_bytes(Eng* e) { (void) e; return 0; }   // no KV files: the recurrent state is not in the KV cache

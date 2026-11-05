@@ -1,6 +1,10 @@
 // harness/nslm-chat.c - one chat turn with K2-Horizon-MoVA or Qwen3.8-Flash-Next, streamed to stdout (usage() lists options).
 // temp > 0 is the MLX sampler: p ~ exp((l - l_max) / T) in f64, u = (splitmix64 seeded with --seed >> 11) 2^-53 sum, the
-// first index whose cumulative sum exceeds u. temp 0: the arg max, ties to the lowest id.
+// first index whose cumulative sum exceeds u. temp 0: the arg max, ties to the lowest id. With Q4E_DRAFTS = K (1 to 3,
+// Qwen3.8-Flash-Next's MTP drafts) temp 0 decodes the tokens after the first through eng_generate, K + 1 at a call: the
+// same tokens, in forwards that verify up to K drafts each (eng_generate drafts across its calls, so short calls cost
+// nothing). A call's tokens after a stop (at most K) are not shown; the engine keeps them, since the turn ends there (on
+// Qwen3.8-Flash-Next an eng_rewind would compute the whole context again).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +123,10 @@ int main(int argc, char** argv) {
     float* lg = (float*) malloc(sizeof(float) * (size_t) V);
     double* cum = (double*) malloc(sizeof(double) * (size_t) V);
     uint64_t rng = seed;
+    const char* dk = getenv("Q4E_DRAFTS");
+    const int drafts = temp > 0 || !dk || atoi(dk) < 1 ? 0 : atoi(dk) < 3 ? atoi(dk) : 3, seq0 = 0;
+    EngStats gs;
+    memset(&gs, 0, sizeof gs);
 
     unsigned char* pend = NULL;   // decoded bytes not yet written (an incomplete UTF-8 tail)
     size_t npend = 0;
@@ -127,34 +135,46 @@ int main(int argc, char** argv) {
     const double t0 = now_s();
     double t1 = t0;
     if (eng_prefill(e, 0, ids, n)) { fprintf(stderr, "prefill failed\n"); return 1; }
-    for (int s = 0; s < max_tokens; ++s) {
-        if (eng_step(e, 0, lg)) { fprintf(stderr, "step failed\n"); return 1; }
-        int b = 0;
-        for (int v = 1; v < V; ++v) if (lg[v] > lg[b]) b = v;
-        int pick = b;
-        if (temp > 0) {
-            double c = 0;
-            for (int v = 0; v < V; ++v) { c += exp(((double) lg[v] - (double) lg[b]) / temp); cum[v] = c; }
-            const double u = (double) (splitmix(&rng) >> 11) * (1.0 / 9007199254740992.0) * c;
-            int lo = 0, hi = V;   // first index with cum > u
-            while (lo < hi) { const int mid = (lo + hi) / 2; if (cum[mid] > u) hi = mid; else lo = mid + 1; }
-            pick = lo < V ? lo : b;
+    while (ngen < max_tokens) {
+        int32_t got[4];   // this round's tokens: one by eng_step, or a chunk of eng_generate's (at most 3 + 1)
+        int ng = 1, stepped = !drafts || !ngen;
+        if (stepped) {
+            if (eng_step(e, 0, lg)) { fprintf(stderr, "step failed\n"); return 1; }
+            int b = 0;
+            for (int v = 1; v < V; ++v) if (lg[v] > lg[b]) b = v;
+            int pick = b;
+            if (temp > 0) {
+                double c = 0;
+                for (int v = 0; v < V; ++v) { c += exp(((double) lg[v] - (double) lg[b]) / temp); cum[v] = c; }
+                const double u = (double) (splitmix(&rng) >> 11) * (1.0 / 9007199254740992.0) * c;
+                int lo = 0, hi = V;   // first index with cum > u
+                while (lo < hi) { const int mid = (lo + hi) / 2; if (cum[mid] > u) hi = mid; else lo = mid + 1; }
+                pick = lo < V ? lo : b;
+            }
+            got[0] = pick;
+        } else {
+            ng = max_tokens - ngen < drafts + 1 ? max_tokens - ngen : drafts + 1;
+            if (eng_generate(e, &seq0, 1, ng, ENG_MODE_DEFAULT, got, &gs)) { fprintf(stderr, "generate failed\n"); return 1; }
         }
-        if (s == 0) t1 = now_s();
-        if (cm_stop(&cm, pick)) { finish = "stop"; break; }
-        eng_push(e, 0, pick);
-        ++ngen;
-        char* piece = tok_decode(tok, &pick, 1, NULL);
-        const size_t k = strlen(piece);
-        pend = (unsigned char*) realloc(pend, npend + k + 1);
-        memcpy(pend + npend, piece, k);
-        npend += k;
-        free(piece);
+        if (ngen == 0) t1 = now_s();
+        int keep = 0;
+        while (keep < ng && !cm_stop(&cm, got[keep])) ++keep;
+        if (stepped && keep) eng_push(e, 0, got[0]);
+        for (int i = 0; i < keep; ++i) {
+            char* piece = tok_decode(tok, got + i, 1, NULL);
+            const size_t k = strlen(piece);
+            pend = (unsigned char*) realloc(pend, npend + k + 1);
+            memcpy(pend + npend, piece, k);
+            npend += k;
+            free(piece);
+        }
+        ngen += keep;
         const size_t ok = utf8_complete(pend, npend);
         fwrite(pend, 1, ok, stdout);
         fflush(stdout);
         memmove(pend, pend + ok, npend - ok);
         npend -= ok;
+        if (keep < ng) { finish = "stop"; break; }
     }
     const double t2 = now_s();
     if (npend) fwrite(pend, 1, npend, stdout);
@@ -162,6 +182,9 @@ int main(int argc, char** argv) {
     fflush(stdout);
     fprintf(stderr, "[%s] prompt %d tokens, TTFT %.2f s, prefill %.1f tok/s; generated %d tokens, decode %.1f tok/s\n",
             finish, n, t1 - t0, n / (t1 - t0), ngen, ngen > 1 ? (ngen - 1) / (t2 - t1) : 0.0);
+    if (drafts)
+        fprintf(stderr, "%d MTP draft%s a forward: %lld forwards, %.2f tokens a forward, %lld of %lld drafts accepted\n", drafts, drafts > 1 ? "s" : "",
+                (long long) gs.forwards, gs.forwards ? (double) gs.tokens / (double) gs.forwards : 0.0, (long long) gs.accepted, (long long) gs.proposals);
     free(pend); free(lg); free(cum); free(ids);
     eng_close(e);
     tok_close(tok);
