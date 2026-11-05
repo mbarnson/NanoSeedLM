@@ -164,9 +164,9 @@ $(BIN)/test_qwen4_kernels: tests/test_qwen4_kernels.c tests/kernel_backend_metal
 $(BIN)/test_qwen4_metal: tests/test_qwen4_metal.c $(Q4E_O) $(LIB_O) $(NSLM_HDRS) $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(Q4E_O) $(LIB_O) $(LIBS) -lm -lpthread -o $@
-$(BIN)/nslm-qwen4-gen: harness/nslm-qwen4-gen.c $(Q4E_O) $(HARN_O) $(LIB_O) $(HARN_HDRS) $(NSLM_HDRS)
+$(BIN)/nslm-qwen4-gen: harness/nslm-qwen4-gen.c $(Q4E_O) $(OBJ)/e_qwen4_nomtp.o $(HARN_O) $(LIB_O) $(HARN_HDRS) $(NSLM_HDRS)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $< $(Q4E_O) $(HARN_O) $(LIB_O) $(LIBS) $(HLIBS) -lm -lpthread -o $@
+	$(CC) $(CFLAGS) $< $(Q4E_O) $(OBJ)/e_qwen4_nomtp.o $(HARN_O) $(LIB_O) $(LIBS) $(HLIBS) -lm -lpthread -o $@
 
 $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 	$(PY) tools/mova_affine_golden.py --out $(OUT)/test/affine

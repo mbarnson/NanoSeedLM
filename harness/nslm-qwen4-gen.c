@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
         ++steps;
     }
     const double td = now_s() - t0;
-    if (rc) fprintf(stderr, "\n%s\n", q4e_error(e));
+    if (rc) fprintf(stderr, "\n%s\n", *q4e_error(e) ? q4e_error(e) : "this engine has no MTP drafts");
     fprintf(stderr, "\nprompt %d tokens in %.2f s (%.1f tokens/s); %d tokens in %.2f s (%.2f tokens/s)\n", n, tp, n / (tp > 0 ? tp : 1), gen,
             td, gen / (td > 0 ? td : 1));
     if (drafts) fprintf(stderr, "%d drafts a forward: %d forwards, %.2f tokens a forward\n", drafts, steps, gen / (steps > 0 ? (double) steps : 1));
