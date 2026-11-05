@@ -354,25 +354,42 @@ kernel void k_q4_qsa_scores(constant Q4QsaArgs& a [[buffer(0)]], device const fl
     }
     if (lane == 0) sc[(ulong) t * a.maxdone + j] = s;
 }
-// Threadgroup per row (256 threads): the k-th largest score by a radix select on its bits (scores are >= 0), then every
+// Threadgroup per row (256 threads): the k-th largest score by a radix select on its bits (scores are >= 0: their bits
+// sort as the floats), 8 bits a pass with a 256-bin histogram of the digits under the prefix, as CUDA's; then every
 // score above it in block order (attention sums the keys in this order, so it must not depend on timing: a
 // threadgroup-wide prefix of the matches, as CUDA's ballot prefix) and, of the equal ones, those of the highest blocks.
 // Rows with done <= k are left as they are.
 kernel void k_q4_qsa_topk(constant Q4QsaArgs& a [[buffer(0)]], device const float* sc [[buffer(1)]], device const int* done [[buffer(2)]],
                           device int* sel [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float red[32];
+    threadgroup atomic_uint hist[256];
+    threadgroup uint pre_s, need_s;
     threadgroup uint wcnt[8];
     const int n = done[t];
     if (n <= a.k) return;
     device const uint* u = (device const uint*) (sc + (ulong) t * a.maxdone);
-    uint p = 0;
-    for (int b = 31; b >= 0; --b) {
-        const uint cand = p | (1u << b);
-        float cnt = 0;
-        for (int j = (int) tid; j < n; j += 256) cnt += u[j] >= cand ? 1.0f : 0.0f;
-        if (tg_sum(cnt, red, lane, sg, 8) >= (float) a.k) p = cand;
+    uint mask = 0;
+    if (tid == 0) { pre_s = 0; need_s = (uint) a.k; }
+    for (int sh = 24; sh >= 0; sh -= 8) {   // the k-th largest score's next 8 bits: count each digit under the prefix
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint pf = pre_s;
+        for (int j = (int) tid; j < n; j += 256) {
+            const uint v = u[j];
+            if ((v & mask) == pf) atomic_fetch_add_explicit(&hist[(v >> sh) & 255u], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint cum = 0, need = need_s;
+            int d = 255;
+            while (cum + atomic_load_explicit(&hist[d], memory_order_relaxed) < need) cum += atomic_load_explicit(&hist[d--], memory_order_relaxed);
+            pre_s = pf | ((uint) d << sh);
+            need_s = need - cum;
+        }
+        mask |= 255u << sh;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    const uint p = pre_s;
     device int* out = sel + (ulong) t * a.k;
     uint nout = 0;   // the same in every thread
     for (int j0 = 0; j0 < n; j0 += 256) {
@@ -387,10 +404,19 @@ kernel void k_q4_qsa_topk(constant Q4QsaArgs& a [[buffer(0)]], device const floa
         if (f) out[before + before_lane] = j;
         nout += total;
     }
-    threadgroup_barrier(mem_flags::mem_device);
-    if (tid == 0)
-        for (int j = n - 1, m = (int) nout; j >= 0 && m < a.k; --j)
-            if (u[j] == p) out[m++] = j;
+    // then the scores equal to p from the highest block, in parallel (one thread used to walk them all)
+    for (int c0 = 0; c0 < n && nout < (uint) a.k; c0 += 256) {
+        const int j = n - 1 - c0 - (int) tid;
+        const uint f = j >= 0 && u[j] == p ? 1u : 0u;
+        const uint before_lane = simd_prefix_exclusive_sum(f), in_sg = simd_sum(f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) wcnt[sg] = in_sg;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint before = nout, total = 0;
+        for (uint x = 0; x < 8; ++x) { before += x < sg ? wcnt[x] : 0u; total += wcnt[x]; }
+        if (f && before + before_lane < (uint) a.k) out[before + before_lane] = j;
+        nout += total;
+    }
 }
 
 // ---- attention ---------------------------------------------------------------------------------------------------------
