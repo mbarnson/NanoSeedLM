@@ -579,7 +579,7 @@ static int moe(Q4Eng* e, int l, int T) {
     B(e, 1, e->lg, 0);
     B(e, 2, e->ind, 0);
     B(e, 3, e->wt, 0);
-    tgs(e, (uint64_t) T, 1, 32);
+    tgs(e, (uint64_t) T, 1, 256);
     mark(e, ST_ROUTE);
     if (T > MV_MAXT) {   // prompt rows: the pairs by expert (host), so each tile reads its expert's weights once
         if (cmd_wait(e)) return -1;

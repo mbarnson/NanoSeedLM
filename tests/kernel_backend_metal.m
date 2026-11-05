@@ -861,7 +861,7 @@ int kt_q4_head_norm_rope(const Qwen4Cfg* c, float* x, int rs, int nh, int hs, in
     return 0;
 }
 int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T) {
-    if (c->top_k > 32) { printf("FAIL: kt_q4_route: top_k above 32\n"); return -1; }
+    if (c->top_k > 32 || c->n_exp > 1024) { printf("FAIL: kt_q4_route: top_k above 32 or experts above 1024\n"); return -1; }
     id<MTLComputePipelineState> p = pipe4("k_q4_route");
     if (!p) return -1;
     const size_t nk = (size_t) T * c->top_k;
@@ -869,7 +869,7 @@ int kt_q4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt,
     const Q4RouteArgs ra = {c->n_exp, c->top_k, {0, 0}};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, p, &ra, sizeof ra, @[lb, ib, wb]);
-            [e dispatchThreadgroups:TGS(T, 1) threadsPerThreadgroup:TGS(32, 1)];
+            [e dispatchThreadgroups:TGS(T, 1) threadsPerThreadgroup:TGS(256, 1)];
         }))
         return -1;
     memcpy(ind, ib.contents, 4 * nk);
