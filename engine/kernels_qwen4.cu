@@ -428,7 +428,20 @@ void kq4_qsa_rows(cudaStream_t s, const Qwen4Cfg* c, int pos0, const int32_t* dp
     k_q4_qsa_rows<<<(unsigned) (T + 255) / 256, 256, 0, s>>>(c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, dpos, done, nsel, T);
 }
 
-// Block of QS_R rows x 32 key blocks; thread (row r, block jj): the sum over heads of relu(q_h . blk_j). The rows' q and
+// Decode rows: a warp per (row, block), its lanes over the dims
+__global__ void __launch_bounds__(256) k_q4_qsa_scores1(int nh, int D, const float* iq, int rs, const float* blk, const int32_t* done,
+                                                        int maxdone, float* sc) {
+    const int t = blockIdx.y, j = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (j >= done[t]) return;
+    float s = 0;
+    for (int h = 0; h < nh; ++h) {
+        float d = 0;
+        for (int i = lane; i < D; i += 32) d += iq[(size_t) t * rs + h * D + i] * blk[(size_t) j * D + i];
+        s += fmaxf(warp_sum(d), 0.0f);
+    }
+    if (lane == 0) sc[(size_t) t * maxdone + j] = s;
+}
+// Prompt rows: a block of QS_R rows x 32 key blocks; thread (row r, block jj): the sum over heads of relu(q_h . blk_j). The rows' q and
 // the blocks' keys are in shared memory, the keys' rows one float apart in banks (no conflicts).
 #define QS_R 8
 __global__ void __launch_bounds__(256) k_q4_qsa_scores(int nh, int D, const float* iq, int rs, const float* blk, const int32_t* done,
@@ -489,7 +502,8 @@ void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, 
                     float* sc, int32_t* sel, int T) {
     if (maxdone <= 0) return;
     const size_t sm = sizeof(float) * ((size_t) QS_R * c->ix_heads * c->ix_dim + 32 * ((size_t) c->ix_dim + 1));   // 32 KB here
-    k_q4_qsa_scores<<<dim3((unsigned) (maxdone + 31) / 32, (unsigned) (T + QS_R - 1) / QS_R), 256, sm, s>>>(c->ix_heads, c->ix_dim, iq, rs, blk,
+    if (T <= 8) k_q4_qsa_scores1<<<dim3((unsigned) (maxdone + 7) / 8, (unsigned) T), 256, 0, s>>>(c->ix_heads, c->ix_dim, iq, rs, blk, done, maxdone, sc);
+    else k_q4_qsa_scores<<<dim3((unsigned) (maxdone + 31) / 32, (unsigned) (T + QS_R - 1) / QS_R), 256, sm, s>>>(c->ix_heads, c->ix_dim, iq, rs, blk,
                                                                                                          done, maxdone, sc, T);
     k_q4_qsa_topk<<<(unsigned) T, 256, 0, s>>>(sc, done, maxdone, c->ix_budget / c->ix_ratio, sel);
 }
