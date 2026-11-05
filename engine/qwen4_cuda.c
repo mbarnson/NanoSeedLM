@@ -100,6 +100,7 @@ struct Q4Eng {
     float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog;
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and state copies)
     int tail_skip, tail_renorm;           // Q4EOpts.tail_skip; Q4E_TAIL_RENORM=1 (an A/B): the kept weights scaled up
+    int head_cached;                      // the MTP head's experts are the cache's sparse layer n_layer (layer 0's format)
     cudaGraphExec_t dgraph[Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
@@ -289,13 +290,20 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
     load_w(e, &L->sh_d, 0, "%s.mlp.shared_expert.down_proj.weight", lp);
     W* ex[3] = {&L->eg, &L->eu, &L->ed};
     const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+    char name[3][160];
+    const NsTensor* et[3];
+    int incache = e->cache;   // the MTP head's experts join the cache (sparse layer n_layer) only in layer 0's format
     for (int i = 0; i < 3; ++i) {
-        char name[160];
-        snprintf(name, sizeof name, "%s.mlp.switch_mlp.%s.weight", lp, proj[i]);
-        const NsTensor* t = ns_find(&e->nm, name);
-        e->et[l >= 0 ? l : c->n_layer][i] = t;   // the MTP head's: sparse layer n_layer of the cache
-        if (!e->cache) load_w(e, ex[i], e->host_experts && l >= 0, "%s", name);
-        else if (!t || t->enc == NS_SEED6P8 || t->slices != c->n_exp) fail(e, "%s: missing, P = 8, or not %d experts", name, c->n_exp);
+        snprintf(name[i], sizeof name[i], "%s.mlp.switch_mlp.%s.weight", lp, proj[i]);
+        et[i] = ns_find(&e->nm, name[i]);
+        if (l < 0) incache = incache && et[i] && et[i]->enc == e->et[0][i]->enc && et[i]->s[0].len == e->et[0][i]->s[0].len;
+    }
+    if (l < 0) e->head_cached = incache;
+    for (int i = 0; i < 3; ++i) {
+        const NsTensor* t = et[i];
+        if (incache) e->et[l >= 0 ? l : c->n_layer][i] = t;
+        if (!incache) load_w(e, ex[i], e->host_experts && l >= 0, "%s", name[i]);
+        else if (!t || t->enc == NS_SEED6P8 || t->slices != c->n_exp) fail(e, "%s: missing, P = 8, or not %d experts", name[i], c->n_exp);
         else { memset(ex[i], 0, sizeof *ex[i]); ex[i]->fmt = t->enc; ex[i]->slices = t->slices; ex[i]->rows = t->rows; ex[i]->cols = t->cols; }
     }
     if (l >= 0 && c->ple[l] >= 0) {
@@ -323,7 +331,7 @@ static const uint8_t* unit_bytes(Q4Eng* e, int u, uint8_t* dst) {
 static void build_cache(Q4Eng* e, double gb) {
     const Qwen4Cfg* c = &e->c;
     CachePool* p = &e->pool;
-    const int E = c->n_exp, NL = c->n_layer + e->mtp, units = NL * E;   // the MTP head's experts: sparse layer n_layer
+    const int E = c->n_exp, NL = c->n_layer + (e->mtp && e->head_cached), units = NL * E;   // the head: sparse layer n_layer
     if (E > CACHE_MAX_PER_LAYER) { fail(e, "expert cache: %d experts per layer, at most %d", E, CACHE_MAX_PER_LAYER); return; }
     memset(p, 0, sizeof *p);
     p->per_layer = E;
@@ -804,7 +812,7 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     if (e->routes && l >= 0) cudaMemcpyAsync(e->droute + (size_t) l * P, e->ind, sizeof(int32_t) * (size_t) P, cudaMemcpyDeviceToDevice, e->s);
     if (e->tail_skip && e->cache && side && l >= 0) kq4_tail_skip(e->s, e->ind, e->wt, e->pool.unit_slot + (size_t) l * c->n_exp, T, k, e->tail_skip, e->tail_renorm);
     mark(e, ST_EXPERT);   // the router's own matvec counts with the experts; the admit and copies below with the cache
-    if (e->cache) {   // bring the routed experts missing from VRAM (the pool's slice tables then point at them)
+    if (e->cache && (l >= 0 || e->head_cached)) {   // bring the routed experts missing from VRAM (the pool's tables then point at them)
         kc_cache_admit(e->s, &e->pool, l >= 0 ? l : c->n_layer, e->ind, P, 0);
         if (!e->stream) kc_cache_copy(e->s, &e->pool, 64);
         else {   // the admit's (unit, slot) jobs back to the host, the units from the files, then to their slots
