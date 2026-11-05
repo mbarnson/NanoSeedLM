@@ -511,36 +511,48 @@ __global__ void __launch_bounds__(256) k_q4_qsa_scores(int nh, int D, const floa
 // Block per row: the k-th largest score by a radix select on its bits (scores are >= 0), then every score above it in
 // block order (attention sums the keys in this order, so it must not depend on timing) and, of the equal ones, the highest
 __global__ void __launch_bounds__(256) k_q4_qsa_topk(const float* sc, const int32_t* done, int maxdone, int k, int32_t* sel) {
-    __shared__ float red[32];
-    __shared__ int nout, wcnt[8];
-    const int t = blockIdx.x, n = done[t];
+    __shared__ int hist[256], nout, need, wcnt[8];
+    __shared__ uint32_t pre;
+    const int t = blockIdx.x, n = done[t], lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     if (n <= k) return;
-    const uint32_t* u = (const uint32_t*) (sc + (size_t) t * maxdone);
-    uint32_t p = 0;
-    for (int b = 31; b >= 0; --b) {
-        const uint32_t cand = p | (1u << b);
-        float cnt = 0;
-        for (int j = threadIdx.x; j < n; j += blockDim.x) cnt += u[j] >= cand;
-        if (block_sum(cnt, red) >= (float) k) p = cand;
+    const uint32_t* u = (const uint32_t*) (sc + (size_t) t * maxdone);   // scores >= 0: their bits sort as the floats
+    uint32_t mask = 0;
+    if (threadIdx.x == 0) { pre = 0; need = k; }
+    for (int sh = 24; sh >= 0; sh -= 8) {   // the k-th largest score, 8 bits a pass: count each digit under the prefix
+        hist[threadIdx.x] = 0;
+        __syncthreads();
+        const uint32_t p = pre;
+        for (int j = threadIdx.x; j < n; j += blockDim.x) if ((u[j] & mask) == p) atomicAdd(&hist[(u[j] >> sh) & 255], 1);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int cum = 0, d = 255;
+            while (cum + hist[d] < need) cum += hist[d--];
+            pre = p | (uint32_t) d << sh;
+            need -= cum;
+        }
+        mask |= 255u << sh;
+        __syncthreads();
     }
+    const uint32_t p = pre;
+    int32_t* out = sel + (size_t) t * k;
     if (threadIdx.x == 0) nout = 0;
     __syncthreads();
-    int32_t* out = sel + (size_t) t * k;
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    for (int j0 = 0; j0 < n; j0 += 256) {   // a block-wide prefix of the matches
-        const int j = j0 + threadIdx.x, f = j < n && u[j] > p;
-        const uint32_t m = __ballot_sync(FULL, f);
-        if (lane == 0) wcnt[w] = __popc(m);
-        __syncthreads();
-        int before = nout;
-        for (int x = 0; x < w; ++x) before += wcnt[x];
-        if (f) out[before + __popc(m & ((1u << lane) - 1u))] = j;
-        __syncthreads();
-        if (threadIdx.x == 0) for (int x = 0; x < 8; ++x) nout += wcnt[x];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0)
-        for (int j = n - 1, m = nout; j >= 0 && m < k; --j) if (u[j] == p) out[m++] = j;
+    // The scores above p in index order, then those equal to p from the highest index: a block-wide prefix of the matches
+    for (int pass = 0; pass < 2; ++pass)
+        for (int c0 = 0; c0 < n && nout < k; c0 += 256) {
+            const int j = pass ? n - 1 - c0 - threadIdx.x : c0 + threadIdx.x;
+            const int f = j >= 0 && j < n && (pass ? u[j] == p : u[j] > p);
+            const uint32_t m = __ballot_sync(FULL, f);
+            if (lane == 0) wcnt[w] = __popc(m);
+            __syncthreads();
+            int before = nout;
+            for (int x = 0; x < w; ++x) before += wcnt[x];
+            before += __popc(m & ((1u << lane) - 1u));
+            if (f && before < k) out[before] = j;
+            __syncthreads();
+            if (threadIdx.x == 0) for (int x = 0; x < 8; ++x) nout += wcnt[x];
+            __syncthreads();
+        }
 }
 void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, const float* blk, const int32_t* done, int maxdone,
                     float* sc, int32_t* sel, int T) {
