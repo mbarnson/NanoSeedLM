@@ -88,6 +88,10 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   seeds have 16% more weighted error than IQ3_XXS. Gate G6 fails.
 - [2026-11-04: Expert use by text domain](results/2026-11-04-qwen38-routing-domains.md): a hot third of the experts
   serves 80% to 93% of its own text's router choices, and 20% to 63% of another domain's.
+- [2026-11-04: Seed packs and Unsloth packs against BF16](results/2026-11-04-qwen38-kld-vs-bf16.md): P4 0.0408 at
+  4.50 bits is on Unsloth's curve. P3 0.0600 at 4.00 bits is 18% above it. Gate G5 passes.
+- [2026-11-04: Hybrid P3 / P4 seed packs](results/2026-11-04-qwen38-hybrid-tiers.md): at 4.17 bits, 0.054 with a
+  random or `down_proj` third in P4, 0.0450 with the in-domain hot third.
 
 ## For contributors and agents
 

@@ -4,7 +4,8 @@
 0.177 and the P3 pack 0.237. The median is 0.013 and 0.019, so a few tokens give most of the mean. The top-1 token
 agrees on 91.9% (P4) and 88.2% (P3) of the tokens. The perplexity rises from 2.396 to 2.500 (P4) and 2.480 (P3).
 
-**Status.** Current. The reference is the 4-bit model, not BF16. One text of 1,024 tokens is a small sample: it cannot
+**Status.** Replaced by [the packs against BF16](2026-11-04-qwen38-kld-vs-bf16.md) for quality. The reference here
+is the 4-bit model, not BF16. One text of 1,024 tokens is a small sample: it cannot
 order P4 and P3 by perplexity.
 
 ## Setup

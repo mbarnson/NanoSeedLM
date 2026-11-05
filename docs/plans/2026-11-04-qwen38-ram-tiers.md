@@ -5,9 +5,15 @@ Each PC has a 12 GB GPU and keeps the BF16 PLE table on NVMe. Each pack must mat
 V3.1 pack of its RAM class in one harness. It must also decode faster than that pack on the same PC. Seeds encode every routed expert.
 Seeds also encode other weights where a gate shows no loss.
 
-**Status.** In progress. Matt approved the plan on 2026-11-04. T2 is done, and gate G6 fails
-([seed probe](../results/2026-11-04-qwen38-seed-probe.md)). T64 takes the fallback of G6. The parent plan is
+**Status.** In progress. Matt approved the plan on 2026-11-04. The parent plan is
 [SeedLM packs for Qwen3.8-Flash-Next](2026-11-04-qwen38-flash-next.md).
+
+- T1 is done, and gate G5 passes ([the packs against BF16](../results/2026-11-04-qwen38-kld-vs-bf16.md)).
+- T2 is done, and gate G6 fails on weight error ([seed probe](../results/2026-11-04-qwen38-seed-probe.md)). The S3
+  search of T3 runs anyway, so that the KLD of G7 decides T64.
+- T4 step 1 is done: the hot experts depend on the text domain
+  ([expert use by domain](../results/2026-11-04-qwen38-routing-domains.md)).
+- T5 has its first P3 / P4 hybrids ([hybrid tiers](../results/2026-11-04-qwen38-hybrid-tiers.md)).
 
 ## Key numbers
 
@@ -94,6 +100,9 @@ RAM (parent plan S6). So fewer expert bytes cross PCIe.
 3. Measure the KLD of P3, P4, UD-IQ3_XXS, UD-Q3_K_XL, UD-IQ4_XS and UD-Q4_K_XL in llama.cpp, against that reference.
 
 **Gate G5.** The harness gives the six packs the same order as Unsloth's table. If it fails, find the cause before T5.
+
+**Result.** G5 passes. Against BF16 on wikitext-2, P4 has a KLD of 0.0408 at 4.50 bits, on Unsloth's curve. P3 has
+0.0600 at 4.00 bits, 18% more than UD-IQ4_XS at 3.97 bits.
 
 ### T2. The S3 probe
 

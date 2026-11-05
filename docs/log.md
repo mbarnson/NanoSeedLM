@@ -374,3 +374,16 @@ and Unsloth's IQ3_XXS has 0.184, so gate G6 fails. P4 has 0.079 and Q4_K has 0.0
 third of each layer's experts serves 80% to 93% of its own text's choices. Code's hot third serves 20% to 29% of the
 other texts' choices, against 33% for a random third. Read
 [Expert use by text domain](results/2026-11-04-qwen38-routing-domains.md).
+
+## [2026-11-04] result | Seed packs and Unsloth packs of Qwen3.8-Flash-Next against BF16 in one harness
+
+`7e6c9c4`, `e8426e0`: `nslm-qwen4-emulate` writes decoded seed experts into Unsloth's Q8_0 GGUF, and
+`tools/hf_llama_kld.sh` scores packs against BF16 in llama.cpp with the BF16 PLE table. P4 has 0.0408 at 4.50 bits
+for each expert weight, on Unsloth's curve. P3 has 0.0600 at 4.00 bits, and UD-IQ4_XS has 0.0509 at 3.97 bits. Read
+[the packs against BF16](results/2026-11-04-qwen38-kld-vs-bf16.md).
+
+## [2026-11-04] result | Hybrid P3 / P4 seed packs of Qwen3.8-Flash-Next against BF16
+
+`2009d76`: the emulator takes each expert from one of several packs by a map (`tools/qwen4_tier_map.py`). At 4.17
+bits, a random third, every `down_proj` and the chat and code hot third in P4 all give 0.054. The wiki hot third gives
+0.0450 on wikitext. Read [hybrid tiers](results/2026-11-04-qwen38-hybrid-tiers.md).
