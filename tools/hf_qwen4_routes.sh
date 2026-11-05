@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tools/hf_qwen4_routes.sh - routing traces (Q4E_ROUTES) of a Qwen3.8-Flash-Next pack on calibration texts, for
 # tools/qwen4_tier_map.py (RAM-tier plan T4): chat (UltraChat test conversations in the chat template), code (this
-# repository's C sources) and wiki (wikitext-103 train: other articles than the wikitext-2 test text of hf_llama_kld.sh).
+# repository's C sources), wiki (wikitext-103 train: other articles than the wikitext-2 test text of hf_llama_kld.sh) and
+# wt2 (the start of that wikitext-2 test text: a session's warm-up).
 #   SRC=/b/src OUT=/b/traces [TEXTS="chat code"] [PACK=REPO@REV] [CHARS=60000] bash tools/hf_qwen4_routes.sh
 set -euo pipefail
 PACK=${PACK:-txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3@5753a67}
@@ -18,6 +19,7 @@ cmake -S /work -B /work/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTU
 cmake --build /work/build -j "$(nproc)" --target nslm-qwen4-gen 2>&1 | grep -E "error" || true
 hf download HuggingFaceH4/ultrachat_200k --repo-type dataset --include "data/test_sft-*" --local-dir /uc >/dev/null
 hf download Salesforce/wikitext --repo-type dataset --include "wikitext-103-raw-v1/train-00000-*" --local-dir /wt >/dev/null
+hf download Salesforce/wikitext --repo-type dataset --include "wikitext-2-raw-v1/test-*" --local-dir /wt >/dev/null
 python3 - "$CHARS" <<'EOF'
 import glob, sys, pyarrow.parquet as pq
 n = int(sys.argv[1])
@@ -28,6 +30,8 @@ code = "".join(open(f).read() for f in sorted(glob.glob("/work/engine/*.c") + gl
 open("/code.txt", "w").write(code[:n])
 wiki = "".join(pq.read_table(glob.glob("/wt/wikitext-103-raw-v1/train-00000-*")[0]).column("text").to_pylist()[:20000])
 open("/wiki.txt", "w").write(wiki[:n])
+wt2 = "".join(pq.read_table(glob.glob("/wt/wikitext-2-raw-v1/test-*")[0]).column("text").to_pylist())
+open("/wt2.txt", "w").write(wt2[:n])
 EOF
 wait
 for t in $TEXTS; do
