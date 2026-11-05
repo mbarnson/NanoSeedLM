@@ -225,6 +225,7 @@ int main(void) {
     if (kt_open(err, sizeof err)) { printf("SKIP: %s\n", err); return 77; }
     printf("test_qwen4_kernels on %s\n", kt_name());
     gdn_case(16, 48, 128, 128, 6);   // Qwen3.8-Flash-Next
+    gdn_case(16, 48, 128, 128, 40);  // tokens in more than one stage of the step kernel
     gdn_case(4, 8, 64, 64, 3);
     gdn_case(2, 4, 32, 32, 9);       // tests/data/qwen4_tiny
     hc_case(4, 2560, 320, 3);        // Qwen3.8-Flash-Next

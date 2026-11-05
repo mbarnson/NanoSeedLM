@@ -31,21 +31,20 @@ static __device__ __forceinline__ float warp_max(float v) {
 
 // ---- Gated DeltaNet ---------------------------------------------------------------------------------------------------
 
-// One thread per channel, the T tokens in order: cv = silu(causal conv of the last K inputs); conv keeps the last K - 1.
-__global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, float* conv, float* cv, int T) {
+// Thread (channel, token): cv = silu(causal conv of the last K inputs); inputs before the chunk come from conv.
+__global__ void k_q4_gdn_conv(int cd, int K, const float* w, const float* qkv, const float* conv, float* cv) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (ch >= cd) return;
+    float acc = w[(size_t) ch * K + K - 1] * qkv[(size_t) t * cd + ch];
+    for (int k = 0, u = t - (K - 1); k < K - 1; ++k, ++u) acc += w[(size_t) ch * K + k] * (u >= 0 ? qkv[(size_t) u * cd + ch] : conv[(size_t) (K - 1 + u) * cd + ch]);
+    cv[(size_t) t * cd + ch] = acc * sigm(acc);
+}
+// conv keeps the last K - 1 inputs
+__global__ void k_q4_gdn_conv_keep(int cd, int K, const float* qkv, float* conv, int T) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= cd) return;
-    float st[7], wk[8];
-    for (int k = 0; k < K - 1; ++k) st[k] = conv[(size_t) k * cd + ch];
-    for (int k = 0; k < K; ++k) wk[k] = w[(size_t) ch * K + k];
-    for (int t = 0; t < T; ++t) {
-        const float x = qkv[(size_t) t * cd + ch];
-        float acc = wk[K - 1] * x;
-        for (int k = 0; k < K - 1; ++k) acc += wk[k] * st[k];
-        cv[(size_t) t * cd + ch] = acc * sigm(acc);
-        for (int k = 0; k + 1 < K - 1; ++k) st[k] = st[k + 1];
-        if (K > 1) st[K - 2] = x;
-    }
+    float st[7];
+    for (int k = 0, u = T - (K - 1); k < K - 1; ++k, ++u) st[k] = u >= 0 ? qkv[(size_t) u * cd + ch] : conv[(size_t) (K - 1 + u) * cd + ch];
     for (int k = 0; k < K - 1; ++k) conv[(size_t) k * cd + ch] = st[k];
 }
 
@@ -63,42 +62,68 @@ typedef struct {
     int cd, kd, vd, hv, rep, dv;
 } GdnArgs;
 
-// Block = 32 value rows of head hv (grid hv x dv / 32); SPLIT threads hold one row's state column S[hv][.][i] in registers
-// over the T tokens, DK / SPLIT values each.  q and k come normalised (k_q4_gdn_qknorm).  y gets the raw read S q;
-// k_q4_gdn_norm normalises and gates it.
+// Block = 32 value rows of head hv (grid hv x dv / 32). SPLIT threads hold one row's state column S[hv][.][i] in
+// registers, as float4 runs m of rows ((m SPLIT + p) 4, +4), so the threads read q and k from shared memory without bank
+// conflicts. Tokens are staged GDN_TS at a time. q and k come normalised. y gets the raw read S q (k_q4_gdn_norm gates it).
+#define GDN_TS 16
+static __device__ __forceinline__ float4 mad4(float4 a, float4 b, float4 c) {
+    return make_float4(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y), fmaf(a.z, b.z, c.z), fmaf(a.w, b.w, c.w));
+}
 template <int DK, int SPLIT>
 __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const float* cv, const float* aa, const float* bb,
                                                             const float* A_log, const float* dt_bias, float* S, float* y, int T) {
-    constexpr int DJ = DK / SPLIT;
-    const int hv = blockIdx.x, p = threadIdx.x % SPLIT, i = blockIdx.y * 32 + threadIdx.x / SPLIT, kh = hv / a.rep;
-    __shared__ float q[DK], k[DK];
-    float s[DJ];
-    float* St = S + (size_t) hv * DK * a.dv + (size_t) p * DJ * a.dv + i;
+    constexpr int DM = DK / SPLIT / 4, D4 = DK / 4;
+    const int hv = blockIdx.x, p = threadIdx.x % SPLIT, r = threadIdx.x / SPLIT, i = blockIdx.y * 32 + r, kh = hv / a.rep;
+    __shared__ float4 q[GDN_TS][D4], k[GDN_TS][D4];
+    __shared__ float v[GDN_TS][32], gs[GDN_TS], bs[GDN_TS];
+    float4 s[DM];
+    float* Sh = S + (size_t) hv * DK * a.dv + i;
 #pragma unroll
-    for (int j = 0; j < DJ; ++j) s[j] = St[(size_t) j * a.dv];
+    for (int m = 0; m < DM; ++m) {
+        float* c = Sh + (size_t) (m * SPLIT + p) * 4 * a.dv;
+        s[m] = make_float4(c[0], c[a.dv], c[2 * a.dv], c[3 * a.dv]);
+    }
     const float A = expf(A_log[hv]), dtb = dt_bias[hv];
-    for (int t = 0; t < T; ++t) {
-        const float* c = cv + (size_t) t * a.cd;
-        __syncthreads();   // the previous token's reads of q and k are done
-        for (int j = threadIdx.x; j < DK; j += blockDim.x) { q[j] = c[kh * DK + j]; k[j] = c[a.kd + kh * DK + j]; }
+    for (int t0 = 0; t0 < T; t0 += GDN_TS) {
+        const int nt = min(GDN_TS, T - t0);
+        __syncthreads();   // the previous tokens are read
+        for (int x = threadIdx.x; x < nt * D4; x += blockDim.x) {
+            const float4* c = (const float4*) (cv + (size_t) (t0 + x / D4) * a.cd);
+            q[x / D4][x % D4] = c[kh * D4 + x % D4];
+            k[x / D4][x % D4] = c[(a.kd + kh * DK) / 4 + x % D4];
+        }
+        for (int x = threadIdx.x; x < nt * 32; x += blockDim.x)
+            v[x / 32][x % 32] = cv[(size_t) (t0 + x / 32) * a.cd + 2 * a.kd + (size_t) hv * a.dv + blockIdx.y * 32 + x % 32];
+        if (threadIdx.x < nt) {
+            const int t = t0 + threadIdx.x;
+            const float ap = aa[(size_t) t * a.hv + hv] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
+            gs[threadIdx.x] = expf(-A * sp);
+            bs[threadIdx.x] = sigm(bb[(size_t) t * a.hv + hv]);
+        }
         __syncthreads();
-        const float ap = aa[(size_t) t * a.hv + hv] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
-        const float g = expf(-A * sp), beta = sigm(bb[(size_t) t * a.hv + hv]);
-        const float* kp = k + p * DJ;
-        const float* qp = q + p * DJ;
-        float kv = 0;
+        for (int u = 0; u < nt; ++u) {
+            float4 kv4 = make_float4(0, 0, 0, 0), y4 = kv4;
 #pragma unroll
-        for (int j = 0; j < DJ; ++j) kv += s[j] * kp[j];
-        if (SPLIT == 2) kv += __shfl_xor_sync(FULL, kv, 1);
-        const float delta = (c[2 * a.kd + hv * a.dv + i] - g * kv) * beta;
-        float yq = 0;
+            for (int m = 0; m < DM; ++m) kv4 = mad4(s[m], k[u][m * SPLIT + p], kv4);
+            float kv = (kv4.x + kv4.y) + (kv4.z + kv4.w);
+            if (SPLIT == 2) kv += __shfl_xor_sync(FULL, kv, 1);
+            const float g = gs[u], delta = (v[u][r] - g * kv) * bs[u];
 #pragma unroll
-        for (int j = 0; j < DJ; ++j) { s[j] = g * s[j] + delta * kp[j]; yq += s[j] * qp[j]; }
-        if (SPLIT == 2) yq += __shfl_xor_sync(FULL, yq, 1);
-        if (p == 0) y[(size_t) t * a.vd + (size_t) hv * a.dv + i] = yq;
+            for (int m = 0; m < DM; ++m) {
+                const float4 kk = k[u][m * SPLIT + p];
+                s[m] = make_float4(g * s[m].x + delta * kk.x, g * s[m].y + delta * kk.y, g * s[m].z + delta * kk.z, g * s[m].w + delta * kk.w);
+                y4 = mad4(s[m], q[u][m * SPLIT + p], y4);
+            }
+            float yq = (y4.x + y4.y) + (y4.z + y4.w);
+            if (SPLIT == 2) yq += __shfl_xor_sync(FULL, yq, 1);
+            if (p == 0) y[(size_t) (t0 + u) * a.vd + (size_t) hv * a.dv + i] = yq;
+        }
     }
 #pragma unroll
-    for (int j = 0; j < DJ; ++j) St[(size_t) j * a.dv] = s[j];
+    for (int m = 0; m < DM; ++m) {
+        float* c = Sh + (size_t) (m * SPLIT + p) * 4 * a.dv;
+        c[0] = s[m].x; c[a.dv] = s[m].y; c[2 * a.dv] = s[m].z; c[3 * a.dv] = s[m].w;
+    }
 }
 
 // Block (head, token), thread = value row: RMSNorm over the head (plain weight), gated by sigmoid(z)
@@ -113,7 +138,8 @@ int kq4_gdn(cudaStream_t s, const Qwen4Cfg* c, Q4GdnDev w, const float* qkv, con
             float* conv, float* S, float* cv, float* y, int T) {
     const int kd = c->lin_hk * c->lin_dk, vd = c->lin_hv * c->lin_dv, cd = 2 * kd + vd;
     if (c->lin_conv < 1 || c->lin_conv > 8 || c->lin_dv % 32 || c->lin_dv > 1024) return -1;
-    k_q4_gdn_conv<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, conv, cv, T);
+    k_q4_gdn_conv<<<dim3((unsigned) (cd + 255) / 256, (unsigned) T), 256, 0, s>>>(cd, c->lin_conv, w.conv_w, qkv, conv, cv);
+    k_q4_gdn_conv_keep<<<(unsigned) (cd + 255) / 256, 256, 0, s>>>(cd, c->lin_conv, qkv, conv, T);
     k_q4_gdn_qknorm<<<dim3((unsigned) T, (unsigned) c->lin_hk), (unsigned) c->lin_dk, 0, s>>>(cd, kd, cv);
     const GdnArgs ga = {cd, kd, vd, c->lin_hv, c->lin_hv / c->lin_hk, c->lin_dv};
     const dim3 grid((unsigned) c->lin_hv, (unsigned) c->lin_dv / 32);
