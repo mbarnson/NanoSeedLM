@@ -131,7 +131,7 @@ int main(void) {
               q4e_draft(e, 3, d) == 0 && !memcmp(d, dc, sizeof d), "drafts through the expert cache differ: %s", ec ? q4e_error(ec) : err);
         if (ec) q4e_cache_stats(ec, &h, &m, &slots);
         printf("drafts through a cache of %d slots: %llu misses\n", slots, (unsigned long long) m);
-        CHECK(m > 0, "the cache never missed");
+        CHECK(slots == 0 || m > 0, "the cache never missed");   // Metal: no expert cache
         q4e_close(ec);
     }
     {   // mtp = 1: one draft, one state copy
