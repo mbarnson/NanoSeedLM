@@ -131,7 +131,7 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 | `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
 | `--ctx N` | Context positions (4096) |
 | `--prompt-rows N` | Prompt rows of one forward: 4096, or 16384 on GPUs of 64 GB or more, at most the context. A row takes about 0.25 MB of VRAM |
-| `--drafts K` | The MTP head drafts K tokens (1 to 3), and one forward verifies them. The text does not change. The head takes about 1.9 GB of VRAM |
+| `--drafts K` | The MTP head drafts K tokens (1 to 3), and one forward verifies them. The text does not change. VRAM: about 1.6 GB, and 115 MB a draft |
 | `--effort xhigh\|medium\|low` | The template's reasoning effort (xhigh) |
 | `--no-think` | The template's `enable_thinking=False`: no reasoning block |
 | `--raw` | No chat template. Otherwise the prompt is one user turn through the model's chat template |
