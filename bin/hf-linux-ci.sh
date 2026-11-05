@@ -13,7 +13,8 @@ cd /tmp && git clone -q https://github.com/mbarnson/NanoSeedLM && cd NanoSeedLM 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang >/tmp/cmake.log 2>&1 || { tail -30 /tmp/cmake.log; exit 1; }
 cmake --build build >/tmp/build.log 2>&1 || { grep -E "error|FAILED" /tmp/build.log | head -40; exit 1; }
 echo "warnings: $(grep -c warning /tmp/build.log || true)"
-ctest --test-dir build --output-on-failure 2>&1 | tail -25'
+ctest --test-dir build --output-on-failure 2>&1 | tail -25
+./build/test_qwen4_engine 2>&1 | grep -i "cpu_tail" || true'
 hf jobs run --detach --flavor "$FLAVOR" --timeout 30m --name "nslm-linux-ci-$REV" -e NSLM_REV="$REV" \
     nvidia/cuda:12.8.1-devel-ubuntu24.04 bash -c "$JOB"
 echo "then: hf jobs wait <id> && hf jobs logs <id>"
