@@ -17,7 +17,8 @@ build\bin\nslm-chat --model MODEL_DIR "Why do tide pools matter?"        # Windo
 
 | Option | Use |
 |---|---|
-| `--effort low\|medium\|high` | The length of the reasoning |
+| `--effort E` | The length of the reasoning: low, medium or high (K2), low, medium or xhigh (Qwen3.8-Flash-Next) |
+| `--no-think` | Qwen3.8-Flash-Next: no reasoning block |
 | `--temp`, `--seed` | Sampling |
 | `--prompt-file FILE` | A long prompt from a file |
 
@@ -99,8 +100,22 @@ uses the blocks of another model.
 
 ## Qwen3.8-Flash-Next on CUDA
 
-`nslm-qwen4-gen` runs one prompt through the Qwen3.8-Flash-Next CUDA engine, with greedy decoding. `nslm-chat` and
-`nslm-serve` do not run Qwen3.8-Flash-Next yet.
+`nslm-chat` and `nslm-serve` run Qwen3.8-Flash-Next. They take the engine from the model's `config.json`. The
+server holds one sequence slot for this model. It does not save caches to disk.
+
+```bash
+build/bin/nslm-chat --model Qwen3.8-Flash-Next-NanoSeedLM-P3 --effort low "Why do tide pools matter?"
+build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-P3 --ctx 32768
+```
+
+- `--effort` takes xhigh (the default), medium or low. `--no-think` turns the reasoning block off.
+- In a request, `reasoning_effort: high` means xhigh. `chat_template_kwargs` takes `enable_thinking` and
+  `preserve_thinking`.
+- Tool calls come back as OpenAI `tool_calls`, typed by the tools' schemas.
+- The expert cache takes the free VRAM. `NSLM_EXPERT_VRAM_MB` sets its size. The `Q4E_*` variables set the other
+  engine options ([Environment variables](../reference/env.md)).
+
+`nslm-qwen4-gen` runs one prompt through the engine, with greedy decoding and the options below.
 
 ```bash
 build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why do tide pools matter?"

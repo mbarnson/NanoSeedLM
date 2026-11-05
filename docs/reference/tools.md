@@ -6,8 +6,8 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 
 | Tool | Use |
 |---|---|
-| `nslm-chat` | Run one prompt. Read [Run and serve](../guides/run-and-serve.md) |
-| `nslm-serve` | OpenAI-compatible HTTP server |
+| `nslm-chat` | Run one prompt (K2-Horizon-MoVA or Qwen3.8-Flash-Next). Read [Run and serve](../guides/run-and-serve.md) |
+| `nslm-serve` | OpenAI-compatible HTTP server (K2-Horizon-MoVA or Qwen3.8-Flash-Next) |
 
 ## Measure
 
@@ -21,7 +21,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-mova-refcheck` | The GPU engine against a C reference forward on the CPU (KL, argmax, router choices) |
 | `nslm-mova-routes` | Router choices for a prompt and a generation, for expert-cache studies |
 | `nslm-qwen4-gen` | Greedy generation of one prompt through the Qwen3.8-Flash-Next CUDA engine, with prompt and decode speed |
-| `nslm-qwen4-kld` | KL divergence, top-1 agreement and perplexity of a Qwen3.8-Flash-Next model against a reference, on one text |
+| `nslm-qwen4-kld` | KL divergence, top-1 agreement and perplexity of a Qwen3.8-Flash-Next model against a reference, on one text. `--decode N`: the last N rows through the decode kernels |
 
 ## Make models
 
