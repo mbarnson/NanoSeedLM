@@ -635,3 +635,13 @@ rows bit for bit.
 
 Tried and dropped: weight fragments built in registers with no threadgroup memory (8.7 TFLOPS), and 128 x 64 tiles over
 8 simdgroups (10.7).
+
+## [2026-11-05] kernel | Metal decode: the router, norm1p and short-context attention
+
+`4360e3e`, `40c2393`, `c2dbb47`: P3 decode without drafts on the M4 Max goes from 44.7 to 47.5 tokens/s
+(code prompt). The router's top k takes two phases: each simdgroup takes its own, then one merge, with a single
+barrier (13.5 -> 7.6 us a call, the same experts and weights). `norm1p` at a decode row lets up to 8 threadgroups share
+a group, each taking the whole sum in the same order (8.8 -> 6.5 us, bit for bit). Decode attention now splits a row's
+keys every 32, at most 16 splits. A row of one split walked its tiles serially (86 us a layer at 100 keys, 39 in four
+splits). The first two are bit for bit. The split change moves the text at the rounding level, and MTP verify rows
+still equal decode rows.
