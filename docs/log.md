@@ -521,3 +521,14 @@ through `engine/engine.c`. `test_qwen4_metal` also checks `qwen4_tiny_attn` agai
 each key once for each of a KV group's 12 heads. Rows with 512 keys or more now split their keys over
 threadgroups for the whole group, and a second kernel merges the splits, as CUDA's `5ce032e` does. Decode there is
 36 to 38 tokens/s.
+
+## [2026-11-05] engine | The MTP head in the CUDA engine (plan steps M1 and M2)
+
+`d0a227e`, `9e3fb7a`, `3e33894`, `1362d13`, `ecd552f`: the C reference has the head (`qwen4_ref_mtp`). It matches
+mlx-vlm 0.7.12 to 5.7e-7 on the tiny model, with the same 3 drafts (gate MA). The CUDA engine loads it with
+`Q4EOpts.mtp`. Every forward runs it one row behind, and stores only its keys. `q4e_draft` makes up to 3 greedy
+drafts in one CUDA graph. `q4e_forward_keep` verifies them in one forward, and the kernels write the recurrent state
+after each row. So `q4e_accept` keeps the accepted rows with a copy of about 115 MB, not a second forward.
+`test_qwen4_mtp` checks gate MB on the tiny model: greedy text with 1 to 3 drafts equals greedy text without.
+`nslm-qwen4-gen --drafts K` turns it on. The speed on the RTX 4080 is plan step M3. Metal has the calls as stubs
+(`engine/qwen4_nomtp.c`) until plan step M4.
