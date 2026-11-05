@@ -2160,7 +2160,9 @@ static __device__ __forceinline__ float tq_block(const uint32_t* row, int b, int
     constexpr int W = T / 32, NB = KB * T + L - KB;
     const uint32_t o = (uint32_t) b * NB + (uint32_t) (KB * W) * (uint32_t) lane, sh = o & 31u;
     const uint32_t* p = row + (o >> 5);
-    const uint32_t w0 = p[0], w1 = p[1], w2 = p[2];
+    // p[2] only when the lane's window reaches it: a window that ends in p[1] may sit where p[2] is past the row's
+    // spare word (nbits mod 32 >= KB W + L - KB; no model shape today), so the read is guarded, not assumed safe
+    const uint32_t w0 = p[0], w1 = p[1], w2 = sh + (uint32_t) (KB * (W - 1) + L) > 64u ? p[2] : 0u;
     const uint64_t v = (uint64_t) __funnelshift_r(w0, w1, sh) | (uint64_t) __funnelshift_r(w1, w2, sh) << 32;
     float s = 0.0f;
 #pragma unroll
