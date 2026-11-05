@@ -65,9 +65,10 @@ static int fill(void* ctx, int i, int s, uint8_t* dst, uint64_t len) {
     return 0;
 }
 
-// The layer of a seeded switch_mlp key (language_model.model.layers.L.mlp.switch_mlp.*), else -1.
+// The layer of a seeded switch_mlp key (language_model.model.layers.L.mlp.switch_mlp.*; L: the MTP head's), else -1.
 static int seeded_layer(const char* key, const int* seeded, int L) {
     int l = -1, at = 0;
+    if (!strncmp(key, "mtp.layers.0.mlp.switch_mlp.", 28)) return seeded[L] ? L : -1;
     if (sscanf(key, "language_model.model.layers.%d.mlp.switch_mlp.%n", &l, &at) != 1 || !at) return -1;
     return l >= 0 && l < L && seeded[l] ? l : -1;
 }
@@ -111,10 +112,10 @@ int main(int argc, char** argv) {
     char* cs = json_dumps(cfg, 1);
     const int q = nslm_qwen_experts(cs, &D, &F, &E, &L);
     free(cs);
-    if (q != 1 || L > 256) { fprintf(stderr, "%s: not a qwen4_exp config\n", base); return 2; }
+    if (q != 1 || L > 255) { fprintf(stderr, "%s: not a qwen4_exp config\n", base); return 2; }
     int seeded[256] = {0}, ns = 0;
     char path[2048], err[512];
-    for (int l = 0; l < L; ++l) {
+    for (int l = 0; l <= L; ++l) {   // l = L: the MTP head's blocks
         int have = 0;
         for (int p = 0; p < 3; ++p) { blk_path(path, sizeof path, blk, P, l, p); have += exists(path); }
         if (have && have != 3) { fprintf(stderr, "layer %d: %d of 3 block files\n", l, have); return 2; }
@@ -126,9 +127,9 @@ int main(int argc, char** argv) {
     StFile* sh = (StFile*) calloc((size_t) wm->n, sizeof(StFile));   // one per distinct shard file, opened on first use
     const char** shn = (const char**) calloc((size_t) wm->n, sizeof(char*));
     int nsh = 0, n = 0;
-    NsSpec* spec = (NsSpec*) calloc((size_t) wm->n + 3 * (size_t) L, sizeof(NsSpec));
-    NsRaw* raw = (NsRaw*) calloc((size_t) wm->n + 3 * (size_t) L, sizeof(NsRaw));
-    Item* it = (Item*) calloc((size_t) wm->n + 3 * (size_t) L, sizeof(Item));
+    NsSpec* spec = (NsSpec*) calloc((size_t) wm->n + 3 * (size_t) (L + 1), sizeof(NsSpec));
+    NsRaw* raw = (NsRaw*) calloc((size_t) wm->n + 3 * (size_t) (L + 1), sizeof(NsRaw));
+    Item* it = (Item*) calloc((size_t) wm->n + 3 * (size_t) (L + 1), sizeof(Item));
     uint64_t copied = 0;
     for (int i = 0; i < wm->n; ++i) {
         if (seeded_layer(wm->k[i], seeded, L) >= 0) continue;
@@ -151,10 +152,11 @@ int main(int argc, char** argv) {
         copied += e->end - e->begin;
     }
     static char names[256 * 3][128];
-    for (int l = 0; l < L; ++l)
-        for (int p = 0; l < L && seeded[l] && p < 3; ++p) {
+    for (int l = 0; l <= L; ++l)
+        for (int p = 0; seeded[l] && p < 3; ++p) {
             char* nm = names[3 * l + p];
-            snprintf(nm, 128, "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, kProj[p]);
+            if (l == L) snprintf(nm, 128, "mtp.layers.0.mlp.switch_mlp.%s.weight", kProj[p]);
+            else snprintf(nm, 128, "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, kProj[p]);
             spec[n] = (NsSpec) {nm, P == 4 ? NS_SEED4P4 : NS_SEED4, E, p == 2 ? D : F, p == 2 ? F : D};
             it[n++] = (Item) {NULL, l, p};
         }
@@ -168,7 +170,8 @@ int main(int argc, char** argv) {
     if (write_config(cfg, out, sl ? sl + 1 : loader, seeded, L)) { fprintf(stderr, "%s/config.json: cannot write\n", out); return 1; }
     nslm_copy_model_files(base, out);
     if (nslm_copy_loader(loader, out)) { fprintf(stderr, "%s: cannot copy the loader and nanoseedlm_seeds.py\n", loader); return 1; }
-    printf("wrote %s: %d of %d layers with P = %d seed experts, %.2f GB copied from %s\n", out, ns, L, P, (double) copied / 1e9, base);
+    printf("wrote %s: %d of %d layers (and the MTP head: %s) with P = %d seed experts, %.2f GB copied from %s\n", out, ns - seeded[L], L,
+           seeded[L] ? "yes" : "no", P, (double) copied / 1e9, base);
     for (int k = 0; k < nsh; ++k) st_close_file(&sh[k]);
     free(c.buf); free(sh); free(shn); free(spec); free(raw); free(it);
     json_free(cfg); json_free(idx);

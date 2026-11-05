@@ -164,8 +164,9 @@ static float* load_tensor(const char* name, int rows, int cols, int slices, int 
 static float* load_proj(int l, int p, int e) {
     char name[128];
     const int rows = proj_rows(l, p), cols = proj_cols(l, p), E = proj_experts(p);
-    if (g_qwen) {
-        snprintf(name, sizeof name, "model.language_model.layers.%d.mlp.experts.%s", l, p == P_DOWN ? "down_proj" : "gate_up_proj");
+    if (g_qwen) {   // layer g_L: the MTP head's experts (the packer's L<g_L> blocks)
+        if (l == g_L) snprintf(name, sizeof name, "mtp.layers.0.mlp.experts.%s", p == P_DOWN ? "down_proj" : "gate_up_proj");
+        else snprintf(name, sizeof name, "model.language_model.layers.%d.mlp.experts.%s", l, p == P_DOWN ? "down_proj" : "gate_up_proj");
         return load_tensor(name, rows, cols, E, e, p == P_DOWN ? rows : 2 * rows, p == P_UP ? rows : 0);
     }
     tensor_name(name, sizeof name, l, p, e);
@@ -256,7 +257,7 @@ static int imat_get(int l, int p, const float** sum, const float** cnt) {
 }
 static void imat_h(int l, int p, int e, double n0, float* h) {
     const float *sum, *cnt;
-    imat_get(l, p, &sum, &cnt);
+    if (imat_get(l, p, &sum, &cnt)) { for (int i = 0; i < proj_cols(l, p); ++i) h[i] = 1.0f; return; }   // the MTP head: unweighted
     nslm_imatrix_h(sum, cnt, g_E, proj_cols(l, p), e, n0, h);
 }
 
@@ -535,7 +536,7 @@ static void* job_worker(void* arg) {
                 double hmin = 1e30, hmax = 0;
                 for (int c = 0; c < cols; ++c) { hmin = hh[c] < hmin ? hh[c] : hmin; hmax = hh[c] > hmax ? hh[c] : hmax; }
                 const float *ss, *cc;
-                n = g_imat.map ? (imat_get(l, p, &ss, &cc), (int64_t) cc[e]) : p == P_V ? g_act[l].vcount[e] : g_act[l].count[e];
+                n = g_imat.map ? (imat_get(l, p, &ss, &cc) ? 0 : (int64_t) cc[e]) : p == P_V ? g_act[l].vcount[e] : g_act[l].count[e];
                 printf("  L%d %s expert %3d: %7.2f s  routed %7lld  h min %.3e max %.3e  bias %d clamped %lld\n", l, kProj[p], e,
                        now_s() - ts, (long long) n, hmin, hmax, bias[e], (long long) clamped);
             }
@@ -860,7 +861,8 @@ int main(int argc, char** argv) {
             tensor_name(nm, sizeof nm, l, p, 0);
             if (p >= P_KAX && nslm_moe_index_lookup(g_index, nm, file, sizeof file)) continue;   // kv_a_v: MoVA layers only
             const float *s0, *c0;
-            if (g_imat.map && imat_get(l, p, &s0, &c0)) { fprintf(stderr, "--imatrix: no %s statistics for layer %d\n", kProj[p], l); return 2; }
+            if (g_imat.map && imat_get(l, p, &s0, &c0) && l != g_L) { fprintf(stderr, "--imatrix: no %s statistics for layer %d\n", kProj[p], l); return 2; }
+            if (g_qwen && l > g_L) { fprintf(stderr, "--layers: qwen4_exp has layers 0 to %d (%d: the MTP head)\n", g_L, g_L); return 2; }
             items[n++] = (JobItem){l, p};
         }
     int si = 0, sn = 1;   // --shard I/N: jobs I, I + N, ... (one process per GPU)

@@ -47,12 +47,18 @@ hf jobs run --detach --flavor rtx-pro-6000x4 --timeout 95m -v ./src:/src -v hf:/
     nvidia/cuda:12.8.1-devel-ubuntu24.04 bash /src/tools/hf_seedbank.sh
 ```
 
+Layer 48 is the MTP head (`mtp.layers.0`). The imatrix has no statistics for it, so its search is unweighted.
+`--layers 48-48` searches only the head. It needs the shards that hold `mtp.layers.0.mlp.experts`.
+
 To pack, start from an MLX folder of the model (`mlx-community/Qwen3.8-Flash-Next-4bit-mtp`). The packer copies its
 tensors and replaces the routed experts with seeds. `--blk` takes P = 3 blocks, and `--blk4` takes P = 4 blocks.
 
 ```bash
 out/bin/nslm-qwen4-pack --base MLX_DIR --blk4 out/blocks --out MODEL_DIR
 ```
+
+`L48_*.blk` block files seed the MTP head too. A seed pack can be the base: then only the layers with block files change.
+For example, `--base P3_DIR --blk out/head` gives the P3 pack with a P3 head.
 
 On HF Jobs, `tools/hf_qwen4_pack.sh` packs on a CPU node, from and to mounted buckets:
 
