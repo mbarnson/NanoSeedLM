@@ -529,17 +529,23 @@ __global__ void __launch_bounds__(128) k_q4_attend_tc(AttArgs a, const float* q,
                 keys[tid] = tid >= nk ? -1 : k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
             }
             __syncthreads();
-            for (int x = tid; x < TC_KT * hd / 4; x += blockDim.x) {
-                const int kk = x / (hd / 4);
-                float4 kv = make_float4(0, 0, 0, 0), vv = kv;
-                if (keys[kk] >= 0) {
+            float4 kr[TC_KT * 256 / 4 / 128], vr[TC_KT * 256 / 4 / 128];   // all of a thread's loads first: one wait a tile
+#pragma unroll
+            for (int u = 0; u < TC_KT * 256 / 4 / 128; ++u) {
+                const int x = tid + u * 128, kk = x / (hd / 4);
+                kr[u] = vr[u] = make_float4(0, 0, 0, 0);
+                if (x < TC_KT * hd / 4 && keys[kk] >= 0) {
                     const size_t at = (((size_t) keys[kk] * a.nkv + g) * hd) / 4 + x % (hd / 4);
-                    kv = ((const float4*) K)[at];
-                    if (pass) vv = ((const float4*) V)[at];
+                    kr[u] = ((const float4*) K)[at];
+                    if (pass) vr[u] = ((const float4*) V)[at];
                 }
-                ((float4*) Ks)[x] = kv;
-                ((float4*) Vs)[x] = vv;
             }
+#pragma unroll
+            for (int u = 0; u < TC_KT * 256 / 4 / 128; ++u)
+                if (tid + u * 128 < TC_KT * hd / 4) {
+                    ((float4*) Ks)[tid + u * 128] = kr[u];
+                    if (pass) ((float4*) Vs)[tid + u * 128] = vr[u];
+                }
             __syncthreads();
             wmma::fragment<wmma::accumulator, 16, 16, 8, float> sacc;   // warp w: the dims [w ds, (w + 1) ds) of S
             wmma::fill_fragment(sacc, 0.0f);
