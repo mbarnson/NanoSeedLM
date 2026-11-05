@@ -68,9 +68,8 @@ void kq4_qsa_rows(cudaStream_t s, const Qwen4Cfg* c, int pos0, const int32_t* dp
 // sc is scratch of T x maxdone floats.  Rows with done[t] <= budget / ratio are left as they are.
 void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, const float* blk, const int32_t* done, int maxdone,
                     float* sc, int32_t* sel, int T);
-// qwen4_attend for row t: q[t][n_head][2 head_dim], caches K, V [pos][n_kv][head_dim], nsel[t] blocks of
-// sel[t][budget / ratio]; o[t][n_head][head_dim].  -1 unless head_dim is a multiple of 32, at most 256, and a KV head
-// serves at most 32 heads.
+// qwen4_attend for row t: q[t][n_head][2 head_dim], K, V [pos][n_kv][head_dim], nsel[t] blocks of sel[t]; o[t][n_head][head_dim].
+// -1 unless head_dim is a multiple of 32 up to 256 and a KV head serves at most 32 heads.
 int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T);
 // The same with the rows of q qld floats apart, and part, the scratch of decode rows (T <= 8): kq4_attend_part_len
