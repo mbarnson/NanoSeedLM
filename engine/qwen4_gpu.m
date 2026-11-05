@@ -22,9 +22,9 @@
 #include "qwen4_ops.h"
 #include "rows.h"
 
-// Rows of one forward without logits.  Larger than CUDA's Q4E_MAX_ROWS: unified memory has no copy to amortize, but
-// the grouped expert GEMMs want rows (4,096 rows: about 80 a routed expert, 2.5 GEMM tiles; 1,024: 20, under one).
-#define MAXT 4096
+// The default rows of one forward without logits (Q4EOpts.rows overrides it): the grouped expert GEMMs want rows (4,096
+// rows: about 80 a routed expert, 2.5 GEMM tiles; 1,024: 20, under one)
+#define MAXT_DEFAULT 4096
 #define LOGT Q4E_LOGIT_ROWS
 
 typedef struct {   // a tensor of the folder: its streams (nslm/model_st.h), format, shape and affine group
@@ -63,6 +63,7 @@ struct Q4Eng {
     NSMutableArray<id<MTLBuffer>>* buffers;
     id<MTLBuffer> stab, stab32, inv;   // the P = 3 and P = 4 seed stream tables; RoPE inverse frequencies
     int max_pos, pos, nb, nple, kq;    // context; QSA block slots; PLE layers; QSA blocks a row attends
+    int maxt;                          // rows of one prompt forward (Q4EOpts.rows, or MAXT_DEFAULT)
     int32_t* ids;                      // the context (host), for the PLE n-grams
     id<MTLBuffer> x, H, normed, lo, up, inj, br, qp, kk, vv, o, ixo, sc, emb, keys, qs, vals, gated;
     id<MTLBuffer> lg, wt, A, Gb, Ub, Dx, sh, sgv, logits, y, cv, qkvb, zb, bb, ab;
@@ -454,14 +455,14 @@ static void hc_add(Q4Eng* e, int T) {
     thr(e, (uint64_t) e->c.d, (uint64_t) T, 256);
 }
 
-// The PLE rows of rows [pos, pos + T) of each PLE layer into emb [ple index][MAXT][ple_dim]: host work, before encoding
+// The PLE rows of rows [pos, pos + T) of each PLE layer into emb [ple index][maxt][ple_dim]: host work, before encoding
 static int ple_rows(Q4Eng* e, int T) {
     const Qwen4Cfg* c = &e->c;
     float* emb = (float*) e->emb.contents;
     for (int l = 0; l < c->n_layer; ++l)
         for (int t = 0; c->ple[l] >= 0 && t < T; ++t)
             if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
-                                emb + ((size_t) c->ple[l] * MAXT + t) * c->ple_dim))
+                                emb + ((size_t) c->ple[l] * e->maxt + t) * c->ple_dim))
                 return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
     return 0;
 }
@@ -470,7 +471,7 @@ static void ple(Q4Eng* e, int l, int T) {
     const Qwen4Cfg* c = &e->c;
     Layer* L = &e->L[l];
     const int HD = c->hc * c->d;
-    const uint64_t eo = sizeof(float) * (uint64_t) c->ple[l] * MAXT * c->ple_dim;
+    const uint64_t eo = sizeof(float) * (uint64_t) c->ple[l] * e->maxt * c->ple_dim;
     mv_o(e, &L->key, e->emb, eo, c->ple_dim, e->keys, 0, HD, T);
     norm1p(e, e->keys, HD, c->d, L->nk, e->keys, T);
     mv_o(e, &L->val, e->emb, eo, c->ple_dim, e->vals, 0, c->d, T);
@@ -682,6 +683,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const Qwen4Cfg* c = &e->c;
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
     e->nb = e->max_pos / c->ix_ratio + 1;
+    e->maxt = o && o->rows > 0 ? o->rows : MAXT_DEFAULT;   // from LOGT to the context
+    if (e->maxt > e->max_pos) e->maxt = e->max_pos;
+    if (e->maxt < LOGT) e->maxt = LOGT;
     e->kq = c->ix_budget / c->ix_ratio;
     e->dev = MTLCreateSystemDefaultDevice();
     e->queue = [e->dev newCommandQueue];
@@ -725,7 +729,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         load_layer(e, l);
         if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     }
-    const size_t T = MAXT, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
+    const size_t T = (size_t) e->maxt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, iw = (size_t) (c->ix_heads + 1) * c->ix_dim, kf = (size_t) c->top_k * c->ff_exp;
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
     if (!e->err[0]) {
@@ -796,7 +800,7 @@ void q4e_reset(Q4Eng* e) {
     e->pos = 0;
 }
 
-// ---- the forward of up to MAXT rows ----------------------------------------------------------------------------------
+// ---- the forward of up to maxt rows ----------------------------------------------------------------------------------
 
 static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     const Qwen4Cfg* c = &e->c;
@@ -846,7 +850,7 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
     for (int l = 0; l < e->c.n_layer; ++l)   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
         for (int t = 0; e->c.ple[l] >= 0 && t < n; ++t) qwen4_ple_prefetch(&e->nm, e->table, &e->c, &e->ng[e->c.ple[l]], l, e->ids, e->pos + t);
-    const int step = logits ? LOGT : MAXT;
+    const int step = logits ? LOGT : e->maxt;
     for (int i = 0; i < n; i += step) {
         const int T = n - i < step ? n - i : step;
         if (forward_rows(e, ids + i, T, logits ? logits + (size_t) i * e->c.vocab : NULL)) return -1;
