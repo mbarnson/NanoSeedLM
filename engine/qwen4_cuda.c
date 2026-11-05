@@ -57,6 +57,13 @@ struct Q4Eng {
     int mt;                        // rows of one prompt forward (a chunk): Q4EOpts.rows
     int xr;                        // rows of a layer-major pass: the context in chunks of mt, at most Q4E_PASS_ROWS
     CachePool pool;   // the expert cache (cache = 1)
+    // Prompt prefetch (pf_ok): every expert of layer l + 1 is admitted when layer l starts and copied on cs while layer
+    // l computes. pf is a view of pool with its own job list. Victims come from finished layers if the pool holds 3 layers.
+    CachePool pf;
+    cudaStream_t cs;
+    cudaEvent_t ev_admit, ev_ready[QWEN4_MAX_LAYERS];
+    int32_t* all_ids;
+    int pf_ok;
     uint64_t ulen[3][4];   // bytes of each expert stream in a unit
     uint8_t* stage;        // stream = 1: pinned staging of the units one admit brings
     int32_t* hjobs;        // stream = 1: the admit's jobs, read back (pinned)
@@ -334,11 +341,12 @@ static void build_cache(Q4Eng* e, double gb) {
     free(us); free(su); free(tab);
 }
 
-void q4e_cache_stats(Q4Eng* e, uint64_t* hits, uint64_t* misses, int* slots) {
-    uint32_t st[2] = {0, 0};
+void q4e_cache_stats(Q4Eng* e, uint64_t* hits, uint64_t* misses, int* slots) {   // the layers' admits and the prefetch's
+    uint32_t st[2] = {0, 0}, sp[2] = {0, 0};
     if (e->cache) cudaMemcpy(st, e->pool.stats, 8, cudaMemcpyDeviceToHost);
-    *hits = st[0];
-    *misses = st[1];
+    if (e->pf_ok) cudaMemcpy(sp, e->pf.stats, 8, cudaMemcpyDeviceToHost);
+    *hits = (uint64_t) st[0] + sp[0];
+    *misses = (uint64_t) st[1] + sp[1];
     *slots = e->cache ? e->pool.slots : 0;
 }
 
@@ -419,6 +427,21 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->emb_h = (float*) pin(e, sizeof(float) * e->xr * (size_t) c->ple_dim * (size_t) (e->nple ? e->nple : 1));
     e->hlog = (float*) pin(e, sizeof(float) * (size_t) Q4E_LOGIT_ROWS * c->vocab);
     e->no_graph = getenv("NSLM_NO_GRAPH") != NULL;
+    if (e->cache && !e->stream && !e->err[0] && e->pool.slots >= 3 * c->n_exp && c->n_exp <= CACHE_MAX_PER_LAYER && !getenv("Q4E_NO_PREFETCH")) {
+        int32_t ids[CACHE_MAX_PER_LAYER];
+        int lo = 0, hi = 0;   // the copy stream first: its blocks take SMs ahead of the prompt's kernels
+        for (int i = 0; i < c->n_exp; ++i) ids[i] = i;
+        e->pf = e->pool;
+        e->pf.jobs = (int32_t*) dmem(e, NULL, 8 * (size_t) c->n_exp);
+        e->pf.njobs = (int32_t*) dmem(e, NULL, 16);
+        e->pf.stats = (uint32_t*) dmem(e, NULL, 16);
+        e->all_ids = (int32_t*) dmem(e, ids, sizeof(int32_t) * (size_t) c->n_exp);
+        e->pf_ok = !e->err[0] && cudaMemset(e->pf.stats, 0, 16) == cudaSuccess && cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+                   cudaStreamCreateWithPriority(&e->cs, cudaStreamNonBlocking, hi) == cudaSuccess &&
+                   cudaEventCreateWithFlags(&e->ev_admit, cudaEventDisableTiming) == cudaSuccess;
+        for (int l = 0; e->pf_ok && l < c->n_layer; ++l) e->pf_ok = cudaEventCreateWithFlags(&e->ev_ready[l], cudaEventDisableTiming) == cudaSuccess;
+        if (!e->pf_ok) fail(e, "prefetch: CUDA setup failed");
+    }
     const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     e->ple_threads = getenv("Q4E_PLE_THREADS") ? atoi(getenv("Q4E_PLE_THREADS")) : ncpu > 16 ? 16 : ncpu > 1 ? (int) ncpu : 1;
     if (e->ple_threads < 1) e->ple_threads = 1;
@@ -457,6 +480,9 @@ void q4e_close(Q4Eng* e) {
     free(e->dev); free(e->host); free(e->ids);
     if (e->routes) fclose(e->routes);
     if (e->s) cudaStreamDestroy(e->s);
+    if (e->cs) cudaStreamDestroy(e->cs);
+    if (e->ev_admit) cudaEventDestroy(e->ev_admit);
+    for (int l = 0; l < e->c.n_layer; ++l) if (e->ev_ready[l]) cudaEventDestroy(e->ev_ready[l]);
     if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
     free(e);
@@ -673,10 +699,31 @@ static int layer(Q4Eng* e, int l, int T, int row0) {
     mark(e, ST_EXPERT);
     return e->err[0] ? -1 : 0;
 }
+// Admit every expert of layer l on the main stream (after the last reader of the slots it may replace), copy the
+// misses on the copy stream; ev_ready[l] when they are in VRAM
+static void prefetch(Q4Eng* e, int l) {
+    kc_cache_admit(e->s, &e->pf, l, e->all_ids, e->c.n_exp, 0);
+    cudaEventRecord(e->ev_admit, e->s);
+    cudaStreamWaitEvent(e->cs, e->ev_admit, 0);
+    kc_cache_copy(e->cs, &e->pf, 8);
+    cudaEventRecord(e->ev_ready[l], e->cs);
+}
+// At layer l's start (pre: a prompt of more than Q4E_PREFETCH_ROWS rows, which uses nearly every expert of each layer):
+// layer l's experts in VRAM, layer l + 1's on their way. The layers' own admits then find their experts resident.
+static void layer_start(Q4Eng* e, int l, int pre) {
+    if (!pre) return;
+    if (l == 0) prefetch(e, 0);
+    cudaStreamWaitEvent(e->s, e->ev_ready[l], 0);
+    mark(e, ST_ROUTE);
+    if (l + 1 < e->c.n_layer) prefetch(e, l + 1);
+}
 static int enqueue(Q4Eng* e, int T, int want) {   // the rows of slot 0 through every layer; want: with the head
     rows_in(e, 0, T);
     embed(e, T);
-    for (int l = 0; l < e->c.n_layer; ++l) if (layer(e, l, T, 0)) return -1;
+    for (int l = 0; l < e->c.n_layer; ++l) {
+        layer_start(e, l, e->pf_ok && T > Q4E_PREFETCH_ROWS);
+        if (layer(e, l, T, 0)) return -1;
+    }
     if (want) {   // prompt rows without logits skip the mixer and the head
         hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
         mv(e, &e->head, e->x, e->logits, T);
@@ -696,7 +743,8 @@ static int forward_pass(Q4Eng* e, const int32_t* ids, int n) {
         memcpy(h + 1, ids + (size_t) k * e->mt, sizeof(int32_t) * (size_t) (n - k * e->mt < e->mt ? n - k * e->mt : e->mt));
     }
     int rc = ple_rows(e, n);
-    for (int l = -1; !rc && l < e->c.n_layer; ++l)   // l = -1: the embedding
+    for (int l = -1; !rc && l < e->c.n_layer; ++l) {   // l = -1: the embedding
+        if (l >= 0) layer_start(e, l, e->pf_ok && n > Q4E_PREFETCH_ROWS);
         for (int k = 0; !rc && k < nc; ++k) {
             const int T = n - k * e->mt < e->mt ? n - k * e->mt : e->mt;
             e->H = e->Hall + (size_t) k * e->mt * HD;
@@ -705,6 +753,7 @@ static int forward_pass(Q4Eng* e, const int32_t* ids, int n) {
             if (l < 0) embed(e, T);
             else rc = layer(e, l, T, k * e->mt);
         }
+    }
     e->H = e->Hall;
     e->pos = pos0;
     if (rc) return -1;

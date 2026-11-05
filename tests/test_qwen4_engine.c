@@ -198,6 +198,35 @@ int main(void) {
             q4e_close(e);
         }
         set_env("Q4E_PLE_THREADS", NULL);
+        // a cache of 3 to 4 layers' experts: the prompt prefetch copies each layer beside the one before, and evicts
+        Q4EOpts oc3 = ol;
+        int slots = 0, E = 1, units = 0;
+        for (double gb = 1e-5; gb < 1e-2 && slots < 3 * E; gb *= 1.2) {
+            uint64_t h, m;
+            oc3.cache_gb = gb;
+            if (!(e = q4e_open("tests/data/qwen4_tiny", &oc3, err, sizeof err))) break;
+            q4e_cache_stats(e, &h, &m, &slots);
+            E = q4e_cfg(e)->n_exp;
+            units = E * q4e_cfg(e)->n_layer;
+            q4e_close(e);
+        }
+        CHECK(slots >= 3 * E && slots < units, "no cache of 3 to 4 layers' experts (%d slots)", slots);
+        for (int pre = 1; pre >= 0 && slots < units; --pre) {
+            set_env("Q4E_NO_PREFETCH", pre ? NULL : "1");
+            e = q4e_open("tests/data/qwen4_tiny", &oc3, err, sizeof err);
+            CHECK(e != NULL, "open with %d slots: %s", slots, err);
+            if (!e) continue;
+            uint64_t h, m;
+            CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, rows3) == 0, "a pass with %d slots: %s", slots, q4e_error(e));
+            q4e_cache_stats(e, &h, &m, &slots);
+            int diff = 0;
+            for (int v = 0; v < V; ++v) diff += pass[v] != rows3[v];
+            printf("the pass with %d slots%s: %llu hits, %llu misses, %d logits differ from no cache\n", slots, pre ? ", prefetched" : "",
+                   (unsigned long long) h, (unsigned long long) m, diff);
+            CHECK(diff == 0 && m > 0, "the cache%s changes the pass's logits, or never misses", pre ? " with the prefetch" : "");
+            q4e_close(e);
+        }
+        set_env("Q4E_NO_PREFETCH", NULL);
         free(lid); free(pass); free(rows3);
     }
     free(got);
