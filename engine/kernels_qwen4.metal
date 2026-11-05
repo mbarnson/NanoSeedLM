@@ -225,48 +225,61 @@ kernel void k_q4_head_norm_rope(constant Q4RopeArgs& a [[buffer(0)]], device flo
     }
 }
 
-// Threadgroup per row, 256 threads (E <= 1024: up to 4 logits a thread, in registers): k rounds of an arg max of the
-// logits (ties to the higher expert), each a simdgroup reduction then one over the 8 simdgroups; weights exp(l - max)
-// renormalised over the k, summed in round order (the max is round 0's winner)
+// Threadgroup per row, 256 threads (E <= 1024: up to 4 logits a thread, in registers), the top k (ties to the higher
+// expert) in two phases without a barrier a round: each simdgroup takes its own top k by simdgroup reductions, then
+// simdgroup 0 takes the top k of their 8 k candidates. The order is total, so the winners are the round-by-round
+// arg max's. Weights exp(l - max) renormalised over the k, summed in round order (the max is round 0's winner).
 #define ROUTE_TG 256
+static inline bool route_better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia > ib); }
 kernel void k_q4_route(constant Q4RouteArgs& a [[buffer(0)]], device const float* logits [[buffer(1)]], device int* ind [[buffer(2)]],
                        device float* wt [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float sv[ROUTE_TG / 32], ws[32];
-    threadgroup int si[ROUTE_TG / 32], is[32];
+    threadgroup float cv[ROUTE_TG / 32][32];   // each simdgroup's top k, in order
+    threadgroup int ci[ROUTE_TG / 32][32];
     device const float* l = logits + (ulong) t * a.E;
     float v[4];
     int nv = 0;
     for (int e = (int) tid; e < a.E && nv < 4; e += ROUTE_TG) v[nv++] = l[e];
     uint taken = 0;   // bit i: logit tid + ROUTE_TG * i is chosen
-    float mx = 0, top = 0;
-    for (int r = 0; r < a.k; ++r) {
+    for (int r = 0; r < a.k; ++r) {   // phase 1: this simdgroup's top k
         float bv = -INFINITY;
         int bi = -1;
         for (int i = 0; i < nv; ++i) {
             const int e = (int) tid + ROUTE_TG * i;
-            if (!((taken >> i) & 1u) && (v[i] > bv || (v[i] == bv && e > bi))) { bv = v[i]; bi = e; }
+            if (!((taken >> i) & 1u) && route_better(v[i], e, bv, bi)) { bv = v[i]; bi = e; }
         }
         for (ushort o = 16; o > 0; o >>= 1) {
             const float ov = simd_shuffle_xor(bv, o);
             const int oi = simd_shuffle_xor(bi, o);
-            if (ov > bv || (ov == bv && oi > bi)) { bv = ov; bi = oi; }
+            if (route_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
         }
-        if (lane == 0) { sv[sg] = bv; si[sg] = bi; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        bv = sv[0];
-        bi = si[0];
-        for (int s = 1; s < ROUTE_TG / 32; ++s)
-            if (sv[s] > bv || (sv[s] == bv && si[s] > bi)) { bv = sv[s]; bi = si[s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);   // every thread read sv / si before the next round writes them
         if (bi >= 0 && bi % ROUTE_TG == (int) tid) taken |= 1u << (bi / ROUTE_TG);
-        if (r == 0) mx = bv;
-        const float w = exp(bv - mx);
-        top += w;   // the same in every thread
-        if (tid == 0) { is[r] = bi; ws[r] = w; }
+        if (lane == 0) { cv[sg][r] = bv; ci[sg][r] = bi; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if ((int) tid < a.k) { ind[(ulong) t * a.k + tid] = is[tid]; wt[(ulong) t * a.k + tid] = ws[tid] / top; }
+    if (sg != 0) return;
+    // phase 2, simdgroup 0: lane s < 8 walks simdgroup s's list (in order), the best head wins a round
+    int head = 0;
+    const int ns = ROUTE_TG / 32;
+    float mx = 0, top = 0, wr = 0;
+    int ir = 0;
+    for (int r = 0; r < a.k; ++r) {
+        float bv = (int) lane < ns && head < a.k ? cv[lane][head] : -INFINITY;
+        int bi = (int) lane < ns && head < a.k ? ci[lane][head] : -1;
+        const float mv = bv;
+        const int mi = bi;
+        for (ushort o = 16; o > 0; o >>= 1) {
+            const float ov = simd_shuffle_xor(bv, o);
+            const int oi = simd_shuffle_xor(bi, o);
+            if (route_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+        }
+        if (mi == bi && mv == bv && (int) lane < ns) ++head;   // this lane's head won
+        if (r == 0) mx = bv;
+        const float w = exp(bv - mx);
+        top += w;   // the same in every lane
+        if ((int) lane == r) { ir = bi; wr = w; }
+    }
+    if ((int) lane < a.k) { ind[(ulong) t * a.k + lane] = ir; wt[(ulong) t * a.k + lane] = wr / top; }
 }
 
 // ---- PLE ---------------------------------------------------------------------------------------------------------------
