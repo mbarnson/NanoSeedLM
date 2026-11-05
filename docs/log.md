@@ -615,3 +615,23 @@ the C reference. MTP verify rows still equal decode rows bit for bit, so drafts 
 
 Tried and dropped: the router top-k in one simdgroup (13.5 -> 18.5 us a call, 46 with a sorting network). The
 distinct-expert pass for verify rows was slower (51.5 against 56.9 tokens/s at 2 drafts), with the same text.
+
+## [2026-11-05] kernel | Metal decode and prompt: smaller kernels, and a 64 x 64 prompt GEMM
+
+`a5d5ea2`, `8c33e1e`, `e5ae64d`: P3 decode without drafts on the M4 Max goes from 43.3 to 44.7 tokens/s (code prompt).
+- The experts' down projection (80 blocks a row) runs two rows a simdgroup, 16 lanes each: 56 -> 45 us a call.
+- `k_mv_split` takes Q4 in MLX's qmv form, as `k_mv` does: 6.9 -> 5.9 us a call.
+- The hyper-connections' up projection (40 blocks a row) runs four rows a simdgroup.
+
+`2a83c97`, `6b284fc`: prompts. `Q4E_PROFILE=4` times prompt rows by kernel, and it showed the two GEMMs at 74% of a
+5,607-token prompt, at about 9.4 TFLOPS. `k_mm64` uses 64 x 64 tiles, each simdgroup 32 x 32 with its loops fully
+unrolled (without that, 1.6 TFLOPS). The dense Q4 GEMM goes from 9.4 to 11.6 TFLOPS. The grouped expert GEMM uses
+tiles of 64 pairs, so each seed block expands fewer times: 4.61 -> 3.99 s a prompt. y is bit for bit `k_mm`'s, so the text
+is the same. A 5,607-token prompt goes from 445 to 507 tokens/s (mlx-vlm 0.7.12: 457 to 500), and a 20,131-token prompt
+from 284 to 493.
+
+The decode changes reorder some sums, so the text changes at the rounding level. MTP verify rows still equal decode
+rows bit for bit.
+
+Tried and dropped: weight fragments built in registers with no threadgroup memory (8.7 TFLOPS), and 128 x 64 tiles over
+8 simdgroups (10.7).
