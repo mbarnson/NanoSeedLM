@@ -581,11 +581,12 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
 }
 
 // Prompt rows on tensor cores: block (KV group, row), 4 warps. The group's heads (at most 16) are the rows of the
-// matrices, padded with zeros; keys come in tiles of TC_KT. S = Q K^T and O = P V are TF32 mma in three parts
-// (hi hi + hi lo + lo hi, near f32). Two passes: the scores' row maxima, then P and P V, so no accumulator rescales.
-// A warp keeps its Q fragments (split once) in registers. The K, then V, tile comes by cp.async into one buffer whose
-// rows are hd + 8 floats apart (a fragment's rows in different banks): 22 KB of shared memory, 4 blocks an SM.
+// matrices, padded with zeros; keys come in tiles of TC_KT. S = Q K^T (wmma) and O = P V (mma.sync, whose fragment
+// layout is known) are TF32 in three parts (hi hi + hi lo + lo hi, near f32). One pass: an online softmax scales a
+// row's O and sum by exp(old max - new max) each tile. A warp keeps its Q fragments and its O columns in registers.
+// The K, then V, tile comes by cp.async into one buffer whose rows are hd + 8 floats apart: 23 KB a block.
 #define TC_KT 16
+#define TC_PS 20   // P's row stride: the mma.sync A loads fall in different banks
 template <typename F> static __device__ __forceinline__ void tf32_split(const F& f, F& hi, F& lo) {
     for (int i = 0; i < f.num_elements; ++i) {
         hi.x[i] = nvcuda::wmma::__float_to_tf32(f.x[i]);
@@ -599,11 +600,6 @@ template <typename A, typename B, typename C> static __device__ __forceinline__ 
     nvcuda::wmma::mma_sync(c, ah, bl, c);
     nvcuda::wmma::mma_sync(c, al, bh, c);
 }
-template <typename A, typename B, typename C> static __device__ __forceinline__ void mma3(C& c, const A& a, const B& b) {
-    A ah, al;
-    tf32_split(a, ah, al);
-    mma3s(c, ah, al, b);
-}
 // The tile of TC_KT keys (key < 0: zeros) of K or V into the shared tile, by cp.async; the caller commits and waits
 static __device__ __forceinline__ void tc_fetch(const AttArgs& a, const int* keys, const float* KV, int g, int ld, float* tile) {
     for (int x = threadIdx.x; x < TC_KT * a.hd / 4; x += blockDim.x) {
@@ -613,15 +609,32 @@ static __device__ __forceinline__ void tc_fetch(const AttArgs& a, const int* key
     }
     __pipeline_commit();
 }
-static size_t tc_smem(int hd) { return sizeof(float) * ((size_t) TC_KT * (hd + 8) + 5 * 256); }
+// mma.sync m16n8k8 TF32. Lane (g = lane / 4, t = lane % 4) holds a = {A[g][t], A[g+8][t], A[g][t+4], A[g+8][t+4]},
+// b = {B[t][g], B[t+4][g]}, c = {C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]}
+static __device__ __forceinline__ uint32_t to_tf32(float x) {
+    uint32_t r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return r;
+}
+static __device__ __forceinline__ void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+template <int N> static __device__ __forceinline__ void tf32_parts(const float* x, uint32_t* hi, uint32_t* lo) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) { hi[i] = to_tf32(x[i]); lo[i] = to_tf32(x[i] - __uint_as_float(hi[i])); }
+}
+static size_t tc_smem(int hd) { return sizeof(float) * ((size_t) TC_KT * (hd + 8) + 4 * 256 + 16 * TC_PS); }
 __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
-                                                      const int32_t* nsel, const int32_t* dpos, float* o) {
+                                                         const int32_t* nsel, const int32_t* dpos, float* o) {
     using namespace nvcuda;
     typedef wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> FragA;
-    extern __shared__ __align__(32) float tcs[];   // the Q, then K or V, tile [16][ld], 4 partial S, P [16][16]
+    extern __shared__ __align__(32) float tcs[];   // the Q, then K or V, tile [16][ld], 4 partial S, P [16][TC_PS]
     __shared__ int keys[TC_KT];
-    __shared__ float mx[16], sum[16];
+    __shared__ float mx[16], sum[16], alpha[16];
     const int hd = a.hd, ld = hd + 8, G = a.nh / a.nkv, g = blockIdx.x, t = blockIdx.y, w = threadIdx.x >> 5, tid = threadIdx.x, ds = hd / 4;
+    const int gq = (tid & 31) >> 2, tq = tid & 3;   // the lane's mma.sync rows gq, gq + 8 and columns 2 tq, 2 tq + 1
     const int pos = a.pos0 + (dpos ? *dpos : 0) + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
     float* Ks = tcs, *Sp = Ks + TC_KT * ld, *Ps = Sp + 4 * 256;
     const float* qg = q + (size_t) t * a.qld + (size_t) g * G * 2 * hd;   // head h of the group: qg + h * 2 hd
@@ -636,76 +649,86 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
             wmma::load_matrix_sync(f, Ks + w * ds + 8 * j, ld);
             tf32_split(f, qh[j], ql[j]);
         }
-    wmma::fragment<wmma::accumulator, 16, 16, 8, float> oacc[4];   // the warp's columns [w ds, (w + 1) ds), 16 a tile
-    for (int j = 0; j < ds / 16; ++j) wmma::fill_fragment(oacc[j], 0.0f);
-    for (int pass = 0; pass < 2; ++pass)
-        for (int k0 = 0; k0 < n; k0 += TC_KT) {
-            const int nk = min(TC_KT, n - k0);
-            __syncthreads();   // the previous tile (or Q) is read
-            if (tid < TC_KT) {
-                const int k = k0 + tid;
-                keys[tid] = tid >= nk ? -1 : k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+    float oc[8][4];   // the warp's O columns [w ds, (w + 1) ds): 8 n-tiles of 8, in the mma.sync c layout
+#pragma unroll
+    for (int j = 0; j < 8; ++j) oc[j][0] = oc[j][1] = oc[j][2] = oc[j][3] = 0.0f;
+    for (int k0 = 0; k0 < n; k0 += TC_KT) {
+        const int nk = min(TC_KT, n - k0);
+        __syncthreads();   // the previous tile (or Q) is read
+        if (tid < TC_KT) {
+            const int k = k0 + tid;
+            keys[tid] = tid >= nk ? -1 : k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+        }
+        __syncthreads();
+        tc_fetch(a, keys, K, g, ld, Ks);
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> sacc;   // warp w: the dims [w ds, (w + 1) ds) of S
+        wmma::fill_fragment(sacc, 0.0f);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (j < ds / 8) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kb;
+                wmma::load_matrix_sync(kb, Ks + w * ds + 8 * j, ld);   // K^T: the tile [key][dim] read column-major
+                mma3s(sacc, qh[j], ql[j], kb);
             }
-            __syncthreads();
-            tc_fetch(a, keys, K, g, ld, Ks);
-            __pipeline_wait_prior(0);
-            __syncthreads();
-            wmma::fragment<wmma::accumulator, 16, 16, 8, float> sacc;   // warp w: the dims [w ds, (w + 1) ds) of S
-            wmma::fill_fragment(sacc, 0.0f);
+        wmma::store_matrix_sync(Sp + w * 256, sacc, 16, wmma::mem_row_major);
+        __syncthreads();   // S is done with the K tile: V takes it, while the softmax runs
+        tc_fetch(a, keys, V, g, ld, Ks);
+        {   // row r: 8 threads of 2 keys each. The new maximum, the scale of the row's old O and sum, its probabilities
+            const int r = tid >> 3, h = tid & 7;
+            float sc[2], mt = -INFINITY;
+            for (int u = 0; u < 2; ++u) {
+                const int kk = 2 * h + u, x = r * 16 + kk;
+                sc[u] = kk < nk && r < G ? (Sp[x] + Sp[256 + x] + Sp[512 + x] + Sp[768 + x]) * a.scale : -INFINITY;
+                mt = fmaxf(mt, sc[u]);
+            }
+            for (int sh = 1; sh < 8; sh <<= 1) mt = fmaxf(mt, __shfl_xor_sync(FULL, mt, sh));
+            const float m0 = mx[r], m1 = fmaxf(m0, mt);
+            float ps = 0;
+            for (int u = 0; u < 2; ++u) {
+                const float p = sc[u] == -INFINITY ? 0.0f : expf(sc[u] - m1);
+                Ps[r * TC_PS + 2 * h + u] = p;
+                ps += p;
+            }
+            for (int sh = 1; sh < 8; sh <<= 1) ps += __shfl_xor_sync(FULL, ps, sh);
+            if (!h) {
+                const float al = m0 == -INFINITY ? 0.0f : expf(m0 - m1);
+                alpha[r] = al;
+                sum[r] = sum[r] * al + ps;
+                mx[r] = m1;
+            }
+        }
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        const float a0 = alpha[gq], a1 = alpha[gq + 8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { oc[j][0] *= a0; oc[j][1] *= a0; oc[j][2] *= a1; oc[j][3] *= a1; }
+#pragma unroll
+        for (int k8 = 0; k8 < TC_KT; k8 += 8) {
+            const float pv[4] = {Ps[gq * TC_PS + k8 + tq], Ps[(gq + 8) * TC_PS + k8 + tq], Ps[gq * TC_PS + k8 + tq + 4], Ps[(gq + 8) * TC_PS + k8 + tq + 4]};
+            uint32_t ph[4], pl[4];
+            tf32_parts<4>(pv, ph, pl);
 #pragma unroll
             for (int j = 0; j < 8; ++j)
                 if (j < ds / 8) {
-                    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> kb;
-                    wmma::load_matrix_sync(kb, Ks + w * ds + 8 * j, ld);   // K^T: the tile [key][dim] read column-major
-                    if (pass) mma3s(sacc, qh[j], ql[j], kb);
-                    else {   // the row maxima only keep the exponentials in range (the sums normalise): one TF32 part
-                        for (int i = 0; i < kb.num_elements; ++i) kb.x[i] = wmma::__float_to_tf32(kb.x[i]);
-                        wmma::mma_sync(sacc, qh[j], kb, sacc);
-                    }
-                }
-            wmma::store_matrix_sync(Sp + w * 256, sacc, 16, wmma::mem_row_major);
-            __syncthreads();   // S is done with the K tile: V takes it, while the softmax runs
-            if (pass) tc_fetch(a, keys, V, g, ld, Ks);
-            {   // row r: 8 threads of 2 keys each. Pass 0: the row's maximum. Pass 1: its probabilities and their sum
-                const int r = tid >> 3, h = tid & 7;
-                const float m = mx[r];
-                float v = pass ? 0.0f : -INFINITY;
-                for (int kk = 2 * h; kk < 2 * h + 2; ++kk) {
-                    const int x = r * 16 + kk;
-                    const float sc = (Sp[x] + Sp[256 + x] + Sp[512 + x] + Sp[768 + x]) * a.scale;
-                    const int ok = kk < nk && r < G;
-                    if (!pass) v = ok ? fmaxf(v, sc) : v;
-                    else {
-                        const float p = ok ? expf(sc - m) : 0.0f;
-                        Ps[x] = p;
-                        v += p;
-                    }
-                }
-                for (int sh = 1; sh < 8; sh <<= 1) {
-                    const float u = __shfl_xor_sync(FULL, v, sh);
-                    v = pass ? v + u : fmaxf(v, u);
-                }
-                if (!h) { if (!pass) mx[r] = fmaxf(m, v); else sum[r] += v; }
-            }
-            if (!pass) continue;
-            __pipeline_wait_prior(0);
-            __syncthreads();
-            for (int j = 0; j < ds / 16; ++j)
-                for (int k8 = 0; k8 < TC_KT; k8 += 8) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> pa;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> vb;
-                    wmma::load_matrix_sync(pa, Ps + k8, 16);
-                    wmma::load_matrix_sync(vb, Ks + (size_t) k8 * ld + w * ds + j * 16, ld);
-                    mma3(oacc[j], pa, vb);
+                    const float* vb = Ks + (size_t) (k8 + tq) * ld + w * ds + 8 * j + gq;
+                    const float bv[2] = {vb[0], vb[4 * ld]};
+                    uint32_t bh[2], bl[2];
+                    tf32_parts<2>(bv, bh, bl);
+                    mma_tf32(oc[j], ph, bh);
+                    mma_tf32(oc[j], ph, bl);
+                    mma_tf32(oc[j], pl, bh);
                 }
         }
-    __syncthreads();
-    for (int j = 0; j < ds / 16; ++j) wmma::store_matrix_sync(Ks + w * ds + j * 16, oacc[j], hd, wmma::mem_row_major);   // O [16][hd]
-    __syncthreads();
-    for (int x = tid; x < G * hd; x += blockDim.x) {
-        const int h = x / hd, i = x % hd;
-        o[((size_t) t * a.nh + (size_t) g * G + h) * hd + i] = Ks[x] / sum[h] * sigm(qg[(size_t) h * 2 * hd + hd + i]);
     }
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {   // O / sum, gated: rows gq (u < 2) and gq + 8, columns 2 tq + u % 2
+            const int h = gq + 8 * (u >> 1), i = w * ds + 8 * j + 2 * tq + (u & 1);
+            if (j < ds / 8 && h < G) o[((size_t) t * a.nh + (size_t) g * G + h) * hd + i] = oc[j][u] / sum[h] * sigm(qg[(size_t) h * 2 * hd + hd + i]);
+        }
 }
 
 static int attend_tc(const Qwen4Cfg* c) {   // the tensor-core kernel fits, and may take its shared memory
