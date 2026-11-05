@@ -44,13 +44,16 @@ static int begin(Q4Api* e, int seq, const int32_t* ids, int n, int* reused) {
     return 0;
 }
 
+static int env_int(const char* k) { return getenv(k) ? atoi(getenv(k)) : 0; }   // nslm-qwen4-gen's options
+
 Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     if (o->max_seqs > 1 || o->kv_format) {
         snprintf(err, (size_t) errlen, "Qwen3.8-Flash-Next: one sequence slot and the f32 KV cache only (max_seqs %d, kv %d)", o->max_seqs, o->kv_format);
         return NULL;
     }
     const char* mb = getenv("NSLM_EXPERT_VRAM_MB");   // else the expert cache takes the free VRAM
-    Q4EOpts qo = {(int) (o->kv_tokens > 0 ? o->kv_tokens : 4096), 0, NULL, mb ? atof(mb) * 1048576.0 / 1e9 : -1, 0, 0};
+    Q4EOpts qo = {(int) (o->kv_tokens > 0 ? o->kv_tokens : 4096), env_int("Q4E_VRAM_EXPERTS"), getenv("Q4E_PLE_GGUF"),
+                  mb ? atof(mb) * 1048576.0 / 1e9 : -1, env_int("Q4E_STREAM_EXPERTS"), env_int("Q4E_ROWS")};
     Q4Api* e = (Q4Api*) calloc(1, sizeof *e);
     if (!e || !(e->q = q4e_open(o->model_dir, &qo, err, errlen))) { free(e); return NULL; }
     const Qwen4Cfg* c = q4e_cfg(e->q);
@@ -60,7 +63,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     uint64_t h, m;
     int slots;
     q4e_cache_stats(e->q, &h, &m, &slots);
-    snprintf(e->desc, sizeof e->desc, "Qwen3.8-Flash-Next, CUDA engine: %d layers, %d experts, %d cache slots, one sequence of %d positions",
+    snprintf(e->desc, sizeof e->desc, "Qwen3.8-Flash-Next: %d layers, %d experts, %d cache slots, one sequence of %d positions",
              c->n_layer, c->n_exp, slots, e->max_pos);
     return e;
 }

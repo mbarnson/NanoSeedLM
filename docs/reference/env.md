@@ -27,6 +27,10 @@
 | `Q4E_ROUTES=FILE` | off | Qwen3.8-Flash-Next: write the routed experts of each forward, for `tools/qwen4_cache_sim.py` |
 | `Q4E_NO_PREFETCH=1` | off | Qwen3.8-Flash-Next: do not copy the next layer's experts while a prompt layer computes |
 | `Q4E_PLE_THREADS=N` | CPU cores, at most 16 | Qwen3.8-Flash-Next: host threads for the PLE rows of a prompt |
+| `Q4E_VRAM_EXPERTS=1` | off | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --vram-experts` |
+| `Q4E_STREAM_EXPERTS=1` | off | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --stream-experts` |
+| `Q4E_PLE_GGUF=FILE` | | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --ple-gguf FILE` |
+| `Q4E_ROWS=N` | 4096 or 16384 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --prompt-rows N` |
 | `NSLM_SEED_GEMM_F32=1` | off | Keep seed weights in f32 in the prompt GEMM. This changed neither KLD nor NLL, and it costs about 30% of prompt speed at 4K |
 | `NSLM_PREFILL_RANGE` | 8192, or 32768 when the KV cache is partly in host memory | Prompt rows that the engine computes layer by layer at a time. Each range copies the earlier host rows again |
 | `NSLM_MLA_DEC_KEYS` | 8192 (128 MiB of VRAM) | MLA keys that the engine decompresses at a time for prompt rows. 0 attends prompts absorbed, as decode does |
