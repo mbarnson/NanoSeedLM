@@ -144,6 +144,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   decodes P3 code at 69.6 tokens per second, against 47.8 without drafts, with the same text. Chat: +8.5% at 1 draft, -13% at 3.
 - [2026-11-05: The tail skip and the CPU tail on an RTX PRO 6000](results/2026-11-05-qwen38-tail-hf.md): the tail skip
   fails gate DL at R = 7 to 9. The CPU tail keeps the KL but halves decode there: one P3 expert is 1.6 ms of one core.
+- [2026-11-05: The CPU tail on the RTX 4080](results/2026-11-05-qwen38-cpu-tail-4080.md): 14% and 27% slower at 1 and 2
+  CPU experts a layer. A CPU expert costs more than the PCIe 4 copy it saves.
 - [2026-11-05: Trellis-coded experts: weight error](results/2026-11-05-trellis-probe.md): at 3.1 and 4.1 bits a trellis
   has less weighted error than ggml's IQ3_S (3.44 bits) and IQ4_XS (4.25 bits). It saves about 0.4 to 0.5 bits a weight.
 

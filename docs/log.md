@@ -731,3 +731,10 @@ The probe used layer 20's experts, a bitshift trellis with QTIP's computed code,
 At 3.11 bits the weighted error is 0.0158, against 0.0182 for IQ3_S at 3.44 bits. At 4.11 bits it has 0.0042, against 0.0057 for
 IQ4_XS at 4.25 bits. At 2.12 bits it equals IQ2_S at 2.56 bits. It saves about 0.4 to 0.5 bits a weight, and it is
 close to the bound for Gaussian weights. Read [Trellis-coded experts: weight error](results/2026-11-05-trellis-probe.md).
+
+## [2026-11-05] result | The CPU tail on the RTX 4080: slower at every setting
+
+`cb3d6b6`, pc-cuda's RTX 4080, P3, the automatic cache: `--cpu-tail 1` and `2` decode at 31.9 and 26.9 tokens per
+second, against 37.2 without. The CPU removes 22% and 41% of the misses, but one CPU expert takes 240 to 340 us, more
+than the PCIe 4 copy it saves. Plan step D4 closes. Read
+[The CPU tail on the RTX 4080](results/2026-11-05-qwen38-cpu-tail-4080.md).
