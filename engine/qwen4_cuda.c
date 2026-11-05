@@ -19,6 +19,8 @@
 #include "qwen4_ops.h"
 #include "rows.h"
 
+#define Q4E_NEV 8192   // Q4E_PROFILE events of one forward
+
 #define MAXT Q4E_MAX_ROWS
 #define XR Q4E_PASS_ROWS
 
@@ -77,8 +79,8 @@ struct Q4Eng {
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
     MmTile* tiles;
     int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
-    cudaEvent_t ev[1024];
-    int evstage[1024];
+    cudaEvent_t ev[Q4E_NEV];   // a pass of 8,192 rows marks about 2,700 stages
+    int evstage[Q4E_NEV];
     double stage_ms[8];
     void** dev;   // allocations, freed at close
     int ndev, cdev;
@@ -402,7 +404,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->droute = (int32_t*) dmem(e, NULL, sizeof(int32_t) * (size_t) c->n_layer * T * c->top_k);
         e->hroute = (int32_t*) pin(e, sizeof(int32_t) * (size_t) c->n_layer * T * c->top_k);
     }
-    for (int i = 0; e->prof && i < 1024; ++i) cudaEventCreate(&e->ev[i]);
+    for (int i = 0; e->prof && i < Q4E_NEV; ++i) cudaEventCreate(&e->ev[i]);
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     if (!e->err[0] && cudaDeviceSynchronize() != cudaSuccess) fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     if (e->err[0]) { snprintf(err, (size_t) errlen, "%s", e->err); q4e_close(e); return NULL; }
@@ -419,7 +421,7 @@ void q4e_close(Q4Eng* e) {
         for (int i = 0; i < ST_N; ++i)
             if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
         fprintf(stderr, "Q4E_PROFILE: host PLE prefetch %.0f ms, PLE rows %.0f ms (%d threads)\n", e->host_ms[0], e->host_ms[1], e->ple_threads);
-        for (int i = 0; i < 1024; ++i) cudaEventDestroy(e->ev[i]);
+        for (int i = 0; i < Q4E_NEV; ++i) cudaEventDestroy(e->ev[i]);
     }
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
@@ -450,7 +452,7 @@ void q4e_reset(Q4Eng* e) {
 // ---- the stage profiler (Q4E_PROFILE=1): an event after each stage, the time to the previous event added to it -------
 
 static void mark(Q4Eng* e, int stage) {
-    if (!e->prof || e->nev >= 1024) return;
+    if (!e->prof || e->nev >= Q4E_NEV) return;
     cudaEventRecord(e->ev[e->nev], e->s);
     e->evstage[e->nev++] = stage;
 }
