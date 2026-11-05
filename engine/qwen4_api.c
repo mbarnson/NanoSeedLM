@@ -87,7 +87,7 @@ int eng_prefill_cached(Eng* e, int seq, const int32_t* ids, int n, int* reused) 
 int eng_prefill_begin(Eng* e, int seq, const int32_t* ids, int n, int* reused) { return begin(e, seq, ids, n, reused); }
 int eng_prefill_next(Eng* e, int seq, int max_rows) {
     if (seq || max_rows < 1) return -1;
-    const int to = e->at + max_rows < e->n - 1 ? e->at + max_rows : e->n - 1;
+    const int left = e->n - 1 - e->at, to = e->at + (max_rows < left ? max_rows : left);   // max_rows may be INT_MAX
     return fwd(e, to, NULL) ? -1 : e->n - 1 - e->at > 0 ? e->n - 1 - e->at : 0;
 }
 int eng_rewind(Eng* e, int seq, int n) {

@@ -1,5 +1,6 @@
 // tests/test_qwen4_api.c - engine_api.h over the qwen4 engine (engine/qwen4_api.c) on tests/data/qwen4_tiny, against
 // direct qwen4_eng.h calls: steps, extended prompts, rewinds, greedy decode and scoring. Skipped without a GPU.
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,8 @@ int main(void) {
     CHECK(left == 0 && eng_step(e, 0, a) == 0, "prefill in steps (%d)", left);
     direct(q, ids, n, b);
     CHECK(rounds == 3 && same(a, b, V), "the stepped prefill (%d rounds) differs from one prefill", rounds);
+    CHECK(eng_prefill(e, 0, ids, 20) == 0 && eng_prefill_begin(e, 0, ids, n, &reused) == 0 && reused == 19 &&   // nslm-serve's
+          eng_prefill_next(e, 0, INT_MAX) == 0 && eng_step(e, 0, a) == 0 && same(a, b, V), "a kept prefix, then all rows (INT_MAX)");
 
     int32_t out[6], seq = 0;   // greedy decode against the engine's own argmax loop
     CHECK(eng_prefill(e, 0, ids, 20) == 0 && eng_generate(e, &seq, 1, 6, ENG_MODE_AR, out, NULL) == 0, "generate");
