@@ -933,16 +933,20 @@ int kt_q4_qsa(const Qwen4Cfg* c, const float* raw, const float* w, int nb, float
 int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float* V, int npos, int pos0, const int32_t* sel,
                  const int32_t* nsel, float* o, int T) {
     if (c->head_dim % 32 || c->head_dim > 256) { printf("FAIL: kt_q4_attend: head_dim not supported\n"); return -1; }
-    id<MTLComputePipelineState> p = pipe4("k_q4_attend");
+    // as the engine: the grouped kernel (the group's heads as matrix rows) for prompt rows, or with KT_ATTEND_G=1
+    const int grouped = (T > MV_MAXT || getenv("KT_ATTEND_G")) && c->n_head / c->n_kv <= 16;
+    id<MTLComputePipelineState> p = pipe4(grouped ? "k_q4_attend_g" : "k_q4_attend");
     if (!p) return -1;
     const size_t kv = (size_t) npos * c->n_kv * c->head_dim, no = (size_t) T * c->n_head * c->head_dim;
     const int topk = c->ix_budget / c->ix_ratio;
-    id<MTLBuffer> qb = buf(q, 4 * no * 2), Kb = buf(K, 4 * kv), Vb = buf(V, 4 * kv), sb = buf(sel, 4 * (size_t) T * topk),
-                  nb = buf(nsel, 4 * (size_t) T), ob = buf(NULL, 4 * no);
+    id<MTLBuffer> qb = buf(NULL, 4 * (no * 2 + (size_t) 32 * c->head_dim)), Kb = buf(K, 4 * kv), Vb = buf(V, 4 * kv),
+                  sb = buf(sel, 4 * (size_t) T * topk), nb = buf(nsel, 4 * (size_t) T), ob = buf(NULL, 4 * no);
+    memcpy(qb.contents, q, 4 * no * 2);   // + 16 heads of slack: k_q4_attend_g reads its padding heads
     const Q4AttArgs aa = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, topk, pos0, 1.0f / sqrtf((float) c->head_dim), 0};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, p, &aa, sizeof aa, @[qb, Kb, Vb, sb, nb, ob]);
-            [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
+            if (grouped) [e dispatchThreadgroups:TGS(c->n_kv, T) threadsPerThreadgroup:TGS(64, 1)];
+            else [e dispatchThreadgroups:TGS(c->n_head, T) threadsPerThreadgroup:TGS(256, 1)];
         }))
         return -1;
     memcpy(o, ob.contents, 4 * no);

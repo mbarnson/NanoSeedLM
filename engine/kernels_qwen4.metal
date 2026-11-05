@@ -386,5 +386,87 @@ kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float*
     }
 }
 
+// Prompt rows: threadgroup (KV group g, row t), 2 simdgroups for the group's G <= 16 query heads (heads 8 s .. 8 s + 7 of
+// the group; rows past G are padding: q needs 16 heads of slack after the last row).  The keys in tiles of 8, staged in
+// threadgroup memory (the QSA blocks of R keys need not be adjacent), so one load serves all the group's heads; scores
+// Q K^T on f32 simdgroup matrices, an online softmax per head row (lanes 0..7), O = diag(rescale) O + P V.  The same
+// result as k_q4_attend up to the order of the sums.  hd a multiple of 8, <= 256.
+#define ATG_K 8
+kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* K [[buffer(2)]],
+                          device const float* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
+                          device float* o [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sK[ATG_K * 256], sV[ATG_K * 256];
+    threadgroup float sS[2][64], sD[2][64], sL[2][8];
+    const int g = (int) tg.x, t = (int) tg.y, G = a.nh / a.nkv, hd = a.hd, kvw = a.nkv * hd;
+    const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
+    const bool active = (int) sg * 8 < G;
+    const int nj = hd / 8;   // the loops below run to the constant 32 so that O[] stays in registers
+    device const float* qb = q + ((ulong) t * a.nh + (ulong) g * G + sg * 8) * 2 * hd;   // 8 heads, stride 2 hd
+    simdgroup_float8x8 O[32];
+    for (int j = 0; j < 32; ++j) O[j] = simdgroup_float8x8(0);
+    float m = -INFINITY, l = 0;   // lanes 0..7: head row `lane` of this simdgroup
+    for (int k0 = 0; k0 < n; k0 += ATG_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // the previous tile's reads are done
+        for (int x = (int) tid; x < ATG_K * hd; x += 64) {
+            const int r = x / hd, i = x % hd, k = k0 + r;
+            float kv = 0.0f, vv = 0.0f;
+            if (k < n) {
+                const int key = k < ns * a.R ? sel[(ulong) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
+                kv = K[(ulong) key * kvw + (ulong) g * hd + i];
+                vv = V[(ulong) key * kvw + (ulong) g * hd + i];
+            }
+            sK[x] = kv;
+            sV[x] = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!active) continue;
+        simdgroup_float8x8 S = simdgroup_float8x8(0);
+        for (int j = 0; j < 32; ++j) {
+            if (j >= nj) break;
+            simdgroup_float8x8 qm, km;
+            simdgroup_load(qm, qb + j * 8, (ulong) 2 * hd);                    // 8 heads x 8 dims
+            simdgroup_load(km, sK + j * 8, (ulong) hd, ulong2(0, 0), true);    // transposed: 8 dims x 8 keys
+            simdgroup_multiply_accumulate(S, qm, km, S);
+        }
+        simdgroup_store(S, sS[sg], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float cf = 1.0f;
+        if (lane < 8) {
+            float s[8], mx = m;
+            for (int c = 0; c < 8; ++c) { s[c] = k0 + c < n ? sS[sg][lane * 8 + c] * a.scale : -INFINITY; mx = max(mx, s[c]); }
+            cf = exp(m - mx);   // 0 on the first tile (m = -inf; key k0 is visible, so mx is finite)
+            float ps = 0.0f;
+            for (int c = 0; c < 8; ++c) { const float p = exp(s[c] - mx); sS[sg][lane * 8 + c] = p; ps += p; }
+            for (int c = 0; c < 8; ++c) sD[sg][lane * 8 + c] = c == (int) lane ? cf : 0.0f;
+            l = l * cf + ps;
+            m = mx;
+        }
+        const bool rescale = simd_any(lane < 8 && cf != 1.0f);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 P, D;
+        simdgroup_load(P, sS[sg], 8);
+        if (rescale) simdgroup_load(D, sD[sg], 8);
+        for (int j = 0; j < 32; ++j) {
+            if (j >= nj) break;
+            simdgroup_float8x8 vm;
+            simdgroup_load(vm, sV + j * 8, (ulong) hd);   // 8 keys x 8 dims
+            if (rescale) simdgroup_multiply(O[j], D, O[j]);
+            simdgroup_multiply_accumulate(O[j], P, vm, O[j]);
+        }
+    }
+    // the output / l, gated by sigmoid of the query's gate half: through threadgroup memory, only the group's heads
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* sO = sg == 0 ? sK : sV;
+    if (active) {
+        for (int j = 0; j < 32; ++j) if (j < nj) simdgroup_store(O[j], sO + j * 8, (ulong) hd);
+        if (lane < 8) sL[sg][lane] = l;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int h = 0; active && h < 8 && (int) sg * 8 + h < G; ++h)
+        for (int i = (int) lane; i < hd; i += 32)
+            o[((ulong) t * a.nh + (ulong) g * G + sg * 8 + h) * hd + i] = sO[h * hd + i] / sL[sg][h] * sigm(qb[(ulong) h * 2 * hd + hd + i]);
+}
+
 #endif   // __METAL_VERSION__
 #endif   // NSLM_KERNELS_QWEN4_METAL

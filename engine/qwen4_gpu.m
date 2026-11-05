@@ -71,14 +71,15 @@ struct Q4Eng {
     id<MTLComputeCommandEncoder> enc;
     int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage
     int no_split;              // Q4E_NO_SPLIT=1: k_mv for the few-row projections too (A / B)
-    double stage_ms[8];
+    int no_attg;               // Q4E_NO_ATTG=1: prompt rows through k_q4_attend too (A / B)
+    double stage_ms[10];
     char err[256];
 };
 
 // the stages of a forward, for Q4E_PROFILE (as engine/qwen4_cuda.c)
-enum { ST_EMBED, ST_PLE, ST_HC, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
-static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "attention", "gated deltanet", "router",
-                                         "experts", "head"};
+enum { ST_EMBED, ST_PLE, ST_HC, ST_ATTN, ST_QSA, ST_ATTEND, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
+static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "attention: proj", "attention: QSA", "attention: attend",
+                                         "gated deltanet", "router", "experts", "head"};
 
 static int fail(Q4Eng* e, const char* fmt, ...) {
     if (!e->err[0]) {
@@ -507,6 +508,7 @@ static void attention(Q4Eng* e, Layer* L, int T) {
     mv(e, &L->ix, e->x, e->ixo, T);
     store(e, L->raw, D, e->ixo, sizeof(float) * (uint64_t) c->ix_heads * D, iw, T);
     head_norm_rope(e, e->ixo, 0, iw, c->ix_heads, D, D, L->iqn, e->pos, 1, T);
+    mark(e, ST_ATTN);
     // the key blocks these rows complete: the mean of their raw keys, then norm + RoPE at the block's first position
     const int j0 = e->pos / R, j1 = (e->pos + T) / R;
     if (j1 > j0) {
@@ -534,8 +536,11 @@ static void attention(Q4Eng* e, Layer* L, int T) {
         B(e, 3, e->sel, 0);
         tgs(e, (uint64_t) T, 1, 256);
     }
+    mark(e, ST_QSA);
     const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, e->pos, 1.0f / sqrtf((float) hd), 0};
-    [e->enc setComputePipelineState:pipe4(e, "k_q4_attend")];
+    // prompt rows: a KV group's heads as the rows of simdgroup matrices, each key tile loaded once for all of them
+    const int grouped = T > MV_MAXT && c->n_head / c->n_kv <= 16 && hd % 8 == 0 && !e->no_attg;
+    [e->enc setComputePipelineState:pipe4(e, grouped ? "k_q4_attend_g" : "k_q4_attend")];
     A_(e, &aa, sizeof aa);
     B(e, 1, e->qp, 0);
     B(e, 2, L->K, 0);
@@ -543,7 +548,9 @@ static void attention(Q4Eng* e, Layer* L, int T) {
     B(e, 4, e->sel, 0);
     B(e, 5, e->nsel, 0);
     B(e, 6, e->o, 0);
-    tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
+    if (grouped) tgs(e, (uint64_t) c->n_kv, (uint64_t) T, 64);
+    else tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
+    mark(e, ST_ATTEND);
     mv(e, &L->o, e->o, e->br, T);
 }
 
@@ -723,7 +730,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
     if (!e->err[0]) {
         e->x = F(T * c->d); e->H = F(T * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
-        e->br = F(T * c->d); e->qp = F(T * c->n_head * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);
+        e->br = F(T * c->d); e->qp = F((T * c->n_head + 16) * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);   // qp: + 16 heads, k_q4_attend_g's padding
         e->vv = F(T * c->n_kv * c->head_dim); e->o = F(T * c->n_head * c->head_dim); e->ixo = F(T * iw); e->sc = F(T * (size_t) e->nb);
         e->emb = F(T * c->ple_dim * (size_t) (e->nple ? e->nple : 1)); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d);
         e->gated = F(T * HD); e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * ka); e->Gb = F(T * ka); e->Ub = F(T * ka);
@@ -736,6 +743,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
     e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
+    e->no_attg = getenv("Q4E_NO_ATTG") != NULL;
     if (@available(macOS 15.0, *)) {   // the weights and buffers resident on the GPU
         MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
         e->residency = e->err[0] ? nil : [e->dev newResidencySetWithDescriptor:rd error:nil];
