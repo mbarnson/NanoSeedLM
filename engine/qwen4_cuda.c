@@ -521,7 +521,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         const double res = nslm_vram_reserve_mb();
         cudaMemGetInfo(&fr, &to);
         const double most = ((double) fr - res * 1048576.0) / 1e9;
-        if (o->cache_gb > most) fprintf(stderr, "qwen4: expert cache %.1f GB, not %.1f: %.0f MB of VRAM stay free (NSLM_VRAM_RESERVE_MB)\n", most, o->cache_gb, res);
+        if (o->cache_gb > most) fprintf(stderr, "qwen4: expert cache %.2f GB, not %.2f: %.0f MB of VRAM stay free (NSLM_VRAM_RESERVE_MB)\n", most, o->cache_gb, res);
         build_cache(e, o->cache_gb > 0 && o->cache_gb < most ? o->cache_gb : most);
     }
     for (int l = 0; l < c->n_layer; ++l) if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
