@@ -314,11 +314,11 @@ __global__ void __launch_bounds__(256) k_q4_qsa_scores(int nh, int D, const floa
     }
     if (lane == 0) sc[(size_t) t * maxdone + j] = s;
 }
-// Block per row: the k-th largest score by a radix select on its bits (scores are >= 0), then every score above it and,
-// of the equal ones, those of the highest blocks
+// Block per row: the k-th largest score by a radix select on its bits (scores are >= 0), then every score above it in
+// block order (attention sums the keys in this order, so it must not depend on timing) and, of the equal ones, the highest
 __global__ void __launch_bounds__(256) k_q4_qsa_topk(const float* sc, const int32_t* done, int maxdone, int k, int32_t* sel) {
     __shared__ float red[32];
-    __shared__ int nout;
+    __shared__ int nout, wcnt[8];
     const int t = blockIdx.x, n = done[t];
     if (n <= k) return;
     const uint32_t* u = (const uint32_t*) (sc + (size_t) t * maxdone);
@@ -332,8 +332,19 @@ __global__ void __launch_bounds__(256) k_q4_qsa_topk(const float* sc, const int3
     if (threadIdx.x == 0) nout = 0;
     __syncthreads();
     int32_t* out = sel + (size_t) t * k;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) if (u[j] > p) out[atomicAdd(&nout, 1)] = j;
-    __syncthreads();
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    for (int j0 = 0; j0 < n; j0 += 256) {   // a block-wide prefix of the matches
+        const int j = j0 + threadIdx.x, f = j < n && u[j] > p;
+        const uint32_t m = __ballot_sync(FULL, f);
+        if (lane == 0) wcnt[w] = __popc(m);
+        __syncthreads();
+        int before = nout;
+        for (int x = 0; x < w; ++x) before += wcnt[x];
+        if (f) out[before + __popc(m & ((1u << lane) - 1u))] = j;
+        __syncthreads();
+        if (threadIdx.x == 0) for (int x = 0; x < 8; ++x) nout += wcnt[x];
+        __syncthreads();
+    }
     if (threadIdx.x == 0)
         for (int j = n - 1, m = nout; j >= 0 && m < k; --j) if (u[j] == p) out[m++] = j;
 }

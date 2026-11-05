@@ -120,6 +120,27 @@ int main(void) {
         q4e_close(e);
     }
     }
+    {   // a prompt of more than Q4E_LOGIT_ROWS rows in one forward, or in three: the next token's logits bit for bit
+        const int L = 199;
+        int32_t* lid = (int32_t*) malloc(sizeof(int32_t) * (L + 1));
+        for (int i = 0; i <= L; ++i) lid[i] = ids[i % n];
+        float* one = (float*) malloc(sizeof(float) * (size_t) V);
+        float* three = (float*) malloc(sizeof(float) * (size_t) V);
+        e = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
+        CHECK(e != NULL, "open: %s", err);
+        if (e) {
+            CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, one) == 0, "one forward of %d rows: %s", L, q4e_error(e));
+            q4e_reset(e);
+            CHECK(q4e_forward(e, lid, 64, NULL) == 0 && q4e_forward(e, lid + 64, 64, NULL) == 0 && q4e_forward(e, lid + 128, L - 128, NULL) == 0 &&
+                  q4e_forward(e, lid + L, 1, three) == 0, "three forwards: %s", q4e_error(e));
+            int diff = 0;
+            for (int v = 0; v < V; ++v) diff += one[v] != three[v];
+            printf("a prompt of %d rows in one forward or three: %d logits differ\n", L, diff);
+            CHECK(diff == 0, "the prompt's row split changes the next token's logits");
+            q4e_close(e);
+        }
+        free(lid); free(one); free(three);
+    }
     free(got);
     free(again);
     free(big);
