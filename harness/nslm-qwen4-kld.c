@@ -1,5 +1,6 @@
 // harness/nslm-qwen4-kld.c - KL divergence of a qwen4 model against a reference on one text, through the CUDA engine.
 //   nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens 1024] [--expert-cache-gb N [--stream-experts]] [--vram-experts] [--decode N]
+//                  [--ple-gguf FILE] [--ref-ple-gguf FILE]   (the PLE table of the model's or the reference's run from an engram GGUF)
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ int main(int argc, char** argv) {
     int ntok = 1024, dec = 0;
     Q4EOpts o = {0, 0, NULL, 0, 0, 0, 0, 0, 0};
     int tail = 0, ctail = 0;   // --tail-skip, --cpu-tail: the model's run only
+    const char *ple = NULL, *rple = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--ref") && i + 1 < argc) ref = argv[++i];
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -52,9 +54,11 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--stream-experts")) o.stream_experts = 1;
         else if (!strcmp(argv[i], "--tail-skip") && i + 1 < argc) tail = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cpu-tail") && i + 1 < argc) ctail = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ple-gguf") && i + 1 < argc) ple = argv[++i];
+        else if (!strcmp(argv[i], "--ref-ple-gguf") && i + 1 < argc) rple = argv[++i];
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N] [--decode N] [--tail-skip R]\n"); return 2; }
+    if (!ref || !model || !text || ntok < 2) { fprintf(stderr, "usage: nslm-qwen4-kld --ref DIR --model DIR --text FILE [--tokens N] [--decode N] [--tail-skip R] [--cpu-tail N] [--ple-gguf FILE] [--ref-ple-gguf FILE]\n"); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", ref);
     Tok* tok = tok_open(path, err, sizeof err);
@@ -75,6 +79,8 @@ int main(int argc, char** argv) {
     Q4EOpts om = o;
     om.tail_skip = tail;
     om.cpu_tail = ctail;
+    om.ple_gguf = ple;
+    o.ple_gguf = rple;
     if (!lr || !lm || run(ref, &o, ids, n, 0, lr, c.vocab) || run(model, &om, ids, n, dec, lm, c.vocab)) return 1;
     float* kl = (float*) malloc(sizeof(float) * (size_t) n);
     double skl = 0, dkl = 0, nll_r = 0, nll_m = 0;
