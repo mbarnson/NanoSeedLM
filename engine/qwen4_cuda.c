@@ -357,7 +357,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->emb = F(T * c->ple_dim); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d); e->gated = F(T * HD);
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
     e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * ka); e->Gb = F(T * ka); e->Ub = F(T * ka);
-    e->Dx = F(T * c->top_k * c->d); e->sh = F(T * c->d); e->sgv = F(T); e->logits = F(T * c->vocab); e->y = F(T * vd);
+    e->Dx = F(T * c->top_k * c->d); e->sh = F(T * c->d); e->sgv = F(T); e->logits = F((size_t) Q4E_LOGIT_ROWS * c->vocab); e->y = F(T * vd);
     e->cv = F(T * cd); e->qkvb = F(T * cd); e->zb = F(T * vd); e->bb = F(T * c->lin_hv); e->ab = F(T * c->lin_hv);
     e->d_ids = I(T); e->ind = I(T * c->top_k); e->sel = I(T * (c->ix_budget / c->ix_ratio)); e->done = I(T); e->nsel = I(T); e->zero = I(T);
     e->perm = I(T * c->top_k); e->ntiles = I(2 * (size_t) c->n_exp + 3);
@@ -580,8 +580,9 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
     for (int l = 0; l < e->c.n_layer; ++l)   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
         for (int t = 0; e->c.ple[l] >= 0 && t < n; ++t) qwen4_ple_prefetch(&e->nm, e->table, &e->c, &e->ng[e->c.ple[l]], l, e->ids, e->pos + t);
-    for (int i = 0; i < n; i += MAXT) {
-        const int T = n - i < MAXT ? n - i : MAXT;
+    const int step = logits ? Q4E_LOGIT_ROWS : MAXT;
+    for (int i = 0; i < n; i += step) {
+        const int T = n - i < step ? n - i : step;
         if (forward_rows(e, ids + i, T, logits ? logits + (size_t) i * e->c.vocab : NULL)) return -1;
     }
     return 0;

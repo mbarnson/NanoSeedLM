@@ -3,7 +3,8 @@
 #pragma once
 #include <stdint.h>
 
-#define Q4E_MAX_ROWS 128   // rows of one forward: up to MV_MAXT (8) on the matvec kernels, more on the GEMM
+#define Q4E_MAX_ROWS 1024    // rows of one forward without logits: fewer forwards copy each missing expert fewer times
+#define Q4E_LOGIT_ROWS 128   // rows of one forward with logits (the logits take vocab floats a row)
 
 #include "qwen4_cfg.h"
 
