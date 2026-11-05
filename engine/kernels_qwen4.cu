@@ -65,18 +65,39 @@ typedef struct {
 
 // Block = 32 value rows of head hv (grid hv x dv / 32). SPLIT threads hold one row's state column S[hv][.][i] in
 // registers, as float4 runs m of rows ((m SPLIT + p) 4, +4), so the threads read q and k from shared memory without bank
-// conflicts. Tokens are staged GDN_TS at a time. q and k come normalised. y gets the raw read S q (k_q4_gdn_norm gates it).
+// conflicts. Tokens come GDN_TS at a time by cp.async, the next stage while the block works on this one. q and k come
+// normalised. y gets the raw read S q (k_q4_gdn_norm gates it).
 #define GDN_TS 16
 static __device__ __forceinline__ float4 mad4(float4 a, float4 b, float4 c) {
     return make_float4(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y), fmaf(a.z, b.z, c.z), fmaf(a.w, b.w, c.w));
+}
+template <int D4> struct GdnStage {   // a stage's q and k of head kh, v of the block's 32 rows, raw a and b of head hv
+    float4 q[GDN_TS][D4], k[GDN_TS][D4];
+    float4 v[GDN_TS][8];
+    float a[GDN_TS], b[GDN_TS];
+};
+template <int D4>
+static __device__ __forceinline__ void gdn_fetch(const GdnArgs& a, const float* cv, const float* aa, const float* bb, int hv, int kh, int t0,
+                                                 int nt, GdnStage<D4>* st) {
+    for (int x = threadIdx.x; x < nt * D4; x += blockDim.x) {
+        const float* c = cv + (size_t) (t0 + x / D4) * a.cd + 4 * (x % D4);
+        __pipeline_memcpy_async(&st->q[x / D4][x % D4], c + kh * 4 * D4, 16);
+        __pipeline_memcpy_async(&st->k[x / D4][x % D4], c + a.kd + kh * 4 * D4, 16);
+    }
+    for (int x = threadIdx.x; x < nt * 8; x += blockDim.x)
+        __pipeline_memcpy_async(&st->v[x / 8][x % 8], cv + (size_t) (t0 + x / 8) * a.cd + 2 * a.kd + (size_t) hv * a.dv + blockIdx.y * 32 + 4 * (x % 8), 16);
+    if (threadIdx.x < nt) {
+        __pipeline_memcpy_async(&st->a[threadIdx.x], aa + (size_t) (t0 + threadIdx.x) * a.hv + hv, 4);
+        __pipeline_memcpy_async(&st->b[threadIdx.x], bb + (size_t) (t0 + threadIdx.x) * a.hv + hv, 4);
+    }
+    __pipeline_commit();
 }
 template <int DK, int SPLIT>
 __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const float* cv, const float* aa, const float* bb,
                                                             const float* A_log, const float* dt_bias, float* S, float* y, int T) {
     constexpr int DM = DK / SPLIT / 4, D4 = DK / 4;
     const int hv = blockIdx.x, p = threadIdx.x % SPLIT, r = threadIdx.x / SPLIT, i = blockIdx.y * 32 + r, kh = hv / a.rep;
-    __shared__ float4 q[GDN_TS][D4], k[GDN_TS][D4];
-    __shared__ float v[GDN_TS][32], gs[GDN_TS], bs[GDN_TS];
+    __shared__ __align__(16) GdnStage<D4> st[2];
     float4 s[DM];
     float* Sh = S + (size_t) hv * DK * a.dv + i;
 #pragma unroll
@@ -85,35 +106,27 @@ __global__ void __launch_bounds__(32 * SPLIT) k_q4_gdn_step(GdnArgs a, const flo
         s[m] = make_float4(c[0], c[a.dv], c[2 * a.dv], c[3 * a.dv]);
     }
     const float A = expf(A_log[hv]), dtb = dt_bias[hv];
-    for (int t0 = 0; t0 < T; t0 += GDN_TS) {
+    if (T > 0) gdn_fetch<D4>(a, cv, aa, bb, hv, kh, 0, min(GDN_TS, T), &st[0]);
+    for (int t0 = 0, cur = 0; t0 < T; t0 += GDN_TS, cur ^= 1) {
         const int nt = min(GDN_TS, T - t0);
-        __syncthreads();   // the previous tokens are read
-        for (int x = threadIdx.x; x < nt * D4; x += blockDim.x) {
-            const float4* c = (const float4*) (cv + (size_t) (t0 + x / D4) * a.cd);
-            q[x / D4][x % D4] = c[kh * D4 + x % D4];
-            k[x / D4][x % D4] = c[(a.kd + kh * DK) / 4 + x % D4];
-        }
-        for (int x = threadIdx.x; x < nt * 32; x += blockDim.x)
-            v[x / 32][x % 32] = cv[(size_t) (t0 + x / 32) * a.cd + 2 * a.kd + (size_t) hv * a.dv + blockIdx.y * 32 + x % 32];
-        if (threadIdx.x < nt) {
-            const int t = t0 + threadIdx.x;
-            const float ap = aa[(size_t) t * a.hv + hv] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
-            gs[threadIdx.x] = expf(-A * sp);
-            bs[threadIdx.x] = sigm(bb[(size_t) t * a.hv + hv]);
-        }
-        __syncthreads();
+        __pipeline_wait_prior(0);
+        __syncthreads();   // this stage is in, and every thread is done with the other buffer
+        if (t0 + GDN_TS < T) gdn_fetch<D4>(a, cv, aa, bb, hv, kh, t0 + GDN_TS, min(GDN_TS, T - t0 - GDN_TS), &st[cur ^ 1]);
+        const GdnStage<D4>* g4 = &st[cur];
         for (int u = 0; u < nt; ++u) {
+            const float ap = g4->a[u] + dtb, sp = ap > 20.0f ? ap : log1pf(expf(ap));
+            const float g = expf(-A * sp), beta = sigm(g4->b[u]);
             float4 kv4 = make_float4(0, 0, 0, 0), y4 = kv4;
 #pragma unroll
-            for (int m = 0; m < DM; ++m) kv4 = mad4(s[m], k[u][m * SPLIT + p], kv4);
+            for (int m = 0; m < DM; ++m) kv4 = mad4(s[m], g4->k[u][m * SPLIT + p], kv4);
             float kv = (kv4.x + kv4.y) + (kv4.z + kv4.w);
             if (SPLIT == 2) kv += __shfl_xor_sync(FULL, kv, 1);
-            const float g = gs[u], delta = (v[u][r] - g * kv) * bs[u];
+            const float delta = (((const float*) g4->v[u])[r] - g * kv) * beta;
 #pragma unroll
             for (int m = 0; m < DM; ++m) {
-                const float4 kk = k[u][m * SPLIT + p];
+                const float4 kk = g4->k[u][m * SPLIT + p];
                 s[m] = make_float4(g * s[m].x + delta * kk.x, g * s[m].y + delta * kk.y, g * s[m].z + delta * kk.z, g * s[m].w + delta * kk.w);
-                y4 = mad4(s[m], q[u][m * SPLIT + p], y4);
+                y4 = mad4(s[m], g4->q[u][m * SPLIT + p], y4);
             }
             float yq = (y4.x + y4.y) + (y4.z + y4.w);
             if (SPLIT == 2) yq += __shfl_xor_sync(FULL, yq, 1);
