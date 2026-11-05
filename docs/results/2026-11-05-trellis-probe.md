@@ -7,7 +7,9 @@ The trellis saves about 0.4 to 0.5 bits for each weight at the same error, and i
 weights. Our P = 3 and P = 4 seeds are 0.6 to 0.9 bits from that bound.
 
 **Status.** Current. Weight error only, on a sample of rows of one layer. Step T1 of the
-[trellis plan](../plans/2026-11-05-trellis-experts.md).
+[trellis plan](../plans/2026-11-05-trellis-experts.md). Two corrections to the text below (2026-11-05, from the
+page's own errors and output files). The P = 3 and P = 4 seeds are 0.83 to 0.90 bits from the bound, not 0.6 to 0.9.
+At L = 16 the LFSR code has 0.6 to 1.7% more weighted error than 1MAD, not "within 1%".
 
 ## Setup
 
