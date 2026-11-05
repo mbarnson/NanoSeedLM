@@ -81,7 +81,7 @@ struct Q4Eng {
     int prof, nev;                     // Q4E_PROFILE=1: CUDA events between the stages of a forward
     cudaEvent_t ev[Q4E_NEV];   // a pass of 8,192 rows marks about 2,700 stages
     int evstage[Q4E_NEV];
-    double stage_ms[8];
+    double stage_ms[16];
     void** dev;   // allocations, freed at close
     int ndev, cdev;
     void** host;
@@ -90,9 +90,9 @@ struct Q4Eng {
 };
 
 // the stages of a forward, for Q4E_PROFILE
-enum { ST_EMBED, ST_PLE, ST_HC, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
-static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "attention", "gated deltanet", "router + cache",
-                                         "experts", "head"};
+enum { ST_EMBED, ST_PLE, ST_HC, ST_PROJ, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };   // PROJ: attention and DeltaNet projections
+static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "projections", "attention",
+                                         "gated deltanet", "router + cache", "experts", "head"};
 
 static int fail(Q4Eng* e, const char* fmt, ...) {
     if (!e->err[0]) {
@@ -545,6 +545,7 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     kq4_store(e->s, L->K, kvw, e->kk, kvw, 0, e->din, T);
     kq4_store(e->s, L->V, kvw, e->vv, kvw, 0, e->din, T);
     mv(e, &L->ix, e->x, e->ixo, T);
+    mark(e, ST_PROJ);
     kq4_store(e->s, L->raw, D, e->ixo + (size_t) c->ix_heads * D, iw, 0, e->din, T);
     kq4_head_norm_rope(e->s, c, e->ixo, iw, c->ix_heads, D, D, L->iqn, 0, e->din, T);
     kq4_qsa_blocks(e->s, c, L->raw, L->ikn, 0, e->din, T, L->blk);
@@ -552,7 +553,9 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
     kq4_qsa_select(e->s, c, e->ixo, iw, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
     if (kq4_attend(e->s, c, e->qp, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
+    mark(e, ST_ATTN);
     mv(e, &L->o, e->o, e->br, T);
+    mark(e, ST_PROJ);
     return 0;
 }
 
@@ -561,8 +564,11 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
     mv(e, &L->z, e->x, e->zb, T);
     mv(e, &L->b, e->x, e->bb, T);
     mv(e, &L->a, e->x, e->ab, T);
+    mark(e, ST_PROJ);
     if (kq4_gdn(e->s, &e->c, L->gw, e->qkvb, e->zb, e->ab, e->bb, L->conv, L->S, e->cv, e->y, T)) return fail(e, "Gated DeltaNet head widths not supported");
+    mark(e, ST_GDN);
     mv(e, &L->out, e->y, e->br, T);
+    mark(e, ST_PROJ);
     return 0;
 }
 
