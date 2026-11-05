@@ -75,7 +75,10 @@ struct Q4Eng {
     id<MTLBuffer> tok, ind, sel, done, nsel, zero, perm, tiles, apart;   // apart: k_q4_attend_g's split partials
     id<MTLCommandBuffer> cb;   // the forward being encoded
     id<MTLComputeCommandEncoder> enc;
-    int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage; 2: decode rows only
+    int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage; 2: decode rows only;
+                               // 3: decode rows, a command buffer per dispatch, its GPU time added to the kernel (and specialisation)
+    NSString* kname;           // Q4E_PROFILE=3: the pipeline of the next dispatch
+    NSMutableDictionary<NSString*, NSNumber*>* kms, *kcalls;
     int prof_skip;             // this forward's rows are not counted (Q4E_PROFILE=2 and T > MV_MAXT)
     int no_split;              // Q4E_NO_SPLIT=1: k_mv for the few-row projections too (A / B)
     int no_attg;               // Q4E_NO_ATTG=1: prompt rows through k_q4_attend too (A / B)
@@ -122,6 +125,7 @@ static id<MTLBuffer> dbuf(Q4Eng* e, const void* p, size_t n) {   // a shared buf
 static id<MTLComputePipelineState> pipe_g(Q4Eng* e, const char* name, int fmt, int T, int gs) {
     NSString* key = [NSString stringWithFormat:@"%s|%d|%d|%d", name, fmt, T, gs];
     id<MTLComputePipelineState> p = e->pipes[key];
+    if (e->prof == 3) e->kname = key;
     if (p) return p;
     const int q4 = !strncmp(name, "k_q4_", 5);
     NSError* err = nil;
@@ -135,6 +139,7 @@ static id<MTLComputePipelineState> pipe_g(Q4Eng* e, const char* name, int fmt, i
         if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
         fn = [e->lib newFunctionWithName:[NSString stringWithUTF8String:name] constantValues:cv error:&err];
     }
+    if (e->prof == 3) e->kname = key;
     p = fn ? [e->dev newComputePipelineStateWithFunction:fn error:&err] : nil;
     if (!p) { fprintf(stderr, "qwen4 engine: kernel %s: %s\n", name, err ? err.localizedDescription.UTF8String : "not found"); abort(); }
     e->pipes[key] = p;
@@ -158,7 +163,7 @@ static int cmd_wait(Q4Eng* e) {
 }
 // Q4E_PROFILE: the work encoded since the last mark is stage's (its command buffer's GPU time)
 static void mark(Q4Eng* e, int stage) {
-    if (!e->prof || !e->cb) return;
+    if (!e->prof || e->prof == 3 || !e->cb) return;
     id<MTLCommandBuffer> cb = e->cb;
     if (cmd_wait(e)) return;
     if (!e->prof_skip) e->stage_ms[stage] += 1e3 * (cb.GPUEndTime - cb.GPUStartTime);
@@ -166,11 +171,23 @@ static void mark(Q4Eng* e, int stage) {
 }
 static void B(Q4Eng* e, int i, id<MTLBuffer> b, uint64_t off) { [e->enc setBuffer:b offset:off atIndex:(NSUInteger) i]; }
 static void A_(Q4Eng* e, const void* p, size_t n) { [e->enc setBytes:p length:n atIndex:0]; }
+// Q4E_PROFILE=3: the dispatch just encoded runs alone; its GPU time goes to its pipeline's line
+static void kprof(Q4Eng* e) {
+    if (e->prof != 3 || e->prof_skip || !e->cb) return;
+    id<MTLCommandBuffer> cb = e->cb;
+    if (cmd_wait(e)) return;
+    NSString* k = e->kname ? e->kname : @"?";
+    e->kms[k] = @(e->kms[k].doubleValue + 1e3 * (cb.GPUEndTime - cb.GPUStartTime));
+    e->kcalls[k] = @(e->kcalls[k].intValue + 1);
+    cmd_begin(e);
+}
 static void tgs(Q4Eng* e, uint64_t x, uint64_t y, uint64_t tx) {
     [e->enc dispatchThreadgroups:MTLSizeMake(x, y, 1) threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
+    kprof(e);
 }
 static void thr(Q4Eng* e, uint64_t x, uint64_t y, uint64_t tx) {
     [e->enc dispatchThreads:MTLSizeMake(x, y, 1) threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
+    kprof(e);
 }
 
 // ---- weights ---------------------------------------------------------------------------------------------------------
@@ -588,9 +605,11 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
         B(e, 5, e->nsel, dro);
         B(e, 6, e->o, 0);
         B(e, 7, e->apart, 0);
-        if (g) [e->enc dispatchThreadgroups:MTLSizeMake((NSUInteger) c->n_kv, (NSUInteger) T, (NSUInteger) aa.nsplit)
+        if (g) {
+            [e->enc dispatchThreadgroups:MTLSizeMake((NSUInteger) c->n_kv, (NSUInteger) T, (NSUInteger) aa.nsplit)
                   threadsPerThreadgroup:MTLSizeMake(64 * ATG_NQ, 1, 1)];
-        else tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
+            kprof(e);
+        } else tgs(e, (uint64_t) c->n_head, (uint64_t) T, 256);
     }
     if (split) {
         [e->enc setComputePipelineState:pipe4(e, "k_q4_attend_comb")];
@@ -908,6 +927,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     e->prof = getenv("Q4E_PROFILE") ? atoi(getenv("Q4E_PROFILE")) : 0;
+    e->kms = [NSMutableDictionary new];
+    e->kcalls = [NSMutableDictionary new];
     e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
     e->no_attg = getenv("Q4E_NO_ATTG") != NULL;
     e->no_splitk = getenv("Q4E_NO_SPLITK") != NULL;
@@ -931,7 +952,15 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 
 void q4e_close(Q4Eng* e) {
     if (!e) return;
-    if (e->prof) {
+    if (e->prof == 3) {
+        double total = 0;
+        for (NSString* k in e->kms) total += e->kms[k].doubleValue;
+        fprintf(stderr, "Q4E_PROFILE=3: %.0f ms of decode GPU time (a command buffer per dispatch; kernel|format|T|group)\n", total);
+        NSArray* keys = [e->kms keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber* a, NSNumber* b) { return [b compare:a]; }];
+        for (NSString* k in keys)
+            fprintf(stderr, "  %-32s %8d calls %9.1f ms %7.2f us a call %5.1f%%\n", k.UTF8String, e->kcalls[k].intValue, e->kms[k].doubleValue,
+                    1e3 * e->kms[k].doubleValue / e->kcalls[k].intValue, 100 * e->kms[k].doubleValue / (total > 0 ? total : 1));
+    } else if (e->prof) {
         double total = 0;
         for (int i = 0; i < ST_N; ++i) total += e->stage_ms[i];
         fprintf(stderr, "Q4E_PROFILE: %.0f ms of GPU time (a command buffer per stage)\n", total);
@@ -984,7 +1013,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         nsel[t] = done[t] > e->kq ? e->kq : 0;
     }
     if (ple_rows(e, T)) return -1;
-    e->prof_skip = e->prof == 2 && T > MV_MAXT;
+    e->prof_skip = e->prof >= 2 && T > MV_MAXT;
     cmd_begin(e);
     embed(e, T);
     mark(e, ST_EMBED);
