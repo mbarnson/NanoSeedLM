@@ -93,7 +93,7 @@ target_link_libraries(nslm_engine PUBLIC nslm CUDA::cudart_static)
 set_target_properties(nslm_engine PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 # ---- the tools ------------------------------------------------------------------------------------------------------
-add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/tool_calls.c harness/kv_disk.c
+add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/chat_model.c harness/tool_calls.c harness/kv_disk.c
             $<IF:$<BOOL:${APPLE}>,harness/telemetry.m,harness/telemetry_nvml.c>)
 target_include_directories(nslm_harness PUBLIC harness)
 if(WIN32)

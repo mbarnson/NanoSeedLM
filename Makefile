@@ -23,7 +23,7 @@ PY        ?= python3
 NSLM_LIB  := $(wildcard nslm/lib_*.c)
 NSLM_HDRS := $(wildcard nslm/*.h)
 ENGINE    := engine/mova_gpu.m nslm/lib_model_st.c nslm/lib_json.c nslm/lib_mova_cfg.c nslm/lib_mova_ckpt.c nslm/lib_moe.c nslm/lib_format.c nslm/lib_sha256.c
-HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/tool_calls.c harness/kv_disk.c
+HARNESS   := harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/chat_model.c harness/tool_calls.c harness/kv_disk.c
 HARN_HDRS := $(wildcard harness/*.h)
 ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm/model_st.h nslm/json.h nslm/mova_cfg.h nslm/mova_ckpt.h nslm/lfsr.h
 

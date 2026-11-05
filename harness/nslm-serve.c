@@ -1,15 +1,15 @@
-// harness/nslm-serve.c - OpenAI-compatible HTTP server for K2-Horizon-MoVA on the nslm engine.
+// harness/nslm-serve.c - OpenAI-compatible HTTP server for K2-Horizon-MoVA or Qwen3.8-Flash-Next on the nslm engine.
 //
 //   nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080]
 //              [--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]
 //              [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048] [--kv-disk-days 30]
-//   nslm-serve --render REQUEST.json     print the prompt a chat request renders to, and exit
+//   nslm-serve --render REQUEST.json [--model DIR]     print the prompt a chat request renders to, and exit
 //
 // GET /v1/models, GET /health, POST /v1/chat/completions, POST /v1/completions (stream or not).
-// Chat prompts: harness/chat_template.c (the model's chat_template.jinja, tools included).  Tool calls in the output
-// come back as OpenAI tool_calls (harness/tool_calls.c).  The thinking span is returned as reasoning_content.
-// Sampling defaults: IFM's model card (temperature 1.0, top_p 0.95); temperature 0 is greedy.  reasoning_effort defaults
-// to high when a request names none.
+// Chat prompts: the model's chat template, tools included (harness/chat_model.h).  Tool calls in the output come back
+// as OpenAI tool_calls (harness/tool_calls.c).  The thinking span is returned as reasoning_content.  Sampling
+// defaults: the model cards (temperature 1.0, top_p 0.95; Qwen top_k 20); temperature 0 is greedy.  reasoning_effort
+// defaults to the template's (K2 high, Qwen xhigh).  Qwen: one sequence slot, no cold cache.
 // Continuous batching: a scheduler thread owns the engine; each request gets one of --max-seqs sequence slots (--ctx
 // tokens each; default: as many as free memory holds), the idle slot whose cache shares the longest prefix with the
 // prompt.  Every scheduler step computes one prompt chunk of one slot and one decode step of every decoding slot, each
@@ -52,7 +52,7 @@ typedef int sock_t;
 #endif
 #include <pthread.h>
 
-#include "chat_template.h"
+#include "chat_model.h"
 #include "engine_api.h"
 #include "json.h"
 #include "kv_disk.h"
@@ -70,12 +70,11 @@ typedef int sock_t;
 #define MAX_CONNS 64             // connections served at once; more are answered 503 and closed
 #define READ_DEADLINE_S 60.0     // a request must arrive whole within this
 #define IO_TIMEOUT_MS 60000      // one stalled recv / send (a client that stops reading ends its generation)
-#define TOK_EOS 1         // <|ifm|endoftext|>
-#define TOK_IM_END 250019 // <|ifm|im_end|>
 
 static char g_model_id[256];
 static Eng* g_eng;
 static Tok* g_tok;
+static ChatModel g_cm;
 static int g_ctx = 65536;
 static int g_max_seqs = 1;
 static KvDisk* g_kvd;      // the cold cache, or NULL
@@ -247,24 +246,25 @@ static const char* str_or(const Json* o, const char* k, const char* def) {
     return v ? v->s : def;
 }
 
-// The chat prompt for a request (malloc'd), or NULL with err.  *close_tag: the thinking close of the effort;
-// *tools_out: the tools in effect (or NULL).
+// The chat prompt for a request (malloc'd), or NULL with err.  *close_tag: the close of the thinking span the prompt
+// opens (NULL: none); *tools_out: the tools in effect (or NULL).
 static char* chat_prompt(Json* req, const char** close_tag, const Json** tools_out, char* err, int errlen) {
     const Json* kw = jfield(req, "chat_template_kwargs", J_OBJ);
     const char* effort = str_or(req, "reasoning_effort", NULL);
     const Json* rs = jfield(req, "reasoning", J_OBJ);
     if (rs) effort = str_or(rs, "effort", effort);
-    effort = str_or(kw, "reasoning_effort", effort ? effort : "high");
-    if (!strcmp(effort, "minimal")) effort = "low";
+    effort = cm_effort(&g_cm, str_or(kw, "reasoning_effort", effort));
+    const Json *th = json_get(kw, "enable_thinking"), *pt = json_get(kw, "preserve_thinking");
     Json* messages = json_get(req, "messages");
     if (ct_normalize(messages, err, errlen)) return NULL;
     const Json* tools = json_get(req, "tools");
     const Json* tc = jfield(req, "tool_choice", J_STR);
     if (tc && !strcmp(tc->s, "none")) tools = NULL;
-    CtOpts o = {str_or(kw, "tool_presentation_format", NULL), str_or(kw, "tool_call_format", NULL), effort, 1};
-    char* p = ct_render(messages, tools, &o, err, errlen);
+    CtOpts o = {str_or(kw, "tool_presentation_format", NULL), str_or(kw, "tool_call_format", NULL), effort, 1,
+                th && th->t == J_FALSE, pt && pt->t == J_FALSE};
+    char* p = cm_render(&g_cm, messages, tools, &o, err, errlen);
     if (!p) return NULL;
-    *close_tag = !strcmp(effort, "low") ? "</ifm|think_faster>" : !strcmp(effort, "medium") ? "</ifm|think_fast>" : "</ifm|think>";
+    *close_tag = cm_close_tag(&g_cm, &o);
     *tools_out = json_truthy(tools) ? tools : NULL;
     return p;
 }
@@ -290,7 +290,7 @@ typedef struct {
     bool chat, stream, include_usage;
     char** stops;
     int nstops;
-    const char* close_tag;          // the prompt's "</ifm|think...>" for chat (any of the three closes); NULL for raw completions
+    const char* close_tag;          // the close of the prompt's thinking span (any close ends it); NULL: no thinking span
     const Json* tools;              // tools in effect: content is scanned for tool calls
     char id_[64];
     const char* model;
@@ -376,18 +376,14 @@ static bool emit_text(Conn* c, Gen* g, const char* text, size_t n, bool reasonin
     buf_put(&g->content, text, n);
     return flush_content(c, g, false);
 }
-// The template already opens thinking, but models can echo an opening tag.
-static const char* thinking_tags[] = {
-    "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>",
-    "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>"
-};
+// The template already opens thinking, but models can echo an opening tag (the model's tags: g_cm.tags).
 static const char* find_thinking_tag(const char* b, size_t from, size_t upto, size_t* tl, bool* closing) {
     for (size_t i = from; i < upto; ++i)
-        for (size_t t = 0; t < sizeof thinking_tags / sizeof *thinking_tags; ++t) {
-            const size_t l = strlen(thinking_tags[t]);
-            if (i + l <= upto && !memcmp(b + i, thinking_tags[t], l)) {
+        for (int t = 0; t < 2 * g_cm.ntags; ++t) {
+            const size_t l = strlen(g_cm.tags[t]);
+            if (i + l <= upto && !memcmp(b + i, g_cm.tags[t], l)) {
                 *tl = l;
-                *closing = thinking_tags[t][1] == '/';
+                *closing = t >= g_cm.ntags;
                 return b + i;
             }
         }
@@ -396,10 +392,10 @@ static const char* find_thinking_tag(const char* b, size_t from, size_t upto, si
 // Keep a partial delimiter until the next decoded chunk; never emit its prefix as reasoning.
 static size_t thinking_tag_suffix(const char* b, size_t from, size_t upto) {
     size_t keep = 0;
-    for (size_t t = 0; t < sizeof thinking_tags / sizeof *thinking_tags; ++t) {
-        const size_t tl = strlen(thinking_tags[t]) - 1, max = tl < upto - from ? tl : upto - from;
+    for (int t = 0; t < 2 * g_cm.ntags; ++t) {
+        const size_t tl = strlen(g_cm.tags[t]) - 1, max = tl < upto - from ? tl : upto - from;
         for (size_t k = max; k > keep; --k)
-            if (!memcmp(b + upto - k, thinking_tags[t], k)) { keep = k; break; }
+            if (!memcmp(b + upto - k, g_cm.tags[t], k)) { keep = k; break; }
     }
     return keep;
 }
@@ -686,7 +682,7 @@ static void* scheduler(void* arg) {
             const int rc = eng_step_batch(g_eng, seqs, n, logits);
             for (int k = 0; k < n && !rc; ++k) {
                 tok[k] = sample_job(dec[k], logits + (size_t) k * V, V);
-                if (tok[k] != TOK_EOS && tok[k] != TOK_IM_END && dec[k]->nout < dec[k]->max_tokens) {
+                if (!cm_stop(&g_cm, tok[k]) && dec[k]->nout < dec[k]->max_tokens) {
                     eng_push(g_eng, seqs[k], tok[k]);
                     slot_push(&g_slots[seqs[k]], tok[k]);
                 }
@@ -695,7 +691,7 @@ static void* scheduler(void* arg) {
             for (int k = 0; k < n; ++k) {
                 Job* j = dec[k];
                 if (rc) { g_slots[seqs[k]].len = 0; j->failed = j->done = true; }
-                else if (tok[k] == TOK_EOS || tok[k] == TOK_IM_END) j->eos = j->done = true;
+                else if (cm_stop(&g_cm, tok[k])) j->eos = j->done = true;
                 else {
                     j->out[j->nout++] = tok[k];
                     j->done = j->nout >= j->max_tokens;
@@ -868,7 +864,7 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     g.top_p = v ? jnumber(v) : 0.95;
     if (g.top_p <= 0 || g.top_p > 1) g.top_p = 1;
     v = jfield(req, "top_k", J_NUM);
-    g.top_k = v ? (int) jclamp(v, 0, INT32_MAX) : 0;
+    g.top_k = v ? (int) jclamp(v, 0, INT32_MAX) : g_cm.top_k;
     v = jfield(req, "min_p", J_NUM);
     g.min_p = v ? jnumber(v) : 0;
     v = jfield(req, "seed", J_NUM);
@@ -901,15 +897,15 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
         g.close_tag = tag;
         g.tools = tools;
         if (g.reasoning_budget > 0) {
-            g.reasoning_close = -1;
-            for (int i = 0; i < 3; ++i) {
+            g.reasoning_close = g.reasoning_closes[0] = g.reasoning_closes[1] = g.reasoning_closes[2] = -1;
+            for (int i = 0; i < g_cm.ntags; ++i) {
                 int32_t id = -1;
-                if (tok_encode(g_tok, thinking_tags[i + 3], 0, &id, 1) != 1) {
+                if (tok_encode(g_tok, g_cm.tags[g_cm.ntags + i], 0, &id, 1) != 1) {
                     free(prompt); free(g.stops); json_free(req);
-                    send_error(c, 400, "reasoning budget requires native IFM thinking tokens"); return;
+                    send_error(c, 400, "reasoning budget requires native thinking tokens"); return;
                 }
                 g.reasoning_closes[i] = id;
-                if (tag && !strcmp(tag, thinking_tags[i + 3])) g.reasoning_close = id;
+                if (tag && !strcmp(tag, g_cm.tags[g_cm.ntags + i])) g.reasoning_close = id;
             }
             if (g.reasoning_close < 0) {
                 free(prompt); free(g.stops); json_free(req);
@@ -960,7 +956,7 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
         char* vis = NULL;
         Json* parsed = NULL;
         char err[256];
-        if (tc_parse(g.content.p, g.tools, &vis, &parsed, err, sizeof err) == 0) {
+        if (cm_tool_calls(&g_cm, g.content.p, g.tools, &vis, &parsed, err, sizeof err) == 0) {
             free(content);
             content = vis;
             if (parsed->n) { calls = openai_calls(parsed, g.stream); g.finish = "tool_calls"; }
@@ -1129,6 +1125,7 @@ static void base_name(const char* path, char* out, size_t cap) {
 
 // The --max-seqs default: slots of --ctx tokens in half of the memory available beyond the weights (1 .. 16).
 static int default_max_seqs(const char* model, int kv_format) {
+    if (g_cm.qwen) return 1;   // the qwen4 engine holds one sequence
     MovaCfg c;
     char err[256];
     if (mova_cfg_load(&c, model, err, sizeof err)) return 1;
@@ -1149,15 +1146,17 @@ static int default_max_seqs(const char* model, int kv_format) {
 
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
-    if (opt(argc, argv, "--render", NULL)) return render_file(opt(argc, argv, "--render", NULL));
     const char *model = opt(argc, argv, "--model", NULL), *host = opt(argc, argv, "--host", "127.0.0.1");
+    char err[512] = "", tpath[1100];
+    cm_open(&g_cm, model, NULL, err, sizeof err);   // the template's model (K2 without --model); stop tokens below
+    if (opt(argc, argv, "--render", NULL)) return render_file(opt(argc, argv, "--render", NULL));
     const int port = atoi(opt(argc, argv, "--port", "8080"));
     g_ctx = atoi(opt(argc, argv, "--ctx", "65536"));
     if (opt_flag(argc, argv, "--quiet")) g_verbose = 0;
     if (!model || g_ctx < 64) {
         fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
                         "[--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]\n"
-                        "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048] [--kv-disk-days 30]\n       nslm-serve --render REQUEST.json\n");
+                        "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048] [--kv-disk-days 30]\n       nslm-serve --render REQUEST.json [--model DIR]\n");
         return 2;
     }
     char base[256];
@@ -1182,10 +1181,10 @@ int main(int argc, char** argv) {
     o.max_seqs = g_max_seqs;
     o.kv_tokens = (int64_t) g_ctx * g_max_seqs;
 
-    char err[512] = "", tpath[1100];
     snprintf(tpath, sizeof tpath, "%s/tokenizer.json", model);
     g_tok = tok_open(tpath, err, sizeof err);
     if (!g_tok) { fprintf(stderr, "tokenizer: %s\n", err); return 1; }
+    if (cm_open(&g_cm, model, g_tok, err, sizeof err)) { fprintf(stderr, "tokenizer: %s\n", err); return 1; }
     const double t0 = now_s();
     g_eng = eng_open(&o, err, sizeof err);
     if (!g_eng) { fprintf(stderr, "engine: %s\n", err); return 1; }
@@ -1194,12 +1193,18 @@ int main(int argc, char** argv) {
     fprintf(stderr, "nslm-serve: loaded in %.1f s: %s; weights %.2f GB, KV %.2f GB, GPU %.2f GB\n", now_s() - t0,
             eng_describe(g_eng), (m.weights + m.lut) / 1e9, m.kv / 1e9, m.gpu_allocated / 1e9);
     {   // build the pipelines before the first request: prompts, and decode steps of 1 .. 8 slots
-        int32_t w[64], out[8];
-        const int n = tok_encode(g_tok, "<|ifm|begin_of_text|><|ifm|im_start|>user\nHi<|ifm|im_end|><|ifm|im_start|>assistant\n", 0, w, 64);
+        int32_t w[256], out[8];
+        const char* hi = "[{\"role\":\"user\",\"content\":\"Hi\"}]";
+        Json* msgs = json_parse(hi, strlen(hi), NULL, 0);
+        const CtOpts co = {NULL, NULL, NULL, 1, 0, 0};
+        char* wp = cm_render(&g_cm, msgs, NULL, &co, err, sizeof err);
+        const int n = wp ? tok_encode(g_tok, wp, 0, w, 256) : -1;
+        free(wp);
+        json_free(msgs);
         int seqs[8];
         for (int k = 0; k < 8 && k < g_max_seqs; ++k) {
             seqs[k] = k;
-            if (eng_prefill(g_eng, k, w, n) || eng_generate(g_eng, seqs, k + 1, 1, ENG_MODE_AR, out, NULL)) {
+            if (n < 1 || n > 256 || eng_prefill(g_eng, k, w, n) || eng_generate(g_eng, seqs, k + 1, 1, ENG_MODE_AR, out, NULL)) {
                 fprintf(stderr, "engine: warm-up failed\n");
                 return 1;
             }
@@ -1209,7 +1214,8 @@ int main(int argc, char** argv) {
     g_slots = (Slot*) calloc((size_t) g_max_seqs, sizeof(Slot));
     const double kv_gb = atof(opt(argc, argv, "--kv-disk-gb", "32"));
     g_kv_min = atoi(opt(argc, argv, "--kv-disk-min", "2048"));
-    if (kv_gb > 0) {
+    if (kv_gb > 0 && !eng_kv_bytes(g_eng)) fprintf(stderr, "nslm-serve: cold cache off (the engine cannot save its cache)\n");
+    else if (kv_gb > 0) {
         char kdir[1100], kerr[256] = "";
         const char* la = getenv("LOCALAPPDATA");   // Windows
         if (la) snprintf(kdir, sizeof kdir, "%s/nslm/kv", la);

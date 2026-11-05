@@ -1,27 +1,26 @@
-// harness/nslm-chat.c - single-turn chat with K2-Horizon-MoVA through the engine, streaming the reply to stdout.
+// harness/nslm-chat.c - single-turn chat with K2-Horizon-MoVA or Qwen3.8-Flash-Next through the engine, streaming the
+// reply to stdout.
 //
-//   nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N]
-//             [--system TEXT] [--effort high|medium|low] [--kv bf16|q8|fp8|fp4] [--ctx N] [--print-ids]
-//             ("prompt text" | --prompt-file FILE)
+//   nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N] [--system TEXT]
+//             [--effort E] [--no-think] [--kv bf16|q8|fp8|fp4] [--ctx N] [--print-ids] ("prompt text" | --prompt-file FILE)
 //
-// The prompt is MoVA's chat_template.jinja rendered for an optional system message and one user message, with the
-// generation prompt (reasoning effort high = <ifm|think>, the template's default).  temp 0 = greedy (arg max, ties to
-// the lowest id); temp > 0 = the MLX reference sampler's pick(): p ~ exp((l - l_max) / T) in double, splitmix64 seeded
-// with --seed, u = (z >> 11) 2^-53 * sum, the first index whose cumulative sum exceeds u.  Stops at
-// <|ifm|endoftext|> (1) or <|ifm|im_end|> (250019).  Timing goes to stderr.  --kv q8 / fp8 / fp4: smaller KV caches (long
-// contexts); --ctx: the KV capacity (default: the prompt and the reply).
+// The prompt is the model's chat template (harness/chat_model.h) rendered for an optional system message and one user
+// message, with the generation prompt.  --effort: K2 high (default), medium or low; Qwen xhigh (default), medium or
+// low; --no-think: Qwen without thinking.  temp 0 = greedy (arg max, ties to the lowest id); temp > 0 = the MLX
+// reference sampler's pick(): p ~ exp((l - l_max) / T) in double, splitmix64 seeded with --seed, u = (z >> 11) 2^-53 *
+// sum, the first index whose cumulative sum exceeds u.  Stops at the model's end-of-text or end-of-turn token.  Timing
+// goes to stderr.  --kv q8 / fp8 / fp4: smaller KV caches (long contexts); --ctx: the KV capacity (default: the prompt
+// and the reply).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "chat_model.h"
 #include "engine_api.h"
 #include "json.h"
 #include "platform.h"
 #include "tokenizer.h"
-
-#define TOK_EOT 1
-#define TOK_IM_END 250019
 
 static uint64_t splitmix(uint64_t* s) {
     *s += 0x9E3779B97F4A7C15ull;
@@ -32,8 +31,9 @@ static uint64_t splitmix(uint64_t* s) {
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0]\n"
-                    "                 [--seed N] [--system TEXT] [--effort high|medium|low] [--print-ids] \"prompt text\"\n");
+    fprintf(stderr, "usage: nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N] [--system TEXT]\n"
+                    "                 [--effort E] [--no-think] [--kv bf16|q8|fp8|fp4] [--ctx N] [--print-ids]\n"
+                    "                 (\"prompt text\" | --prompt-file FILE)\n");
     return 2;
 }
 
@@ -50,14 +50,15 @@ static size_t utf8_complete(const unsigned char* b, size_t n) {
 
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
-    const char *model = NULL, *res = "out/res", *system = NULL, *effort = "high", *prompt = NULL;
-    int max_tokens = 512, print_ids = 0, kvf = 0, ctx = 0;
+    const char *model = NULL, *res = "out/res", *system = NULL, *effort = NULL, *prompt = NULL;
+    int max_tokens = 512, print_ids = 0, kvf = 0, ctx = 0, no_think = 0;
     double temp = 0;
     uint64_t seed = 0;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         const int has_val = i + 1 < argc;
         if (!strcmp(a, "--print-ids")) print_ids = 1;
+        else if (!strcmp(a, "--no-think")) no_think = 1;
         else if (!strcmp(a, "--model") && has_val) model = argv[++i];
         else if (!strcmp(a, "--res") && has_val) res = argv[++i];
         else if (!strcmp(a, "--max-tokens") && has_val) max_tokens = atoi(argv[++i]);
@@ -78,34 +79,35 @@ int main(int argc, char** argv) {
         else return usage();
     }
     if (!model || !prompt || max_tokens < 1) return usage();
-    const char* think = !strcmp(effort, "high") ? "<ifm|think>" : !strcmp(effort, "medium") ? "<ifm|think_fast>"
-                      : !strcmp(effort, "low") ? "<ifm|think_faster>" : NULL;
-    if (!think) { fprintf(stderr, "--effort must be high, medium or low\n"); return 2; }
-
-    Buf text = {0};
-    buf_puts(&text, "<|ifm|begin_of_text|>");
-    if (system) { buf_puts(&text, "<|ifm|im_start|>system\n"); buf_puts(&text, system); buf_puts(&text, "<|ifm|im_end|>"); }
-    buf_puts(&text, "<|ifm|im_start|>user\n");
-    buf_puts(&text, prompt);
-    buf_puts(&text, "<|ifm|im_end|><|ifm|im_start|>assistant\n");
-    buf_puts(&text, think);
-    buf_puts(&text, "\n");
 
     char err[512] = "";
     char tpath[2048];
     snprintf(tpath, sizeof tpath, "%s/tokenizer.json", model);
     Tok* tok = tok_open(tpath, err, sizeof err);
     if (!tok) { fprintf(stderr, "tokenizer: %s\n", err); return 1; }
+    ChatModel cm;
+    if (cm_open(&cm, model, tok, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
+    Json* msgs = json_new(J_ARR);
+    for (int r = !system; r < 2; ++r) {
+        Json* m = json_new(J_OBJ);
+        json_set(m, "role", json_str(r ? "user" : "system"));
+        json_set(m, "content", json_str(r ? prompt : system));
+        json_push(msgs, m);
+    }
+    const CtOpts co = {NULL, NULL, cm_effort(&cm, effort), 1, no_think, 0};
+    char* text = cm_render(&cm, msgs, NULL, &co, err, sizeof err);
+    json_free(msgs);
+    if (!text) { fprintf(stderr, "template: %s\n", err); return 2; }
     int cap = 4096, n;
     int32_t* ids = NULL;
     for (;;) {
         ids = (int32_t*) realloc(ids, sizeof(int32_t) * (size_t) cap);
-        n = tok_encode(tok, text.p, 0, ids, cap);
+        n = tok_encode(tok, text, 0, ids, cap);
         if (n < 0) { fprintf(stderr, "tokenizer: cannot encode the prompt\n"); return 1; }
         if (n <= cap) break;
         cap = n;
     }
-    free(text.p);
+    free(text);
     if (print_ids) {
         for (int i = 0; i < n; ++i) fprintf(stderr, "%s%d", i ? "," : "prompt ids: ", ids[i]);
         fprintf(stderr, "\n");
@@ -148,7 +150,7 @@ int main(int argc, char** argv) {
             pick = lo < V ? lo : b;
         }
         if (s == 0) t1 = now_s();
-        if (pick == TOK_EOT || pick == TOK_IM_END) { finish = "stop"; break; }
+        if (cm_stop(&cm, pick)) { finish = "stop"; break; }
         eng_push(e, 0, pick);
         ++ngen;
         char* piece = tok_decode(tok, &pick, 1, NULL);

@@ -1,6 +1,6 @@
 // tests/test_serve_splitter.c - parts of the server (harness/nslm-serve.c) without a model or a socket: the thinking /
 // answer splitter (every byte split of each case, and one-byte feeds, must give the same reasoning and content), JSON
-// output of invalid UTF-8, and the clamping of request numbers.
+// output of invalid UTF-8, the clamping of request numbers, and Qwen3.8-Flash-Next's thinking tags.
 #define main nslm_server_main
 #include "../harness/nslm-serve.c"
 #undef main
@@ -167,4 +167,17 @@ static int budget_tests(void) {
     printf("reasoning budget validation, forced close, natural closes, zero-budget RNG identity: %s\n", failed ? "FAILED" : "passed");
     return failed;
 }
-int main(void) { return original_splitter_tests() + budget_tests() ? 1 : 0; }
+static int qwen_splitter_tests(void) {   // Qwen3.8-Flash-Next's <think> span: K2's tags are text there
+    cm_init(&g_cm, 1);
+    int failed = check("plan\n</think>\n\nanswer", "plan", "answer", true);
+    failed += check("<think>\nplan\n</think>\n\nanswer", "\nplan", "answer", true);
+    failed += check("plan</ifm|think>answer", "plan</ifm|think>answer", "", true);
+    failed += check("plan</thi", "plan</thi", "", true);
+    printf("Qwen thinking splitter: %s\n", failed ? "FAILED" : "passed");
+    cm_init(&g_cm, 0);
+    return failed;
+}
+int main(void) {
+    cm_init(&g_cm, 0);
+    return original_splitter_tests() + budget_tests() + qwen_splitter_tests() ? 1 : 0;
+}
