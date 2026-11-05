@@ -428,13 +428,15 @@ static int bucket(Q4Eng* e, int T, int cap) {   // tiles of at most cap pairs
 // ---- the qwen4 kernels (engine/kernels_qwen4.metal) -------------------------------------------------------------------
 
 static void norm1p_o(Q4Eng* e, id<MTLBuffer> X, uint64_t xo, int len, int g, id<MTLBuffer> w, id<MTLBuffer> Y, int T) {
-    const Q4NormArgs a = {len, g, e->c.eps, 0};
+    // few groups (decode rows): up to 8 threadgroups a group, each writing a slice; not in place (the others still read x)
+    const int ng = T * (len / g), parts = X == Y || ng >= 32 ? 1 : ng >= 16 ? 2 : ng >= 8 ? 4 : 8;
+    const Q4NormArgs a = {len, g, e->c.eps, parts};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_norm1p")];
     A_(e, &a, sizeof a);
     B(e, 1, X, xo);
     B(e, 2, w, 0);
     B(e, 3, Y, 0);
-    tgs(e, (uint64_t) T * (len / g), 1, 256);
+    tgs(e, (uint64_t) ng * parts, 1, 256);
 }
 static void norm1p(Q4Eng* e, id<MTLBuffer> X, int len, int g, id<MTLBuffer> w, id<MTLBuffer> Y, int T) { norm1p_o(e, X, 0, len, g, w, Y, T); }
 // RMSNorm (1 + w) + RoPE of nh heads of hd (stride hs) in rows of rs floats at byte offset xo, row t at pos0 + t * pstep

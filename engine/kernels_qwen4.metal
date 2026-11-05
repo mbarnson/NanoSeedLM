@@ -7,7 +7,7 @@
 typedef struct { int cd, K, T, keep; } Q4ConvArgs;                   // GDN causal conv: channels, kernel, tokens; keep: below
 typedef struct { int cd, kd, vd, hv, rep, dv, T, keep; } Q4GdnArgs;   // GDN step: conv_dim, hk * dk, hv * dv, ...
 typedef struct { int hv, dv; float eps; int pad; } Q4GNormArgs;       // GDN output norm
-typedef struct { int len, g; float eps; int pad; } Q4NormArgs;        // RMSNorm (1 + w) in groups of g
+typedef struct { int len, g; float eps; int parts; } Q4NormArgs;      // RMSNorm (1 + w) in groups of g, each written by parts threadgroups
 typedef struct { int hc, d, n; float inv_hc; } Q4HcArgs;              // hyper-connection pointwise steps
 typedef struct { int rs, hs, hd, rot, pos0, pstep; float eps; int pad; } Q4RopeArgs;   // row t at pos0 + t * pstep
 typedef struct { int E, k, pad[2]; } Q4RouteArgs;                     // experts, top k (<= 32)
@@ -141,12 +141,16 @@ kernel void k_q4_norm1p(constant Q4NormArgs& a [[buffer(0)]], device const float
                         device float* y [[buffer(3)]], uint b [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float red[32];
-    const int groups = a.len / a.g, t = (int) b / groups, o = ((int) b % groups) * a.g;
+    // parts > 1 (not in place): parts threadgroups a group, each takes the whole group's sum (the same order, so the
+    // same r) and writes its slice: more threadgroups at one row (hyper-connections: 4 groups)
+    const int parts = max(a.parts, 1), gb = (int) b / parts, part = (int) b % parts;
+    const int groups = a.len / a.g, t = gb / groups, o = (gb % groups) * a.g;
     device const float* xi = x + (ulong) t * a.len + o;
     float ss = 0;
     for (int k = (int) tid; k < a.g; k += 256) ss += xi[k] * xi[k];
     const float r = rsqrt(tg_sum(ss, red, lane, sg, 8) / a.g + a.eps);
-    for (int k = (int) tid; k < a.g; k += 256) y[(ulong) t * a.len + o + k] = xi[k] * r * (1.0f + w[o + k]);
+    const int chunk = (a.g + parts - 1) / parts, k1 = min(a.g, (part + 1) * chunk);
+    for (int k = part * chunk + (int) tid; k < k1; k += 256) y[(ulong) t * a.len + o + k] = xi[k] * r * (1.0f + w[o + k]);
 }
 
 kernel void k_q4_hc_act(constant Q4HcArgs& a [[buffer(0)]], device float* lo [[buffer(1)]], uint i [[thread_position_in_grid]]) {
