@@ -67,8 +67,15 @@ struct Q4Eng {
     id<MTLBuffer> tok, ind, sel, done, nsel, zero, perm, tiles;
     id<MTLCommandBuffer> cb;   // the forward being encoded
     id<MTLComputeCommandEncoder> enc;
+    int prof;                  // Q4E_PROFILE=1: a command buffer per stage, its GPU time added to the stage
+    double stage_ms[8];
     char err[256];
 };
+
+// the stages of a forward, for Q4E_PROFILE (as engine/qwen4_cuda.c)
+enum { ST_EMBED, ST_PLE, ST_HC, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
+static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "attention", "gated deltanet", "router",
+                                         "experts", "head"};
 
 static int fail(Q4Eng* e, const char* fmt, ...) {
     if (!e->err[0]) {
@@ -128,6 +135,14 @@ static int cmd_wait(Q4Eng* e) {
     e->enc = nil;
     e->cb = nil;
     return bad ? -1 : 0;
+}
+// Q4E_PROFILE: the work encoded since the last mark is stage's (its command buffer's GPU time)
+static void mark(Q4Eng* e, int stage) {
+    if (!e->prof || !e->cb) return;
+    id<MTLCommandBuffer> cb = e->cb;
+    if (cmd_wait(e)) return;
+    e->stage_ms[stage] += 1e3 * (cb.GPUEndTime - cb.GPUStartTime);
+    cmd_begin(e);
 }
 static void B(Q4Eng* e, int i, id<MTLBuffer> b, uint64_t off) { [e->enc setBuffer:b offset:off atIndex:(NSUInteger) i]; }
 static void A_(Q4Eng* e, const void* p, size_t n) { [e->enc setBytes:p length:n atIndex:0]; }
@@ -565,6 +580,7 @@ static int moe(Q4Eng* e, int l, int T) {
     B(e, 2, e->ind, 0);
     B(e, 3, e->wt, 0);
     tgs(e, (uint64_t) T, 1, 32);
+    mark(e, ST_ROUTE);
     if (T > MV_MAXT) {   // prompt rows: the pairs by expert (host), so each tile reads its expert's weights once
         if (cmd_wait(e)) return -1;
         cmd_begin(e);
@@ -703,6 +719,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->perm = dbuf(e, NULL, 4 * T * c->top_k); e->tiles = dbuf(e, NULL, sizeof(MmTile) * (T * c->top_k / MM_BN + (size_t) c->n_exp + 1));
     }
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
+    e->prof = getenv("Q4E_PROFILE") && atoi(getenv("Q4E_PROFILE")) > 0;
     if (@available(macOS 15.0, *)) {   // the weights and buffers resident on the GPU
         MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
         e->residency = e->err[0] ? nil : [e->dev newResidencySetWithDescriptor:rd error:nil];
@@ -719,6 +736,13 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
 
 void q4e_close(Q4Eng* e) {
     if (!e) return;
+    if (e->prof) {
+        double total = 0;
+        for (int i = 0; i < ST_N; ++i) total += e->stage_ms[i];
+        fprintf(stderr, "Q4E_PROFILE: %.0f ms of GPU time (a command buffer per stage)\n", total);
+        for (int i = 0; i < ST_N; ++i)
+            if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
+    }
     if (e->residency) { [e->residency endResidency]; [e->queue removeResidencySet:e->residency]; }
     e->residency = nil;
     e->pipes = nil; e->buffers = nil; e->lib = nil; e->lib4 = nil; e->queue = nil; e->dev = nil;
@@ -762,22 +786,30 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     if (ple_rows(e, T)) return -1;
     cmd_begin(e);
     embed(e, T);
+    mark(e, ST_EMBED);
     for (int l = 0; l < c->n_layer; ++l) {
         Layer* L = &e->L[l];
         if (c->ple[l] >= 0) ple(e, l, T);
+        mark(e, ST_PLE);
         hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
+        mark(e, ST_HC);
         if (c->attn[l]) attention(e, L, T);
         else gdn(e, L, T);
+        mark(e, c->attn[l] ? ST_ATTN : ST_GDN);
         hc_add(e, T);
         hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
+        mark(e, ST_HC);
         if (moe(e, l, T)) return -1;
         hc_add(e, T);
+        mark(e, ST_EXPERT);
     }
     if (logits) {   // prompt rows without logits skip the mixer and the head
         hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
         mv(e, &e->head, e->x, e->logits, T);
     }
+    id<MTLCommandBuffer> last = e->cb;
     if (cmd_wait(e)) return -1;
+    if (e->prof) e->stage_ms[ST_HEAD] += 1e3 * (last.GPUEndTime - last.GPUStartTime);
     if (logits) memcpy(logits, e->logits.contents, sizeof(float) * (size_t) T * c->vocab);
     e->pos += T;
     return 0;
