@@ -796,8 +796,8 @@ static int pool_run(Q4Eng* e, int n, int (*fn)(Q4Eng*, const void*, int, int), c
 
 // ---- plan D4: the decode tail's missed experts on the CPU --------------------------------------------------------------
 // A layer's list (kq4_tail_skip) groups by expert. Pass 1: each group's gate and up rows; then SwiGLU on the host; pass 2:
-// the down rows. Items are 64-row chunks of one group's matrix, so the pool splits each pass.
-#define CT_ROWS 64
+// the down rows. Items are CT_ROWS-row chunks of one group's matrix, so the pool splits each pass.
+#define CT_ROWS 16   // a P = 3 gate row of 2560 weights is about 2 us: items fine enough to balance 16 threads
 typedef struct { int x, n, j[MV_MAXT]; } CtGroup;   // an expert and the list entries (pairs) that use it
 // The scratch of G = MV_MAXT * top_k groups of MV_MAXT rows: x transposed (xt, xs), gate and up (gu), the SwiGLU
 // transposed (act, axs), the down outputs (down), and tmp (a group's rows before a transpose)
@@ -815,6 +815,8 @@ static void ct_bufs(CtJob* j, float* b, const Qwen4Cfg* c) {
 static const uint8_t* ct_unit(Q4Eng* e, int l, int x, int i, int s) {
     return e->arena_h + ((uint64_t) l * e->c.n_exp + (uint64_t) x) * e->pool.unit_bytes + e->pool.off[i][s];
 }
+// One logical CPU stays free for the thread that waits on the GPU: with every CPU busy, the OS stops a worker for a time slice
+static int ct_threads(const Q4Eng* e) { return e->nth > 0 ? e->nth : 1; }
 // Each pool worker claims items until none are left: a worker the OS stops holds back one item, not a share
 // BF16 at the GPU expert path's points (kernels_moe.cu mv_gu_body, store_y): the CPU tail differs only in sum order
 static float ct_bf(float x) { return nslm_bf2f(nslm_f2bf(x)); }
@@ -822,7 +824,7 @@ static float ct_act(float g, float u) {   // bf16(silu(bf16(g)) * bf16(u)), silu
     g = ct_bf(g);
     return ct_bf(ct_bf(g * ct_bf(1.0f / (1.0f + expf(-g)))) * ct_bf(u));
 }
-static int ct_items(Q4Eng* e, const void* ctx, int i0, int i1) {   // item: group << 16 | matrix << 8 | 64-row chunk
+static int ct_items(Q4Eng* e, const void* ctx, int i0, int i1) {   // item: group << 16 | matrix << 8 | CT_ROWS-row chunk
     CtJob* j = (CtJob*) ctx;
     const Qwen4Cfg* c = &e->c;
     const size_t M = MV_MAXT, D = c->d, F = c->ff_exp;
@@ -863,7 +865,7 @@ static void ct_layer(Q4Eng* e) {
         for (int m = 0; m < 2; ++m) for (int ch = 0; ch * CT_ROWS < (int) F; ++ch) j.item[j.nitems++] = k << 16 | m << 8 | ch;
     }
     atomic_store(&j.next, 0);
-    pool_run(e, e->nth + 1, ct_items, &j);
+    pool_run(e, ct_threads(e), ct_items, &j);
     j.pass = 1; j.nitems = 0;
     for (int k = 0; k < ng; ++k) {
         for (int r = 0; r < g[k].n; ++r)
@@ -875,7 +877,7 @@ static void ct_layer(Q4Eng* e) {
         for (int ch = 0; ch * CT_ROWS < (int) D; ++ch) j.item[j.nitems++] = k << 16 | ch;
     }
     atomic_store(&j.next, 0);
-    pool_run(e, e->nth + 1, ct_items, &j);
+    pool_run(e, ct_threads(e), ct_items, &j);
     for (int k = 0; k < ng; ++k)
         for (int r = 0; r < g[k].n; ++r)
             for (size_t i = 0; i < D; ++i) e->cy_h[(size_t) g[k].j[r] * D + i] = ct_bf(j.down[(k * M + r) * D + i]);
