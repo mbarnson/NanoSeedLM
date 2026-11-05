@@ -112,6 +112,8 @@ build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-P3 --ctx 32768
 - In a request, `reasoning_effort: high` means xhigh. `chat_template_kwargs` takes `enable_thinking` and
   `preserve_thinking`.
 - Tool calls come back as OpenAI `tool_calls`, typed by the tools' schemas.
+- Send each reply back with its `reasoning_content`. Then the next turn keeps the cache. Without it, the engine starts the
+  prompt again: its DeltaNet state cannot go back.
 - The expert cache takes the free VRAM. `NSLM_EXPERT_VRAM_MB` sets its size. The `Q4E_*` variables set the other
   engine options ([Environment variables](../reference/env.md)).
 
