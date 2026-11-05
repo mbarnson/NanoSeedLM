@@ -34,7 +34,7 @@ ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score 
 TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-qwen4-pack nslm-qwen4-emulate nslm-bits-probe nslm-cpu-seed-bench)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c tests/test_searchc_gpu.c tests/test_searchp_gpu.c \
                             tests/test_mova_kernels.c tests/test_qwen4_kernels.c \
-                            tests/test_qwen4_engine.c tests/test_qwen4_api.c,$(wildcard tests/test_*.c))
+                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_engine_dispatch.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
              $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels
 
@@ -120,7 +120,7 @@ $(BIN)/nslm-qwen4-emulate: nslm/qwen4_emulate.c $(LIB_O) $(NSLM_HDRS)
 $(BIN)/test_%: tests/test_%.c $(LIB_O) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(LIB_O) -o $@ -lm -lpthread
-$(BIN)/test_chat_template $(BIN)/test_tool_calls $(BIN)/test_tokenizer $(BIN)/test_kv_disk $(BIN)/test_qwen4_template: $(BIN)/test_%: tests/test_%.c $(HARN_O) $(LIB_O) tests/data/template_golden.json
+$(BIN)/test_chat_template $(BIN)/test_tool_calls $(BIN)/test_tokenizer $(BIN)/test_kv_disk $(BIN)/test_qwen4_template $(BIN)/test_qwen4_tools: $(BIN)/test_%: tests/test_%.c $(HARN_O) $(LIB_O) tests/data/template_golden.json
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(HARN_O) $(LIB_O) $(HLIBS) -o $@ -lm
 $(BIN)/test_engine: tests/test_engine.c $(ENG_O) $(LIB_O) $(ENG_HDRS) $(RES)/kernels_moe.metallib

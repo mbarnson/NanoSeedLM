@@ -21,16 +21,18 @@ static char* dup_trim(const char* a, const char* z) {
 }
 static int fail(char* err, int errlen, const char* msg) { snprintf(err, (size_t) errlen, "%s", msg); return -1; }
 
-// Names of the tool's parameters whose schema type is "string".
-static int is_string_arg(const Json* tools, const char* tool, const char* arg) {
+// The schema type of the tool's parameter, or NULL.
+static const char* arg_type(const Json* tools, const char* tool, const char* arg) {
     for (int t = 0; tools && tools->t == J_ARR && t < tools->n; ++t) {
         const Json* fn = json_get(tools->v[t], "function");
         if (!fn || !json_gets(fn, "name") || strcmp(json_gets(fn, "name"), tool)) continue;
-        const Json* spec = json_get(json_get(json_get(fn, "parameters"), "properties"), arg);
-        const char* type = json_gets(spec, "type");
-        return type && !strcmp(type, "string");
+        return json_gets(json_get(json_get(json_get(fn, "parameters"), "properties"), arg), "type");
     }
-    return 0;
+    return NULL;
+}
+static int is_string_arg(const Json* tools, const char* tool, const char* arg) {
+    const char* type = arg_type(tools, tool, arg);
+    return type && !strcmp(type, "string");
 }
 // json.loads, then the Python literals True / False / None, else the raw string.
 static Json* deserialize(const char* s) {
@@ -172,6 +174,70 @@ int tc_parse(const char* text, const Json* tools, char** visible, Json** calls, 
             return -1;
         }
         pos = e + strlen(TC_CLOSE);
+    }
+    *visible = buf_take(&vis);
+    *calls = out;
+    return 0;
+}
+
+// One Qwen call body: "<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>...</function>". A value loses one newline at
+// each end. Strings, and parameters the schema does not type, stay text (vLLM's qwen3_coder parser).
+static Json* qwen_call(const char* b, const Json* tools, char* err, int errlen) {
+    b = skip_ws(b);
+    const char* gt = starts(b, "<function=") ? strchr(b, '>') : NULL;
+    if (!gt || gt == b + 10) { fail(err, errlen, "tool call is missing a function name"); return NULL; }
+    char* name = dup_trim(b + 10, gt);
+    Json* args = json_new(J_OBJ);
+    for (b = skip_ws(gt + 1); starts(b, "<parameter="); b = skip_ws(b)) {
+        const char* kz = strchr(b, '>');
+        const char* vz = kz ? strstr(kz, "</parameter>") : NULL;
+        if (!vz) break;
+        char* key = dup_trim(b + 11, kz);
+        const char* va = kz + 1 + (kz[1] == '\n');
+        const char* ve = vz > va && vz[-1] == '\n' ? vz - 1 : vz;
+        Buf v = {0};
+        buf_put(&v, va, (size_t) (ve - va));
+        char* val = buf_take(&v);
+        const char* type = arg_type(tools, name, key);
+        json_set(args, key, !type || !strcmp(type, "string") ? json_str(val) : deserialize(val));
+        free(key);
+        free(val);
+        b = vz + 12;
+    }
+    if (!starts(b, "</function>") || *skip_ws(b + 11)) {
+        free(name);
+        json_free(args);
+        fail(err, errlen, "tool call contains an incomplete argument");
+        return NULL;
+    }
+    Json* c = make_call(name, args);
+    free(name);
+    return c;
+}
+
+int tc_parse_qwen(const char* text, const Json* tools, char** visible, Json** calls, char* err, int errlen) {
+    Buf vis = {0};
+    buf_puts(&vis, "");
+    Json* out = json_new(J_ARR);
+    for (const char* pos = text;;) {
+        const char* st = strstr(pos, "<tool_call>");
+        const char* a = out->n ? skip_ws(pos) : pos;   // the text beside a call loses its whitespace
+        if (!st) { buf_puts(&vis, a); break; }
+        const char* z = st;
+        while (z > a && isspace((unsigned char) z[-1])) --z;
+        if (z > a) buf_put(&vis, a, (size_t) (z - a));
+        const char* en = strstr(st, "</tool_call>");
+        char* body = en ? dup_trim(st + 11, en) : NULL;
+        Json* call = body ? qwen_call(body, tools, err, errlen) : NULL;
+        free(body);
+        if (!call) {
+            if (!en) fail(err, errlen, "incomplete <tool_call>");
+            free(vis.p);
+            json_free(out);
+            return -1;
+        }
+        json_push(out, call);
+        pos = en + 12;
     }
     *visible = buf_take(&vis);
     *calls = out;

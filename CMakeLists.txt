@@ -80,7 +80,7 @@ set_tests_properties(test_mova_cfg PROPERTIES SKIP_RETURN_CODE 77)   # 77: no mo
 if(NSLM_MODEL_DIR)
   set_tests_properties(test_mova_cfg PROPERTIES ENVIRONMENT "MOVA_DIR=${NSLM_MODEL_DIR}")
 endif()
-foreach(t chat_template tool_calls qwen4_template)
+foreach(t chat_template tool_calls qwen4_template qwen4_tools)
   add_executable(test_${t} tests/test_${t}.c harness/chat_template.c harness/chat_qwen.c harness/tool_calls.c)
   target_link_libraries(test_${t} nslm)
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
