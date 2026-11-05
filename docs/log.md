@@ -516,3 +516,8 @@ row. Matvecs with few rows and a long input (`k_mv_split`) now spread each row o
 4,096 rows (`--prompt-rows`). Prompt attention (`k_q4_attend_g`) treats a KV group's 12 heads as the rows of simdgroup
 matrices, so each key tile is loaded once for all of them. `nslm-chat` and `nslm-serve` now reach the Metal engine
 through `engine/engine.c`. `test_qwen4_metal` also checks `qwen4_tiny_attn` against the C reference.
+
+`d292cf8`: after a 19,768-token prompt the Metal engine decoded at 25 tokens/s, because its decode attention loaded
+each key once for each of a KV group's 12 heads. Rows with 512 keys or more now split their keys over
+threadgroups for the whole group, and a second kernel merges the splits, as CUDA's `5ce032e` does. Decode there is
+36 to 38 tokens/s.
