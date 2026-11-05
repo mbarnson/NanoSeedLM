@@ -133,6 +133,47 @@ static int check3(int rows, int kb, int bias, int ntok, int threads) {
     return ok;
 }
 
+// cpu_seed3_rows on the row-major layout (the GPU arena's) against the double reference; each token as alone
+static int check3_rows(int rows, int kb, int bias, int ntok) {
+    const int n = rows * kb;
+    uint16_t* seeds = malloc(n * 2), *nibs = malloc(n * 2);
+    float* x = malloc((size_t) ntok * kb * 8 * 4), *y = malloc((size_t) ntok * rows * 4), *y1 = malloc(rows * 4);
+    float* xt = malloc((size_t) ntok * kb * 8 * 4), *xs = malloc((size_t) ntok * kb * 4);
+    for (int i = 0; i < n; ++i) { seeds[i] = (uint16_t) (1 + rnd() % 65535); nibs[i] = (uint16_t) rnd(); }
+    for (int i = 0; i < ntok * kb * 8; ++i) x[i] = (float) ((int) (rnd() % 20001) - 10000) / 10000.0f;
+    const uint32_t* table = cpu_seed4_table();
+    cpu_seed_xt(x, ntok, kb, xt, xs);
+    cpu_seed3_rows(seeds, nibs, bias, table, xt, xs, ntok, kb, 0, rows, y, rows);
+    double worst = 0.0, scale = 0.0;
+    int same = 1;
+    for (int t = 0; t < ntok; ++t) {
+        cpu_seed3_rows(seeds, nibs, bias, table, xt + (size_t) t * kb * 8, xs + (size_t) t * kb, 1, kb, 0, rows, y1, rows);
+        for (int r = 0; r < rows; ++r) {
+            same &= y[(size_t) t * rows + r] == y1[r];
+            double d = 0.0;
+            for (int b = 0; b < kb; ++b) {
+                const uint16_t nb = nibs[r * kb + b];
+                uint16_t st[24];
+                lfsr_states(seeds[r * kb + b], 24, st);
+                double e = 0.0;
+                for (int c = 0; c < 8; ++c) {
+                    int32_t isum = 0;
+                    for (int p = 0; p < 3; ++p) isum += ((int32_t) st[3 * c + p] - 32768) * nslm_q(nb, p);
+                    e += (double) x[(size_t) t * kb * 8 + 8 * b + c] * (double) isum;
+                }
+                d += e * (double) nslm_scale(bias + nslm_ecode(nb));
+            }
+            worst = fmax(worst, fabs((double) y[(size_t) t * rows + r] - d));
+            scale = fmax(scale, fabs(d));
+        }
+    }
+    const int ok = same && worst / scale < 2e-6;
+    printf("P = 3 row-major rows %d kb %d tokens %d: max |y - ref| / max |ref| = %.2e, tokens %s %s\n", rows, kb, ntok, worst / scale,
+           same ? "equal" : "differ", ok ? "ok" : "FAIL");
+    free(seeds); free(nibs); free(x); free(y); free(y1); free(xt); free(xs);
+    return ok;
+}
+
 int main(void) {
     uint32_t* t = cpu_seed4_table();
     for (int s = 1; s < 65536; s += 997)
@@ -147,6 +188,9 @@ int main(void) {
     ok &= check_tokens(640, 320, 4, 3);   // a qwen4 expert's gate / up (640 x 2560), an MTP verify window
     ok &= check3(37, 10, -19, 1, 1);
     ok &= check3(640, 320, -21, 4, 3);
+    ok &= check3_rows(37, 16, -19, 1);
+    ok &= check3_rows(640, 320, -21, 4);   // a qwen4 expert's gate / up, an MTP verify window
+    ok &= check3_rows(2560, 80, -22, 2);   // its down (2560 x 640)
     printf("test_cpu_seed4: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

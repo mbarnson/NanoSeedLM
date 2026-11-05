@@ -40,3 +40,9 @@ void cpu_seed4_tiled_matvec_mt(const CpuSeed4Tiled* t, const uint32_t* table, co
 // them; each token's rows equal cpu_seed4_tiled_matvec_mt's, bit for bit.
 #define CPU_SEED4_MAX_TOK 8
 void cpu_seed4_tiled_matmul_mt(const CpuSeed4Tiled* t, const uint32_t* table, const float* x, int ntok, float* y, int threads);
+// P = 3 rows [r0, r1) of the row-major layout (seeds, nibs [rows][kb]: the GPU arena's), ntok <= CPU_SEED4_MAX_TOK tokens:
+// a vector step is 16 blocks of one row. xt, xs from cpu_seed_xt; y[k * ys + r]
+void cpu_seed3_rows(const uint16_t* seeds, const uint16_t* nibs, int bias, const uint32_t* table, const float* xt,
+                    const float* xs, int ntok, int kb, int r0, int r1, float* y, int ys);
+// xt[k][c][b] = x[k][8 b + c] and xs[k][b] = the sum over c, for ntok tokens of kb blocks (kb a multiple of 16)
+void cpu_seed_xt(const float* x, int ntok, int kb, float* xt, float* xs);
