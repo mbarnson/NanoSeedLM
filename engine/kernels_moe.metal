@@ -749,7 +749,8 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
 // ---- small-row matvec: one threadgroup of MVS_TG threads per output row, the row's 8-weight blocks split among all of
 // them, then a simdgroup and a threadgroup sum.  For the few-row, long-K projections that k_mv runs on few simdgroups
 // (qwen4: the hyper-connection inject 4 x 10,240 and down 320 x 10,240, DeltaNet a / b 48 x 2,560).  FC_T tokens
-// (<= MV_MAXT), BF16 / Q8 / Q4 (AFF_GS); y[t][r] = bf16(acc), or bf16(y + bf16(acc)) with a.add.
+// (<= MV_MAXT), BF16 / Q8 / Q4 (AFF_GS; Q4 in MLX's qmv form, BF16 / Q8 dequantized); y[t][r] = bf16(acc), or
+// bf16(y + bf16(acc)) with a.add.
 kernel void k_mv_split(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const ushort* S [[buffer(2)]],
                        device const ushort* B [[buffer(3)]], device const float* x [[buffer(4)]], device float* y [[buffer(5)]],
                        uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -759,6 +760,20 @@ kernel void k_mv_split(constant MvArgs& a [[buffer(0)]], device const uchar* W [
     float acc[MV_MAXT];
     for (int t = 0; t < MV_MAXT; ++t) acc[t] = 0;
     for (int j = (int) tid; j < nbk; j += MVS_TG) {
+        if (FC_FMT == MF_Q4) {   // MLX's qmv form, as k_mv: s (q . x) + b sum(x) a block
+            const ulong gi = ((ulong) r * a.K + (ulong) j * 8) / AFF_GS;
+            const float sc = bf(S[gi]), bi = bf(B[gi]);
+            const uint qw = ((device const uint*) W)[((ulong) r * a.K) / 8 + (ulong) j];
+            const float4 q0 = float4(as_type<float>(0x4B000000u | extract_bits(qw, 0u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 4u, 4u)),
+                                     as_type<float>(0x4B000000u | extract_bits(qw, 8u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 12u, 4u))) - 8388608.0f;
+            const float4 q1 = float4(as_type<float>(0x4B000000u | extract_bits(qw, 16u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 20u, 4u)),
+                                     as_type<float>(0x4B000000u | extract_bits(qw, 24u, 4u)), as_type<float>(0x4B000000u | extract_bits(qw, 28u, 4u))) - 8388608.0f;
+            for (int t = 0; t < nt; ++t) {
+                device const float4* xp = (device const float4*) (x + (ulong) t * a.xs + (ulong) j * 8);
+                acc[t] += q4_term(sc, bi, q0, q1, xp[0], xp[1]);
+            }
+            continue;
+        }
         float w[8];
         wblock(FC_FMT, W, S, B, (ulong) r, a.K, j, w);
         for (int t = 0; t < nt; ++t) {
