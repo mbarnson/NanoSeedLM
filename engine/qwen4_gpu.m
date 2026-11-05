@@ -46,7 +46,7 @@ typedef struct {
     MW gate, sg, sh_g, sh_u, sh_d, eg, eu, ed;      // MoE
     MW key, val;                                    // PLE
     id<MTLBuffer> nk, nq, nc, pw, hist;
-    id<MTLBuffer> kconv[Q4E_KEEP_SLOTS], kS[Q4E_KEEP_SLOTS], khist[Q4E_KEEP_SLOTS];   // the state after verify rows 0, 1, 2 (MTP)
+    id<MTLBuffer> kconv[Q4E_KEEP_SLOTS], kS[Q4E_KEEP_SLOTS], khist[Q4E_KEEP_SLOTS];   // the state after verify rows 0 .. ndraft - 1 (MTP)
 } Layer;
 _Static_assert(Q4E_KEEP_SLOTS == Q4E_MAX_DRAFTS, "the kernels' snapshot buffers: one for each verify row but the last");
 
@@ -87,7 +87,7 @@ struct Q4Eng {
     Layer M;
     MW m_fe, m_fh, m_down, m_up;
     id<MTLBuffer> m_ne, m_nh, m_norm, Hin, Hm, ones, mlog, dtok;
-    int mtp, lrow, keep, nkeep;
+    int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and snapshot buffers a layer)
     double stage_ms[10];
     char err[256];
 };
@@ -866,8 +866,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         load_layer(e, &e->L[l], lp, c->attn[l], l);
         if (c->ple[l] + 1 > e->nple) e->nple = c->ple[l] + 1;
     }
-    if (o && o->mtp && !e->err[0] && !ns_find(&e->nm, "mtp.fc_embedding.weight")) fail(e, "no MTP head (mtp.*) in %s", model_dir);
-    else if (o && o->mtp && !e->err[0]) {
+    if (o && o->mtp > 0 && !e->err[0] && !ns_find(&e->nm, "mtp.fc_embedding.weight")) fail(e, "no MTP head (mtp.*) in %s", model_dir);
+    else if (o && o->mtp > 0 && !e->err[0]) {
         e->m_ne = load_v(e, c->d, "mtp.pre_fc_norm_embedding.weight");
         e->m_nh = load_v(e, (int64_t) c->hc * c->d, "mtp.pre_fc_norm_hidden.weight");
         load_w(e, &e->m_fe, "mtp.fc_embedding.weight");
@@ -877,6 +877,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->m_norm = load_v(e, (int64_t) c->hc * c->d, "mtp.hyper_connection_mixer.hc_norm.weight");
         load_layer(e, &e->M, "mtp.layers.0", 1, -1);
         e->mtp = 1;
+        e->ndraft = o->mtp < Q4E_MAX_DRAFTS ? o->mtp : Q4E_MAX_DRAFTS;
     }
     const size_t T = (size_t) e->maxt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
     const size_t vd = (size_t) c->lin_hv * c->lin_dv, iw = (size_t) (c->ix_heads + 1) * c->ix_dim, kf = (size_t) c->top_k * c->ff_exp;
@@ -899,7 +900,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->dtok = dbuf(e, NULL, sizeof(int32_t) * (Q4E_MAX_DRAFTS + 1));
         for (size_t i = 0; e->ones && i < T * c->hc; ++i) ((float*) e->ones.contents)[i] = 1.0f;
         for (int l = 0; l < c->n_layer; ++l)
-            for (int i = 0; i < Q4E_KEEP_SLOTS; ++i) {
+            for (int i = 0; i < e->ndraft; ++i) {   // a verify of ndraft + 1 rows keeps the state after its first ndraft
                 Layer* L = &e->L[l];
                 if (!c->attn[l]) { L->kconv[i] = F(qwen4_gdn_conv_len(c)); L->kS[i] = F(qwen4_gdn_state_len(c)); }
                 if (c->ple[l] >= 0) L->khist[i] = F(qwen4_ple_hist_len(c));
@@ -1024,7 +1025,7 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
 int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
     const Qwen4Cfg* c = &e->c;
     e->err[0] = 0;
-    if (!e->mtp || e->lrow < 0 || k < 1 || k > Q4E_MAX_DRAFTS || e->pos + k > e->max_pos)
+    if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos)
         return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
     const float* l = (const float*) e->logits.contents + (size_t) e->lrow * c->vocab;
     int32_t* dt = (int32_t*) e->dtok.contents;
@@ -1049,7 +1050,7 @@ int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
 int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     e->err[0] = 0;
     e->nkeep = 0;
-    if (!e->mtp || n < 1 || n > Q4E_MAX_DRAFTS + 1) return fail(e, "q4e_forward_keep: %s", e->mtp ? "1 to 4 rows" : "no MTP head");
+    if (!e->mtp || n < 1 || n > e->ndraft + 1) return fail(e, "q4e_forward_keep: %s", e->mtp ? "more rows than Q4EOpts.mtp + 1" : "no MTP head");
     e->keep = 1;
     const int rc = q4e_forward(e, ids, n, logits);
     e->keep = 0;
