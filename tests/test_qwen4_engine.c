@@ -1,6 +1,5 @@
-// tests/test_qwen4_engine.c - the qwen4 CUDA engine on tests/data/qwen4_tiny against mlx-vlm's float32 logits: matvec
-// rows (any split, the same logits, CUDA graphs or not) and one GEMM row of 48, with and without the smallest expert
-// cache.  Also kc_bucket for qwen4's 512 experts (the tiny model has 8).  Skipped without a GPU.
+// tests/test_qwen4_engine.c - the qwen4 CUDA engine against mlx-vlm and the C reference on tiny models: row splits,
+// graphs, caches, passes and the prefetch; kc_bucket for 512 experts. Skipped without a GPU.
 #define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c99 (Windows: _putenv_s)
 #include <math.h>
 #include <stdio.h>

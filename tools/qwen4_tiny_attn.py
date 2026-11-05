@@ -1,7 +1,5 @@
-# tools/qwen4_tiny_attn.py - tests/data/qwen4_tiny with its attention layers made strong, so engine tests see them.
-#   python tools/qwen4_tiny_attn.py tests/data/qwen4_tiny tests/data/qwen4_tiny_attn
-# q_norm and k_norm (RMSNorm times 1 + w) times NORM, so the scores are sharper; v_proj and o_proj (MLX affine: scales
-# and biases) times VO, so the attention branch weighs more in the residual. Pure Python: no mlx, no numpy.
+# tools/qwen4_tiny_attn.py SRC DST - qwen4_tiny with strong attention (q/k norms 1 + w times NORM, v and o times VO),
+# so engine tests see attention bugs. Pure Python.
 import json
 import os
 import shutil

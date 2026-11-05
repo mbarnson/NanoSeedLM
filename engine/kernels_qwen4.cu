@@ -69,10 +69,8 @@ typedef struct {
     int cd, kd, vd, hv, rep, dv, abld;   // abld: the rows of a and b are abld apart
 } GdnArgs;
 
-// Block = 32 value rows of head hv (grid hv x dv / 32). SPLIT threads hold one row's state column S[hv][.][i] in
-// registers, as float4 runs m of rows ((m SPLIT + p) 4, +4), so the threads read q and k from shared memory without bank
-// conflicts. Tokens come GDN_TS at a time by cp.async, the next stage while the block works on this one. q and k come
-// normalised. y gets the raw read S q (k_q4_gdn_norm gates it).
+// Block = 32 value rows of head hv; SPLIT threads hold a row's state column S[hv][.][i] as float4 runs of rows
+// ((m SPLIT + p) 4, +4). Stages of GDN_TS tokens come by cp.async, the next during this one. y = S q, ungated.
 #define GDN_TS 16
 static __device__ __forceinline__ float4 mad4(float4 a, float4 b, float4 c) {
     return make_float4(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y), fmaf(a.z, b.z, c.z), fmaf(a.w, b.w, c.w));
@@ -306,7 +304,6 @@ void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int 
     k_q4_store<<<dim3((unsigned) (w + 255) / 256, (unsigned) T), 256, 0, s>>>(dst, w, src, ss, pos0, dpos);
 }
 
-// One warp per row: k rounds of a warp arg max of the logits (ties to the higher expert); weights exp(l - max) renormalised
 // Row t: one warp, a lane's logits in registers (E at most 32 RT_PER). k rounds of a warp arg-max (ties: the higher
 // index); the weights are the softmax over all E, renormalised over the k picked.
 #define RT_PER 32
@@ -603,11 +600,8 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
     for (int i = 0; i < dl; ++i) o[((size_t) t * a.nh + h) * a.hd + lane + 32 * i] = acc[i] / l * sigm(qh[a.hd + lane + 32 * i]);
 }
 
-// Prompt rows on tensor cores: block (KV group, row), 4 warps. The group's heads (at most 16) are the rows of the
-// matrices, padded with zeros; keys come in tiles of TC_KT. S = Q K^T (wmma) and O = P V (mma.sync, whose fragment
-// layout is known) are TF32 in three parts (hi hi + hi lo + lo hi, near f32). One pass: an online softmax scales a
-// row's O and sum by exp(old max - new max) each tile. A warp keeps its Q fragments and its O columns in registers.
-// The K, then V, tile comes by cp.async into one buffer whose rows are hd + 8 floats apart: 23 KB a block.
+// Prompt rows on tensor cores: block (KV group, row), the group's heads as matrix rows. S = Q K^T (wmma), O = P V
+// (mma.sync), TF32 in three parts; one pass, an online softmax rescales O by row. K, then V, tiles by cp.async.
 #define TC_KT 16
 #define TC_PS 20   // P's row stride: the mma.sync A loads fall in different banks
 template <typename F> static __device__ __forceinline__ void tf32_split(const F& f, F& hi, F& lo) {

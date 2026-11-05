@@ -1,6 +1,5 @@
-// harness/nslm-qwen4-gen.c - greedy generation through the qwen4 CUDA engine (engine/qwen4_eng.h), with timings.
-//   nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens 128] [--ctx 4096] [--raw] [--vram-experts] [--ple-gguf FILE]
-//                  [--expert-cache-gb N [--stream-experts]] [--prompt-rows N]
+// harness/nslm-qwen4-gen.c - greedy generation through the qwen4 CUDA engine, with timings. The options are in
+// docs/guides/run-and-serve.md (Qwen3.8-Flash-Next on CUDA).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +27,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--prompt-rows") && i + 1 < argc) rows = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw]\n"); return 2; }
+    if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw] [--vram-experts]\n"
+                                         "  [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N]\n"); return 2; }
     char err[512], path[2048];
     snprintf(path, sizeof path, "%s/tokenizer.json", model);
     Tok* tok = tok_open(path, err, sizeof err);

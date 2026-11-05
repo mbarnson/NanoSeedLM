@@ -57,8 +57,9 @@ struct Q4Eng {
     int mt;                        // rows of one prompt forward (a chunk): Q4EOpts.rows
     int xr;                        // rows of a layer-major pass: the context in chunks of mt, at most Q4E_PASS_ROWS
     CachePool pool;   // the expert cache (cache = 1)
-    // Prompt prefetch (pf_ok): every expert of layer l + 1 is admitted when layer l starts and copied on cs while layer
-    // l computes. pf is a view of pool with its own job list. Victims come from finished layers if the pool holds 3 layers.
+
+    // Prompt prefetch (pf_ok): layer l + 1's experts admitted as layer l starts, copied on cs. pf: pool with its own
+    // job list. It needs a pool of 3 layers, so the victims come from finished layers.
     CachePool pf;
     cudaStream_t cs;
     cudaEvent_t ev_admit, ev_ready[QWEN4_MAX_LAYERS];
@@ -96,9 +97,8 @@ struct Q4Eng {
     char err[256];
 };
 
-// the stages of a forward, for Q4E_PROFILE
-// PROJ: attention and DeltaNet projections; ROPE: the head norms, RoPE and K / V stores; QSA: the indexer's block keys,
-// scores and top-k; ATTN: the attention itself
+// The stages of a forward, for Q4E_PROFILE. PROJ: projections; ROPE: head norms, RoPE, K / V stores; QSA: the indexer's
+// block keys, scores and top-k; ATTN: the attention itself
 enum { ST_EMBED, ST_PLE, ST_HC, ST_PROJ, ST_ROPE, ST_QSA, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
 static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "projections", "norm + rope + store",
                                          "qsa select", "attention", "gated deltanet", "router + cache", "experts", "head"};
