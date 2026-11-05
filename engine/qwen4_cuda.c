@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -877,7 +878,7 @@ static void* ct_thread(void* arg) {   // answers each layer's signal (kq4_signal
         if (v == done) continue;
         ct_layer(e);
         done = v;
-        __sync_synchronize();
+        atomic_thread_fence(memory_order_seq_cst);   // the outputs before the ack
         hs[16] = v;
     }
     return NULL;
