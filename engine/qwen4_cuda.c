@@ -90,8 +90,9 @@ struct Q4Eng {
 };
 
 // the stages of a forward, for Q4E_PROFILE
-enum { ST_EMBED, ST_PLE, ST_HC, ST_PROJ, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };   // PROJ: attention and DeltaNet projections
-static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "projections", "attention",
+// PROJ: attention and DeltaNet projections; QSA: the indexer's block keys, scores and top-k
+enum { ST_EMBED, ST_PLE, ST_HC, ST_PROJ, ST_QSA, ST_ATTN, ST_GDN, ST_ROUTE, ST_EXPERT, ST_HEAD, ST_N };
+static const char* const kStage[ST_N] = {"embed", "ple", "hyper-connections", "projections", "qsa select", "attention",
                                          "gated deltanet", "router + cache", "experts", "head"};
 
 static int fail(Q4Eng* e, const char* fmt, ...) {
@@ -548,10 +549,12 @@ static int attention(Q4Eng* e, Layer* L, int T) {
     mark(e, ST_PROJ);
     kq4_store(e->s, L->raw, D, e->ixo + (size_t) c->ix_heads * D, iw, 0, e->din, T);
     kq4_head_norm_rope(e->s, c, e->ixo, iw, c->ix_heads, D, D, L->iqn, 0, e->din, T);
+    mark(e, ST_ATTN);
     kq4_qsa_blocks(e->s, c, L->raw, L->ikn, 0, e->din, T, L->blk);
     kq4_qsa_rows(e->s, c, 0, e->din, e->done, e->nsel, T);
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
     kq4_qsa_select(e->s, c, e->ixo, iw, L->blk, e->done, e->cap ? e->nb : (e->pos + T) / R, e->sc, e->sel, T);
+    mark(e, ST_QSA);
     if (kq4_attend(e->s, c, e->qp, L->K, L->V, 0, e->din, e->sel, e->nsel, e->o, T)) return fail(e, "head_dim %d not supported", hd);
     mark(e, ST_ATTN);
     mv(e, &L->o, e->o, e->br, T);
