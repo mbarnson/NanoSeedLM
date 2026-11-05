@@ -382,7 +382,8 @@ static void mv_gu(Q4Eng* e, const MW* wg, const MW* wu, id<MTLBuffer> X, int xs,
 static void mm_grouped(Q4Eng* e, const MW* w, id<MTLBuffer> X, int xs, id<MTLBuffer> Y, int ys, int xdiv, int ntiles) {
     if (!ntiles) return;
     const MmArgs a = {w->cols, w->rows, 0, xs, ys, xdiv, 0, 0};
-    [e->enc setComputePipelineState:pipe_g(e, "k_mm", w->fmt, 0, w->gs)];
+    const int m64 = !e->no_mm64;   // the tiles of bucket() hold MM2_BN pairs then (xs: the input row stride, a multiple of 4)
+    [e->enc setComputePipelineState:pipe_g(e, m64 ? "k_mm64" : "k_mm", w->fmt, 0, w->gs)];
     A_(e, &a, sizeof a);
     bind_w(e, w, 1);
     B(e, 4, X, 0);
@@ -392,7 +393,7 @@ static void mm_grouped(Q4Eng* e, const MW* w, id<MTLBuffer> X, int xs, id<MTLBuf
     B(e, 8, e->tiles, 0);
     bind_codes(e, w, 9);
     B(e, 10, Y, 0);
-    tgs(e, (uint64_t) (w->rows + MM_BM - 1) / MM_BM, (uint64_t) ntiles, 128);
+    tgs(e, (uint64_t) (w->rows + (m64 ? MM2_BM : MM_BM) - 1) / (m64 ? MM2_BM : MM_BM), (uint64_t) ntiles, 128);
 }
 static void swiglu(Q4Eng* e, id<MTLBuffer> G, id<MTLBuffer> U, id<MTLBuffer> Out, int n) {
     const int32_t nn = n;
@@ -404,7 +405,7 @@ static void swiglu(Q4Eng* e, id<MTLBuffer> G, id<MTLBuffer> U, id<MTLBuffer> Out
     tgs(e, (uint64_t) (n + 255) / 256, 1, 256);
 }
 // The T x k routed pairs grouped by expert (ascending pair within an expert): perm[], tiles of <= MM_BN pairs
-static int bucket(Q4Eng* e, int T) {
+static int bucket(Q4Eng* e, int T, int cap) {   // tiles of at most cap pairs
     const int k = e->c.top_k, E = e->c.n_exp, P = T * k;
     const int32_t* inds = (const int32_t*) e->ind.contents;
     int* cnt = (int*) calloc((size_t) E + 1, sizeof(int));
@@ -418,7 +419,7 @@ static int bucket(Q4Eng* e, int T) {
     MmTile* tl = (MmTile*) e->tiles.contents;
     int nt = 0;
     for (int x = 0; x < E; ++x)
-        for (int s = off[x]; s < off[x + 1]; s += MM_BN) tl[nt++] = (MmTile) {x, s, off[x + 1] - s < MM_BN ? off[x + 1] - s : MM_BN, 0};
+        for (int s = off[x]; s < off[x + 1]; s += cap) tl[nt++] = (MmTile) {x, s, off[x + 1] - s < cap ? off[x + 1] - s : cap, 0};
     free(cnt);
     free(off);
     return nt;
@@ -682,7 +683,7 @@ static int moe(Q4Eng* e, Layer* L, int T) {
     if (T > MV_MAXT) {   // prompt rows: the pairs by expert (host), so each tile reads its expert's weights once
         if (cmd_wait(e)) return -1;
         cmd_begin(e);
-        const int nt = bucket(e, T);
+        const int nt = bucket(e, T, e->no_mm64 ? MM_BN : MM2_BN);
         mm_grouped(e, &L->eg, e->x, c->d, e->Gb, c->ff_exp, k, nt);
         mm_grouped(e, &L->eu, e->x, c->d, e->Ub, c->ff_exp, k, nt);
         swiglu(e, e->Gb, e->Ub, e->A, P * c->ff_exp);

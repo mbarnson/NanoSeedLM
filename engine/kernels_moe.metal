@@ -980,10 +980,11 @@ kernel void k_mm(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffe
     }
 }
 
-// Dense prompt rows (k_mm with FC_T = 1, weights [R][K]) in 64-row x 64-column tiles: 4 simdgroups of 32 x 32 each
-// (16 accumulators: 16 multiplies for 8 fragment loads, against k_mm's 4 for 4). The weights dequantized as k_mm's
-// (tile_weights), and each output's products added in the same k order, so y is k_mm's.  Threadgroup memory: one
-// buffer for the weight and input tiles, then for the transposed store.
+// Prompt rows as k_mm (FC_T = 1 dense, FC_T = 0 grouped over the tile table, weights [R][K]) in 64-row x 64-column
+// tiles: 4 simdgroups of 32 x 32 each (16 accumulators: 16 multiplies for 8 fragment loads, against k_mm's 4 for 4).
+// Grouped tiles hold up to 64 pairs of an expert, so each seed block expands for fewer tiles. The weights dequantized
+// as k_mm's (tile_weights), and each output's products added in the same k order, so y is k_mm's.  Threadgroup
+// memory: one buffer for the weight and input tiles, then for the transposed store.
 kernel void k_mm64(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const ushort* S [[buffer(2)]],
                    device const ushort* B [[buffer(3)]], device const float* X [[buffer(4)]], device float* Y [[buffer(5)]],
                    device const int* perm [[buffer(6)]], device const uint* G [[buffer(7)]], device const MmTile* tiles [[buffer(8)]],
@@ -993,21 +994,26 @@ kernel void k_mm64(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buf
     threadgroup float buf[MM2_BM * MM2_BN];
     threadgroup float* Wt = buf;                    // [row][k], MM2_BM x MM_BK
     threadgroup float* Xt = buf + MM2_BM * MM_BK;   // [k][n], MM_BK x MM2_BN
-    const int r0 = (int) tg.x * MM2_BM, start = (int) tg.y * MM2_BN, count = min(MM2_BN, a.T - start);
-    const int ebias = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[0] : 0;
+    const bool grouped = FC_T == 0;
+    const int r0 = (int) tg.x * MM2_BM;
+    int slice = 0, start, count;
+    if (grouped) { const MmTile tl = tiles[tg.y]; slice = tl.slice; start = tl.start; count = tl.count; }
+    else { start = (int) tg.y * MM2_BN; count = min(MM2_BN, a.T - start); }
+    const int ebias = FC_FMT == MF_SEED4 || FC_FMT == MF_SEED4P4 || FC_FMT == MF_SEED6P8 ? ((device const int*) B)[slice] : 0;
     simdgroup_float8x8 acc[4][4];
     _Pragma("clang loop unroll(full)") for (int i = 0; i < 4; ++i) _Pragma("clang loop unroll(full)") for (int j = 0; j < 4; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
     const int sr = (int) (sgi / 2) * 32, sn = (int) (sgi % 2) * 32;   // this simdgroup's 32 x 32 sub-tile
     for (int k0 = 0; k0 < a.K; k0 += MM_BK) {
         for (int h = 0; h < 2; ++h) {   // weights: 64 rows x 32 k = 256 blocks, two per thread
             const int rr = (int) tid / 4 + 32 * h, jb = (int) tid % 4, row = r0 + rr;
-            if (row < a.R) tile_weights(FC_FMT, W, S, B, G, 0, (ulong) row, a.K, k0 / 8 + jb, ebias, Wt + rr * MM_BK + jb * 8, EN);
+            if (row < a.R) tile_weights(FC_FMT, W, S, B, G, slice, (ulong) slice * a.R + row, a.K, k0 / 8 + jb, ebias, Wt + rr * MM_BK + jb * 8, EN);
             else for (int i = 0; i < 8; ++i) Wt[rr * MM_BK + jb * 8 + i] = 0;
         }
         {   // inputs: 64 columns x 32 k, 16 per thread
             const int n = (int) tid / 2, kk = ((int) tid % 2) * 16;
             if (n < count) {
-                device const float4* xr = (device const float4*) (X + (ulong) (start + n) * a.xs + k0 + kk);
+                const int src = grouped ? perm[start + n] / a.xdiv : start + n;
+                device const float4* xr = (device const float4*) (X + (ulong) src * a.xs + k0 + kk);
                 for (int i = 0; i < 4; ++i) {
                     const float4 v = xr[i];
                     Xt[(kk + 4 * i) * MM2_BN + n] = v.x; Xt[(kk + 4 * i + 1) * MM2_BN + n] = v.y;
@@ -1031,9 +1037,10 @@ kernel void k_mm64(constant MmArgs& a [[buffer(0)]], device const uchar* W [[buf
     for (int idx = (int) tid; idx < MM2_BN * MM2_BM; idx += 128) {
         const int n = idx / MM2_BM, rr = idx % MM2_BM, row = r0 + rr;
         if (n >= count || row >= a.R) continue;
-        device float* yo = Y + (ulong) (start + n) * a.ys + row;
+        const int dst = grouped ? perm[start + n] : start + n;
+        device float* yo = Y + (ulong) dst * a.ys + row;
         const float s = Ot[n * MM2_BM + rr];
-        *yo = a.add == 2 ? bfr(bfr(s) * softplus_ln2_bf(Gt[(ulong) (start + n) * a.ys + row])) : a.add ? bfr(*yo + bfr(s)) : bfr(s);
+        *yo = a.add == 2 ? bfr(bfr(s) * softplus_ln2_bf(Gt[(ulong) dst * a.ys + row])) : a.add ? bfr(*yo + bfr(s)) : bfr(s);
     }
 }
 
