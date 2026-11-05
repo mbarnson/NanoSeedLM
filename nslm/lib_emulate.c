@@ -40,9 +40,10 @@ void ns_q8_0_row(const float* x, int n, uint8_t* out) {
     }
 }
 
-typedef struct { const NsTensor* t; uint64_t off; } EmTensor;   // a pack tensor, the file offset of its Q8_0 data
+typedef struct { const NsTensor* t[NS_EMU_PACKS]; uint64_t off; int lp; } EmTensor;   // + Q8_0 offset, 3 L + p
 typedef struct {
     const EmTensor* t;
+    const uint8_t* map;
     const NsRows* nr;
     size_t len, cols;           // the largest tensor slice in bytes, the most columns
     int fd, items, next, bad;   // item k: expert k % slices of tensor k / slices (all tensors of a shard share slices)
@@ -58,9 +59,9 @@ static void* emu_worker(void* arg) {
         const int k = m->bad ? m->items : m->next++;
         pthread_mutex_unlock(&m->mu);
         if (k >= m->items) break;
-        const EmTensor* et = &m->t[k / m->t[0].t->slices];
-        const NsTensor* t = et->t;
-        const int e = k % t->slices;
+        const EmTensor* et = &m->t[k / m->t[0].t[0]->slices];
+        const int e = k % et->t[0]->slices;
+        const NsTensor* t = et->t[m->map ? m->map[(size_t) et->lp * (size_t) et->t[0]->slices + (size_t) e] : 0];
         const size_t rb = (size_t) t->cols / 32 * 34, len = rb * (size_t) t->rows;
         for (int r = 0; r < t->rows; ++r) {
             ns_row_f32(m->nr, t, e, r, 0, w);
@@ -80,9 +81,11 @@ static void* emu_worker(void* arg) {
     return NULL;
 }
 
-int ns_emulate_gguf(const NsModel* pack, const char* gguf, int workers, int* n, char* err, int errlen) {
+int ns_emulate_gguf(const NsModel* const* packs, int np, const uint8_t* map, size_t map_len, const char* gguf, int workers,
+                    int* n, char* err, int errlen) {
     static const char* kProj[3] = {"gate", "up", "down"};
     *n = 0;
+    if (np < 1 || np > NS_EMU_PACKS) { snprintf(err, (size_t) errlen, "%d packs: 1 to %d", np, NS_EMU_PACKS); return -1; }
     Gguf g;
     if (gguf_open(&g, gguf, err, errlen)) return -1;
     EmTensor* et = (EmTensor*) malloc(sizeof *et * (size_t) (g.n ? g.n : 1));
@@ -96,23 +99,32 @@ int ns_emulate_gguf(const NsModel* pack, const char* gguf, int workers, int* n, 
         while (p < 3 && strcmp(kProj[p], proj)) ++p;
         if (p == 3) continue;
         snprintf(name, sizeof name, "language_model.model.layers.%d.mlp.switch_mlp.%s_proj.weight", l, proj);
-        const NsTensor* t = ns_find(pack, name);
-        const uint64_t bytes = t ? (uint64_t) t->slices * (uint64_t) t->rows * (uint64_t) (t->cols / 32) * 34 : 0;
-        if (!t) rc = snprintf(err, (size_t) errlen, "%s: the pack has no %s", gguf, name);
-        else if (gt->type != 8 || gt->ndim != 3 || gt->dims[0] != t->cols || gt->dims[1] != t->rows || gt->dims[2] != t->slices ||
-                 t->cols % 32 || t->enc == NS_SEED6P8 || (nt && t->slices != et[0].t->slices) || g.data + gt->offset + bytes > g.size)
-            rc = snprintf(err, (size_t) errlen, "%s: %s is not Q8_0 [%d][%d][%d] like %s", gguf, gt->name, t->slices, t->rows, t->cols, name);
-        else {
-            et[nt++] = (EmTensor) {t, g.data + gt->offset};
-            len = (size_t) (bytes / (uint64_t) t->slices) > len ? (size_t) (bytes / (uint64_t) t->slices) : len;
-            cols = (size_t) t->cols > cols ? (size_t) t->cols : cols;
+        EmTensor x = {{NULL}, g.data + gt->offset, 3 * l + p};
+        for (int k = 0; k < np && !rc; ++k) {
+            const NsTensor* t = x.t[k] = ns_find(packs[k], name);
+            if (!t) rc = snprintf(err, (size_t) errlen, "%s: pack %d has no %s", gguf, k, name);
+            else if (gt->type != 8 || gt->ndim != 3 || gt->dims[0] != t->cols || gt->dims[1] != t->rows || gt->dims[2] != t->slices ||
+                     t->cols % 32 || t->enc == NS_SEED6P8 || (nt && t->slices != et[0].t[0]->slices) ||
+                     g.data + gt->offset + (uint64_t) t->slices * (uint64_t) t->rows * (uint64_t) (t->cols / 32) * 34 > g.size)
+                rc = snprintf(err, (size_t) errlen, "%s: %s is not Q8_0 [%d][%d][%d] like %s of pack %d", gguf, gt->name, t->slices,
+                              t->rows, t->cols, name, k);
         }
+        if (rc) break;
+        const NsTensor* t0 = x.t[0];
+        const size_t E = (size_t) t0->slices, lp = (size_t) x.lp, rb = (size_t) t0->rows * (size_t) (t0->cols / 32) * 34;
+        if (map && (lp + 1) * E > map_len) rc = snprintf(err, (size_t) errlen, "the map has no %s", gt->name);
+        for (size_t e = 0; map && !rc && e < E; ++e)
+            if (map[lp * E + e] >= np) rc = snprintf(err, (size_t) errlen, "the map takes %s from pack %d", gt->name, map[lp * E + e]);
+        if (rc) break;
+        et[nt++] = x;
+        if (rb > len) len = rb;
+        if ((size_t) t0->cols > cols) cols = (size_t) t0->cols;
     }
     gguf_close(&g);   // before the writes: the mapping is read-only
     if (rc || !nt) { free(et); return rc ? -1 : 0; }
     NsRows* nr = (NsRows*) malloc(sizeof *nr);
     ns_rows_init(nr);
-    Emu m = {et, nr, len, cols, open(gguf, O_RDWR), nt * et[0].t->slices, 0, 0, PTHREAD_MUTEX_INITIALIZER};
+    Emu m = {et, map, nr, len, cols, open(gguf, O_RDWR), nt * et[0].t[0]->slices, 0, 0, PTHREAD_MUTEX_INITIALIZER};
     if (m.fd < 0) rc = snprintf(err, (size_t) errlen, "%s: cannot open for writing", gguf);
     else {
         pthread_t th[64];

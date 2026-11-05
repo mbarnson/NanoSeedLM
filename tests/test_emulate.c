@@ -73,59 +73,74 @@ int main(void) {
     for (int i = 0; i < 32; ++i) CHECK((int8_t) q[2 + i] == (int8_t) roundf(x[i] * id), "q[%d] = %d", i, (int8_t) q[2 + i]);
     CHECK(q[34] == 0 && q[35] == 0 && q[36] == 0, "zero block");
 
-    // A pack: gate in SEED4 (P = 3), down in SEED4P4 (P = 4)
-    const char* dir = "out/test_emulate_pack";
-    mkdir(dir, 0755);
-    const NsSpec sp[2] = {{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight", NS_SEED4, E, R, CG},
-                          {"language_model.model.layers.0.mlp.switch_mlp.down_proj.weight", NS_SEED4P4, E, R, CD}};
+    // Two packs with the encodings swapped; the map takes each expert of each projection from one of them
+    const char* dirs[2] = {"out/test_emulate_pack", "out/test_emulate_pack4"};
+    const char* names[2] = {"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+                            "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight"};
+    NsModel m[2];
+    const NsModel* pk[2] = {&m[0], &m[1]};
     char err[512] = "";
-    CHECK(ns_write(dir, sp, 2, 1u << 20, NULL, fill, NULL, err, sizeof err) == 0, "pack: %s", err);
-    NsModel m;
-    CHECK(ns_open(&m, dir, err, sizeof err) == 0, "open pack: %s", err);
+    for (int i = 0; i < 2; ++i) {
+        mkdir(dirs[i], 0755);
+        const NsSpec sp[2] = {{names[0], i ? NS_SEED4P4 : NS_SEED4, E, R, CG}, {names[1], i ? NS_SEED4 : NS_SEED4P4, E, R, CD}};
+        CHECK(ns_write(dirs[i], sp, 2, 1u << 20, NULL, fill, NULL, err, sizeof err) == 0, "pack %d: %s", i, err);
+        CHECK(ns_open(&m[i], dirs[i], err, sizeof err) == 0, "open pack %d: %s", i, err);
+    }
     NsRows* nr = (NsRows*) malloc(sizeof *nr);
     ns_rows_init(nr);
+    const uint8_t map[3 * E] = {0, 1, 1, 1, 1, 0};   // [proj gate, up, down][expert]: gate 0 1, down 1 0
 
     const char* path = "out/test_emulate.gguf";
-    write_gguf(path, R);
-    int nt = 0;
-    CHECK(ns_emulate_gguf(&m, path, 2, &nt, err, sizeof err) == 0 && nt == 2, "emulate: %d tensors, %s", nt, err);
-    Gguf g;
-    CHECK(gguf_open(&g, path, err, sizeof err) == 0, "reopen: %s", err);
-    for (int k = 0; k < 2; ++k) {
-        const int cols = k ? CD : CG;
-        const NsTensor* t = ns_find(&m, sp[k].name);
-        const uint8_t* got = g.map + g.data + kOff[k ? 2 : 0];
-        float w[64], back;
-        uint8_t want[68];
-        double maxerr = 0;
-        for (int e = 0; e < E; ++e)
-            for (int r = 0; r < R; ++r) {
-                ns_row_f32(nr, t, e, r, 0, w);
-                ns_q8_0_row(w, cols, want);
-                const uint8_t* row = got + ((size_t) e * R + r) * (cols / 32) * 34;
-                CHECK(!memcmp(row, want, (size_t) (cols / 32) * 34), "tensor %d expert %d row %d", k, e, r);
-                for (int c = 0; c < cols; ++c) {   // near the decoded weight
-                    const uint8_t* b = row + (c / 32) * 34;
-                    const float dd = h2f((uint16_t) (b[0] | b[1] << 8));
-                    back = dd * (int8_t) b[2 + c % 32];
-                    const double rel = fabs(back - w[c]) / (dd > 0 ? dd : 1);
-                    if (rel > maxerr) maxerr = rel;
+    for (int run = 0; run < 2; ++run) {   // one pack, then two with the map
+        write_gguf(path, R);
+        int nt = 0;
+        CHECK(ns_emulate_gguf(pk, run + 1, run ? map : NULL, sizeof map, path, 2, &nt, err, sizeof err) == 0 && nt == 2,
+              "run %d: %d tensors, %s", run, nt, err);
+        Gguf g;
+        CHECK(gguf_open(&g, path, err, sizeof err) == 0, "reopen: %s", err);
+        for (int k = 0; k < 2; ++k) {
+            const int cols = k ? CD : CG;
+            const uint8_t* got = g.map + g.data + kOff[k ? 2 : 0];
+            float w[64], back;
+            uint8_t want[68];
+            double maxerr = 0;
+            for (int e = 0; e < E; ++e)
+                for (int r = 0; r < R; ++r) {
+                    const int from = run ? map[(k ? 2 : 0) * E + e] : 0;
+                    ns_row_f32(nr, ns_find(&m[from], names[k]), e, r, 0, w);
+                    ns_q8_0_row(w, cols, want);
+                    const uint8_t* row = got + ((size_t) e * R + r) * (cols / 32) * 34;
+                    CHECK(!memcmp(row, want, (size_t) (cols / 32) * 34), "run %d tensor %d expert %d row %d", run, k, e, r);
+                    for (int c = 0; c < cols; ++c) {   // near the decoded weight
+                        const uint8_t* b = row + (c / 32) * 34;
+                        const float dd = h2f((uint16_t) (b[0] | b[1] << 8));
+                        back = dd * (int8_t) b[2 + c % 32];
+                        const double rel = fabs(back - w[c]) / (dd > 0 ? dd : 1);
+                        if (rel > maxerr) maxerr = rel;
+                    }
                 }
-            }
-        CHECK(maxerr <= 0.5 + 127.0 / 2048, "tensor %d: error %.3f steps", k, maxerr);   // half a step, and d in f16
+            CHECK(maxerr <= 0.5 + 127.0 / 2048, "tensor %d: error %.3f steps", k, maxerr);   // half a step, and d in f16
+        }
+        const uint8_t* norm = g.map + g.data + kOff[1];
+        int kept = 1;
+        for (int i = 0; i < 64; ++i) kept &= norm[i] == 0xAB;
+        CHECK(kept, "a tensor that is not an expert changed");
+        gguf_close(&g);
     }
-    const uint8_t* norm = g.map + g.data + kOff[1];
-    int kept = 1;
-    for (int i = 0; i < 64; ++i) kept &= norm[i] == 0xAB;
-    CHECK(kept, "a tensor that is not an expert changed");
-    gguf_close(&g);
 
-    write_gguf(path, R - 1);   // shape mismatch: nothing is written
-    CHECK(ns_emulate_gguf(&m, path, 1, &nt, err, sizeof err) != 0, "a [%d] x %d tensor accepted", R - 1, CG);
-    CHECK(gguf_open(&g, path, err, sizeof err) == 0 && g.map[g.data] == 0xAB, "a failed file changed");
-    gguf_close(&g);
+    // Refused before any write: a shape mismatch, a map entry past the packs, a map too short
+    const uint8_t bad[3 * E] = {0, 2, 0, 0, 0, 0};
+    for (int c = 0; c < 3; ++c) {
+        write_gguf(path, c ? R : R - 1);
+        int nt = 0;
+        CHECK(ns_emulate_gguf(pk, 2, c ? (c == 1 ? bad : map) : NULL, c == 2 ? 2 * E : sizeof map, path, 1, &nt, err, sizeof err) != 0,
+              "case %d accepted", c);
+        Gguf g;
+        CHECK(gguf_open(&g, path, err, sizeof err) == 0 && g.map[g.data] == 0xAB, "case %d: the file changed", c);
+        gguf_close(&g);
+    }
 
-    ns_close(&m);
+    for (int i = 0; i < 2; ++i) ns_close(&m[i]);
     free(nr);
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

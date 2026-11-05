@@ -31,7 +31,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 | `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, from an MLX base folder |
-| `nslm-qwen4-emulate` | Write a seed pack's experts into Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them |
+| `nslm-qwen4-emulate` | Write seed experts into Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them. A map takes each expert from one of several packs |
 
 Read [Make a model folder](../guides/make-a-model.md).
 
@@ -48,6 +48,8 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `hf_qwen4_gen.sh` | Run a Qwen3.8-Flash-Next pack through `nslm-qwen4-gen` on an HF Jobs GPU node |
 | `hf_qwen4_kld.sh` | Score packs with `nslm-qwen4-kld` against a reference model on wikitext-2, on an HF Jobs GPU node |
 | `hf_llama_kld.sh` | Score Unsloth packs and emulated seed packs against BF16 in llama.cpp, with the BF16 PLE table |
+| `hf_qwen4_routes.sh` | Record routing traces of a pack on chat and code text, on an HF Jobs GPU node |
+| `qwen4_tier_map.py` | Write a per-expert tier map from routing traces (most used experts), at random, or by projection |
 | `mova_capture.py` | Activation statistics for the expert search, through MLX |
 | `mova_score.py` | Scores in MLX |
 | `mova_export.py` | Inputs for `nslm-mova-score`, `nslm-mova-gen`, `nslm-mova-bench` and route studies |

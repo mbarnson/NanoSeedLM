@@ -2,10 +2,12 @@
 # tools/hf_llama_kld.sh - KL divergence of Qwen3.8-Flash-Next packs against BF16 in llama.cpp, each with the BF16 PLE
 # table (RAM-tier plan T1), on an HF Jobs node with 1 TB of RAM and 384 GB of VRAM (rtx-pro-6000x4).
 #
-#   SRC=/b/src OUT=/b/kld [PACKS="Q8_0 P3 P4 UD-IQ3_XXS UD-Q3_K_XL UD-IQ4_XS UD-Q4_K_XL"] [CHUNKS=64] bash tools/hf_llama_kld.sh
+#   SRC=/b/src OUT=/b/kld [PACKS="Q8_0 P3 P4 UD-IQ3_XXS UD-Q3_K_XL UD-IQ4_XS UD-Q4_K_XL"] [CHUNKS=64] [MAPS=/b/maps] \
+#     bash tools/hf_llama_kld.sh
 #
-# A pack is an Unsloth folder, or P3 / P4: the Q8_0 shards with that seed pack's experts (nslm-qwen4-emulate), so P3 and
-# P4 come after Q8_0.  The reference logits: BF16 on the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
+# A pack is an Unsloth folder, P3 / P4 (the Q8_0 shards with that seed pack's experts, nslm-qwen4-emulate), or H-NAME:
+# experts from P3 and P4 by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py).  The reference logits: BF16 on the
+# first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
 set -uo pipefail
 UREPO=unsloth/Qwen3.8-Flash-Next-GGUF
 UREV=${UREV:-d96201194f103c906994f283f504209dc8d2a10c}
@@ -19,6 +21,9 @@ pip install -q --break-system-packages "huggingface_hub[hf_xet]" pyarrow >/dev/n
 mkdir -p "$OUT" /m /w
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader; uptime; free -g | head -2; df -h / | tail -1
 
+seed() {   # seed P3|P4: that seed pack in /m/seed-P3 or /m/seed-P4, kept for the next packs
+    [ -d "/m/seed-$1" ] || hf download "${SEED[$1]%@*}" --revision "${SEED[$1]#*@}" --local-dir "/m/seed-$1" --max-workers 32 >/dev/null
+}
 get() {   # get FOLDER [EXCLUDED SHARD]: one Unsloth folder into /m
     local t0; t0=$(date +%s)
     hf download "$UREPO" --revision "$UREV" --include "$1/*" ${2:+--exclude "$1/*$2.gguf"} --local-dir /m --max-workers 32 >/dev/null
@@ -59,16 +64,17 @@ ppl /m/BF16 "$OUT/BF16.log" -f /w/text.txt --kl-divergence-base /w/ref.kld
 PLE=/m/BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf
 for pk in $PACKS; do
     case $pk in
-        Q8_0) get Q8_0 -00003-of-00006; stamp "$PLE" 3 6; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf; dir=/m/Q8_0 ;;
-        P3|P4)
+        Q8_0) [ -d /m/Q8_0 ] || get Q8_0 -00003-of-00006; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf
+            stamp "$PLE" 3 6; dir=/m/Q8_0 ;;
+        P3|P4|H-*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
             t1=$(date +%s)
-            hf download "${SEED[$pk]%@*}" --revision "${SEED[$pk]#*@}" --local-dir "/m/$pk" --max-workers 32 >/dev/null
-            if ! /w/src/build/bin/nslm-qwen4-emulate --pack "/m/$pk" --workers "$(nproc)" /m/Q8_0/*.gguf | tail -3; then
+            if [[ $pk == H-* ]]; then seed P3; seed P4; args=(--pack /m/seed-P3 --pack /m/seed-P4 --map "$MAPS/${pk#H-}.bin")
+            else seed "$pk"; args=(--pack "/m/seed-$pk"); fi
+            if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack"; then
                 echo "== $pk: emulate failed"; continue
             fi
-            rm -rf "/m/$pk"
             stamp "$PLE" 3 6
-            echo "== $pk: download and emulate $(( $(date +%s) - t1 )) s"; dir=/m/Q8_0 ;;
+            echo "== $pk: emulate $(( $(date +%s) - t1 )) s"; dir=/m/Q8_0 ;;
         UD-*) get "$pk" -00004-of-00004; stamp "$PLE" 4 4; ln -sf "$PLE" "/m/$pk/Qwen3.8-Flash-Next-$pk-00004-of-00004.gguf"; dir=/m/$pk ;;
         *) echo "unknown pack $pk"; continue ;;
     esac
