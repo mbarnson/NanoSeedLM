@@ -282,3 +282,19 @@ On the M4 Max, `test_qwen4_kernels` passed. Each qwen4 kernel is within 6.4e-7 o
 within 3.7e-3 of exact dequantization, from the BF16 output rounding. The rest of the `make test` output is the same
 as on main. The Metal engine does not run Qwen3.8-Flash-Next yet. The MoE combine, the stream tile and the Q4
 embedding are not on Metal yet.
+
+## [2026-11-04] result | The prompt time of Qwen3.8-Flash-Next on the CUDA engine, by stage
+
+`Q4E_PROFILE=1` showed where 1,024 prompt tokens of P4 spent 15.4 s (RTX PRO 6000, 8 GB expert cache). Two changes
+bring this to 7.5 s, 2.1 times faster:
+
+- `d5cd048`: the PLE prefetch. `q4e_forward` asks the OS to read all PLE rows of the call first (`madvise` WILLNEED).
+  The PLE stage goes from 5,415 ms to 4 ms. The logits do not change.
+- `cafb3a2`: prompt rows of more than 8 run the routed experts as grouped GEMMs (`kc_bucket`, `kc_mm_grouped_dev`). The
+  expert stage goes from 3,820 ms to 1,118 ms. `kc_bucket` now takes up to 1,024 experts.
+
+The grouped GEMMs round their inputs to BF16. The KL against the 4-bit model went from 0.179 to 0.176. The reference's
+perplexity went from 2.364 to 2.402, so the rounding cost is not known yet. The router and expert cache stage (4.2 s) is
+now 57% of the time. Read
+[The prompt time of Qwen3.8-Flash-Next on the CUDA engine, by stage](results/2026-11-04-qwen38-prompt-profile.md).
+

@@ -68,6 +68,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   with experts in host memory, a VRAM expert cache, and streamed experts.
 - [2026-11-04: Qwen3.8-Flash-Next-NanoSeedLM-P3 in mlx-vlm on the M4 Max](results/2026-11-04-qwen38-m4max-mlx-p3.md):
   decode speed and peak memory against a 4-bit affine quantization.
+- [2026-11-04: The prompt time of Qwen3.8-Flash-Next on the CUDA engine, by stage](results/2026-11-04-qwen38-prompt-profile.md):
+  the PLE prefetch and the grouped expert GEMMs. 1,024 tokens take 7.5 s, not 15.4 s.
 
 ## For contributors and agents
 
