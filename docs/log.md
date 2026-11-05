@@ -476,3 +476,10 @@ The two packs have about the same KL against BF16 (0.0600 and 0.0593). With the 
 29,120 tokens at 4,222 tokens per second and decodes at 53.8. llama.cpp (`-ot exps=CPU`) does 793 and 9.9. With
 everything in VRAM, llama.cpp leads: 5,130 and 114 against 4,418 and 87.6. Read
 [P3 against llama.cpp](results/2026-11-05-qwen38-vs-llamacpp.md).
+
+## [2026-11-05] result | Faster decode norms and RoPE, and the expert copy is PCIe-bound
+
+`0233258`: P3 decode with an 8 GB expert cache goes from 54.6 to 56.5 tokens per second on an RTX PRO 6000 (three
+runs each on one node), with the same greedy text. Two norm kernels load a thread's values together, and RoPE reads a
+table of inverse frequencies in place of an f64 `pow`. The decode expert copy is 46% of the GPU time, and 32 to 1,024
+blocks give the same speed. Read [faster decode norms and RoPE](results/2026-11-05-qwen38-decode-small-kernels.md).

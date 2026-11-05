@@ -112,6 +112,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   per second at 29,120 tokens and 4,165 at 15,922 (RTX PRO 6000), the default on GPUs of 64 GB or more.
 - [2026-11-05: P3 against llama.cpp UD-Q3_K_XL](results/2026-11-05-qwen38-vs-llamacpp.md): experts in host memory,
   4,222 and 53.8 tokens per second against 793 and 9.9. All in VRAM, 4,418 and 87.6 against 5,130 and 114.
+- [2026-11-05: Faster decode norms and RoPE; the expert copy is PCIe-bound](results/2026-11-05-qwen38-decode-small-kernels.md):
+  P3 decode 54.6 to 56.5 tokens per second (8 GB cache, RTX PRO 6000), the same text. More copy blocks do not help.
 
 ## For contributors and agents
 
