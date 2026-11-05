@@ -44,6 +44,8 @@ Work that is not done yet, with its gates and hypotheses.
   the PLE table choice, for a PC with a 16 GB GPU.
 - [2026-11-04: MTP drafts in the CUDA engine](plans/2026-11-04-qwen38-mtp.md): draft. The model's MTP head drafts
   tokens, and one main forward verifies them (+31% on code on the M4 Max).
+- [2026-11-05: Qwen3.8-Flash-Next decode on the RTX 4080 near Strata's speed](plans/2026-11-05-qwen38-decode-4080.md):
+  draft. Cheaper decode rows: the MTP head in the cache, a matvec by expert, the tail skip, and the CPU for misses.
 - [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
   engine keeps the session's hot experts in P4 and the rest in S3 or P3.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
@@ -130,6 +132,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   drafts, chat 1% to 20%, the same text.
 - [2026-11-05: MTP drafts on the RTX 4080, again](results/2026-11-05-qwen38-mtp-4080-rerun.md): after the PLE and RAM
   fixes, drafts are 14% to 27% slower. Each verify row pays the PCIe copies of its missed experts.
+- [2026-11-05: Strata on the RTX 4080 PC](results/2026-11-05-strata-4080-probe.md): IQ3_S at 85 tokens per second with
+  MTP and 57 without. A step costs 10.5 ms + 7.1 ms a row, against our 9 ms + 25 ms.
 
 ## For contributors and agents
 

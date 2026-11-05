@@ -662,3 +662,11 @@ prompts. Code decodes at 37.6 tokens per second without drafts and 29.0 to 32.5 
 without drafts and 24.1 to 32.7 with drafts. The head takes about 1.9 GB of the cache, and each verify row pays the
 PCIe copies of its missed experts. Drafts stay off by default on CUDA. On the M4 Max they make code 31% to 37% faster.
 Read [MTP drafts on the RTX 4080, again](results/2026-11-05-qwen38-mtp-4080-rerun.md).
+
+## [2026-11-05] result | Strata on the RTX 4080 PC: why its MTP drafts pay
+
+pc-cuda's PC, Strata with Matt's IQ3_S configuration: 85 tokens per second with MTP drafts and 57 without. A Strata step
+of T rows takes about 10.5 ms + 7.1 ms x T, and ours about 9 ms + 25 ms x T. Strata misses fewer experts (2.2 a layer
+against our 3.5), and computes most misses on the CPU. Each of our rows copies its misses over PCIe. Read
+[Strata on the RTX 4080 PC](results/2026-11-05-strata-4080-probe.md). The plan
+[decode on the RTX 4080 near Strata's speed](plans/2026-11-05-qwen38-decode-4080.md) follows from it.
