@@ -104,6 +104,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   10.4 GB the tier serves 64% to 71% of router choices and loads 3 to 5 experts for each token.
 - [2026-11-05: Prefill with larger chunks and an expert prefetch](results/2026-11-05-qwen38-prefill-chunks.md): 1,343
   to 2,801 tokens per second on a 15,922-token prompt (RTX PRO 6000), 1,571 on an A100 at 29,120 tokens.
+- [2026-11-05: cp.async attention, merged GEMMs and a register router](results/2026-11-05-qwen38-merged-gemms.md):
+  2,801 to 3,403 tokens per second on 15,922 tokens, 3,423 at 29,120, and decode 44.0 to 54.2 (RTX PRO 6000).
 
 ## For contributors and agents
 

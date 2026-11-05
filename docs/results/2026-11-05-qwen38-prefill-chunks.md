@@ -5,7 +5,7 @@ A 29,120-token prompt went from 1,414 to 2,782, and from 746 to 1,571 on an A100
 the largest gain, because each expert's GEMM tiles now fill. The next layer's expert copies now run beside the layer's
 compute. Decode did not change (44.0 tokens per second).
 
-**Status.** Current. One prompt text, one pack. The RTX 4080 is not measured.
+**Status.** Replaced by [cp.async attention, merged GEMMs and a register router](2026-11-05-qwen38-merged-gemms.md).
 
 ## Setup
 

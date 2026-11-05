@@ -441,3 +441,17 @@ A draft for Matt's go. On the M4 Max, mac-metal measured the P3 pack with MTP: c
 - DeltaNet: the conv computes all tokens at once, and the step stages 16 tokens.
 
 Decode did not change. Read [prefill with larger chunks](results/2026-11-05-qwen38-prefill-chunks.md).
+
+## [2026-11-05] result | cp.async attention, merged GEMMs and a register router
+
+`6314b52` to `470d42a`: on an RTX PRO 6000, a 15,922-token prompt of the P3 pack went from 2,801 to 3,403 tokens per
+second, and a 29,120-token prompt from 2,782 to 3,423. Decode went from 44.0 to 54.2. The changes:
+
+- Attention: Q in registers, K and V tiles by cp.async, 4 blocks an SM.
+- DeltaNet: double-buffered stages by cp.async.
+- Weights of one input load as one GEMM: HC down and inject, each layer's input projections, the router and the shared
+  expert gate.
+- The router keeps its logits in registers. QSA scores run in shared-memory tiles.
+
+`0708c6b` changed the greedy text of the decode prompt (a near-tie on its first token). Read
+[merged GEMMs](results/2026-11-05-qwen38-merged-gemms.md).
