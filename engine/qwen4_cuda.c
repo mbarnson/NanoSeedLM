@@ -90,6 +90,7 @@ struct Q4Eng {
     W m_fe, m_fh, m_down, m_up;
     float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog;
     int mtp, lrow, keep, nkeep;
+    cudaGraphExec_t dgraph[Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
@@ -567,6 +568,7 @@ void q4e_close(Q4Eng* e) {
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
     for (int w = 0; w < 4; ++w) for (int t = 0; t <= MV_MAXT; ++t) if (e->graph[w][t]) cudaGraphExecDestroy(e->graph[w][t]);
+    for (int k = 0; k <= Q4E_MAX_DRAFTS; ++k) if (e->dgraph[k]) cudaGraphExecDestroy(e->dgraph[k]);
     free(e->dev); free(e->host); free(e->ids);
     if (e->routes) fclose(e->routes);
     if (e->s) cudaStreamDestroy(e->s);
@@ -683,7 +685,8 @@ static void ple(Q4Eng* e, int l, int T, int row0) {   // row0: the chunk's first
     kq4_ple_conv_keep(e->s, c, L->pw, e->keys, e->gated, L->hist, e->keep ? L->khist : NULL, e->H, T);
 }
 
-static int attention(Q4Eng* e, Layer* L, int p0, int T) {   // row t at *din + p0 + t
+// Row t at *din + p0 + t. keys_only: the KV and QSA block-key stores, no output (the MTP head's forward rows)
+static int attention(Q4Eng* e, Layer* L, int p0, int T, int keys_only) {
     const Qwen4Cfg* c = &e->c;
     const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio;
     const int ld = att_ld(c);   // a row of qp: q, k, v, the indexer's q heads and key
@@ -698,6 +701,7 @@ static int attention(Q4Eng* e, Layer* L, int p0, int T) {   // row t at *din + p
     kq4_head_norm_rope_inv(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, e->inv, p0, e->din, T);
     mark(e, ST_ROPE);
     kq4_qsa_blocks_inv(e->s, c, L->raw, L->ikn, e->inv, p0, e->din, T, L->blk);
+    if (keys_only) return 0;
     kq4_qsa_rows(e->s, c, p0, e->din, e->done, e->nsel, T);
     // the score grid and stride: the blocks done by the last row, or in a graph (any position) every block slot
     kq4_qsa_select(e->s, c, ixo, ld, L->blk, e->done, e->cap ? e->nb : (e->pos + p0 + T) / R, e->sc, e->sel, T);
@@ -790,7 +794,7 @@ static int run_layer(Q4Eng* e, Layer* L, int l, int attn, int T, int row0, int p
     mark(e, ST_PLE);
     hc_mix(e, L->hc_norm[0], &L->hc_di[0], &L->hc_up[0], 1, T);
     mark(e, ST_HC);
-    if (attn ? attention(e, L, p0, T) : gdn(e, L, T)) return -1;
+    if (attn ? attention(e, L, p0, T, 0) : gdn(e, L, T)) return -1;
     mark(e, attn ? ST_ATTN : ST_GDN);
     kq4_hc_add_norm(e->s, c->hc, c->d, e->H, e->br, e->inj, L->hc_norm[1], c->eps, e->normed, T);
     hc_mix(e, NULL, &L->hc_di[1], &L->hc_up[1], 1, T);
@@ -813,14 +817,15 @@ static void head_in(Q4Eng* e, const int32_t* tok, const float* Hin, int n) {
     mv(e, &e->m_fh, e->normed, e->Hm, n * c->hc);   // a stream a row
     kq4_hc_add(e->s, c->hc, c->d, e->Hm, e->br, e->ones, n);
 }
-// The head's rows of a chunk after its last layer: row t on token din[1 + s + t] and the main streams of row t - 1 + s
-// (Hall[-1] before the first chunk), at *din - 1 + s + t. s = 1 at position 0, where no row comes before.
+// The head's keys for a chunk's rows: row t on token din[1 + s + t] and the main streams of row t - 1 + s (Hall[-1]
+// before the first chunk), at *din - 1 + s + t. s = 1 at position 0, where no row comes before.
 static int head_rows(Q4Eng* e, int T, int s) {
     float* H = e->H;
     if (!e->mtp || T - s <= 0) return 0;
     head_in(e, e->din + 1 + s, H + (ptrdiff_t) (s - 1) * e->c.hc * e->c.d, T - s);
     e->H = e->Hm;
-    const int rc = run_layer(e, &e->M, -1, 1, T - s, 0, s - 1);
+    hc_mix(e, e->M.hc_norm[0], &e->M.hc_di[0], &e->M.hc_up[0], 1, T - s);
+    const int rc = attention(e, &e->M, s - 1, T - s, 1);
     e->H = H;
     return rc;
 }
@@ -951,16 +956,12 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
 
 // ---- MTP: drafts, and verify forwards that keep each row's state -----------------------------------------------------
 
-int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
+// k head rows on din = {pos, bonus, ...}: row j at pos - 1 + j on token din[1 + j] and Hall[-1], then its own streams;
+// draft j to din[2 + j]
+static int draft_rows(Q4Eng* e, int k) {
     const Qwen4Cfg* c = &e->c;
     float* H = e->H;
-    e->err[0] = 0;
-    if (!e->mtp || e->lrow < 0 || k < 1 || k > Q4E_MAX_DRAFTS || e->pos + k > e->max_pos)
-        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
-    e->hin[0] = e->pos;   // din: the position, the bonus, then the drafts
-    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t), cudaMemcpyHostToDevice, e->s);
-    kc_argmax(e->s, e->logits + (size_t) e->lrow * c->vocab, e->din + 1, c->vocab, 1);
-    for (int j = 0; j < k && !e->err[0]; ++j) {   // head row j at pos - 1 + j: token din[1 + j], streams Hall[-1] then its own
+    for (int j = 0; j < k && !e->err[0]; ++j) {
         head_in(e, e->din + 1 + j, j ? e->Hm : e->Hall - (size_t) c->hc * c->d, 1);
         e->H = e->Hm;
         if (run_layer(e, &e->M, -1, 1, 1, 0, j - 1)) break;
@@ -970,7 +971,30 @@ int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
         mark(e, ST_HEAD);
     }
     e->H = H;
-    if (e->err[0]) return -1;
+    return e->err[0] ? -1 : 0;
+}
+
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
+    const Qwen4Cfg* c = &e->c;
+    e->err[0] = 0;
+    if (!e->mtp || e->lrow < 0 || k < 1 || k > Q4E_MAX_DRAFTS || e->pos + k > e->max_pos)
+        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
+    e->hin[0] = e->pos;
+    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t), cudaMemcpyHostToDevice, e->s);
+    kc_argmax(e->s, e->logits + (size_t) e->lrow * c->vocab, e->din + 1, c->vocab, 1);   // the bonus
+    cudaGraphExec_t* ge = &e->dgraph[k];
+    if (!e->prof && !e->no_graph && !*ge) {   // a graph for each k: the positions come from din
+        cudaGraph_t gr = NULL;
+        if (cudaStreamBeginCapture(e->s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return fail(e, "CUDA graph capture failed");
+        e->cap = 1;
+        const int rc = draft_rows(e, k);
+        e->cap = 0;
+        if (cudaStreamEndCapture(e->s, &gr) != cudaSuccess || rc) { if (gr) cudaGraphDestroy(gr); return fail(e, "CUDA graph capture failed"); }
+        const cudaError_t ri = cudaGraphInstantiate(ge, gr, 0);
+        cudaGraphDestroy(gr);
+        if (ri != cudaSuccess) { *ge = NULL; return fail(e, "CUDA graph: %s", cudaGetErrorString(ri)); }
+    }
+    if (*ge ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : draft_rows(e, k)) return fail(e, "CUDA: draft failed");
     cudaMemcpyAsync(e->hin + 1, e->din + 2, sizeof(int32_t) * (size_t) k, cudaMemcpyDeviceToHost, e->s);
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));

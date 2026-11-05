@@ -1,5 +1,6 @@
 // tests/test_qwen4_mtp.c - the qwen4 CUDA engine's MTP head (Q4EOpts.mtp) on tests/data/qwen4_tiny: drafts against the
 // C reference, verify forwards that keep each row's state, and greedy decode with drafts. Skipped without a GPU.
+#define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c99 (Windows: _putenv_s)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,13 @@ static int fails;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); ++fails; } } while (0)
 #define DIR_ "tests/data/qwen4_tiny"
 
+static void set_env(const char* k, const char* v) {   // v = NULL: unset
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
 static int argmax(const float* l, int n) { int b = 0; for (int v = 1; v < n; ++v) if (l[v] > l[b]) b = v; return b; }
 
 // The C reference's bonus and 3 drafts after ids[0..n) (test_qwen4_ref checks the head against mlx-vlm's)
@@ -103,6 +111,15 @@ int main(void) {
                   lens[i], rows[w], argmax(lg, V), d[0], d[1], d[2], want[0], want[1], want[2], want[3]);
         }
         printf("prompt of %d: bonus %d, drafts %d %d %d (the C reference's)\n", lens[i], want[0], want[1], want[2], want[3]);
+    }
+    {   // the drafts run as a CUDA graph for each k: without graphs, the same drafts
+        set_env("NSLM_NO_GRAPH", "1");
+        Q4Eng* ng = q4e_open(DIR_, &o, err, sizeof err);
+        set_env("NSLM_NO_GRAPH", NULL);
+        int32_t dn[3];
+        CHECK(ng && prompt(ng, ids, 45, 8, lg, buf) == 0 && q4e_draft(ng, 3, dn) == 0 && prompt(e, ids, 45, 8, lg, buf) == 0 &&
+              q4e_draft(e, 3, d) == 0 && !memcmp(d, dn, sizeof d), "drafts without CUDA graphs differ: %s", ng ? q4e_error(ng) : err);
+        q4e_close(ng);
     }
     CHECK(q4e_draft(e, 4, d) == -1 && q4e_forward_keep(e, ids, 5, NULL) == -1 && q4e_accept(e, 1) == -1, "out-of-range calls");
 
