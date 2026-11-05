@@ -18,9 +18,23 @@
 
 ## Weights that the kernel computes
 
-- [QTIP](https://arxiv.org/abs/2406.11235) and
-  [ik_llama.cpp trellis quants](https://github.com/ikawrakow/ik_llama.cpp/pull/113). The kernel computes the weights.
-  It does not look them up in a table.
+- [QTIP](https://arxiv.org/abs/2406.11235), Tseng, Sun, Hou and De Sa, NeurIPS 2024. A bitshift trellis over a
+  computed Gaussian code, with a randomized Hadamard transform. The kernel computes the weights. It does not look them
+  up in a table. Read the [trellis plan](../plans/2026-11-05-trellis-experts.md).
+- [ik_llama.cpp trellis quants](https://github.com/ikawrakow/ik_llama.cpp/pull/113). Trellis-coded formats (IQ*_KT)
+  with CPU and CUDA kernels in a llama.cpp fork.
+
+## Trellis-coded quantization
+
+- [Trellis coded quantization of memoryless and Gauss-Markov sources](https://doi.org/10.1109/26.46532), Marcellin
+  and Fischer, IEEE Transactions on Communications, 1990. The origin of TCQ: a Viterbi search over a trellis, within
+  0.21 dB of the distortion-rate bound for a uniform source.
+- [QuIP](https://arxiv.org/abs/2307.13304), Chee, Cai, Kuleshov and De Sa, NeurIPS 2023. Incoherence processing and
+  adaptive rounding (LDLQ): the first usable 2-bit LLMs.
+- [QuIP#](https://arxiv.org/abs/2402.04396), Tseng, Chee, Sun, Kuleshov and De Sa, 2024. A randomized Hadamard transform,
+  E8 lattice codebooks and BlockLDLQ. QTIP replaces the lattice with a trellis.
+- [BCJR-QAT](https://arxiv.org/abs/2605.10655), Iyengar, 2026. The trellis search made differentiable (BCJR
+  forward-backward) for quantization-aware training.
 
 ## Discussion
 

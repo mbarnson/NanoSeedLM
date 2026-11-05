@@ -59,5 +59,7 @@ weight of the weight's input column times the squared error.
 
 ## See also
 
-- [QTIP](https://arxiv.org/abs/2406.11235), [related work](../reference/related-work.md)
+- [QTIP](https://arxiv.org/abs/2406.11235), [QuIP#](https://arxiv.org/abs/2402.04396), and TCQ's origin
+  ([Marcellin and Fischer, 1990](https://doi.org/10.1109/26.46532))
+- [Related work](../reference/related-work.md), section "Trellis-coded quantization"
 - [SeedLM packs for Qwen3.8-Flash-Next](2026-11-04-qwen38-flash-next.md)
