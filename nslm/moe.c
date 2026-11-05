@@ -10,7 +10,8 @@
 //   nslm-moe --model DIR --act FILE --check L,PROJ,EXPERT,K    GPU vs the CPU search on K column groups of one expert
 //   nslm-moe --model DIR --imatrix FILE --probe L,PROJ,EXPERTS,BLOCKS [--probe-ref FILE] [--workers 4]   the weighted
 //       error of seed layouts (C, P) = (8, 3), (8, 4), (12, 4), (16, 7) on BLOCKS sampled blocks of EXPERTS experts (CPU,
-//       nslm/searchc.h); --probe-ref: also of the BF16 weights 'w' [E][rows][cols] of FILE (e.g. a dequantized GGUF tensor)
+//       nslm/searchc.h); --probe-ref: also of the BF16 weights 'w' [E][rows][cols] of FILE (tools/gguf_experts.py); BLOCKS
+//       0: the reference only
 //   --scope mla --p4 --xtx DIR [--damp 0.01]: the MLA projections by GPTQ (nslm/gptq4.h) over their inputs' X^T X
 //       (nslm-mova-mlacapture --xtx DIR: L{l}_{x,v,q,o}.xtx), H dampened by damp * mean(diag H); the heads of a per-head
 //       map with one exponent bias search together; --codec p3 / p8 in place of --p4: P = 3 (.blk, SEED4 nibble words) or
@@ -656,7 +657,7 @@ static void* probe_worker(void* arg) {
 static int probe(const char* spec, const char* refp, const SearchOpts* so, double n0, int workers) {
     int l = 0, ne = 0, nbk = 0, p = 0;
     char pn[32], err[512];
-    if (sscanf(spec, "%d,%31[^,],%d,%d", &l, pn, &ne, &nbk) != 4 || ne < 1 || nbk < 1) { fprintf(stderr, "--probe L,PROJ,EXPERTS,BLOCKS\n"); return 2; }
+    if (sscanf(spec, "%d,%31[^,],%d,%d", &l, pn, &ne, &nbk) != 4 || ne < 1 || nbk < 0) { fprintf(stderr, "--probe L,PROJ,EXPERTS,BLOCKS\n"); return 2; }
     while (p < NPROJ && strcmp(kProj[p], pn)) ++p;
     if (p == NPROJ) { fprintf(stderr, "unknown projection %s\n", pn); return 2; }
     const Search4Opts o = {so->n_seeds, so->n_exp, {so->exp_delta[0], so->exp_delta[1], so->exp_delta[2]}, so->refit};
@@ -677,7 +678,7 @@ static int probe(const char* spec, const char* refp, const SearchOpts* so, doubl
         if (!w) return 2;
         act_h(l, p, e, n0, hh);
         for (int c = 0; c < cols; ++c) sh[c] = sqrtf(hh[c] > 1e-12f ? hh[c] : 1e-12f);
-        for (int li = 0; li < NL; ++li) {
+        for (int li = 0; nbk > 0 && li < NL; ++li) {
             const int C = lay[li][0], P = lay[li][1], ng = cols / C;   // whole blocks only
             int top = -1000;   // the exponent window ends at the largest block norm (nslm_choose_bias, C weights a block)
             for (int r = 0; r < rows; ++r)
@@ -717,7 +718,7 @@ static int probe(const char* spec, const char* refp, const SearchOpts* so, doubl
         free(w);
     }
     printf("probe L%d %s: %d experts, %d blocks each, %d seeds, %.0f s\n", l, kProj[p], ne, nbk, o.n_seeds, now_s() - t0);
-    for (int li = 0; li < NL; ++li)
+    for (int li = 0; nbk > 0 && li < NL; ++li)
         printf("  C %2d P %d  %.2f bits  weighted relative error %.4f\n", lay[li][0], lay[li][1], nslmc_bits(lay[li][0], lay[li][1]), rel[li]);
     if (rw) printf("  %-28s weighted relative error %.4f\n", refp, rel[4]);
     free(hh); free(sh); free(wb); free(sb); free(eb);
