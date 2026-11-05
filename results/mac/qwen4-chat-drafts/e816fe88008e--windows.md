@@ -1,6 +1,6 @@
 Status: PASS
 Branch: mac/qwen4-chat-drafts
-Commit: e816fe88008ecc
+Commit: e816fe88008e72c184a63a21cd6a55bb5466ca94
 Platform: windows
 Agent: pc-cuda
 Time: 2026-11-05T21:47:53Z
