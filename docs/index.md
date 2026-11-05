@@ -78,6 +78,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   beats LFU and a hot set. The optimum would halve the misses.
 - [2026-11-04: Expert cache misses of MTP verify windows](results/2026-11-04-qwen38-verify-windows.md): verify windows
   of 2 to 4 tokens do not reduce the misses for each token.
+- [2026-11-04: Qwen3.8-Flash-Next decode with affine, P4 and P3 experts](results/2026-11-04-qwen38-decode-by-format.md):
+  P3 46.1, affine 42.4, P4 40.0 tokens per second on one GPU.
 
 ## For contributors and agents
 

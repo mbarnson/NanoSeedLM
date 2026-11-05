@@ -340,3 +340,10 @@ The next-layer expert prediction of `1cd7c57`, on top of the CUDA graphs (local 
 stays out. Its wrong guesses also cost PCIe traffic, and decode is bound by that bandwidth. The A100 decodes slower than
 the RTX 4080 did at `5ed8d1b` (28 tokens per second). So its absolute speeds do not model the 4080.
 
+## [2026-11-04] result | Qwen3.8-Flash-Next decode with affine, P4 and P3 experts on one GPU
+
+On an RTX PRO 6000 with an 8 GB cache and CUDA graphs, P3 decodes at 46.1 tokens per second, the 4-bit affine model at
+42.4 and P4 at 40.0. The PCIe traffic is 391, 581 and 502 MB a token. The seed expansion makes the expert stage 1.7 ms
+(P3) and 2.6 ms (P4) a token slower than affine. On this PCIe 5 GPU, that eats all of P4's byte saving. Read
+[Qwen3.8-Flash-Next decode with affine, P4 and P3 experts](results/2026-11-04-qwen38-decode-by-format.md).
+
