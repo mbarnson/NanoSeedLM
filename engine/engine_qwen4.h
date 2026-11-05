@@ -1,6 +1,5 @@
 // engine/engine_qwen4.h - included before engine_api.h: its names become the qwen4 adapter's (engine/qwen4_api.c), so
 // one binary can hold it beside the MoVA engine.
-#pragma once
 #define Eng Q4Api
 #define eng_open q4_eng_open
 #define eng_close q4_eng_close

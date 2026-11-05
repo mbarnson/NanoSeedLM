@@ -1,0 +1,23 @@
+// engine/engine_unname.h - undoes engine_mova.h or engine_qwen4.h (engine/engine.c declares both engines' functions)
+#undef Eng
+#undef eng_open
+#undef eng_close
+#undef eng_describe
+#undef eng_vocab
+#undef eng_mem
+#undef eng_prefill
+#undef eng_prefill_cached
+#undef eng_prefill_begin
+#undef eng_prefill_next
+#undef eng_rewind
+#undef eng_fork
+#undef eng_free
+#undef eng_len
+#undef eng_generate
+#undef eng_step
+#undef eng_push
+#undef eng_step_batch
+#undef eng_kv_bytes
+#undef eng_kv_read
+#undef eng_kv_write
+#undef eng_score

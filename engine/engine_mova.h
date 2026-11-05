@@ -1,0 +1,24 @@
+// engine/engine_mova.h - included before engine_api.h by the MoVA engine (engine/mova_cuda.c, engine/mova_gpu.m): its
+// names become mova_eng_*, so engine/engine.c can hold it beside the qwen4 engine.
+#define Eng MovaEng
+#define eng_open mova_eng_open
+#define eng_close mova_eng_close
+#define eng_describe mova_eng_describe
+#define eng_vocab mova_eng_vocab
+#define eng_mem mova_eng_mem
+#define eng_prefill mova_eng_prefill
+#define eng_prefill_cached mova_eng_prefill_cached
+#define eng_prefill_begin mova_eng_prefill_begin
+#define eng_prefill_next mova_eng_prefill_next
+#define eng_rewind mova_eng_rewind
+#define eng_fork mova_eng_fork
+#define eng_free mova_eng_free
+#define eng_len mova_eng_len
+#define eng_generate mova_eng_generate
+#define eng_step mova_eng_step
+#define eng_push mova_eng_push
+#define eng_step_batch mova_eng_step_batch
+#define eng_kv_bytes mova_eng_kv_bytes
+#define eng_kv_read mova_eng_kv_read
+#define eng_kv_write mova_eng_kv_write
+#define eng_score mova_eng_score
