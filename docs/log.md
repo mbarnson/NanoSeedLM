@@ -532,3 +532,11 @@ after each row. So `q4e_accept` keeps the accepted rows with a copy of about 115
 `test_qwen4_mtp` checks gate MB on the tiny model: greedy text with 1 to 3 drafts equals greedy text without.
 `nslm-qwen4-gen --drafts K` turns it on. The speed on the RTX 4080 is plan step M3. Metal has the calls as stubs
 (`engine/qwen4_nomtp.c`) until plan step M4.
+
+## [2026-11-05] result | MTP drafts on the RTX 4080: the same text, not faster
+
+`ecd552f`, pc-cuda's RTX 4080, P3, 6 GB expert cache. Greedy text with 0 to 3 drafts has the same md5 on a code
+prompt and on a chat prompt (gate MB). Code decodes at 29.7 tokens per second without drafts and 27.6 to 28.9 with drafts. Chat
+decodes at 29.2 without drafts and 22.7 to 28.7 with drafts. Gate MC fails, so drafts stay off by default. A step of T
+rows takes about 10 ms + 25 ms x T: each verify row pays its expert copies and its expert matvec again. Read
+[MTP drafts on the RTX 4080](results/2026-11-05-qwen38-mtp-4080.md).

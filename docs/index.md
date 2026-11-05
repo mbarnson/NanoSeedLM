@@ -120,6 +120,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   tokens, P3 decode 43.8 to 58.8 tokens per second (split-key attention, 8-bit QSA top-k). Decode-row KL unchanged.
 - [2026-11-05: Prompt attention over 4 rows' shared key tiles is slower](results/2026-11-05-qwen38-shared-tile-attention.md):
   480 to 805 ms at 15,922 tokens with 2.7 times fewer key loads. Reverted.
+- [2026-11-05: MTP drafts on the RTX 4080: the same text, not faster](results/2026-11-05-qwen38-mtp-4080.md): P3 code
+  29.7 tokens per second without drafts, 27.6 to 28.9 with 1 to 3. Each verify row pays its expert copies again.
 
 ## For contributors and agents
 
