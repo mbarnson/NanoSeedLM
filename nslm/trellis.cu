@@ -163,12 +163,15 @@ struct NslmTqGpu {
     int smem_optin;
 };
 
-// The shared-memory limit is the kernel's, for every thread of the process: set the device's maximum, the same value from
-// every caller, so one thread's smaller block (T 256) cannot cut another's launch (T 320) short
+// The shared-memory limit is the kernel's, for every thread of the process: set the most the device allows (its opt-in
+// maximum less the kernel's static arrays), the same from every caller, so a T 256 launch cannot cut a T 320 one short
 template <int QPT>
 static cudaError_t launch(const TqArgs& a, int ctas, size_t smem, int smem_max, cudaStream_t st, const float* W, const float* Hm,
                           unsigned char* back, unsigned short* path, float* aout) {
-    const cudaError_t e = cudaFuncSetAttribute(k_tq_encode<QPT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+    cudaFuncAttributes fa;
+    cudaError_t e = cudaFuncGetAttributes(&fa, k_tq_encode<QPT>);
+    if (e == cudaSuccess)
+        e = cudaFuncSetAttribute(k_tq_encode<QPT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max - (int) fa.sharedSizeBytes);
     if (e != cudaSuccess) return e;
     k_tq_encode<QPT><<<(unsigned) ctas, TQ_TPB, smem, st>>>(a, W, Hm, back, path, aout);
     return cudaGetLastError();

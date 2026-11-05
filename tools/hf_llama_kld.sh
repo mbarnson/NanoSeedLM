@@ -7,7 +7,8 @@
 #
 # A pack is an Unsloth folder, a seed or trellis tier (P3, P4, S3, TQ{K}L{L}: the Q8_0 shards with those experts,
 # nslm-qwen4-emulate; TQ3L12 is the folder TQBANK/TQ3L12 of nslm-moe --codec tq banks, as tools/hf_seedbank.sh writes), or
-# LOW+HIGH@NAME: experts from two tiers by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py), e.g. S3+P3@down.  The
+# LOW+HIGH@NAME: experts from two tiers by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py), e.g. S3+P3@down, or
+# Q8_0-PLE: Q8_0 with its own Q8_0 PLE table in place of BF16's (the PLE format's own KL; it must come before the tiers).  The
 # reference logits: BF16 on the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
 set -uo pipefail
 UREPO=unsloth/Qwen3.8-Flash-Next-GGUF
@@ -72,6 +73,10 @@ for pk in $PACKS; do
     case $pk in
         Q8_0) [ -d /m/Q8_0 ] || get Q8_0 -00003-of-00006; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf
             stamp "$PLE" 3 6; dir=/m/Q8_0 ;;
+        Q8_0-PLE)   # Q8_0's shards with its own table: shard 3 from Unsloth, the others linked from /m/Q8_0
+            mkdir -p /m/Q8_0-PLE && hf download "$UREPO" --revision "$UREV" --include "Q8_0/*-00003-of-00006.gguf" --local-dir /m/q8ple >/dev/null
+            for f in /m/Q8_0/*.gguf; do ln -sf "$f" /m/Q8_0-PLE/; done
+            ln -sf /m/q8ple/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf /m/Q8_0-PLE/; dir=/m/Q8_0-PLE ;;
         P3|P4|S3|TQ*|*+*@*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
             t1=$(date +%s)
             if [[ $pk == *@* ]]; then
