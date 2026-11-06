@@ -4,7 +4,9 @@
 gives a folder that the NanoSeedLM engines run on a PC (CUDA, Linux or Windows) and on a Mac (Metal). Each card states
 the pack's KL against BF16 as shipped, its speed and the machine that it is for.
 
-**Status.** Draft. Matt approved the release on 2026-11-05.
+**Status.** Draft. Matt approved the release on 2026-11-05. D0 of the dense plan changed release 1: P3's 4-bit MLX
+dense weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit
+dense weights (step R2b).
 
 ## The family
 
@@ -25,8 +27,9 @@ rows that a run reads.
 ## What a repository holds
 
 - `config.json`, the tokenizer, the chat template and Qwen's `LICENSE`.
-- P3's dense tensors (4-bit MLX), its PLE table (4-bit MLX), its vision tower and its MTP head, without P3's seed
-  experts. The engines map the PLE table from the disk.
+- 8-bit MLX dense tensors from `mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp`, written in groups of 64. The engines
+  read 8-bit groups of 64 now. The routers, norms and other tensors, the PLE table (4-bit MLX), the vision tower and
+  the MTP head come from P3, without P3's seed experts. The engines map the PLE table from the disk.
 - The trellis banks `L{l}_{gate,up,down}_proj.blkt` of layers 0 to 47 and of the MTP head (layer 48). `ns_add_banks`
   adds them as the routed experts.
 - `README.md`: the card. It has the sections of the P3 card: lineage, the difference, quality, platforms, how to run,
@@ -40,7 +43,8 @@ oMLX cannot load these packs in this release.
 | Step | Work | Who | Gate |
 |---|---|---|---|
 | R1 | The MTP head's banks at K = 4 for `gate_proj` and `up_proj`. All head banks into the bucket | pc-cuda | The sizes of layer 47's banks |
-| R2 | `tools/qwen4_trellis_pack.py`: P3's folder without its experts, plus a pack's banks, a card and `LICENSE` | cloud | RA |
+| R2 | `nslm-qwen4-pack --tq`: P3's folder without its experts, plus a pack's banks and `LICENSE` (done, `99cf18a`) | cloud | RA |
+| R2b | `nslm-qwen4-pack --dense8 DIR`: the dense tensors of an 8-bit MLX folder, its groups of 128 split into 64 | cloud | RA |
 | R3 | The KL against BF16 of each pack as shipped (`NAME/mlx` in `tools/hf_llama_kld.sh`) | cloud, HF | RB |
 | R4 | The three folders, built in the bucket by an HF job, and a run of each on an RTX PRO 6000 | cloud, HF | RC |
 | R5 | The upload job to three private repositories, a download and run on the PC and on the Mac, then public | pc-cuda, mac-metal | RD |
@@ -49,7 +53,8 @@ oMLX cannot load these packs in this release.
 
 - **RA.** The engine opens a packed folder of the tiny model, and its logits equal those of the same banks beside the
   full folder.
-- **RB.** Each pack's KL as shipped is on its card. The KL of TQ3-D4 as shipped is at most 5% above P3's as shipped.
+- **RB.** Each pack's KL as shipped is on its card. The KL of TQ3-D4 as shipped is at most 5% above its KL with
+  Q8_0 dense weights (0.0619).
 - **RC.** Each folder gives the same text in two runs, and the text of its banks beside P3's folder.
 - **RD.** On the RTX 4080 and the M4 Max, `hf download` and one command give the same text as RC.
 - **RE.** On a Windows PC with no NanoSeedLM, the script reaches a chat in one run.

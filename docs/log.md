@@ -821,3 +821,10 @@ Matt approved a public release of the trellis packs. The plan has three reposito
 K = 4) and TQ3. Each holds P3's dense tensors, PLE table and head, without P3's seed experts, plus the trellis banks
 and a card with the KL as shipped. Release 1 runs in the NanoSeedLM engines. A start script and the MLX loader follow.
 Read [The trellis family on Hugging Face](plans/2026-11-05-release-family.md).
+
+## [2026-11-05] result | Packs as shipped: the 4-bit MLX dense weights triple the KL
+
+`7eb5d9b`, HF job `6aed6158`: P3's 4-bit MLX dense weights took the place of Unsloth's Q8_0 ones. Then the KL
+against BF16 is 0.182 for P3 and 0.185 for the trellis mix, not 0.060 and 0.062. Top-1 agreement falls from 91.5% to 84%. Unsloth's
+3-bit packs keep their dense weights at Q6_K or Q8_0. So release 1 takes 8-bit dense weights. Read
+[Packs as shipped](results/2026-11-05-dense-as-shipped.md).

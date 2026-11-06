@@ -4,8 +4,8 @@
 them, as Unsloth's dynamic packs do. Then a decode token reads fewer bytes than with the 4-bit MLX dense weights, and
 every pack has a KL measured as it is shipped.
 
-**Status.** Draft. Matt asked for it on 2026-11-05 and approved the HF jobs within the weekly cap. D0's emulator is
-on `main`. It maps DeltaNet's value heads, which llama.cpp keeps in another order (see How the emulation works).
+**Status.** Draft. Matt asked for it on 2026-11-05 and approved the HF jobs within the weekly cap. D0 is done: the 4-bit MLX dense weights add about 0.12 of
+KL (P3 0.182, the mix 0.185), so HD1 holds ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)).
 
 ## Why
 

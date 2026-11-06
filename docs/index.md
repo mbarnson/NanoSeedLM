@@ -174,6 +174,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   the head in trellis banks, drafts break even (-2% to +5%), against -6% to -12% before.
 - [2026-11-05: Trellis codes from tables on the M4 Max](results/2026-11-05-table-code-metal.md): slower than the
   computed 1MAD. An LFSR code through two tables makes the gathers about 60% slower.
+- [2026-11-05: Packs as shipped](results/2026-11-05-dense-as-shipped.md): the 4-bit MLX dense weights triple the KL
+  (P3 0.182, the trellis mix 0.185, against 0.060 and 0.062 with Q8_0 dense weights).
 
 ## For contributors and agents
 
