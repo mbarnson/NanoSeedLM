@@ -30,6 +30,7 @@ typedef struct {
                             // from the pinned arena, beside the GPU's copies (exact; P = 3 seeds; 0: off; at most 16)
     const char* resource_dir; // Metal: the folder of kernels_moe.metallib and kernels_qwen4.metallib (EngOpts.resource_dir,
                             // the harnesses' --res; NULL: out/res). NSLM_RES, when set, overrides it
+    int pass_rows;          // most rows of a layer-major pass (0: Q4E_PASS_ROWS); CUDA: each row keeps 40 KB of VRAM
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);

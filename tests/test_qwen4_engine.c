@@ -554,6 +554,18 @@ int main(void) {
             CHECK(diff == 0, "the layer-major pass changes the next token's logits");
             q4e_close(e);
         }
+        Q4EOpts op = ol;   // passes of one chunk (Q4EOpts.pass_rows): three passes, the same logits as one
+        op.pass_rows = R;
+        e = q4e_open("tests/data/qwen4_tiny", &op, err, sizeof err);
+        CHECK(e != NULL, "open: %s", err);
+        if (e) {
+            CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, rows3) == 0, "passes of %d rows: %s", R, q4e_error(e));
+            int diff = 0;
+            for (int v = 0; v < V; ++v) diff += pass[v] != rows3[v];
+            printf("a prompt of %d rows in passes of %d rows or one pass: %d logits differ\n", L, R, diff);
+            CHECK(diff == 0, "Q4EOpts.pass_rows changes the next token's logits");
+            q4e_close(e);
+        }
         set_env("Q4E_PLE_THREADS", "1");   // the PLE rows on one thread: the same pass, bit for bit
         e = q4e_open("tests/data/qwen4_tiny", &ol, err, sizeof err);
         CHECK(e != NULL, "open: %s", err);

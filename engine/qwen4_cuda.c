@@ -476,8 +476,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     const int mt = o && o->rows > 0 ? o->rows : vtotal >= ((size_t) 64 << 30) ? Q4E_BIG_ROWS : Q4E_MAX_ROWS;
     const int ctx = (e->max_pos + Q4E_LOGIT_ROWS - 1) / Q4E_LOGIT_ROWS * Q4E_LOGIT_ROWS;
     e->mt = mt < Q4E_LOGIT_ROWS ? Q4E_LOGIT_ROWS : mt > Q4E_PASS_ROWS ? Q4E_PASS_ROWS : mt > ctx ? ctx : mt;
+    const int pr = o && o->pass_rows > 0 ? o->pass_rows : Q4E_PASS_ROWS;
     e->xr = (e->max_pos + e->mt - 1) / e->mt * e->mt;
-    if (e->xr > Q4E_PASS_ROWS) e->xr = Q4E_PASS_ROWS / e->mt * e->mt;
+    if (e->xr > pr) e->xr = pr < e->mt ? e->mt : pr / e->mt * e->mt;
     e->host_experts = !(o && o->vram_experts);
     e->tail_skip = o ? o->tail_skip : 0;
     e->cpu_tail = o ? o->cpu_tail : 0;
