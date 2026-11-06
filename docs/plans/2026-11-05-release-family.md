@@ -4,13 +4,14 @@
 gives a folder that the NanoSeedLM engines run on a PC (CUDA, Linux or Windows) and on a Mac (Metal). Each card states
 the pack's KL against BF16 as shipped, its speed and the machine that it is for.
 
-**Status.** Draft. Matt approved the release on 2026-11-05. D0 of the dense plan changed release 1: P3's 4-bit MLX dense
-weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit dense
-weights (step R2b). R1 to R4 are done, and the folders are in the bucket. Their KL as shipped is 0.0415 (TQ4), 0.0638
-(TQ3-D4) and 0.0778 (TQ3) ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)). The first R5
-job failed: `hf upload` of the bucket mount gives EIO. The script now copies each folder to the local disk first
-(`29a76aa`). R5's upload is done (TQ3 `5f2a8599`, TQ3-D4 `7e5edb2b`, TQ4 `25339937`, private). RD passes on the RTX 4080
-([the release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). RD and RE pass on the M4 Max ([the
+**Status.** Current: the three repositories are public (2026-11-06). Matt approved the release on 2026-11-05. D0 of the
+dense plan changed release 1: P3's 4-bit MLX dense weights triple the KL ([packs as
+shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit dense weights (step R2b). R1 to R4 are
+done, and the folders are in the bucket. Their KL as shipped is 0.0415 (TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3) ([the
+release packs as shipped](../results/2026-11-05-release-as-shipped.md)). The first R5 job failed: `hf upload` of the
+bucket mount gives EIO. The script now copies each folder to the local disk first (`29a76aa`). R5's upload is done (TQ3
+`5f2a8599`, TQ3-D4 `7e5edb2b`, TQ4 `25339937`), and Matt made them public on 2026-11-06. RD passes on the RTX 4080 ([the
+release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). RD and RE pass on the M4 Max ([the
 release packs from the Hub on the M4 Max](../results/2026-11-06-release-downloads-m4max.md)). R6 is a draft release of
 the engines (v0.1.0) with the start scripts. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the
 risk of a stale loader is closed for them.
@@ -57,6 +58,7 @@ oMLX cannot load these packs in this release.
 | R5 | The upload job to three private repositories, a download and run on the PC and on the Mac, then public | pc-cuda, mac-metal | RD |
 | R6 | `start-here.bat` and `start-here.sh`, as Strata's: check the PC, pick a pack, download the engine and the pack, start `nslm-serve` | cloud, pc-cuda | RE |
 | R7 | Trellis kernels in the MLX loader, and a test in oMLX | mac-metal | RF |
+| R8 | The macOS binaries signed with Matt's Developer ID and notarized in `release.yml` (`cce4968`). After v0.1.0: the five secrets in a GitHub environment `release` that only `main` can deploy to | cloud, mac-metal, Matt | RG |
 
 - **RA.** The engine opens a packed folder of the tiny model, and its logits equal those of the same banks beside the
   full folder.
@@ -66,8 +68,20 @@ oMLX cannot load these packs in this release.
 - **RD.** On the RTX 4080 and the M4 Max, `hf download` and one command give the same text as RC.
 - **RE.** On a Windows PC with no NanoSeedLM, the script reaches a chat in one run.
 - **RF.** mlx-vlm with `--trust-remote-code` gives the text of the Metal engine within BF16 rounding.
+- **RG.** Gatekeeper accepts the `nslm-serve` of a quarantined download, and `start-here.sh` does not clear the
+  quarantine. A workflow on a branch other than `main` cannot read the signing secrets.
 
 Release 1 is R1 to R5. R6 and R7 follow as release 1.1 and release 2.
+
+R8 after v0.1.0, in order:
+
+1. Make the GitHub environment `release`, with a deployment policy of `main` only. Matt can be its reviewer.
+2. Set the five secrets in it (`gh secret set --env release`). Export the `.p12` again, because GitHub does not give
+   back a secret.
+3. Add `environment: release` to the `macos` job. Then delete the five secrets of the repository.
+4. Check that the App Store Connect key has only the Developer role. Pin the actions of `release.yml` to commit SHAs.
+5. The Developer ID certificate expires on 2027-02-01. A new certificate needs new `MACOS_CERT_P12` and
+   `MACOS_CERT_PASSWORD` values.
 
 ## Costs
 
