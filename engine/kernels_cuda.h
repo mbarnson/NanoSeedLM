@@ -175,6 +175,7 @@ void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, 
 // MLA kernels read, for tests
 void kc_kv_f32(cudaStream_t s, int fmt, const uint8_t* codes, const uint8_t* scales, int n, int rows, float* y);
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n);
+void kc_argmax_p(cudaStream_t s, const float* logits, int32_t* out, float* prob, int V, int n);   // and its softmax probability
 
 #ifdef __cplusplus
 }

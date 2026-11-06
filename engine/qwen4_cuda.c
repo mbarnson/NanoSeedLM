@@ -108,7 +108,7 @@ struct Q4Eng {
     // streams (its next input); lrow: the last row's logits in logits (-1: none); keep: a q4e_forward_keep of nkeep rows
     Layer M;
     W m_fe, m_fh, m_down, m_up;
-    float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog;
+    float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog, *dprob, *hprob;   // dprob, hprob: the head's probability of each draft
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and state copies)
     int tail_skip, tail_renorm;           // Q4EOpts.tail_skip; Q4E_TAIL_RENORM=1 (an A/B): the kept weights scaled up
     int head_cached;                      // the MTP head's experts are the cache's sparse layer n_layer (layer 0's format)
@@ -559,7 +559,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         for (size_t i = 0; i < T * c->hc; ++i) one[i] = 1.0f;
         e->ones = (float*) dmem(e, one, sizeof(float) * T * c->hc);
         free(one);
-        e->Hm = F(T * HD); e->mlog = F((size_t) c->vocab);
+        e->Hm = F(T * HD); e->mlog = F((size_t) c->vocab); e->dprob = F(Q4E_MAX_DRAFTS);
+        e->hprob = (float*) pin(e, sizeof(float) * Q4E_MAX_DRAFTS);
         for (int l = 0; l < c->n_layer; ++l) {
             Layer* L = &e->L[l];
             if (!c->attn[l]) { L->kconv = F(e->ndraft * qwen4_gdn_conv_len(c)); L->kS = F(e->ndraft * qwen4_gdn_state_len(c)); }
@@ -1258,7 +1259,7 @@ static int draft_rows(Q4Eng* e, int k) {
         if (run_layer(e, &e->M, -1, 1, 1, 0, j - 1)) break;
         hc_mix(e, e->m_norm, &e->m_down, &e->m_up, 0, 1);
         mv(e, &e->head, e->x, e->mlog, 1);
-        kc_argmax(e->s, e->mlog, e->din + 2 + j, c->vocab, 1);
+        kc_argmax_p(e->s, e->mlog, e->din + 2 + j, e->dprob + j, c->vocab, 1);
         mark(e, ST_HEAD);
     }
     e->H = H;
@@ -1289,10 +1290,17 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     }
     if (*ge ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : draft_rows(e, k)) return fail(e, "CUDA: draft failed");
     cudaMemcpyAsync(e->hin + 1, e->din + 2, sizeof(int32_t) * (size_t) k, cudaMemcpyDeviceToHost, e->s);
+    cudaMemcpyAsync(e->hprob, e->dprob, sizeof(float) * (size_t) k, cudaMemcpyDeviceToHost, e->s);
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     memcpy(drafts, e->hin + 1, sizeof(int32_t) * (size_t) k);
     prof_collect(e);
+    return 0;
+}
+
+int q4e_draft_probs(const Q4Eng* e, int k, float* p) {
+    if (!e->mtp || k < 1 || k > e->ndraft) return -1;
+    memcpy(p, e->hprob, sizeof(float) * (size_t) k);
     return 0;
 }
 

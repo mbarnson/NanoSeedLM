@@ -66,6 +66,27 @@ int main(void) {
     }
     CHECK(n == NT && !memcmp(got, plain, sizeof plain), "greedy picks with drafts: %d tokens, or other tokens", n);
 
+    // The confidence gate (Q4E_DRAFT_MIN_P) sets only how many drafts a forward verifies: the greedy tokens stay
+    for (int g = 0; g < 2; ++g) {
+#ifdef _WIN32
+        _putenv_s("Q4E_DRAFT_MIN_P", g ? "2" : "0.5");
+#else
+        setenv("Q4E_DRAFT_MIN_P", g ? "2" : "0.5", 1);
+#endif
+        Eng* eg = open_k(3, err, sizeof err);
+        EngStats sg;
+        memset(&sg, 0, sizeof sg);
+        CHECK(eg && eng_prefill(eg, 0, ids, 20) == 0 && eng_generate_pick(eg, 0, NT, pick_max, NULL, got, &sg) == NT && !memcmp(got, plain, sizeof plain),
+              "greedy picks with Q4E_DRAFT_MIN_P %s", g ? "2" : "0.5");
+        printf("Q4E_DRAFT_MIN_P %s: %lld of %lld drafts kept in %lld forwards\n", g ? "2" : "0.5", (long long) sg.accepted, (long long) sg.proposals, (long long) sg.forwards);
+        eng_close(eg);
+    }
+#ifdef _WIN32
+    _putenv_s("Q4E_DRAFT_MIN_P", "");
+#else
+    unsetenv("Q4E_DRAFT_MIN_P");
+#endif
+
     // A stop after 13 tokens: 13 committed, and the history ends there
     Stop s = {13};
     CHECK(eng_prefill(e3, 0, ids, 20) == 0 && eng_generate_pick(e3, 0, NT, pick_stop, &s, got, NULL) == 13 && eng_len(e3, 0) == 33 &&

@@ -1107,6 +1107,11 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     return 0;
 }
 
+int q4e_draft_probs(const Q4Eng* e, int k, float* p) {   // plan A1m: the head's probabilities on Metal
+    (void) e; (void) k; (void) p;
+    return -1;
+}
+
 int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     e->err[0] = 0;
     e->nkeep = 0;

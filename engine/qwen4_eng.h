@@ -47,6 +47,8 @@ void q4e_reset(Q4Eng* e);   // an empty context
 int q4e_draft(Q4Eng* e, int k, int32_t* drafts);
 // q4e_draft from a given bonus (a sampled token: the drafts of speculative sampling); bonus < 0: the arg max
 int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts);
+// The head's softmax probability of drafts 1 .. k of the last q4e_draft; -1 where the engine has none (Metal: plan A1m)
+int q4e_draft_probs(const Q4Eng* e, int k, float* p);
 // q4e_forward of n <= Q4E_MAX_DRAFTS + 1 rows that keeps the recurrent state (DeltaNet, conv, PLE) after each row;
 // q4e_accept(e, m) then keeps rows [0, m) of it: the position and the state of row m - 1. 0, or -1.
 int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits);

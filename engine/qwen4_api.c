@@ -14,6 +14,7 @@ struct Eng {   // Q4Api: hist[0 .. n) committed; the engine holds hist[0 .. at),
     Q4Eng* q;
     int vocab, max_pos, cap, n, at;
     int drafts;    // Q4E_DRAFTS: eng_generate's MTP drafts a forward (0: none, and no MTP head)
+    float min_p;   // Q4E_DRAFT_MIN_P: a forward verifies the drafts before the first of a lower head probability
     int lrow;      // last holds the logits of hist[lrow] (-1: none), the engine's last row when lrow == at - 1
     int next;      // the token picked from last's first row (-1: not picked yet)
     int32_t* hist;
@@ -72,6 +73,7 @@ Eng* eng_open(const EngOpts* o, char* err, int errlen) {
     e->vocab = c->vocab;
     e->max_pos = qo.max_pos;
     e->drafts = drafts;
+    e->min_p = getenv("Q4E_DRAFT_MIN_P") ? (float) atof(getenv("Q4E_DRAFT_MIN_P")) : 0;
     e->lrow = e->next = -1;
     if (!(e->last = (float*) malloc(sizeof(float) * (size_t) e->vocab * (size_t) (drafts + 1)))) { eng_close(e); snprintf(err, (size_t) errlen, "out of memory"); return NULL; }
     uint64_t h, m;
@@ -157,15 +159,19 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         int k = e->drafts && e->lrow >= 0 && e->lrow == e->n - 2 ? e->drafts : 0;
         if (k > n_new - j) k = n_new - j;
         if (k > e->max_pos - e->n) k = e->max_pos - e->n;   // the drafts' positions n .. n + k - 1
+        int32_t row[Q4E_MAX_DRAFTS + 1];
+        float pr[Q4E_MAX_DRAFTS];
+        row[0] = e->hist[e->n - 1];
+        if (k && q4e_draft_from(e->q, row[0], k, row + 1)) { rc = fail_reset(e); break; }
+        if (k && e->min_p > 0 && !q4e_draft_probs(e->q, k, pr))   // the gate: the drafts before the first unsure one
+            for (int g = 0; g < k; ++g) if (pr[g] < e->min_p) { k = g; break; }
         if (!k) {   // the pending token alone
             if (fwd(e, e->n, e->last)) { rc = -1; break; }
             ++fw; ++rows;
             continue;
         }
-        int32_t row[Q4E_MAX_DRAFTS + 1];
         int m = 1, t = -1;
-        row[0] = e->hist[e->n - 1];
-        if (q4e_draft_from(e->q, row[0], k, row + 1) || q4e_forward_keep(e->q, row, k + 1, e->last)) { rc = fail_reset(e); break; }
+        if (q4e_forward_keep(e->q, row, k + 1, e->last)) { rc = fail_reset(e); break; }
         while (m <= k && (t = pick(ctx, e->last + (size_t) (m - 1) * V, V, row[m])) == row[m]) ++m;   // rows 0 .. m - 1 hold
         if (q4e_accept(e->q, m)) { rc = fail_reset(e); break; }
         if (m > 1) memmove(e->last, e->last + (size_t) (m - 1) * V, sizeof(float) * (size_t) V);

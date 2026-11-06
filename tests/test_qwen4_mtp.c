@@ -1,6 +1,7 @@
 // tests/test_qwen4_mtp.c - the qwen4 engine's MTP head (Q4EOpts.mtp, CUDA or Metal) on tests/data/qwen4_tiny: drafts
 // against the C reference, verify forwards that keep each row's state, and greedy decode with drafts. Skipped without a GPU.
 #define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c99 (Windows: _putenv_s)
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +24,9 @@ static void set_env(const char* k, const char* v) {   // v = NULL: unset
 static int argmax(const float* l, int n) { int b = 0; for (int v = 1; v < n; ++v) if (l[v] > l[b]) b = v; return b; }
 
 // The C reference's bonus and 3 drafts after ids[0..n) (test_qwen4_ref checks the head against mlx-vlm's): the bonus
-// given, or the arg max when bonus < 0.  1 when each draft leads the next logit by over 10% of the largest (BF16-safe)
-static int ref_drafts(Qwen4Ref* r, const int32_t* ids, int n, int bonus, int32_t* want) {
+// given, or the arg max when bonus < 0; prob (or NULL): their softmax probabilities.  1 when each draft leads the next
+// logit by over 10% of the largest (BF16-safe)
+static int ref_drafts(Qwen4Ref* r, const int32_t* ids, int n, int bonus, int32_t* want, float* prob) {
     const int V = qwen4_ref_cfg(r)->vocab, HD = qwen4_ref_cfg(r)->hc * qwen4_ref_cfg(r)->d;
     float* lg = (float*) malloc(sizeof(float) * (size_t) (n + 3) * V);
     float* H = (float*) malloc(sizeof(float) * (size_t) (n + 3) * HD), *Hm = (float*) malloc(sizeof(float) * (size_t) (n + 3) * HD);
@@ -40,6 +42,9 @@ static int ref_drafts(Qwen4Ref* r, const int32_t* ids, int n, int bonus, int32_t
         float second = -1e30f;
         for (int v = 0; v < V; ++v) if (v != b && l[v] > second) second = l[v];
         clear &= l[b] - second > 0.1f * (l[b] > 0 ? l[b] : -l[b]);
+        double z = 0;
+        for (int v = 0; v < V; ++v) z += exp((double) l[v] - l[b]);
+        if (prob) prob[j] = (float) (1 / z);
         want[1 + j] = tok[n + j] = b;
         memcpy(H + (size_t) (n + j) * HD, Hm + (size_t) (n + j - 1) * HD, sizeof(float) * (size_t) HD);
     }
@@ -111,19 +116,24 @@ int main(void) {
     const int lens[2] = {16, 45}, rows[3] = {0, 8, 1};
     for (int i = 0; i < 2; ++i) {
         int32_t want[4];
-        ref_drafts(r, ids, lens[i], -1, want);
+        float wp[3], gp[3];
+        ref_drafts(r, ids, lens[i], -1, want, wp);
         for (int w = 0; w < 3; ++w) {
             CHECK(prompt(e, ids, lens[i], rows[w], lg, buf) == 0 && q4e_draft(e, 3, d) == 0, "prompt of %d: %s", lens[i], q4e_error(e));
             CHECK(argmax(lg, V) == want[0] && !memcmp(d, want + 1, sizeof d), "%d tokens in rows of %d: bonus %d drafts %d %d %d, want %d %d %d %d",
                   lens[i], rows[w], argmax(lg, V), d[0], d[1], d[2], want[0], want[1], want[2], want[3]);
+            if (q4e_draft_probs(e, 3, gp)) { if (!w) printf("no draft probabilities on this engine (plan A1m)\n"); continue; }
+            for (int j = 0; j < 3; ++j)   // BF16 weights move the logits a little
+                CHECK(fabsf(gp[j] - wp[j]) < 0.05f, "%d tokens, draft %d: probability %.4f, the reference's %.4f", lens[i], j + 1, gp[j], wp[j]);
+            if (!w) printf("prompt of %d: draft probabilities %.4f %.4f %.4f (the reference's %.4f %.4f %.4f)\n", lens[i], gp[0], gp[1], gp[2], wp[0], wp[1], wp[2]);
         }
         printf("prompt of %d: bonus %d, drafts %d %d %d (the C reference's)\n", lens[i], want[0], want[1], want[2], want[3]);
     }
     {   // a bonus that is not the arg max (a sampled token): the head drafts on it, as the reference does
         int32_t want[4], ref[4];
-        ref_drafts(r, ids, 45, -1, ref);
+        ref_drafts(r, ids, 45, -1, ref, NULL);
         int b = -1;
-        for (int t = 1; t < 64 && b < 0; ++t) if ((ref[0] + t) % V != ref[0] && ref_drafts(r, ids, 45, (ref[0] + t) % V, want)) b = (ref[0] + t) % V;
+        for (int t = 1; t < 64 && b < 0; ++t) if ((ref[0] + t) % V != ref[0] && ref_drafts(r, ids, 45, (ref[0] + t) % V, want, NULL)) b = (ref[0] + t) % V;
         CHECK(b >= 0, "no other bonus with clear drafts in the reference");
         if (b >= 0) {
             CHECK(prompt(e, ids, 45, 0, lg, buf) == 0 && q4e_draft_from(e, b, 3, d) == 0 && !memcmp(d, want + 1, sizeof d),

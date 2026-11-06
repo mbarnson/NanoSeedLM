@@ -2111,8 +2111,8 @@ __global__ void __launch_bounds__(512) k_cache_copy(CachePool p) {
     }
 }
 
-// Greedy argmax over the vocabulary (ties: the lowest id); one block of 1024 per row.
-__global__ void __launch_bounds__(1024) k_argmax(const float* logits, int32_t* out, int V) {
+// Greedy argmax over the vocabulary (ties: the lowest id); one block of 1024 per row. prob: its softmax probability
+__global__ void __launch_bounds__(1024) k_argmax(const float* logits, int32_t* out, float* prob, int V) {
     __shared__ float bv[32];
     __shared__ int bi[32];
     const int t = (int) blockIdx.x, tid = threadIdx.x, lane = tid & 31, sgi = tid >> 5;
@@ -2132,6 +2132,21 @@ __global__ void __launch_bounds__(1024) k_argmax(const float* logits, int32_t* o
         int ix = bi[0];
         for (int s = 1; s < 32; ++s) if (bv[s] > b || (bv[s] == b && bi[s] < ix)) { b = bv[s]; ix = bi[s]; }
         out[t] = ix;
+        bv[0] = b;
+    }
+    if (!prob) return;
+    __syncthreads();
+    const float mx = bv[0];
+    float s = 0;
+    for (int i = tid; i < V; i += 1024) s += __expf(l[i] - mx);
+    for (int o = 16; o > 0; o /= 2) s += __shfl_down_sync(FULL, s, o);
+    __syncthreads();   // every thread has read bv[0]
+    if (lane == 0) bv[sgi] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0;
+        for (int w = 0; w < 32; ++w) tot += bv[w];
+        prob[t] = 1.0f / tot;
     }
 }
 
@@ -2655,7 +2670,10 @@ void kc_cache_admit(cudaStream_t s, const CachePool* p, int sl, const int32_t* i
 }
 void kc_cache_copy(cudaStream_t s, const CachePool* p, int blocks) { k_cache_copy<<<(unsigned) blocks, 512, 0, s>>>(*p); }
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n) {
-    k_argmax<<<(unsigned) n, 1024, 0, s>>>(logits, out, V);
+    k_argmax<<<(unsigned) n, 1024, 0, s>>>(logits, out, NULL, V);
+}
+void kc_argmax_p(cudaStream_t s, const float* logits, int32_t* out, float* prob, int V, int n) {
+    k_argmax<<<(unsigned) n, 1024, 0, s>>>(logits, out, prob, V);
 }
 
 }   // extern "C"
