@@ -28,6 +28,8 @@ typedef struct {
                             // is not copied or computed (0: off). CUDA only: Metal holds every expert
     int cpu_tail;           // decode with a cache: up to cpu_tail missed experts a layer (lowest rank first) computed by the CPU
                             // from the pinned arena, beside the GPU's copies (exact; P = 3 seeds; 0: off; at most 16)
+    const char* resource_dir; // Metal: the folder of kernels_moe.metallib and kernels_qwen4.metallib (EngOpts.resource_dir,
+                            // the harnesses' --res; NULL: out/res). NSLM_RES, when set, overrides it
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);

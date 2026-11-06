@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "format.h"
 #include "moe.h"
@@ -83,6 +84,36 @@ static int tcq_fixture(const char* dir, int head, char* err, int errlen) {
     return 0;
 }
 // Trellis experts (NS_TCQ banks) in the Metal engine against the C reference, with tcq_check's limits
+// Q4EOpts.resource_dir reaches the engine (nslm-serve's ../res beside the binary, --res) when NSLM_RES is unset: a folder
+// without the metallibs fails with its path in the error, and out/res by its absolute path opens from another directory.
+static void res_check(void) {
+    char err[512] = "", cwd[1024], res[1100], model[1100];
+    const char* env = getenv("NSLM_RES");
+    char* saved = env ? strdup(env) : NULL;
+    unsetenv("NSLM_RES");
+    if (!getcwd(cwd, sizeof cwd)) { CHECK(0, "getcwd"); free(saved); return; }
+    snprintf(res, sizeof res, "%s/%s", cwd, saved ? saved : "out/res");
+    snprintf(model, sizeof model, "%s/tests/data/qwen4_tiny", cwd);
+    if (saved && saved[0] == '/') snprintf(res, sizeof res, "%s", saved);
+    Q4EOpts o;
+    memset(&o, 0, sizeof o);
+    o.max_pos = 64;
+    o.resource_dir = "/nonexistent-nslm-res";
+    Q4Eng* e = q4e_open(model, &o, err, sizeof err);
+    CHECK(!e && strstr(err, "/nonexistent-nslm-res/kernels_moe.metallib"), "resource_dir without metallibs: %s", e ? "opened" : err);
+    if (e) q4e_close(e);
+    o.resource_dir = res;
+    CHECK(!chdir("/tmp"), "chdir /tmp");
+    err[0] = 0;
+    e = q4e_open(model, &o, err, sizeof err);
+    CHECK(e != NULL, "resource_dir %s from /tmp: %s", res, err);
+    if (e) q4e_close(e);
+    CHECK(!chdir(cwd), "chdir back");
+    if (saved) setenv("NSLM_RES", saved, 1);
+    free(saved);
+    printf("resource_dir: a folder without the metallibs fails (%s), out/res by its absolute path opens from /tmp\n",
+           "named in the error");
+}
 static void tcq_check(void) {
     char dir[512], err[512] = "";
     snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq_metal", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
@@ -338,6 +369,7 @@ int main(void) {
     st_close_file(&st);
     tcq_check();
     tcq_head_check();
+    res_check();
     printf("test_qwen4_metal: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }
