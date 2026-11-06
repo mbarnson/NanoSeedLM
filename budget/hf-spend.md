@@ -30,4 +30,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 | nslm-kld-r3 (6aed64480e0338d1bb80e4a3): Q8_0, TQ3 /mlx, TQ4 /mlx with the saved reference | rtx-pro-6000x2 ($5.50/h) | about 23 | about $2.10 | about $12.59 |
 | Linux CI a58d0f5 (6aed69190e0338d1bb80e5b4): --dense8 | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $12.67 |
 
-Left this week: about $12.33.
+| Linux CI d2a249b (6aed69a9c78863f9c633de07): emulator packed folders | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $12.75 |
+
+Left this week: about $12.25.
