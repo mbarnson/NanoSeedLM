@@ -1,7 +1,7 @@
 // nslm/qwen4_emulate.c - nslm-qwen4-emulate: a seed pack's routed experts written into the Q8_0 expert tensors of
 // Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them (an emulated pack, nslm/emulate.h).  With several
 // packs, MAP (uint8 [layer][gate, up, down][expert], tools/qwen4_tier_map.py) names the pack of each expert.  A pack is a
-// model folder, or a folder of S3 seed banks or trellis banks (nslm-moe --codec s3 or tq).  --dense DIR: also the
+// model folder (with the banks beside its shards), or a folder of S3 seed or trellis banks (nslm-moe).  --dense DIR: also the
 // dense tensors of model folder DIR (attention, DeltaNet, shared experts, hyper-connections, lm_head, embedding).
 //   nslm-qwen4-emulate [--pack DIR ...] [--map FILE] [--dense DIR] [--workers 8] SHARD.gguf [SHARD.gguf ...]
 #include <stdio.h>
@@ -59,7 +59,8 @@ int main(int argc, char** argv) {
     const NsModel* pk[NS_EMU_PACKS];
     char err[512];
     for (int k = 0; k < np; ++k) {
-        if (ns_open(&m[k], dirs[k], err, sizeof err) && ns_open_bank(&m[k], dirs[k], err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
+        const int rc0 = ns_open(&m[k], dirs[k], err, sizeof err);   // a folder (with its banks, as nslm-qwen4-pack --tq writes), or banks
+        if ((rc0 ? ns_open_bank(&m[k], dirs[k], err, sizeof err) : ns_add_banks(&m[k], dirs[k], err, sizeof err))) { fprintf(stderr, "%s\n", err); return 1; }
         pk[k] = &m[k];
     }
     Qwen4Cfg cfg;
