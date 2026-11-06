@@ -49,6 +49,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI a499194 (6aedacb2c78863f9c6340172): the loader packer and mac-metal's resource_dir, running | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $21.01 |
 
-| nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda, src-29a76aa: a local copy first), running | cpu-xl ($1.00/h) | at most 180 | at most $3.00 | |
+| nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda): TQ3 5f2a8599, TQ3-D4 7e5edb2b, TQ4 25339937 (each copy about 8 min, each upload about 1 min: Xet found the chunks) | cpu-xl ($1.00/h) | 29.1 | about $0.49 | about $21.50 |
 
-Left this week: about $3.99 before the third upload job.
+Left this week: about $3.50.
