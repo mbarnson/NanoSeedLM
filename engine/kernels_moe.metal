@@ -2135,12 +2135,11 @@ kernel void k_attn_prefill_q8(constant AttnArgs& a [[buffer(0)]], device const f
     attn_prefill(a, q, Kc, Vc, Ks, Vs, ri, g, o, T, tg, tid, lane, sgi, Kt, Vt, Qt[sgi], Ox[sgi]);
 }
 
-// Greedy argmax over the vocabulary (ties: the lowest id); one threadgroup of 1024 per row.
-kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [[buffer(1)]], constant int& V [[buffer(2)]],
-                     uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                     uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float bv[32];
-    threadgroup int bi[32];
+// Greedy argmax over the vocabulary (ties: the lowest id); one threadgroup of 1024 per row. P: also its softmax
+// probability, 1 / sum_i exp(l_i - max) (CUDA's k_argmax with prob, plan A1: the MTP head's draft confidence)
+template <bool P>
+static inline void argmax_row(device const float* logits, device int* out, device float* prob, int V, uint t, uint tid, uint lane,
+                              uint sgi, threadgroup float* bv, threadgroup int* bi) {
     device const float* l = logits + (ulong) t * V;
     float best = -INFINITY;
     int idx = 0;
@@ -2157,7 +2156,83 @@ kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [
         int ix = bi[0];
         for (int s = 1; s < 32; ++s) if (bv[s] > b || (bv[s] == b && bi[s] < ix)) { b = bv[s]; ix = bi[s]; }
         out[t] = ix;
+        bv[0] = b;
     }
+    if (!P) return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mx = bv[0];
+    float s = 0.0f;
+    for (int i = (int) tid; i < V; i += 1024) s += exp(l[i] - mx);
+    s = simd_sum(s);
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // every thread has read bv[0]
+    if (lane == 0) bv[sgi] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < 32; ++w) tot += bv[w];
+        prob[t] = 1.0f / tot;
+    }
+}
+kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [[buffer(1)]], constant int& V [[buffer(2)]],
+                     uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float bv[32];
+    threadgroup int bi[32];
+    argmax_row<false>(logits, out, nullptr, V, t, tid, lane, sgi, bv, bi);
+}
+kernel void k_argmax_p(device const float* logits [[buffer(0)]], device int* out [[buffer(1)]], constant int& V [[buffer(2)]],
+                       device float* prob [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float bv[32];
+    threadgroup int bi[32];
+    argmax_row<true>(logits, out, prob, V, t, tid, lane, sgi, bv, bi);
+}
+
+#define K_DRAFT_Q 20   // Q4E_DRAFT_Q
+// A sampled draft (one threadgroup of 1024; CUDA's k_draft_q, plan A2m): q is the softmax at tu[0] of the row's top
+// K_DRAFT_Q logits (by value, then the lowest id), found in K_DRAFT_Q passes. The draft is q's sample at uniform
+// tu[1 + j]. Writes q's ids, q and q(draft)
+kernel void k_draft_q(device const float* logits [[buffer(0)]], constant int& V [[buffer(1)]], device const float* tu [[buffer(2)]],
+                      constant int& j [[buffer(3)]], device int* out [[buffer(4)]], device int* qid [[buffer(5)]], device float* qp [[buffer(6)]],
+                      device float* prob [[buffer(7)]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                      uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float bv[32], tv[K_DRAFT_Q];
+    threadgroup int bi[32], ti[K_DRAFT_Q];
+    float pv = INFINITY;
+    int pi = -1;
+    for (int q = 0; q < K_DRAFT_Q; ++q) {   // the largest (value, -id) below the previous pick
+        float best = -INFINITY;
+        int idx = V;
+        for (int i = (int) tid; i < V; i += 1024) {
+            const float x = logits[i];
+            if ((x < pv || (x == pv && i > pi)) && (x > best || (x == best && i < idx))) { best = x; idx = i; }
+        }
+        for (int o = 16; o > 0; o /= 2) {
+            const float b2 = simd_shuffle_down(best, (ushort) o);
+            const int i2 = simd_shuffle_down(idx, (ushort) o);
+            if (b2 > best || (b2 == best && i2 < idx)) { best = b2; idx = i2; }
+        }
+        if (lane == 0) { bv[sgi] = best; bi[sgi] = idx; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            for (int s = 1; s < 32; ++s) if (bv[s] > best || (bv[s] == best && bi[s] < idx)) { best = bv[s]; idx = bi[s]; }
+            tv[q] = best;
+            ti[q] = idx < V ? idx : ti[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        pv = tv[q];
+        pi = ti[q];
+    }
+    if (tid) return;
+    float w[K_DRAFT_Q], s = 0.0f;
+    for (int q = 0; q < K_DRAFT_Q; ++q) s += w[q] = exp((tv[q] - tv[0]) / tu[0]);
+    const float u = tu[1 + j] * s;
+    float a = 0.0f;
+    int d = K_DRAFT_Q - 1;
+    for (int q = 0; q < K_DRAFT_Q; ++q) { a += w[q]; if (a > u) { d = q; break; } }
+    *out = ti[d];
+    *prob = w[d] / s;
+    for (int q = 0; q < K_DRAFT_Q; ++q) { qid[q] = ti[q]; qp[q] = w[q] / s; }
 }
 
 #endif

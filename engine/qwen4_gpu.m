@@ -93,7 +93,9 @@ struct Q4Eng {
     // in logits (-1: none); keep: a q4e_forward_keep of nkeep rows
     Layer M;
     MW m_fe, m_fh, m_down, m_up;
-    id<MTLBuffer> m_ne, m_nh, m_norm, Hin, Hm, ones, mlog, dtok;
+    id<MTLBuffer> m_ne, m_nh, m_norm, Hin, Hm, ones, mlog, dtok, dprob;   // dprob: the head's probability of each draft
+    id<MTLBuffer> dtu, dqid, dqp;   // a sampled q4e_draft: {temp, u[k]}, and each draft's q (Q4E_DRAFT_Q ids and probabilities)
+    int dqn;                        // Q4E_DRAFT_Q after a sampled q4e_draft, else 0
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and snapshot buffers a layer)
     double stage_ms[10];
     char err[256];
@@ -807,17 +809,33 @@ static void head_rows(Q4Eng* e, int T) {
     store(e, e->Hin, HD, e->H, sizeof(float) * (uint64_t) (T - 1) * HD, HD, 0, 1);
     mark(e, ST_HEAD);
 }
-static void argmax(Q4Eng* e, id<MTLBuffer> X, id<MTLBuffer> out, uint64_t oo) {   // out = the arg max of X[vocab] (k_argmax)
+// out = the arg max of X[vocab] (k_argmax); prob: also its softmax probability at po (k_argmax_p)
+static void argmax(Q4Eng* e, id<MTLBuffer> X, id<MTLBuffer> out, uint64_t oo, id<MTLBuffer> prob, uint64_t po) {
     const int32_t V = e->c.vocab;
-    [e->enc setComputePipelineState:pipe_g(e, "k_argmax", 0, 0, 0)];
+    [e->enc setComputePipelineState:pipe_g(e, prob ? "k_argmax_p" : "k_argmax", 0, 0, 0)];
     B(e, 0, X, 0);
     B(e, 1, out, oo);
     [e->enc setBytes:&V length:4 atIndex:2];
+    if (prob) B(e, 3, prob, po);
+    tgs(e, 1, 1, 1024);
+}
+// Draft j to out (k_draft_q): a sample of the head's q at dtu, q to dqid / dqp row j and q(draft) to dprob[j]
+static void draft_q(Q4Eng* e, int32_t j) {
+    const int32_t V = e->c.vocab;
+    [e->enc setComputePipelineState:pipe_g(e, "k_draft_q", 0, 0, 0)];
+    B(e, 0, e->mlog, 0);
+    [e->enc setBytes:&V length:4 atIndex:1];
+    B(e, 2, e->dtu, 0);
+    [e->enc setBytes:&j length:4 atIndex:3];
+    B(e, 4, e->dtok, sizeof(int32_t) * (uint64_t) (j + 1));
+    B(e, 5, e->dqid, sizeof(int32_t) * (uint64_t) j * Q4E_DRAFT_Q);
+    B(e, 6, e->dqp, sizeof(float) * (uint64_t) j * Q4E_DRAFT_Q);
+    B(e, 7, e->dprob, sizeof(float) * (uint64_t) j);
     tgs(e, 1, 1, 1024);
 }
 // k head rows on dtok = {bonus, ...}: row j at pos - 1 + j on token dtok[j] and Hin row 0 (j = 0), then its own
-// streams; draft j to dtok[1 + j]
-static int draft_rows(Q4Eng* e, int k) {
+// streams; draft j to dtok[1 + j]: the arg max, or sampled (a sample of q at dtu)
+static int draft_rows(Q4Eng* e, int k, int sampled) {
     id<MTLBuffer> H = e->H;
     int rc = 0;
     for (int j = 0; j < k && !rc; ++j) {
@@ -827,7 +845,8 @@ static int draft_rows(Q4Eng* e, int k) {
         hc_mix(e, e->m_norm, &e->m_down, &e->m_up, NULL, 1);
         e->H = H;
         mv(e, &e->head, e->x, e->mlog, 1);
-        argmax(e, e->mlog, e->dtok, sizeof(int32_t) * (uint64_t) (j + 1));
+        if (sampled) draft_q(e, j);
+        else argmax(e, e->mlog, e->dtok, sizeof(int32_t) * (uint64_t) (j + 1), e->dprob, sizeof(float) * (uint64_t) j);
         mark(e, ST_HEAD);
     }
     return rc;
@@ -940,7 +959,9 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     if (e->mtp && !e->err[0]) {
         e->Hin = F(T * HD); e->Hm = F(T * HD); e->ones = F(T * c->hc); e->mlog = F(c->vocab);
-        e->dtok = dbuf(e, NULL, sizeof(int32_t) * (Q4E_MAX_DRAFTS + 1));
+        e->dtok = dbuf(e, NULL, sizeof(int32_t) * (Q4E_MAX_DRAFTS + 1)); e->dprob = F(Q4E_MAX_DRAFTS);
+        e->dtu = F(1 + Q4E_MAX_DRAFTS); e->dqp = F(Q4E_MAX_DRAFTS * Q4E_DRAFT_Q);
+        e->dqid = dbuf(e, NULL, sizeof(int32_t) * Q4E_MAX_DRAFTS * Q4E_DRAFT_Q);
         for (size_t i = 0; e->ones && i < T * c->hc; ++i) ((float*) e->ones.contents)[i] = 1.0f;
         for (int l = 0; l < c->n_layer; ++l)
             for (int i = 0; i < e->ndraft; ++i) {   // a verify of ndraft + 1 rows keeps the state after its first ndraft
@@ -1004,7 +1025,7 @@ void q4e_close(Q4Eng* e) {
     e->embed = e->head = e->mix_down = e->mix_up = (MW) {0};
     e->M = (Layer) {0};
     e->m_fe = e->m_fh = e->m_down = e->m_up = (MW) {0};
-    e->m_ne = e->m_nh = e->m_norm = e->Hin = e->Hm = e->ones = e->mlog = e->dtok = nil;
+    e->m_ne = e->m_nh = e->m_norm = e->Hin = e->Hm = e->ones = e->mlog = e->dtok = e->dprob = e->dtu = e->dqid = e->dqp = nil;
     e->mix_norm = e->stab = e->stab32 = e->inv = nil;
     e->x = e->H = e->normed = e->lo = e->up = e->inj = e->br = e->qp = e->kk = e->vv = e->o = e->ixo = e->sc = e->emb = nil;
     e->keys = e->qs = e->vals = e->gated = e->lg = e->wt = e->A = e->Gb = e->Ub = e->Dx = e->sh = e->sgv = e->logits = nil;
@@ -1082,9 +1103,9 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
 // ---- MTP: drafts, and verify forwards that keep each row's state -----------------------------------------------------
 
 int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, 0, NULL, drafts); }
-int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, int32_t* drafts) {   // plan A2m: temp, u
+int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, int32_t* drafts) {
     const Qwen4Cfg* c = &e->c;
-    (void) temp; (void) u;   // arg maxes, q one point: exact, with fewer drafts kept
+    const int sampled = temp > 0 && u;
     e->err[0] = 0;
     if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos || bonus >= c->vocab)
         return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : bonus >= c->vocab ? "bonus out of range" : "k out of range");
@@ -1098,20 +1119,33 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, i
         done[j] = (e->pos + j) / c->ix_ratio;
         nsel[j] = done[j] > e->kq ? e->kq : 0;
     }
+    if (sampled) {
+        float* tu = (float*) e->dtu.contents;
+        tu[0] = temp;
+        memcpy(tu + 1, u, sizeof(float) * (size_t) k);
+    }
+    e->dqn = 0;
     e->prof_skip = 0;
     cmd_begin(e);
-    const int rc = draft_rows(e, k);
+    const int rc = draft_rows(e, k, sampled);
     id<MTLCommandBuffer> last = e->cb;
     if (cmd_wait(e) || rc) return -1;
     if (e->prof) e->stage_ms[ST_HEAD] += 1e3 * (last.GPUEndTime - last.GPUStartTime);
     memcpy(drafts, dt + 1, sizeof(int32_t) * (size_t) k);
+    e->dqn = sampled ? Q4E_DRAFT_Q : 0;
     return 0;
 }
 
-int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p) { (void) e; (void) j; (void) id; (void) p; return 0; }   // plan A2m
-int q4e_draft_probs(const Q4Eng* e, int k, float* p) {   // plan A1m: the head's probabilities on Metal
-    (void) e; (void) k; (void) p;
-    return -1;
+int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p) {   // k_draft_q of draft_rows (plan A2m)
+    if (!e->mtp || !e->dqid || j < 0 || j >= e->ndraft) return -1;
+    memcpy(id, (const int32_t*) e->dqid.contents + (size_t) j * Q4E_DRAFT_Q, sizeof(int32_t) * (size_t) e->dqn);
+    memcpy(p, (const float*) e->dqp.contents + (size_t) j * Q4E_DRAFT_Q, sizeof(float) * (size_t) e->dqn);
+    return e->dqn;
+}
+int q4e_draft_probs(const Q4Eng* e, int k, float* p) {   // k_argmax_p of draft_rows (plan A1m)
+    if (!e->mtp || !e->dprob || k < 1 || k > e->ndraft) return -1;
+    memcpy(p, e->dprob.contents, sizeof(float) * (size_t) k);
+    return 0;
 }
 
 int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits) {
