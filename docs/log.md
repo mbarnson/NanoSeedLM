@@ -814,3 +814,10 @@ slower. Drafts stay off by default on CUDA. Read [MTP drafts with trellis expert
 mac-metal's kernel bench: a 4,096-value table in threadgroup memory makes the trellis gathers slower than the computed
 1MAD (84 against 59 us a call). An LFSR code through two 64-value tables takes 95 us, about -15% in decode. So gate LA
 of the LFSR plan fails on Metal. Read [Trellis codes from tables](results/2026-11-05-table-code-metal.md).
+
+## [2026-11-05] plan | The trellis family on Hugging Face
+
+Matt approved a public release of the trellis packs. The plan has three repositories: TQ4, TQ3-D4 (`down_proj` at
+K = 4) and TQ3. Each holds P3's dense tensors, PLE table and head, without P3's seed experts, plus the trellis banks
+and a card with the KL as shipped. Release 1 runs in the NanoSeedLM engines. A start script and the MLX loader follow.
+Read [The trellis family on Hugging Face](plans/2026-11-05-release-family.md).
