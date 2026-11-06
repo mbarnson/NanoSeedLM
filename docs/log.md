@@ -869,3 +869,9 @@ download at 119 MB/s. TQ4 gives the same text in each run: 38 to 42 tokens per s
 drafts. oMLX loads it with the trellis loader: 49 tokens per second, and 81 to 84 with MTP. The v0.1.0 macOS archive
 passes gate RE. `373499f` fixes the pack choice of the start scripts on 64 GB PCs and 96 GB Macs. Read
 [The release packs from the Hub on the M4 Max](results/2026-11-06-release-downloads-m4max.md).
+
+## [2026-11-06] result | The KL of the 4-bit PLE table
+
+`4373d30` adds `nslm-qwen4-emulate --ple`. In HF job `6aee1d9d`, the 4-bit MLX PLE table that the packs ship gives a KL
+of 0.0259 on Q8_0. Unsloth's Q8_0 table gives 0.0199. `ff92415` makes the start scripts download the Q8_0 table
+by default. Read [The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md).

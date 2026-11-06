@@ -186,6 +186,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   8,192 rows at 32K give 474 more cache slots, decode +8% and prompts +43% to +47%. The default under 32 GB of VRAM.
 - [2026-11-06: The release packs from the Hub on the M4 Max](results/2026-11-06-release-downloads-m4max.md): TQ4 at 38
   to 42 tokens per second, 67 to 69 with 2 drafts. oMLX 49, and 81 to 84 with MTP. The macOS archive passes gate RE.
+- [2026-11-06: The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md): 0.0060 more than Unsloth's Q8_0
+  table (0.0199 to 0.0259 on Q8_0). The start scripts take the Q8_0 table by default.
 
 ## For contributors and agents
 
