@@ -6,10 +6,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
 fail() { printf '\n%s\n' "$*" >&2; exit 1; }
 
-# name, repository, revision, least RAM GB, least VRAM GB (the model cards' "For" column), download GB; NSLM_PACKS: another table
-PACKS=${NSLM_PACKS:-"TQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ4 25339937b55f9efbe384a3f8cb2bc92d86ecfa32 96 24 102
-TQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4 7e5edb2be58071fbe5a5133421ab6c1f2f0de58f 96 16 92
-TQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3 5f2a859927d2215081a7ac5684dbae5da6517104 64 16 87"}
+# name, repository, revision, least RAM and VRAM GB of a PC, least memory GB of a Mac (the cards' "For" column),
+# download GB. NSLM_PACKS: another table
+PACKS=${NSLM_PACKS:-"TQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ4 25339937b55f9efbe384a3f8cb2bc92d86ecfa32 96 24 128 102
+TQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4 7e5edb2be58071fbe5a5133421ab6c1f2f0de58f 96 16 96 92
+TQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3 5f2a859927d2215081a7ac5684dbae5da6517104 64 16 96 87"}
+fits() { [ $(($1 * 10)) -ge $(($2 * 9)) ]; }   # a 64 GB PC reports about 62 GB: 90% of a size counts as that size
 
 echo "NanoSeedLM: Qwen3.8-Flash-Next on this machine"
 echo
@@ -17,11 +19,11 @@ if [ "$(uname -s)" = Darwin ]; then
     bin=out/bin
     [ "$(uname -m)" = arm64 ] || fail "NanoSeedLM on macOS needs Apple Silicon."
     [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ] || fail "NanoSeedLM needs macOS 15 or newer."
-    ram=$(( $(sysctl -n hw.memsize) / 1073741824 )) vram=$ram   # unified memory
+    ram=$(( $(sysctl -n hw.memsize) / 1073741824 )) vram=0 mac=1   # unified memory: the Mac column
     sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
     echo "Mac: $(sysctl -n machdep.cpu.brand_string), $ram GB."
 else
-    bin=build/bin
+    bin=build/bin mac=
     command -v nvidia-smi >/dev/null || fail "No NVIDIA driver found. Install driver 570 or newer: https://www.nvidia.com/drivers"
     IFS=, read -r gpu vmib drv < <(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits | head -1)
     vram=$(( ${vmib// /} / 1024 )) drv=${drv// /}
@@ -33,8 +35,11 @@ fi
 [ -x "$bin/nslm-serve" ] || fail "$bin/nslm-serve is missing. Unpack the whole engine archive, then run start-here.sh in it."
 
 rec=
-while read -r n _ _ r v _; do [ -z "$rec" ] && [ "$ram" -ge "$r" ] && [ "$vram" -ge "$v" ] && rec=$n; done <<<"$PACKS"
-if [ -z "$rec" ]; then [ "$ram" -ge 64 ] || fail "The smallest pack (TQ3) needs 64 GB of RAM. This machine has $ram GB."; rec=TQ3; fi
+while read -r n _ _ r v m _; do
+    [ -n "$mac" ] && r=$m v=0
+    [ -z "$rec" ] && fits "$ram" "$r" && fits "$vram" "$v" && rec=$n
+done <<<"$PACKS"
+if [ -z "$rec" ]; then fits "$ram" 64 || fail "The smallest pack (TQ3) needs 64 GB of RAM. This machine has $ram GB."; rec=TQ3; fi
 echo
 echo "Packs (KL against BF16: lower is closer to the original model):"
 echo "  TQ4     0.0415  a GPU of 24 GB or more with 96 to 128 GB of RAM, or a 128 GB Mac (102 GB download)"
