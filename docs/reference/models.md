@@ -60,7 +60,8 @@ To use a model in the engine, read [Run and serve](../guides/run-and-serve.md).
 - **For a small download to test the seed format:** K2-Horizon-0.9B-NSLM-seeds-4bpw. Its quality is lower than
   IFM's Q4_K_M, and it is slower.
 - **To run Qwen3.8-Flash-Next with the NanoSeedLM engines:** TCQ4, TCQ3-D4 or TCQ3. The start script of the engine
-  release picks one by the memory of the machine. Their KL against BF16 as shipped is 0.0415, 0.0638 and 0.0778
+  release picks one by the memory of the machine. A PC with a 12 or 16 GB GPU and 64 GB of RAM takes TCQ3: it is the
+  only pack whose experts fit there. We did not test a 12 GB GPU or a 64 GB PC yet. Their KL against BF16 as shipped is 0.0415, 0.0638 and 0.0778
   ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
 - **To try seed experts on Qwen3.8-Flash-Next:** Qwen3.8-Flash-Next-NanoSeedLM-P4 or -P3, in mlx-vlm or with
   the NanoSeedLM engines. Against the 4-bit MLX model, P4 agrees on the top token 91.9% of the time. As shipped, with
