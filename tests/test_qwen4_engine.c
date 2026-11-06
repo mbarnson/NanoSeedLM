@@ -234,8 +234,8 @@ static int tcq_fixture(const char* dir, char* err, int errlen) {
     return 0;
 }
 
-// Trellis experts (NS_TCQ banks) in the engine against the C reference: a prompt of 20 rows (the matvecs, no trellis
-// GEMM yet) and 8 decode rows, with every expert in VRAM and through a cache of one layer's experts
+// Trellis experts (NS_TCQ banks) in the engine against the C reference: a prompt of 20 rows (the grouped GEMM) and 8
+// decode rows (the gathers), with every expert in VRAM and through a cache of one layer's experts
 static void tcq_check(void) {
     char dir[512], err[512] = "";
     const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";

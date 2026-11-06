@@ -205,6 +205,7 @@ static void load_w(Q4Eng* e, W* w, int host, const char* fmt, ...) {
         for (int s = 0; s < 4; ++s) if (p[s]) tab[i].p[s] = p[s] + t->s[s].len / (uint64_t) t->slices * (uint64_t) i;
         if (seed) memcpy(&tab[i].eb, t->s[2].p + 4 * (size_t) i, 4);
         if (t->enc == NS_Q4 || t->enc == NS_Q8) tab[i].gs = t->group == 32 ? 5 : 6;
+        if (t->enc == NS_TCQ) tab[i].gs = t->group;   // the GEMM's L | K << 8 | T << 16
     }
     *w = (W) {t->enc, t->slices, t->rows, t->cols, tab[0], (const WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) t->slices), t->group};
     free(tab);
@@ -402,6 +403,7 @@ static void build_cache(Q4Eng* e, double gb) {
                 if (t->enc == NS_SEED4 || t->enc == NS_SEED4P4) memcpy(&w->eb, t->s[2].p + 4 * (size_t) x, 4);
                 if (e->ebias) e->ebias[((size_t) l * E + x) * 3 + i] = w->eb;
                 if (t->enc == NS_Q4 || t->enc == NS_Q8) w->gs = t->group == 32 ? 5 : 6;
+                if (t->enc == NS_TCQ) w->gs = t->group;
             }
             for (int s = 0; s < 4 && host; ++s) st_dontneed(t->s[s].p, t->s[s].len);   // the arena holds them: the file pages go
         }
@@ -989,11 +991,10 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
     return 0;
 }
 
-// Trellis experts (NS_TCQ): the matvecs at every row count, a pair a grid row (no trellis GEMM yet); L | K << 8 | T << 16
+// Trellis experts (NS_TCQ) in decode rows: the gathers take L, K, T (group L | K << 8 | T << 16) as arguments
 static void tq_experts(Q4Eng* e, const Layer* L, int P, int k) {
     const Qwen4Cfg* c = &e->c;
     const int g = L->eg.group, d = L->ed.group;
-    if (P > 65535) { fail(e, "trellis experts: %d pairs in one call, at most 65535", P); return; }
     if (L->eu.group != g || kc_tq_mv_gu(e->s, g & 255, g >> 8 & 255, g >> 16, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k) ||
         kc_tq_mv_sel(e->s, d & 255, d >> 8 & 255, d >> 16, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1))
         fail(e, "trellis experts: gate and up differ, or no kernel for L %d K %d T %d / L %d K %d T %d", g & 255, g >> 8 & 255, g >> 16,
@@ -1038,14 +1039,11 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     mark(e, ST_ROUTE);
     if (T > MV_MAXT) {   // prompt rows: pairs by expert, so each tile reads its expert's weights once (tensor cores)
         const int mt = P / MMT_BN + c->n_exp;
-        if (L->eg.fmt == NS_TCQ) tq_experts(e, L, P, k);
-        else {
-            kc_bucket(e->s, e->ind, P, c->n_exp, e->perm, e->tiles, e->ntiles);
-            kc_mm_grouped_dev(e->s, L->eg.fmt, L->eg.tab, c->d, c->ff_exp, e->x, c->d, e->Gb, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eg));
-            kc_mm_grouped_dev(e->s, L->eu.fmt, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->Ub, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eu));
-            kc_swiglu(e->s, e->Gb, e->Ub, e->A, P * c->ff_exp);
-            kc_mm_grouped_dev(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, 1, e->perm, e->tiles, e->ntiles, mt, G(e, &L->ed));
-        }
+        kc_bucket(e->s, e->ind, P, c->n_exp, e->perm, e->tiles, e->ntiles);
+        kc_mm_grouped_dev(e->s, L->eg.fmt, L->eg.tab, c->d, c->ff_exp, e->x, c->d, e->Gb, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eg));
+        kc_mm_grouped_dev(e->s, L->eu.fmt, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->Ub, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eu));
+        kc_swiglu(e->s, e->Gb, e->Ub, e->A, P * c->ff_exp);
+        kc_mm_grouped_dev(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, 1, e->perm, e->tiles, e->ntiles, mt, G(e, &L->ed));
         mv(e, &L->sh_g, e->x, e->Gb, T);
         mv(e, &L->sh_u, e->x, e->Ub, T);
         kc_swiglu(e->s, e->Gb, e->Ub, e->A, T * c->ff_shared);
