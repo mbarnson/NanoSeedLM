@@ -16,6 +16,22 @@ Each tensor `NAME.weight` is stored in one of these encodings:
 
 Read [SeedLM](../concepts/seedlm.md) for how the engine makes weights from seeds.
 
+## Trellis expert banks
+
+A folder can also hold trellis-coded experts as bank files, `L{layer}_{gate_proj,up_proj,down_proj}.blkt`
+(`nslm-moe --codec tq`). The engine and the C reference add them with `ns_add_banks`. Each bank takes the place of
+the folder's tensor `language_model.model.layers.L.mlp.switch_mlp.PROJ.weight`. The safetensors shards must stay
+whole, because the reader opens every shard that the index names.
+
+| Part | Contents |
+|---|---|
+| Header (56 bytes, `MoeBlkHeader` in `nslm/moe.h`) | magic `NSLMBLKT`, rows, cols, experts E, L (`n_seeds`), K (`n_exp`), T (`refit`), n0, the encode's seconds |
+| `rel[E]`, `wrel[E]` (F32) | Each expert's relative error: plain and imatrix-weighted, square roots |
+| Words (U32) | `[E][rows][nslm_tq_row_words(cols, T, L, K)]`: each row's blocks of T weights as one bit stream |
+| Scales (U16, BF16) | `[E][rows][ceil(cols / T)]`: one scale for each block |
+
+Read [Trellis-coded experts](../concepts/trellis.md) for the code and the bit stream.
+
 ## Shard layout
 
 The writer pads each shard header to a 16 KiB page. Entries whose size is a multiple of the page come first. The

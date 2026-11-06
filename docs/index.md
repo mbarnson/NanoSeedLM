@@ -8,6 +8,8 @@ This is the catalog of all pages. Each line gives a link and one sentence about 
 What the methods are, how they work, and their current numbers.
 
 - [SeedLM](concepts/seedlm.md): weights as seeds of an LFSR, the seed search, the kernels, and why seeds are slower.
+- [Trellis-coded experts](concepts/trellis.md): experts as a bit stream read through a computed code, the Viterbi
+  search, the decode cost, and the KL at 3 and 4 bits.
 - [Multi-head latent attention](concepts/mla.md): the conversion from GQA to MLA, the cache, the attention modes, and
   the quality cost.
 - [The KV cache](concepts/kv-cache.md): cache sizes, the q8 and rq4 caches of the MLX loader, the fp8 and fp4 caches

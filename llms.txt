@@ -12,6 +12,7 @@ Facts to keep in mind:
 
 - [Documentation index](docs/index.md): a catalog of all pages, with one line each
 - [SeedLM](docs/concepts/seedlm.md): seed format, search, kernels, speed cost
+- [Trellis-coded experts](docs/concepts/trellis.md): bit-stream experts, Viterbi search, KL at 3 and 4 bits
 - [Multi-head latent attention](docs/concepts/mla.md): GQA to MLA conversion, attention modes, quality cost
 - [The KV cache](docs/concepts/kv-cache.md): cache sizes and formats, longest context for each Mac
 - [Metal and CUDA parity](docs/concepts/parity.md): shared code, tests, feature matrix
