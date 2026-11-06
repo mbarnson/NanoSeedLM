@@ -861,3 +861,10 @@ the default under 32 GB of VRAM. Read [VRAM that grows with the context](results
 Both engines keep the keys and values of the 12 attention layers in f32: 48 KB a position, about 1.6 GB at 32K. The
 plan stores them in BF16, as MLX does, and gives the RTX 4080's expert cache about 300 more slots at 32K. Read
 [The KV cache in BF16](plans/2026-11-06-qwen4-kv-bf16.md).
+
+## [2026-11-06] result | The KV cache of Qwen3.8-Flash-Next in BF16
+
+`bb40b77`, `20666ef`, `b8dc128`: both engines keep the attention keys and values in BF16. On the RTX 4080 at 32K the
+expert cache has 379 more slots and decode is 5.7% faster. On the M4 Max a 15K prompt is 5% to 6% faster. The KL of
+the BF16 cache against the f32 cache is at or below a half-step noise floor. Read
+[The KV cache in BF16](results/2026-11-06-qwen4-kv-bf16.md).

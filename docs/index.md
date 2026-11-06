@@ -62,8 +62,7 @@ Work that is not done yet, with its gates and hypotheses.
   64, 96 and 128 GB of RAM and a 12 GB GPU. Each must match an Unsloth V3.1 pack.
 - [2026-11-05: Prompt attention that loads each key tile once for several rows](plans/2026-11-05-qwen38-shared-tile-attention.md):
   stopped: 2.7 times fewer key loads, but 1.7 times slower.
-- [2026-11-06: The KV cache of Qwen3.8-Flash-Next in BF16](plans/2026-11-06-qwen4-kv-bf16.md): draft. About 0.8 GB at
-  32K for the expert cache, on CUDA and Metal.
+- [2026-11-06: The KV cache of Qwen3.8-Flash-Next in BF16](plans/2026-11-06-qwen4-kv-bf16.md): done on CUDA and Metal.
 
 ## Results
 
@@ -184,6 +183,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   text in two runs. TQ3-D4 decodes at 39.6 tokens per second with 8-bit dense weights (54.4 with 4-bit), TQ3 at 43.
 - [2026-11-06: VRAM that grows with the context on the RTX 4080](results/2026-11-06-context-vram-4080.md): passes of
   8,192 rows at 32K give 474 more cache slots, decode +8% and prompts +43% to +47%. The default under 32 GB of VRAM.
+- [2026-11-06: The KV cache of Qwen3.8-Flash-Next in BF16](results/2026-11-06-qwen4-kv-bf16.md): +379 slots and decode
+  +5.7% on the RTX 4080 at 32K, a 15K prompt +5% to +6% on the M4 Max. The KL change is at the noise floor.
 
 ## For contributors and agents
 
