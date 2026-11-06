@@ -2,7 +2,7 @@
 """tools/qwen4_release_card.py - the model cards of the trellis release (docs/plans/2026-11-05-release-family.md), one
 README per pack, with the KL as shipped read from tools/hf_release_pack.sh's llama-perplexity logs.
 
-  python3 tools/qwen4_release_card.py KLD_DIR OUT_DIR     (KLD_DIR: the job's OUT/kld, with _b_release_NAME.log)
+  python3 tools/qwen4_release_card.py KLD_DIR OUT_DIR     (KLD_DIR: the job's OUT/kld, with _m_rel_NAME.log)
 """
 import os, re, sys
 
@@ -157,8 +157,7 @@ def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     kdir, out = sys.argv[1], sys.argv[2]
-    ks = {n: kld(os.path.join(kdir, f"_b_release_{n}.log")) for n in PACKS
-          if os.path.exists(os.path.join(kdir, f"_b_release_{n}.log"))}
+    ks = {n: kld(os.path.join(kdir, f"_m_rel_{n}.log")) for n in PACKS if os.path.exists(os.path.join(kdir, f"_m_rel_{n}.log"))}
     os.makedirs(out, exist_ok=True)
     for n, k in ks.items():
         open(os.path.join(out, f"{n}.md"), "w").write(card(n, k, ks))
