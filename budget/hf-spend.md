@@ -12,6 +12,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Job | Flavor | Minutes | Cost | Running total |
 |---|---|---|---|---|
-| nslm-kld-tq-mix (6aed21aec78863f9c633bdd0): TQ2, mixes, UD-Q2_K_XL against BF16 | rtx-pro-6000x4 ($11/h) | about 80 (running) | about $15 | about $15 |
+| nslm-kld-tq-mix (6aed21aec78863f9c633bdd0): TQ2, mixes, UD-Q2_K_XL against BF16 | rtx-pro-6000x4 ($11/h) | 29.3 | $5.37 | $5.37 |
 
-Left this week: about $10.
+Left this week: $19.63.
