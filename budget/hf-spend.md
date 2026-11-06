@@ -65,6 +65,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda): TQ3 5f2a8599, TQ3-D4 7e5edb2b, TQ4 25339937 (each copy about 8 min, each upload about 1 min: Xet found the chunks) | cpu-xl ($1.00/h) | 29.1 | about $0.49 | about $21.50 |
 
-| nslm-kld-ple4 (6aee1d9dc78863f9c634fd46): Q8_0 and Q8_0 with P3's 4-bit MLX PLE table, the saved BF16 reference (Matt approved) | rtx-pro-6000x2 ($5.50/h) | running, timeout 29 | at most $2.66 (about $1.85 expected) | at most about $24.98 |
+| nslm-kld-ple4 (6aee1d9dc78863f9c634fd46): Q8_0 0.01991; Q8_0 with P3's 4-bit MLX PLE table 0.02588 (the saved BF16 reference) | rtx-pro-6000x2 ($5.50/h) | 7.3 | about $0.66 | about $22.98 |
 
-Left this week: about $0.83 after the PLE job (expected), at least $0.02.
+Left this week: about $2.02.
