@@ -1,11 +1,11 @@
 # The engine binaries (nslm-chat, nslm-serve) for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal), as a GitHub
-# release. A change of VERSION on main starts it as a draft (tag v + VERSION), as does the Actions page. A draft stays
-# private until it is published on the releases page, which also makes its tag.
+# release. A change of VERSION (or of this file) on main starts it as a draft (tag v + VERSION), as does the Actions
+# page. A draft stays private until it is published on the releases page, which makes its tag. A published one stays.
 name: release
 on:
   push:
     branches: [main]
-    paths: [VERSION]
+    paths: [VERSION, .github/workflows/release.yml]
   workflow_dispatch:
     inputs:
       tag:
@@ -38,11 +38,11 @@ jobs:
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04   # glibc 2.35
     timeout-minutes: 60
     steps:
-      - run: apt-get update -qq && apt-get install -y -qq git clang libicu-dev python3-pip >/dev/null && pip3 install -q cmake ninja
+      - run: apt-get update -qq && apt-get install -y -qq git libicu-dev python3-pip >/dev/null && pip3 install -q cmake ninja
       - uses: actions/checkout@v4
       - name: build
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DNSLM_STATIC_ICU=ON
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNSLM_STATIC_ICU=ON   # GCC: the CPU seed path is a stub, as with MSVC
           cmake --build build --target nslm-chat nslm-serve
           ldd build/bin/nslm-serve
           if ldd build/bin/nslm-serve | grep -q icu; then echo "ICU is not static"; exit 1; fi
@@ -95,7 +95,7 @@ jobs:
 
   macos:
     needs: meta
-    runs-on: macos-15
+    runs-on: macos-26   # the macOS 26 SDK (Metal 4, behind @available)
     timeout-minutes: 60
     env:
       TAG: ${{ needs.meta.outputs.tag }}
@@ -134,6 +134,7 @@ jobs:
         with: {path: dist, merge-multiple: true}
       - name: publish
         run: |
+          if [ "$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null)" = false ]; then echo "$TAG is published: change VERSION"; exit 1; fi
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > notes.txt
           gh release view "$TAG" >/dev/null 2>&1 ||
