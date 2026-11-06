@@ -71,6 +71,34 @@ hf jobs run --detach --flavor cpu-xl --timeout 2h -v ./src:/src -v hf://buckets/
 From Git Bash on Windows, set `MSYS_NO_PATHCONV=1` first. Otherwise Git Bash changes the job's paths (`/b/...` to
 `B:/...`) and the job stops at once.
 
+## Qwen3.8-Flash-Next trellis experts
+
+`nslm-moe --codec tq` writes trellis-coded experts as bank files, one for each layer and projection
+(`L{layer}_{proj}.blkt`). It uses the GPU encoder (CUDA or Metal) when there is one, else the CPU. All three write the
+same files. Read [Trellis-coded experts](../concepts/trellis.md).
+
+```bash
+out/bin/nslm-moe --model SNAPSHOT --imatrix imatrix_unsloth.gguf_file --out out/tq3 --scope gud --codec tq --tq-k 3 --tq-l 12
+```
+
+| Machine | One K at L = 12, all 121 G expert weights |
+|---|---|
+| 8 RTX PRO 6000 (HF Jobs, `tools/hf_seedbank.sh` with `JOBS=tq3.12`) | About 5 minutes, plus the download |
+| M4 Max GPU (Metal) | About 1.5 to 2.6 hours |
+| M4 Max CPU, 12 threads | About 10 hours |
+
+The search is resumable: it skips a bank file that is complete.
+
+A pack is a seed pack's folder, whole, with the bank files beside its shards. The engine opens the folder, then puts
+each bank in place of the expert tensor of the same name. Hard links save the disk space.
+
+```bash
+mkdir TQ3_DIR && ln P3_DIR/* TQ3_DIR/ && cp out/tq3/*.blkt TQ3_DIR/
+```
+
+A mix takes each projection's banks from another K. For example, `gate_proj` and `up_proj` from K = 3 and `down_proj`
+from K = 4 give 3.46 bits for each expert weight.
+
 ## MLA projections
 
 An MLA model folder also has `model-mla-delta.safetensors`. Read [The model folder format](../reference/model-folder.md).
