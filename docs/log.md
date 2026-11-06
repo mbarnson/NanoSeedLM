@@ -882,3 +882,9 @@ The three repositories moved from `-TQ4`, `-TQ3-D4` and `-TQ3` to `-TCQ4`, `-TCQ
 revisions. TCQ is trellis-coded quantization. In oMLX and in the community, TQ means TurboQuant. The Hub redirects the
 old names. The start scripts, the cards and the current pages use the new names. The dated results pages keep the
 names of their measurements.
+
+## [2026-11-06] plan | MTP drafts in nslm-serve, with sampling
+
+`nslm-serve` does not draft: `eng_generate` keeps only greedy drafts, and the server samples. The plan makes the draft
+rule speculative sampling, with one sampler for `nslm-chat` and `nslm-serve`, and the MTP head's first input from the
+caller. Read [MTP drafts in nslm-serve](plans/2026-11-06-serve-drafts.md).
