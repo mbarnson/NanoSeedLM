@@ -26,9 +26,10 @@ Write-Host "GPU: $($g[0]), $vram GB, driver $($g[2]). RAM: $ram GB."
 if ([int]$g[2].Split('.')[0] -lt 570) { Fail "The driver is older than 570 (CUDA 12.8). Update it: https://www.nvidia.com/drivers" }
 if ($vram -lt 12) { Write-Host "Warning: less than 12 GB of VRAM. The engine may not fit." -ForegroundColor Yellow }
 
+function Fits($have, $size) { $have -ge 0.9 * $size }   # a 64 GB PC may report 62 GB: 90% of a size counts as that size
 $rec = $null
-foreach ($n in $packs.Keys) { $p = $packs[$n]; if (-not $rec -and $ram -ge $p[2] -and $vram -ge $p[3]) { $rec = $n } }
-if (-not $rec) { if ($ram -lt 64) { Fail "The smallest pack (TQ3) needs 64 GB of RAM. This PC has $ram GB." }; $rec = 'TQ3' }
+foreach ($n in $packs.Keys) { $p = $packs[$n]; if (-not $rec -and (Fits $ram $p[2]) -and (Fits $vram $p[3])) { $rec = $n } }
+if (-not $rec) { if (-not (Fits $ram 64)) { Fail "The smallest pack (TQ3) needs 64 GB of RAM. This PC has $ram GB." }; $rec = 'TQ3' }
 Write-Host "`nPacks (KL against BF16: lower is closer to the original model):"
 Write-Host "  TQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TQ4'][4]) GB download)"
 Write-Host "  TQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TQ3-D4'][4]) GB download)"

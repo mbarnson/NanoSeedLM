@@ -4,14 +4,16 @@
 gives a folder that the NanoSeedLM engines run on a PC (CUDA, Linux or Windows) and on a Mac (Metal). Each card states
 the pack's KL against BF16 as shipped, its speed and the machine that it is for.
 
-**Status.** Draft. Matt approved the release on 2026-11-05. D0 of the dense plan changed release 1: P3's 4-bit MLX
-dense weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit
-dense weights (step R2b). R1 to R4 are done, and the folders are in the bucket. Their KL as shipped is 0.0415
-(TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3) ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
-The first R5 job failed: `hf upload` of the bucket mount gives EIO. The script now copies each folder to the local disk
-first (`29a76aa`). R5's upload is done (TQ3 `5f2a8599`, TQ3-D4 `7e5edb2b`, TQ4 `25339937`, private). RD passes on the
-RTX 4080 ([the release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). The Mac's RD waits for
-its download. R6 is a draft release of the engines (v0.1.0) with the start scripts. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the risk of a stale loader is closed for them.
+**Status.** Draft. Matt approved the release on 2026-11-05. D0 of the dense plan changed release 1: P3's 4-bit MLX dense
+weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit dense
+weights (step R2b). R1 to R4 are done, and the folders are in the bucket. Their KL as shipped is 0.0415 (TQ4), 0.0638
+(TQ3-D4) and 0.0778 (TQ3) ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)). The first R5
+job failed: `hf upload` of the bucket mount gives EIO. The script now copies each folder to the local disk first
+(`29a76aa`). R5's upload is done (TQ3 `5f2a8599`, TQ3-D4 `7e5edb2b`, TQ4 `25339937`, private). RD passes on the RTX 4080
+([the release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). RD and RE pass on the M4 Max ([the
+release packs from the Hub on the M4 Max](../results/2026-11-06-release-downloads-m4max.md)). R6 is a draft release of
+the engines (v0.1.0) with the start scripts. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the
+risk of a stale loader is closed for them.
 
 ## The family
 
