@@ -71,4 +71,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 765538e (6aee2912c78863f9c63517fd): serve-drafts S1-S3, 45 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.14 |
 
-Left this week: about $1.86.
+| Linux CI e94f859 (6aee2a01c78863f9c6351a4c): nslm-serve drafts (S4), 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.22 |
+
+Left this week: about $1.78.
