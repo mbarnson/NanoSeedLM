@@ -83,6 +83,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false   # PowerShell 7: a native exit code is not an error here
           & build\bin\nslm-serve.exe *> $null; if ($LASTEXITCODE -ne 2) { throw "nslm-serve did not start ($LASTEXITCODE)" }
           $d = "nslm-$env:TAG-windows-x64-cuda12.8"
           New-Item -ItemType Directory "$d\build\bin" | Out-Null

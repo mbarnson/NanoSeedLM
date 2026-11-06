@@ -1,6 +1,7 @@
 # start/start-here.ps1 - NanoSeedLM's start on a Windows PC (START-HERE.bat runs it from the engine folder): check the PC,
 # pick a pack, download and check it, chat once, write run-PACK.bat and start the server. Run it again to resume.
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false   # PowerShell 7: the script reads curl's and nslm-chat's exit codes
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
