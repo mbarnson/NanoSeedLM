@@ -759,3 +759,10 @@ K = 3 for the rest gives 0.0619 at 3.46 bits, 10% below. K = 2 gives 0.204 at 2.
 K = 3 decode at 49.7 tokens per second, against P3's 39.1 (+27%). Prompts are 22% faster, and the KL is about P3's
 (0.0619 against 0.0600). K = 3 is 43% faster at a KL of 0.0765, and K = 4 is 8% slower. Read
 [Trellis experts on the RTX 4080](results/2026-11-05-trellis-speed-4080.md).
+
+## [2026-11-05] result | Trellis experts on the M4 Max: P3's speed, better quality or less memory
+
+`6f90957`, mac-metal's M4 Max: every trellis pack decodes 1.7% to 2.3% faster than P3 without drafts, and reads an
+8,506-token prompt at P3's speed. All experts stay in unified memory, so there is no PCIe copy to save. Trellis K = 4
+has a KL of 0.0398 against P3's 0.0600 for 1.9 GB more, and K = 3 needs 13.2 GB less. Read
+[Trellis experts on the M4 Max](results/2026-11-05-trellis-speed-m4max.md).

@@ -156,6 +156,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   and 17% below the curve at 3.125 and 4.125 bits. `down_proj` at K = 4 gives 0.0619 at 3.46 bits.
 - [2026-11-05: Trellis experts on the RTX 4080: decode and prompt against P3](results/2026-11-05-trellis-speed-4080.md):
   the mix with P3's KL decodes 27% faster and reads prompts 22% faster. K = 3 is 43% and 61% faster.
+- [2026-11-05: Trellis experts on the M4 Max: decode and prompt against P3](results/2026-11-05-trellis-speed-m4max.md):
+  about 2% faster than P3, prompts at its speed. K = 4 has a third less KL at P3's speed.
 
 ## For contributors and agents
 

@@ -32,6 +32,9 @@ Decode and prompt in the engine on the RTX 4080, with the automatic expert cache
 | Trellis K = 3 + 4 (`down_proj` at K = 4) | 49.7 (+27%) | 781 (+22%) |
 | Trellis K = 3 | 56.0 (+43%) | 1,036 (+61%) |
 
+On the M4 Max all experts stay in unified memory. There, every trellis pack decodes about 2% faster than P3 and reads
+prompts at P3's speed. Read [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md).
+
 Speed of one expert matvec call (gate and up, one token, 10 experts). These are kernel benches, not decode in the
 engine.
 
@@ -95,6 +98,7 @@ shared memory, then uses the same tensor-core GEMM as the seeds. The Metal kerne
 - [Trellis-coded experts against BF16](../results/2026-11-05-trellis-kld.md): the whole model in llama.cpp.
 - [Trellis packs and Unsloth's curve](../results/2026-11-05-trellis-mixes.md): 2 to 4 bits, mixes, the corrected curve.
 - [Trellis experts on the RTX 4080](../results/2026-11-05-trellis-speed-4080.md): decode and prompt against P3.
+- [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md): decode, prompt and the files' sizes.
 
 ## See also
 
