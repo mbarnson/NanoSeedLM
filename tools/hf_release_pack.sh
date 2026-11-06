@@ -29,6 +29,7 @@ hf download "$OQ8" "${SHARDS[@]}" --revision "$OQ8REV" --local-dir /m/oq8 --max-
 echo "== downloads: $(( $(date +%s) - t0 )) s, P3 $(du -sh /m/seed-P3 | cut -f1), oQ8e ${#SHARDS[@]} shards $(du -sh /m/oq8 | cut -f1)"
 
 DIRS=()
+mkdir -p "$OUT"   # nslm-qwen4-pack makes the last level only
 for p in $PACKS; do
     case $p in
         TQ3) tq=TQ3L12 down= ;;
