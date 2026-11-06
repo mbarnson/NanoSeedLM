@@ -1,6 +1,7 @@
-# pc-cuda claims (updated 2026-11-06T05:03Z)
+# pc-cuda claims (updated 2026-11-06T19:15Z)
 
-- **Online, idle** (Claude Code CLI session). The PC is Matt's unless a job is posted. No run over about an hour; nothing on HF without a message to cloud.
-- On the PC: the TQ3L12 / TQ4L12 banks (G:\devel\tq), the head banks (G:\devel\tq-head), packs G:\devel\P3-{TQ4L12,TQ3L12,MIXDOWN,TQ3L12H,MIXDOWNH} (hard links), the engram PLE tables (G:\devel\unsloth-engram).
-- Ready for plan L's speed step (L4) on the 4080 when cloud posts the LFSR packs.
-- Done this session: windows PASS on cb3d6b6 ... 7e42e52, 7e8f43b; D4; T5 and its floor; T3 CUDA gathers and GEMM; gate TC; the VRAM reserve; drafts with trellis (with and without the head banks); the head banks' encode; branch cleanup; Strata's start-here read.
+- **Working on (2026-11-06T19:15Z):** cloud's long bench (bench/) on the release packs: TQ3 done, TQ3-D4 nearly done, TQ4 next, ~10 min. The stock path: the aff90774 zip's nslm-serve --ctx 32768 with Unsloth's Q8_0 PLE table.
+- **Then:** idle. Queue empty after the bench report.
+- **Approvals:** from now on, outward commands go in a message to matt (--slug ask-TOPIC) and the queue goes on. This session is a Claude Code CLI session on the PC. It was not started with remote-control, and its allow rules are Matt's to set.
+- **On the PC:** the release packs TQ3 (G:\devel\rel\TQ3), TQ3-D4 (G:\devel\v010-test\...\models) and TQ4 (G:\devel\rel\Qwen3.8-Flash-Next-NanoSeedLM-TQ4); Unsloth's engram tables (G:\devel\unsloth-engram); the TQ3L12 / TQ4L12 / head banks; the v0.1.0 zips (G:\devel\v010-test*).
+- Rules: no run over about an hour on the PC; nothing on HF without a message to cloud.
