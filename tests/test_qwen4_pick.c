@@ -30,16 +30,16 @@ static Eng* open_k(int k, char* err, int errlen) {   // the tiny model with Q4E_
     o.kv_tokens = 256;
     return eng_open(&o, err, errlen);
 }
-static int32_t pick_max(void* ctx, const float* l, int V, int32_t draft) {
-    (void) ctx; (void) draft;
+static int32_t pick_max(void* ctx, const float* l, int V, int32_t draft, const EngDraftQ* q) {
+    (void) ctx; (void) draft; (void) q;
     int b = 0;
     for (int v = 1; v < V; ++v) if (l[v] > l[b]) b = v;
     return b;
 }
 typedef struct { int left; } Stop;   // the pick after `left` tokens is a stop
-static int32_t pick_stop(void* ctx, const float* l, int V, int32_t draft) {
+static int32_t pick_stop(void* ctx, const float* l, int V, int32_t draft, const EngDraftQ* q) {
     Stop* s = (Stop*) ctx;
-    return s->left-- > 0 ? pick_max(NULL, l, V, draft) : -1;
+    return s->left-- > 0 ? pick_max(NULL, l, V, draft, q) : -1;
 }
 
 int main(void) {

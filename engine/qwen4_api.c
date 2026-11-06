@@ -134,7 +134,7 @@ static int amax(const float* l, int n) {   // ties: the lowest id
     for (int v = 1; v < n; ++v) if (l[v] > x) { x = l[v]; b = v; }
     return b;
 }
-static int32_t pick_max(void* ctx, const float* l, int V, int32_t draft) { (void) ctx; (void) draft; return amax(l, V); }
+static int32_t pick_max(void* ctx, const float* l, int V, int32_t draft, const EngDraftQ* q) { (void) ctx; (void) draft; (void) q; return amax(l, V); }
 // Each token is the bonus (picked from the logits so far) or an accepted draft. With Q4E_DRAFTS = K, the forward of a
 // pending token whose row before it has logits carries up to K drafts of the MTP head, drafted on that token; a draft is
 // committed while pick keeps it, and pick's other token takes the first rejected one's place. So each token has pick's
@@ -149,7 +149,7 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         if (e->n < 1 || e->at < e->n - 1 || reserve(e, e->n + e->drafts + 1)) { rc = -1; break; }
         if (e->at == e->n) {   // the bonus
             if (e->n >= e->max_pos) { rc = -1; break; }
-            const int32_t t = e->next >= 0 ? e->next : pick(ctx, e->last, V, -1);
+            const int32_t t = e->next >= 0 ? e->next : pick(ctx, e->last, V, -1, NULL);
             e->next = -1;
             if (t < 0) break;   // a stop
             out[j++] = e->hist[e->n++] = t;
@@ -172,7 +172,7 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         }
         int m = 1, t = -1;
         if (q4e_forward_keep(e->q, row, k + 1, e->last)) { rc = fail_reset(e); break; }
-        while (m <= k && (t = pick(ctx, e->last + (size_t) (m - 1) * V, V, row[m])) == row[m]) ++m;   // rows 0 .. m - 1 hold
+        while (m <= k && (t = pick(ctx, e->last + (size_t) (m - 1) * V, V, row[m], NULL)) == row[m]) ++m;   // rows 0 .. m - 1 hold
         if (q4e_accept(e->q, m)) { rc = fail_reset(e); break; }
         if (m > 1) memmove(e->last, e->last + (size_t) (m - 1) * V, sizeof(float) * (size_t) V);
         memcpy(e->hist + e->n, row + 1, sizeof(int32_t) * (size_t) (m - 1));

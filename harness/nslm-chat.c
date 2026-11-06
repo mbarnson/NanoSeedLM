@@ -15,9 +15,9 @@
 #include "tokenizer.h"
 
 typedef struct { Sampler s; const ChatModel* cm; } Pick;   // a stop token is a stop (-1)
-static int32_t chat_pick(void* ctx, const float* l, int V, int32_t draft) {
+static int32_t chat_pick(void* ctx, const float* l, int V, int32_t draft, const EngDraftQ* q) {
     Pick* p = (Pick*) ctx;
-    const int32_t t = sample_pick(&p->s, l, V, draft);
+    const int32_t t = sample_pick(&p->s, l, V, draft, q);
     return cm_stop(p->cm, t) ? -1 : t;
 }
 
@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
         int keep;
         if (drafts) keep = eng_generate_pick(e, 0, want, chat_pick, &pk, got, &gs);
         else if (eng_step(e, 0, lg)) keep = -1;
-        else keep = (got[0] = chat_pick(&pk, lg, V, -1)) < 0 ? 0 : eng_push(e, 0, got[0]) ? -1 : 1;
+        else keep = (got[0] = chat_pick(&pk, lg, V, -1, NULL)) < 0 ? 0 : eng_push(e, 0, got[0]) ? -1 : 1;
         if (keep < 0) { fprintf(stderr, "decode failed\n"); return 1; }
         if (ngen == 0) t1 = now_s();
         for (int i = 0; i < keep; ++i) {

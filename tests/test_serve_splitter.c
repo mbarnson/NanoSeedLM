@@ -7,7 +7,7 @@
 // nslm-serve's draw (harness/sample.h, the filtered path) with the old call's shape
 static int sample_row(const float* l, int V, double temp, double top_p, int top_k, double min_p, uint64_t* rng) {
     Sampler s = {temp, top_p, min_p, top_k, 0, *rng};
-    const int t = sample_pick(&s, l, V, -1);
+    const int t = sample_pick(&s, l, V, -1, NULL);
     *rng = s.rng;
     return t;
 }
@@ -154,24 +154,24 @@ static int budget_tests(void) {
     uint64_t ordinary = 77;
     for (int i = 0; i < 100; ++i) {
         const int a = sample_row(lg, 8, 1.3, .95, 6, .02, &ordinary);
-        const int b = sample_job(&j, lg, 8, -1);
+        const int b = sample_job(&j, lg, 8, -1, NULL);
         failed += a != b || ordinary != j.rng;
     }
     memset(&j, 0, sizeof j); j.thinking = true; j.reasoning_budget = 2; j.reasoning_close = 7;
     j.reasoning_closes[0] = 7; j.reasoning_closes[1] = 6; j.reasoning_closes[2] = 5;
-    failed += sample_job(&j, lg, 8, -1) != 0 || j.reasoning_tokens != 1;
-    failed += sample_job(&j, lg, 8, -1) != 0 || j.reasoning_tokens != 2;
+    failed += sample_job(&j, lg, 8, -1, NULL) != 0 || j.reasoning_tokens != 1;
+    failed += sample_job(&j, lg, 8, -1, NULL) != 0 || j.reasoning_tokens != 2;
     const uint64_t before = j.rng;
-    failed += sample_job(&j, lg, 8, -1) != 7 || j.thinking || j.rng != before;
-    failed += sample_job(&j, lg, 8, -1) != 0 || j.reasoning_tokens != 2;
+    failed += sample_job(&j, lg, 8, -1, NULL) != 7 || j.thinking || j.rng != before;
+    failed += sample_job(&j, lg, 8, -1, NULL) != 0 || j.reasoning_tokens != 2;
     for (int i = 0; i < 3; ++i) {
         float early[8] = {0}; early[j.reasoning_closes[i]] = 1;
         j.thinking = true; j.reasoning_tokens = 0;
-        failed += sample_job(&j, early, 8, -1) != j.reasoning_closes[i] || j.thinking;
-        failed += sample_job(&j, lg, 8, -1) != 0;
+        failed += sample_job(&j, early, 8, -1, NULL) != j.reasoning_closes[i] || j.thinking;
+        failed += sample_job(&j, lg, 8, -1, NULL) != 0;
     }
     j.thinking = true; j.reasoning_budget = 0; j.reasoning_tokens = 0;
-    failed += sample_job(&j, lg, 8, -1) != 7 || j.thinking;
+    failed += sample_job(&j, lg, 8, -1, NULL) != 7 || j.thinking;
     printf("reasoning budget validation, forced close, natural closes, zero-budget RNG identity: %s\n", failed ? "FAILED" : "passed");
     return failed;
 }

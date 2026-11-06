@@ -561,12 +561,12 @@ static bool read_reasoning_budget(const Json* req, int* budget) {
     return true;
 }
 // The job's next token; draft >= 0: the draft, or its replacement (speculative sampling, harness/sample.h)
-static int sample_job(Job* j, const float* l, int V, int32_t draft) {
+static int sample_job(Job* j, const float* l, int V, int32_t draft, const EngDraftQ* q) {
     int t = 0;
     if (j->thinking && j->reasoning_tokens >= j->reasoning_budget) t = j->reasoning_close;
     else {
         Sampler sp = {j->temperature, j->top_p, j->min_p, j->top_k, 0, j->rng};
-        t = sample_pick(&sp, l, V, draft);
+        t = sample_pick(&sp, l, V, draft, q);
         j->rng = sp.rng;
     }
     if (j->thinking) {
@@ -578,9 +578,9 @@ static int sample_job(Job* j, const float* l, int V, int32_t draft) {
     return t;
 }
 // eng_generate_pick's pick: the job's token, or -1 at its stop token (not committed)
-static int32_t serve_pick(void* ctx, const float* l, int V, int32_t draft) {
+static int32_t serve_pick(void* ctx, const float* l, int V, int32_t draft, const EngDraftQ* q) {
     Job* j = (Job*) ctx;
-    const int t = sample_job(j, l, V, draft);
+    const int t = sample_job(j, l, V, draft, q);
     if (cm_stop(&g_cm, t)) { j->hit_stop = true; return -1; }
     return t;
 }
@@ -676,7 +676,7 @@ static void* scheduler(void* arg) {
         } else if (n) {
             const int rc = eng_step_batch(g_eng, seqs, n, logits);
             for (int k = 0; k < n && !rc; ++k) {
-                tok[k] = sample_job(dec[k], logits + (size_t) k * V, V, -1);
+                tok[k] = sample_job(dec[k], logits + (size_t) k * V, V, -1, NULL);
                 if (!cm_stop(&g_cm, tok[k]) && dec[k]->nout < dec[k]->max_tokens) {
                     eng_push(g_eng, seqs[k], tok[k]);
                     slot_push(&g_slots[seqs[k]], tok[k]);

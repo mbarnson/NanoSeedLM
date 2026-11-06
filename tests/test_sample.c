@@ -1,5 +1,6 @@
 // tests/test_sample.c - harness/sample.h: the arg max at temperature 0, nslm-chat's and nslm-serve's samplers as they
-// were, and the draft rule of speculative sampling: whatever the draft, each token keeps the sampler's distribution.
+// were, and the draft rule of speculative sampling: whatever the draft and its distribution q, each token keeps the
+// sampler's distribution.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,16 +35,35 @@ static void target(const Sampler* s, double* p) {
     for (int i = 0; i < keep; ++i) p[ord[i]] = w[ord[i]] / ks;
 }
 
-static void freq(Sampler s, int draft, double* f) {
-    int n[V] = {0};
-    for (int k = 0; k < N; ++k) ++n[sample_pick(&s, kL, V, draft)];
+// Token frequencies over N picks: draft fixed (q NULL), or each draft drawn from q; *kept: the share that kept it
+static void freq(Sampler s, int draft, const EngDraftQ* q, double* f, double* kept) {
+    int n[V] = {0}, same = 0;
+    uint64_t r = 99;
+    for (int k = 0; k < N; ++k) {
+        int d = draft;
+        if (q) {   // d ~ q
+            const double u = (double) (sample_rand(&r) >> 11) * (1.0 / 9007199254740992.0);
+            double a = 0;
+            for (int i = 0; i < q->n && (d < 0 || a <= u); ++i) { a += q->p[i]; if (a > u) d = q->id[i]; }
+            if (d < 0) d = q->id[q->n - 1];
+        }
+        const int t = sample_pick(&s, kL, V, d, q);
+        ++n[t];
+        same += t == d;
+    }
     for (int i = 0; i < V; ++i) f[i] = (double) n[i] / N;
+    if (kept) *kept = (double) same / N;
+}
+static double worst_gap(const double* f, const double* p) {
+    double w = 0;
+    for (int i = 0; i < V; ++i) w = fabs(f[i] - p[i]) > w ? fabs(f[i] - p[i]) : w;
+    return w;
 }
 
 int main(void) {
     // Temperature 0: the arg max, ties to the lowest id, whatever the draft
     Sampler g = {0, 1, 0, 0, 0, 7};
-    CHECK(sample_pick(&g, kL, V, -1) == 1 && sample_pick(&g, kL, V, 2) == 1 && sample_pick(&g, kL, V, 1) == 1, "arg max");
+    CHECK(sample_pick(&g, kL, V, -1, NULL) == 1 && sample_pick(&g, kL, V, 2, NULL) == 1 && sample_pick(&g, kL, V, 1, NULL) == 1, "arg max");
 
     // mlx: nslm-chat's sampler, u = (splitmix64 >> 11) 2^-53 sum, the first id whose cumulative sum exceeds u
     {
@@ -56,7 +76,7 @@ int main(void) {
             const double u = (double) (sample_rand(&r) >> 11) * (1.0 / 9007199254740992.0) * t;
             int want = 0;
             while (want < V - 1 && !(c[want] > u)) ++want;
-            same &= sample_pick(&s, kL, V, -1) == want;
+            same &= sample_pick(&s, kL, V, -1, NULL) == want;
         }
         CHECK(same, "nslm-chat's sampler");
     }
@@ -68,10 +88,25 @@ int main(void) {
         target(&ss[c], p);
         const int drafts[4] = {-1, 1, 4, 5};
         for (int d = 0; d < 4; ++d) {
-            freq(ss[c], drafts[d], f);
-            double worst = 0;
-            for (int i = 0; i < V; ++i) worst = fabs(f[i] - p[i]) > worst ? fabs(f[i] - p[i]) : worst;
+            freq(ss[c], drafts[d], NULL, f, NULL);
+            const double worst = worst_gap(f, p);
             CHECK(worst < 0.0015, "sampler %d, draft %d: |freq - p| up to %.4f", c, drafts[d], worst);
+        }
+        // Drafts drawn from q: q = p itself (each draft kept), q near p, q with an id that p filters out, q of one point
+        EngDraftQ qs[4];
+        memset(qs, 0, sizeof qs);
+        for (int i = 0; i < V; ++i) if (p[i] > 0) { qs[0].id[qs[0].n] = i; qs[0].p[qs[0].n++] = (float) p[i]; }
+        const float qn[V] = {0.10f, 0.30f, 0.25f, 0.15f, 0.05f, 0.15f};
+        for (int i = 0; i < V; ++i) { qs[1].id[i] = i; qs[1].p[i] = qn[i]; }
+        qs[1].n = V;
+        qs[2].n = 2; qs[2].id[0] = 4; qs[2].p[0] = 0.5f; qs[2].id[1] = 1; qs[2].p[1] = 0.5f;
+        qs[3].n = 1; qs[3].id[0] = 2; qs[3].p[0] = 1;
+        for (int k = 0; k < 4; ++k) {
+            double kept;
+            freq(ss[c], -1, &qs[k], f, &kept);
+            const double worst = worst_gap(f, p);
+            CHECK(worst < 0.0015, "sampler %d, q %d: |freq - p| up to %.4f", c, k, worst);
+            CHECK(k || kept > 0.999, "sampler %d: q = p keeps %.4f of the drafts", c, kept);
         }
     }
     printf("%s\n", fails ? "FAIL" : "PASS");

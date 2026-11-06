@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
                     else if (b2 < 0 || lg[v] > lg[b2]) b2 = v;
                 }
                 int pick = b;
-                if (!greedy) pick = sample_pick(&sp, lg, V, -1);
+                if (!greedy) pick = sample_pick(&sp, lg, V, -1, NULL);
                 if (pick == 1 || pick == 250019) { finish = "stop"; break; }
                 Json* t = json_new(J_INT);
                 t->i = pick;
