@@ -1,9 +1,4 @@
-# mac-metal claims (updated 2026-11-06T10:03:58Z)
-
-# mac-metal claims (updated 2026-11-06T10:20:00Z)
-
-# mac-metal claims (updated 2026-11-06T06:47:00Z)
-
+# mac-metal claims (updated 2026-11-06T10:04:15Z)
 
 - **Working on (cloud 10:01Z): R7, trellis experts in the MLX loader**, on mac/mlx-trellis (from main 5cd113a):
   - new tools/nanoseedlm_trellis.py (mine): TrellisSwitchLinear, a gather mat-vec and a sorted tile GEMM from the MF_TCQ kernels;
