@@ -2,11 +2,11 @@
 # tools/hf_release_pack.sh - the trellis release folders (docs/plans/2026-11-05-release-family.md, steps R4 and R3) on an HF
 # Jobs GPU node: P3's folder with oQ8e-mtp's 8-bit dense modules and each pack's banks (nslm-qwen4-pack --tq --dense8) into
 # OUT/NAME, then for each a local copy, two runs of nslm-qwen4-gen and the KL as shipped (tools/hf_llama_kld.sh /PATH
-# packs).  PACK=0 tests the folders that an earlier run packed.
+# packs).  PACK=0 tests the folders that an earlier run packed; TESTS (default PACKS) names the folders to test.
 #   hf jobs run --flavor rtx-pro-6000x2 -v hf://buckets/txgsync/nslm-qwen38:/b -e SRC=/b/src-REV [-e OUT=/b/release] \
 #       [-e PACKS="TQ3 TQ3-D4 TQ4"] nvidia/cuda:12.8.1-devel-ubuntu24.04 bash /b/src-REV/tools/hf_release_pack.sh
 set -euo pipefail
-OUT=${OUT:-/b/release} TQBANK=${TQBANK:-/b/tq} PACKS=${PACKS:-"TQ3 TQ3-D4 TQ4"}
+OUT=${OUT:-/b/release} TQBANK=${TQBANK:-/b/tq} PACKS=${PACKS:-"TQ3 TQ3-D4 TQ4"} TESTS=${TESTS:-${PACKS:-"TQ3 TQ3-D4 TQ4"}}
 P3=txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3 P3REV=5753a67
 OQ8=mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp OQ8REV=2a9de025436ea977720e4e3d6f369b185838e791
 PROMPT="Write a Python function that returns the n-th Fibonacci number, with a docstring."
@@ -45,7 +45,7 @@ rm -rf /m/oq8 /m/seed-P3
 fi
 
 first=1
-for p in $PACKS; do   # each folder copied to the local disk: a memory map of the bucket mount faults (SIGBUS)
+for p in $TESTS; do   # each folder copied to the local disk: a memory map of the bucket mount faults (SIGBUS)
     t0=$(date +%s)
     rm -rf /m/rel && mkdir -p /m/rel && cp -r "$OUT/$p" /m/rel/
     echo "== $p: copied in $(( $(date +%s) - t0 )) s, $(du -sh "/m/rel/$p" | cut -f1)"
