@@ -35,6 +35,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 | nslm-release-r4 (6aed6e410e0338d1bb80e70b): failed at the oQ8e download (my --include bug) | rtx-pro-6000x2 ($5.50/h) | 2.4 | about $0.22 | about $12.97 |
 | nslm-release-r4 again (6aed6f19c78863f9c633e011): failed at the first write (no /b/release; my bug) | rtx-pro-6000x2 ($5.50/h) | 3.0 | about $0.27 | about $13.24 |
 | nslm-release-r4, third (6aed6ff30e0338d1bb80e764): packed TQ3 into /b/release (86.5 GB), then bus errors on the bucket mount; cancelled | rtx-pro-6000x2 ($5.50/h) | about 23 | about $2.11 | about $15.35 |
-| nslm-release-r4, fourth (6aed75a20e0338d1bb80e84b), running: pack TQ3-D4 and TQ4, test all three from local copies | rtx-pro-6000x2 ($5.50/h) | expected about 55, at most 95 | expected about $5, at most $8.71 | |
+| nslm-release-r4, fourth (6aed75a20e0338d1bb80e84b): packed TQ3-D4 and TQ4, KL of all three as shipped; runs of TQ3 only (script bug) | rtx-pro-6000x2 ($5.50/h) | 47.9 | about $4.39 | about $19.74 |
 
-Left this week: about $9.65 before the fourth nslm-release-r4.
+Left this week: about $5.26.
