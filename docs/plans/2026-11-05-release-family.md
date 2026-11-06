@@ -8,6 +8,8 @@ the pack's KL against BF16 as shipped, its speed and the machine that it is for.
 dense weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit
 dense weights (step R2b). R1 to R4 are done, and the folders are in the bucket. Their KL as shipped is 0.0415
 (TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3) ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
+The first R5 job failed: `hf upload` of the bucket mount gives EIO. The script now copies each folder to the local disk
+first (`29a76aa`). P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the risk of a stale loader is closed for them.
 
 ## The family
 
