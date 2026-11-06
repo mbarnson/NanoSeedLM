@@ -43,7 +43,7 @@ oMLX cannot load these packs in this release.
 | R2 | `tools/qwen4_trellis_pack.py`: P3's folder without its experts, plus a pack's banks, a card and `LICENSE` | cloud | RA |
 | R3 | The KL against BF16 of each pack as shipped (`NAME/mlx` in `tools/hf_llama_kld.sh`) | cloud, HF | RB |
 | R4 | The three folders, built in the bucket by an HF job, and a run of each on an RTX PRO 6000 | cloud, HF | RC |
-| R5 | Matt's upload job to the three repositories, then a download and run on the PC and on the Mac | Matt, pc-cuda, mac-metal | RD |
+| R5 | The upload job to three private repositories, a download and run on the PC and on the Mac, then public | pc-cuda, mac-metal | RD |
 | R6 | `start-here.bat` and `start-here.sh`, as Strata's: check the PC, pick a pack, download the engine and the pack, start `nslm-serve` | cloud, pc-cuda | RE |
 | R7 | Trellis kernels in the MLX loader, and a test in oMLX | mac-metal | RF |
 
@@ -62,7 +62,8 @@ Release 1 is R1 to R5. R6 and R7 follow as release 1.1 and release 2.
 - R3: one KL job of TQ3 and TQ4 as shipped, with the saved BF16 reference, `rtx-pro-6000x2`, about $2.50. The mix
   and P3 come from the D0 job of [the dense plan](2026-11-05-trellis-dense.md).
 - R4: a CPU job to build about 275 GB of folders, and three runs on `rtx-pro-6000`, about $3 in all.
-- R5: Matt's upload job (`cpu-xl`, about 3 hours), as for P3 and P4.
+- R5: an upload job on an HF CPU (`cpu-xl`, about 3 hours), as for P3 and P4. The PC starts it with Matt's HF token
+  (`--secrets HF_TOKEN`), so the data goes from the bucket to the Hub and not over the PC's link.
 - Disk on the Hub: about 275 GB. The PLE table repeats in each repository.
 
 ## Risks
