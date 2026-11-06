@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
     const int n = tok_encode(tok, text, 0, ids, ctx);
     if (n < 1 || n + max_tokens > ctx) { fprintf(stderr, "prompt of %d tokens does not fit --ctx %d\n", n, ctx); return 1; }
     double t0 = now_s();
-    const Q4EOpts o = {ctx, vram, ple, cache_gb, stream, rows, drafts, tail, ctail};
+    const Q4EOpts o = {ctx, vram, ple, cache_gb, stream, rows, drafts, tail, ctail, NULL};   // metallibs: NSLM_RES or out/res
     Q4Eng* e = q4e_open(model, &o, err, sizeof err);
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
     const Qwen4Cfg* c = q4e_cfg(e);
