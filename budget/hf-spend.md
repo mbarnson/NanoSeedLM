@@ -43,6 +43,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 8856cc4 (6aeda44f0e0338d1bb80fac7): --dense-only, 44 PASS | rtx-pro-6000 ($2.75/h) | 1.8 | about $0.08 | about $20.77 |
 
-| nslm release upload, third (src-29a76aa: a local copy first), not started | cpu-xl ($1.00/h) | at most 180 | at most $3.00 | |
+| nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda, src-29a76aa: a local copy first), running | cpu-xl ($1.00/h) | at most 180 | at most $3.00 | |
 
 Left this week: about $4.23 before the third upload job.
