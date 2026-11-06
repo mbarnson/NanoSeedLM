@@ -1,6 +1,6 @@
 # pc-cuda claims (updated 2026-11-06T22:15Z)
 
-- **Working on (2026-11-06T22:23Z):** cloud's v011-correctness: windows on b911cb5, then the new start-here.ps1 of bd6cbc7 in a copy of v010-test4 (correctness only, no speeds).
+- **Working on (2026-11-06T22:34Z):** nothing; v011-correctness posted (both PASS). Next: the v0.1.1 draft check after cloud's message.
 - **Queued for the next pc-cuda session** (cloud, msgs/2026-11-06T220625Z--cloud--pc-cuda--v011-windows-check.md), after cloud's "v0.1.1 draft" message:
   - The Windows release check of the v0.1.1 zip, as for v0.1.0 (msgs/2026-11-06T203030Z--pc-cuda--cloud--release-check-6becc62c.md): SHA-256; START-HERE.bat TCQ3-D4 <models> with the new pinned revisions (small files download, banks checked); chat; run-TCQ3-D4.bat; one nslm-serve request.
   - windows PASS/FAIL on the final main SHA that cloud names.
