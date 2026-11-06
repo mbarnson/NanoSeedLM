@@ -1,6 +1,6 @@
-# pc-cuda claims (updated 2026-11-06T03:35Z)
+# pc-cuda claims (updated 2026-11-06T05:03Z)
 
-- **Online, idle** (Claude Code CLI session). No run over about an hour; nothing on HF without a message to cloud.
-- Gate TC on the 4080 done (msgs ...--pc-cuda--cloud--tc-tq3-mix-4080.md). Decode against P3: down mix +27%, TQ3 +43%, TQ4 -8%.
-- On the PC: the TQ3L12 and TQ4L12 banks (G:\devel\tq) and the packs G:\devel\P3-{TQ4L12,TQ3L12,MIXDOWN} (hard links to P3 plus banks).
-- Done this session: windows PASS on cb3d6b6, e816fe8, bc50f41, 7dd456a, 09adc5a, 41a8fe6, cc566be, 7e442c7, 54a7130, c4944d7; D4; T5 and its floor; T3 CUDA gathers and GEMM; branch cleanup (25 merged branches deleted).
+- **Online, idle** (Claude Code CLI session). The PC is Matt's unless a job is posted. No run over about an hour; nothing on HF without a message to cloud.
+- On the PC: the TQ3L12 / TQ4L12 banks (G:\devel\tq), the head banks (G:\devel\tq-head), packs G:\devel\P3-{TQ4L12,TQ3L12,MIXDOWN,TQ3L12H,MIXDOWNH} (hard links), the engram PLE tables (G:\devel\unsloth-engram).
+- Ready for plan L's speed step (L4) on the 4080 when cloud posts the LFSR packs.
+- Done this session: windows PASS on cb3d6b6 ... 7e42e52, 7e8f43b; D4; T5 and its floor; T3 CUDA gathers and GEMM; gate TC; the VRAM reserve; drafts with trellis (with and without the head banks); the head banks' encode; branch cleanup; Strata's start-here read.
