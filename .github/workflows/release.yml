@@ -1,0 +1,121 @@
+# The engine binaries (nslm-chat, nslm-serve) for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal), as a GitHub
+# release. Start it from the Actions page or the API with a tag. A draft stays private until it is published.
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+      draft:
+        description: "Keep the release as a draft"
+        type: boolean
+        default: true
+permissions:
+  contents: read
+env:
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04   # glibc 2.35
+    timeout-minutes: 60
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git clang libicu-dev python3-pip >/dev/null && pip3 install -q cmake ninja
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DNSLM_STATIC_ICU=ON
+          cmake --build build --target nslm-chat nslm-serve
+          ldd build/bin/nslm-serve
+          if ldd build/bin/nslm-serve | grep -q icu; then echo "ICU is not static"; exit 1; fi
+          rc=0; build/bin/nslm-serve >/dev/null 2>&1 || rc=$?; test "$rc" = 2   # the usage: the binary starts
+      - name: package
+        run: |
+          d=nslm-$TAG-linux-x64-cuda12.8
+          mkdir -p "$d/build/bin" && cp build/bin/nslm-chat build/bin/nslm-serve "$d/build/bin/" && cp LICENSE "$d/"
+          sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > "$d/README.txt"
+          tar -czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with: {name: linux, path: "nslm-*.tar.gz"}
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: CUDA 12.8 and Ninja
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/12.8.1/network_installers/cuda_12.8.1_windows_network.exe -OutFile cuda.exe
+          $p = Start-Process .\cuda.exe -ArgumentList '-s', 'nvcc_12.8', 'cudart_12.8', 'visual_studio_integration_12.8' -Wait -PassThru
+          if ($p.ExitCode) { throw "the CUDA installer returned $($p.ExitCode)" }
+          $c = "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          "CUDA_PATH=$c" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$c\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+      - name: build
+        shell: cmd
+        env:
+          NSLM_CMAKE_ARGS: -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+        run: win\build.bat
+      - name: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & build\bin\nslm-serve.exe *> $null; if ($LASTEXITCODE -ne 2) { throw "nslm-serve did not start ($LASTEXITCODE)" }
+          $d = "nslm-$env:TAG-windows-x64-cuda12.8"
+          New-Item -ItemType Directory "$d\build\bin" | Out-Null
+          Copy-Item build\bin\nslm-chat.exe, build\bin\nslm-serve.exe "$d\build\bin\"
+          Copy-Item LICENSE $d
+          (Get-Content tools\release-readme.txt) -replace '@TAG@', $env:TAG -replace '@SHA@', $env:GITHUB_SHA | Set-Content "$d\README.txt"
+          Compress-Archive -Path $d -DestinationPath "$d.zip"
+      - uses: actions/upload-artifact@v4
+        with: {name: windows, path: "nslm-*.zip"}
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"   # Metal 3.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+          make out/bin/nslm-chat out/bin/nslm-serve out/res/kernels_moe.metallib out/res/kernels_qwen4.metallib
+          otool -L out/bin/nslm-serve
+          rc=0; out/bin/nslm-serve >/dev/null 2>&1 || rc=$?; test "$rc" = 2
+      - name: package
+        run: |
+          d=nslm-$TAG-macos-arm64-metal
+          mkdir -p "$d/out/bin" "$d/out/res"
+          cp out/bin/nslm-chat out/bin/nslm-serve "$d/out/bin/" && cp out/res/kernels_moe.metallib out/res/kernels_qwen4.metallib "$d/out/res/"
+          cp LICENSE "$d/" && sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > "$d/README.txt"
+          tar -czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with: {name: macos, path: "nslm-*.tar.gz"}
+
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DRAFT: ${{ inputs.draft }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {path: dist, merge-multiple: true}
+      - name: publish
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > notes.txt
+          gh release view "$TAG" >/dev/null 2>&1 ||
+              gh release create "$TAG" --target "$GITHUB_SHA" --title "NanoSeedLM engine $TAG" --notes-file notes.txt --prerelease --draft
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft="$DRAFT"

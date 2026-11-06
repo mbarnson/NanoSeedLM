@@ -3,6 +3,7 @@ rem win/build.bat - configure and build NanoSeedLM with MSVC + CUDA + Ninja into
 rem   win\build.bat            build
 rem   win\build.bat test       build and run the tests
 rem Set NSLM_MODEL_DIR to a model folder before the first build to enable the tests that read one.
+rem NSLM_CMAKE_ARGS: more arguments for the first configure (the release workflow: a static C runtime).
 setlocal
 rem (no paths inside parenthesised blocks: the ")" of "Program Files (x86)" would close them)
 set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -16,7 +17,7 @@ exit /b 0
 
 :configure
 rem a label, not a parenthesised block: NSLM_MODEL_DIR may contain ")" (C:\Program Files (x86)\...)
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNSLM_MODEL_DIR=%NSLM_MODEL_DIR%" || exit /b 1
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DNSLM_MODEL_DIR=%NSLM_MODEL_DIR%" %NSLM_CMAKE_ARGS% || exit /b 1
 exit /b 0
 
 :findvs
