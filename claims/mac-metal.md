@@ -1,22 +1,21 @@
-# mac-metal claims (updated 2026-11-06T14:05:39Z)
+# mac-metal claims (updated 2026-11-06T16:52:45Z)
 
-- **Waiting on TQ4.** The Mac's Wi-Fi is weak (6 GHz, MCS 2): 42 of 102 GB, with a resume loop. When it is down, in order:
-  - RD (nslm-chat at K = 0 and 2 drafts);
-  - the oMLX head-bank (L48) check, with MTP off and on;
-  - the macOS archive test (gate RE) with the 1424085 tarball, whose SHA-256 16a6574a is checked.
-- **Done (14:04Z, to cloud): plan K3.** The qwen4 Metal KV cache in BF16, mac/qwen4-kv-bf16 b8dc128 (from 20666ef), macos PASS.
-  - Gate KA holds.
-  - Gate KC holds on the M4 Max: the 15K prompt is 5–6% faster, the 4K prompt the same, decode about +1%.
-  - Merging is cloud's, after the release.
+- **Done (16:45–16:52Z, the Mac's part of R5 and RE):**
+  - TQ4 downloaded at 25339937, all 169 files SHA-256 checked.
+  - RD: K = 0 41.5 tok/s, 2 drafts 68–69 tok/s, the same text in every run.
+  - The oMLX head-bank (L48) check: 94% of drafts accepted, MTP on = MTP off, 84 tok/s.
+  - Gate RE with the v0.1.0 draft tarball 16a6574a: start-here.sh TQ4 checks the files, chats ("Hello!") and serves (40.9 tok/s).
+- **Done (14:04Z): plan K3**, the qwen4 Metal KV cache in BF16, on the branch as 98491b7 (macos PASS). It joins main after v0.1.0.
 - **Done today, on main or merged by cloud:**
-  - R7, trellis experts in the MLX loader (c5775cb): gate RF passes, and oMLX runs TQ4L12 at 92–94 tok/s with MTP.
-  - The qwen4 Metal resource_dir fix (7e37b5f, a499194).
-  - The oMLX remote-code validation (fork 29ee79c), and the root cause of the oMLX MTP garbage.
-  - macos PASS on 99cf18a, a58d0f5, d2a249b, 8856cc4, a499194, 1a55b64 and 354e2e1.
+  - R7, trellis experts in the MLX loader (c5775cb);
+  - the qwen4 Metal resource_dir fix (7e37b5f, a499194);
+  - the oMLX remote-code validation (fork 29ee79c), and the cause of the oMLX MTP garbage;
+  - macos PASS on 99cf18a, a58d0f5, d2a249b, 8856cc4, a499194, 1a55b64, 354e2e1 and 98491b7.
 - **Kept on the Mac:**
-  - the K = 3 and K = 4 L = 12 banks;
-  - the TQ3L12, TQ4L12 and TQ3TQ4down pack folders;
+  - ~/models/Qwen3.8-Flash-Next-NanoSeedLM-TQ4-rel (the checked release download);
+  - the K = 3 and K = 4 L = 12 banks; the TQ3L12, TQ4L12 and TQ3TQ4down pack folders;
   - ~/models P3 and P4 as they are;
-  - the omlx-29ee79c worktree, for the head-bank check.
+  - the omlx-29ee79c worktree.
+- **Free for more Metal work.**
 - **Mine:** engine/*.metal, engine/qwen4_gpu.m, engine/mova_gpu.m, tests/kernel_backend_metal.m, tests/test_qwen4_metal.c, tests/test_qwen4_api_mtp.c, nslm/trellis.metal, nslm/trellis_metal.m, tools/page_resident.py, tools/nanoseedlm_trellis.py, tools/test_nanoseedlm_trellis.py.
 - **Rules (Matt):** I push only mac/* branches and post them here; main merges are cloud's. Nothing goes to HF without a message to cloud first.
