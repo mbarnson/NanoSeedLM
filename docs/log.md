@@ -908,3 +908,9 @@ Matt published [v0.1.0](https://github.com/mbarnson/NanoSeedLM/releases/tag/v0.1
 notarized), with the start scripts. The scripts download a TCQ pack and Unsloth's Q8_0 PLE table. The stock path passes
 on the M4 Max (tarball `003648f3`) and on the RTX 4080 (zip `6becc62c`). Read [the release
 plan](plans/2026-11-05-release-family.md).
+
+## [2026-11-06] result | Long decode and long prompts on the M4 Max
+
+On the stock path of v0.1.0, the M4 Max decodes 4,096 tokens of TCQ4 at about 39 tokens per second, and also after
+30,000 tokens of prompt. Warm prompts run at about 480. The Q8_0 PLE table costs 0% to 4%: the host reads its rows on one
+thread. Read [Long decode on the M4 Max](results/2026-11-06-long-bench-m4max.md).

@@ -19,10 +19,10 @@ PACKS = {
 }
 # Long runs on the stock path (v0.1.0 nslm-serve, --ctx 32768, Unsloth's Q8_0 PLE table, thinking on): the lead's name,
 # machine, decode of 4,096 tokens, decode after 30K tokens, prompt tok/s at 30K. The first row is the lead's
-# (docs/results/2026-11-06-long-bench-4080.md)
+# (docs/results/2026-11-06-long-bench-4080.md, docs/results/2026-11-06-long-bench-m4max.md)
 RTX = "an RTX 4080", "RTX 4080 (16 GB), CUDA"
 SPEED = {
-    "TCQ4": [(*RTX, "31.4", "30.2", "1,725")],
+    "TCQ4": [("an M4 Max", "M4 Max (128 GB), Metal", "39.0", "38.8", "475"), (*RTX, "31.4", "30.2", "1,725")],
     "TCQ3-D4": [(*RTX, "38.0", "36.0", "1,824")],
     "TCQ3": [(*RTX, "44.0", "43.1", "2,004")],
 }
@@ -87,7 +87,7 @@ decodes at {lead[2]} tokens per second, and at {lead[3]} after a prompt of 30,00
 **How.** The experts are trellis-coded ({kdesc}, 12-bit states, as in
 [QTIP](https://arxiv.org/abs/2406.11235)). Neighbouring weights share the bits of one stream. Each weight is a fixed
 multiply-add of a 12-bit window of it, so there is no codebook to store or look up. The dense weights are 8-bit MLX.
-The 32 GB PLE n-gram table stays on the disk, and the page cache holds the rows that a session reads.
+The PLE n-gram table stays on the disk, and the page cache holds the rows that a session reads.
 
 **Start.** One command. Unpack the [engine release]({GITHUB}/releases) for your machine, then run `START-HERE.bat {name}`
 (Windows) or `./start-here.sh {name}` (Linux, macOS). The script checks the machine, downloads and checks this pack and
@@ -130,8 +130,10 @@ Unsloth's packs, measured in the same way (with their own dense weights):
 
 ## Speed
 
-Long runs on the stock path: `nslm-serve --ctx 32768` with the Q8_0 PLE table, thinking on, in tokens per second.
-Decode is the mean of two runs, and the prompt is the second run ([the runs]({GITHUB}/blob/main/docs/results/2026-11-06-long-bench-4080.md)).
+Long runs on the stock path: `nslm-serve --ctx 32768` with the Q8_0 PLE table, thinking on, temperature 0, without
+MTP drafts, in tokens per second. Decode is the mean of two runs, and the prompt is the second run (the runs on
+[the RTX 4080]({GITHUB}/blob/main/docs/results/2026-11-06-long-bench-4080.md) and
+[the M4 Max]({GITHUB}/blob/main/docs/results/2026-11-06-long-bench-m4max.md)).
 
 | Machine, engine | Decode, 4,096 tokens | Decode after 30K tokens | Prompt of 30K tokens |
 |---|---|---|---|

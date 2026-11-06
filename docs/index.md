@@ -192,6 +192,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   to 42 tokens per second, 67 to 69 with 2 drafts. oMLX 49, and 81 to 84 with MTP. The macOS archive passes gate RE.
 - [2026-11-06: The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md): 0.0060 more than Unsloth's Q8_0
   table (0.0199 to 0.0259 on Q8_0). The start scripts take the Q8_0 table by default.
+- [2026-11-06: Long decode and long prompts on the M4 Max](results/2026-11-06-long-bench-m4max.md): TCQ4 on the stock
+  path decodes about 39 tokens per second to 30K of context. The Q8_0 PLE table costs 0% to 4%.
 - [2026-11-06: Long decode and long prompts on the RTX 4080](results/2026-11-06-long-bench-4080.md): 4,096 tokens
   at 44 (TCQ3), 38 (TCQ3-D4) and 31 (TCQ4) tokens per second, and 42, 36 and 30 after 30K tokens.
 
