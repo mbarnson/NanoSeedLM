@@ -18,4 +18,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI e752917 (6aed4fefc78863f9c633d4db): the VRAM reserve | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.53 |
 
-Left this week: about $19.47.
+| Linux CI 1d0bb37 (6aed588b0e0338d1bb80e1a6): ns_add_banks, the MTP head's banks | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.61 |
+
+Left this week: about $19.39.
