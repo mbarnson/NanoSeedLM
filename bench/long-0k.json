@@ -1,0 +1,1 @@
+{"model": "default", "messages": [{"role": "user", "content": "Write a complete Python module that implements a B-tree with insert, delete, search and range queries, with docstrings and unit tests. Explain the design first."}], "max_tokens": 4096, "temperature": 0}

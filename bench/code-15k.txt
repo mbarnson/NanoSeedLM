@@ -1,0 +1,790 @@
+// nslm/lib_affine.c - MLX-compatible affine quantization (nslm/affine.h).
+#include "affine.h"
+
+#include <math.h>
+#include <string.h>
+
+static inline float bf2f(uint16_t h) {
+    uint32_t u = (uint32_t) h << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+static inline uint16_t f2bf(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+static inline float round_away(float x) { return x < 0 ? -floorf(-x + 0.5f) : floorf(x + 0.5f); }
+
+void nslm_affine_quantize(const uint16_t* w, int rows, int cols, int bits, uint32_t* words, uint16_t* scales,
+                          uint16_t* biases) {
+    const float nb = (float) ((1 << bits) - 1);
+    const int per = 32 / bits;
+    const int64_t groups = (int64_t) rows * cols / 64;
+    for (int64_t g = 0; g < groups; ++g) {
+        const uint16_t* x = w + g * 64;
+        float mx = bf2f(x[0]), mn = mx;
+        for (int i = 1; i < 64; ++i) {
+            const float v = bf2f(x[i]);
+            mx = v > mx ? v : mx;
+            mn = v < mn ? v : mn;
+        }
+        float delta = (mx - mn) / nb;
+        if (delta < 1e-7f) delta = 1e-7f;
+        const int neg = fabsf(mn) > fabsf(mx);
+        float scale = neg ? delta : -delta;
+        const float edge = neg ? mn : mx;
+        const float q0 = round_away(edge / scale);
+        float bias = 0.0f;
+        if (q0 != 0.0f) { scale = edge / q0; bias = edge; }
+        scales[g] = f2bf(scale);
+        biases[g] = f2bf(bias);
+        uint32_t* wd = words + g * 64 / per;
+        for (int k = 0; k < 64 / per; ++k) wd[k] = 0;
+        for (int i = 0; i < 64; ++i) {
+            float q = round_away((bf2f(x[i]) - bias) / scale);
+            q = q < 0 ? 0 : q > nb ? nb : q;
+            wd[i / per] |= (uint32_t) q << (bits * (i % per));
+        }
+    }
+}
+
+void nslm_affine_dequantize(const uint32_t* words, const uint16_t* scales, const uint16_t* biases, int rows, int cols,
+                            int bits, uint16_t* out) {
+    const int per = 32 / bits;
+    const uint32_t mask = (1u << bits) - 1u;
+    const int64_t n = (int64_t) rows * cols;
+    for (int64_t i = 0; i < n; ++i) {
+        const uint32_t q = (words[i / per] >> (bits * (i % per))) & mask;
+        const float s = bf2f(scales[i / 64]), b = bf2f(biases[i / 64]);
+        out[i] = f2bf(s * (float) q + b);
+    }
+}
+// nslm/lib_cpu_seed4.c - see cpu_seed4.h.
+#include "cpu_seed4.h"
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "lfsr.h"
+
+#define VW 16   // rows per vector step
+typedef float f16v __attribute__((ext_vector_type(VW)));
+typedef uint32_t u16v __attribute__((ext_vector_type(VW)));
+typedef int32_t i16v __attribute__((ext_vector_type(VW)));
+
+static uint32_t* g_table;
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+
+static void build_table(void) {
+    g_table = malloc(65536 * sizeof(uint32_t));
+    g_table[0] = 0;
+    for (int s = 1; s < 65536; ++s) g_table[s] = lfsr_stream32((uint16_t) s);
+}
+
+int cpu_seed4_on(void) { return 1; }
+
+uint32_t* cpu_seed4_table(void) {
+    pthread_once(&g_once, build_table);
+    return g_table;
+}
+
+static inline f16v fma16(f16v a, f16v b, f16v c) { return __builtin_elementwise_fma(a, b, c); }
+
+// v = 1 + state_k / 2^16 as f32 bits: 0x3F800000 | (state_k << 7), state_k = bits k .. k + 15 of the window.
+#define STATE(lo, t, k) ((k) <= 16 ? (lo) >> (k) : (t) >> ((k) - 16))
+#define VBITS(src) (((src) << 7 & 0x007FFF80u) | 0x3F800000u)
+
+// One 16-row step over all kb blocks: rows r .. r + VW - 1 (all valid).
+static void rows16(const uint16_t* seeds, const uint16_t* coefs, const uint8_t* codes, int bias, const uint32_t* table,
+                   const float* x, const float* xs, int kb, int r, float* y) {
+    f16v acc = 0.0f;
+    for (int b = 0; b < kb; ++b) {
+        u16v s, t, q, code;
+        for (int i = 0; i < VW; ++i) {
+            const int g = (r + i) * kb + b;
+            s[i] = seeds[g];
+            t[i] = table[seeds[g]];
+            q[i] = coefs[g];
+            code[i] = (codes[g >> 1] >> ((g & 1) * 4)) & 15u;
+        }
+        const u16v lo = s | t << 16;
+        const float* xb = x + 8 * b;
+        f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#define STEP(c)                                                                                  \
+        {                                                                                        \
+            const f16v xc = xb[c];                                                               \
+            a0 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 1)), a0);                               \
+            a1 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 2)), a1);                               \
+            a2 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 3)), a2);                               \
+            a3 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 4)), a3);                               \
+        }
+        STEP(0) STEP(1) STEP(2) STEP(3) STEP(4) STEP(5) STEP(6) STEP(7)
+#undef STEP
+        const i16v qi = (i16v) q;
+        const f16v q0 = __builtin_convertvector(qi << 28 >> 28, f16v), q1 = __builtin_convertvector(qi << 24 >> 28, f16v);
+        const f16v q2 = __builtin_convertvector(qi << 20 >> 28, f16v), q3 = __builtin_convertvector(qi << 16 >> 28, f16v);
+        const f16v qs = 1.5f * (((q0 + q1) + q2) + q3);
+        // sc = R32 * 2^(e + 16) from exponent bits
+        const f16v sc = (f16v) ((u16v) (bias + 16 + 127) + code << 23) * NSLM_R32;
+        const f16v d = (((a0 * q0 + a1 * q1) + a2 * q2) + a3 * q3) - qs * xs[b];
+        acc = fma16(d, sc, acc);
+    }
+    memcpy(y + r, &acc, sizeof acc);
+}
+
+static void rows1(const uint16_t* seeds, const uint16_t* coefs, const uint8_t* codes, int bias, const uint32_t* table,
+                  const float* x, const float* xs, int kb, int r, float* y) {
+    float acc = 0.0f;
+    for (int b = 0; b < kb; ++b) {
+        const int g = r * kb + b;
+        const uint32_t s = seeds[g], t = table[s], lo = s | t << 16, q = coefs[g];
+        const int code = (codes[g >> 1] >> ((g & 1) * 4)) & 15;
+        float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int c = 0; c < 8; ++c)
+            for (int p = 0; p < 4; ++p) {
+                const int k = 4 * c + p + 1;
+                const uint32_t bits = VBITS(STATE(lo, t, k));
+                float v;
+                memcpy(&v, &bits, 4);
+                a[p] = __builtin_fmaf(x[8 * b + c], v, a[p]);
+            }
+        const float q0 = (float) ((int32_t) (q << 28) >> 28), q1 = (float) ((int32_t) (q << 24) >> 28);
+        const float q2 = (float) ((int32_t) (q << 20) >> 28), q3 = (float) ((int32_t) (q << 16) >> 28);
+        const float d = (((a[0] * q0 + a[1] * q1) + a[2] * q2) + a[3] * q3) - 1.5f * (((q0 + q1) + q2) + q3) * xs[b];
+        const uint32_t eb = (uint32_t) (bias + 16 + 127 + code) << 23;
+        float p2;
+        memcpy(&p2, &eb, 4);
+        acc = __builtin_fmaf(d, p2 * NSLM_R32, acc);
+    }
+    y[r] = acc;
+}
+
+static void block_sums(const float* x, int kb, float* xs) {
+    for (int b = 0; b < kb; ++b) {
+        float s = 0.0f;
+        for (int c = 0; c < 8; ++c) s += x[8 * b + c];
+        xs[b] = s;
+    }
+}
+
+static void matvec_rows(const uint16_t* seeds, const uint16_t* coefs, const uint8_t* codes, int bias,
+                        const uint32_t* table, const float* x, const float* xs, int kb, int r0, int r1, float* y) {
+    int r = r0;
+    for (; r + VW <= r1; r += VW) rows16(seeds, coefs, codes, bias, table, x, xs, kb, r, y);
+    for (; r < r1; ++r) rows1(seeds, coefs, codes, bias, table, x, xs, kb, r, y);
+}
+
+void cpu_seed4_matvec_rows(const uint16_t* seeds, const uint16_t* coefs, const uint8_t* codes, int bias,
+                           const uint32_t* table, const float* x, int kb, int r0, int r1, float* y) {
+    float* xs = malloc(kb * sizeof(float));
+    block_sums(x, kb, xs);
+    matvec_rows(seeds, coefs, codes, bias, table, x, xs, kb, r0, r1, y);
+    free(xs);
+}
+
+typedef struct {
+    const uint16_t *seeds, *coefs;
+    const uint8_t* codes;
+    int bias, kb, rows;
+    const uint32_t* table;
+    const float *x, *xs;
+    float* y;
+    atomic_int next;
+} Job;
+
+#define CHUNK 64
+
+static void* worker(void* arg) {
+    Job* j = arg;
+    for (;;) {
+        const int r0 = atomic_fetch_add(&j->next, CHUNK);
+        if (r0 >= j->rows) break;
+        const int r1 = r0 + CHUNK < j->rows ? r0 + CHUNK : j->rows;
+        matvec_rows(j->seeds, j->coefs, j->codes, j->bias, j->table, j->x, j->xs, j->kb, r0, r1, j->y);
+    }
+    return NULL;
+}
+
+void cpu_seed4_matvec_mt(const uint16_t* seeds, const uint16_t* coefs, const uint8_t* codes, int bias,
+                         const uint32_t* table, const float* x, int rows, int kb, float* y, int threads) {
+    float* xs = malloc(kb * sizeof(float));
+    block_sums(x, kb, xs);
+    Job j = {seeds, coefs, codes, bias, kb, rows, table, x, xs, y, 0};
+    if (threads <= 1) {
+        worker(&j);
+    } else {
+        pthread_t* th = malloc((threads - 1) * sizeof(pthread_t));
+        for (int i = 0; i < threads - 1; ++i) pthread_create(&th[i], NULL, worker, &j);
+        worker(&j);
+        for (int i = 0; i < threads - 1; ++i) pthread_join(th[i], NULL);
+        free(th);
+    }
+    free(xs);
+}
+
+// ---- the CPU-tiled layout ----
+typedef uint16_t h16v __attribute__((ext_vector_type(CPU_SEED4_T)));
+typedef uint8_t b16v __attribute__((ext_vector_type(CPU_SEED4_T)));
+_Static_assert(CPU_SEED4_T == VW, "tile = vector width");
+
+void cpu_seed4_tile(CpuSeed4Tiled* t, const uint16_t* seeds, const uint16_t* coefs, const uint8_t* codes, int bias,
+                    int rows, int kb) {
+    const int T = CPU_SEED4_T, tiles = (rows + T - 1) / T;
+    t->seeds = malloc((size_t) tiles * kb * T * 2);
+    t->coefs = calloc((size_t) tiles * kb * T, 2);
+    t->codes = calloc((size_t) tiles * (kb / 2) * T, 1);
+    t->bias = bias, t->rows = rows, t->kb = kb, t->tiles = tiles, t->p = 4;
+    for (int tile = 0; tile < tiles; ++tile)
+        for (int b = 0; b < kb; ++b)
+            for (int i = 0; i < T; ++i) {
+                const int r = tile * T + i;
+                const size_t o = ((size_t) tile * kb + b) * T + i;
+                if (r >= rows) { t->seeds[o] = 1; continue; }   // a valid seed, zero coefficients: contributes 0
+                const size_t g = (size_t) r * kb + b;
+                t->seeds[o] = seeds[g];
+                t->coefs[o] = coefs[g];
+                const int code = (codes[g >> 1] >> ((g & 1) * 4)) & 15;
+                t->codes[((size_t) tile * (kb / 2) + b / 2) * T + i] |= (uint8_t) (code << ((b & 1) * 4));
+            }
+}
+
+void cpu_seed4_tiled_free(CpuSeed4Tiled* t) {
+    free(t->seeds), free(t->coefs), free(t->codes);
+    memset(t, 0, sizeof *t);
+}
+
+void cpu_seed3_tile(CpuSeed4Tiled* t, const uint16_t* seeds, const uint16_t* nibs, int bias, int rows, int kb) {
+    const int T = CPU_SEED4_T, tiles = (rows + T - 1) / T;
+    t->seeds = malloc((size_t) tiles * kb * T * 2);
+    t->coefs = calloc((size_t) tiles * kb * T, 2);
+    t->codes = NULL;
+    t->bias = bias, t->rows = rows, t->kb = kb, t->tiles = tiles, t->p = 3;
+    for (int tile = 0; tile < tiles; ++tile)
+        for (int b = 0; b < kb; ++b)
+            for (int i = 0; i < T; ++i) {
+                const int r = tile * T + i;
+                const size_t o = ((size_t) tile * kb + b) * T + i;
+                t->seeds[o] = r < rows ? seeds[(size_t) r * kb + b] : 1;   // padding: a valid seed, zero coefficients
+                if (r < rows) t->coefs[o] = nibs[(size_t) r * kb + b];
+            }
+}
+
+// One tile: the arithmetic of rows16, with vector loads.
+static void tile_rows(const CpuSeed4Tiled* m, int tile, const uint32_t* table, const float* x, const float* xs,
+                      float* out) {
+    const int kb = m->kb, T = CPU_SEED4_T;
+    const uint16_t* sp = m->seeds + (size_t) tile * kb * T;
+    const uint16_t* qp = m->coefs + (size_t) tile * kb * T;
+    const uint8_t* cp = m->codes + (size_t) tile * (kb / 2) * T;
+    f16v acc = 0.0f;
+    for (int b = 0; b < kb; ++b) {
+        h16v s16, q16;
+        b16v c16;
+        memcpy(&s16, sp + (size_t) b * T, sizeof s16);
+        memcpy(&q16, qp + (size_t) b * T, sizeof q16);
+        memcpy(&c16, cp + (size_t) (b / 2) * T, sizeof c16);
+        const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
+        const u16v code = __builtin_convertvector(c16, u16v) >> ((b & 1) * 4) & 15u;
+        u16v t;
+        for (int i = 0; i < VW; ++i) t[i] = table[sp[(size_t) b * T + i]];
+        const u16v lo = s | t << 16;
+        const float* xb = x + 8 * b;
+        f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#define STEP(c)                                                                                  \
+        {                                                                                        \
+            const f16v xc = xb[c];                                                               \
+            a0 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 1)), a0);                         \
+            a1 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 2)), a1);                         \
+            a2 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 3)), a2);                         \
+            a3 = fma16(xc, (f16v) VBITS(STATE(lo, t, 4 * (c) + 4)), a3);                         \
+        }
+        STEP(0) STEP(1) STEP(2) STEP(3) STEP(4) STEP(5) STEP(6) STEP(7)
+#undef STEP
+        const i16v qi = (i16v) q;
+        const f16v q0 = __builtin_convertvector(qi << 28 >> 28, f16v), q1 = __builtin_convertvector(qi << 24 >> 28, f16v);
+        const f16v q2 = __builtin_convertvector(qi << 20 >> 28, f16v), q3 = __builtin_convertvector(qi << 16 >> 28, f16v);
+        const f16v qs = 1.5f * (((q0 + q1) + q2) + q3);
+        const f16v sc = (f16v) ((u16v) (m->bias + 16 + 127) + code << 23) * NSLM_R32;
+        const f16v d = (((a0 * q0 + a1 * q1) + a2 * q2) + a3 * q3) - qs * xs[b];
+        acc = fma16(d, sc, acc);
+    }
+    memcpy(out, &acc, sizeof acc);
+}
+
+typedef struct {
+    const CpuSeed4Tiled* m;
+    const uint32_t* table;
+    const float *x, *xs;
+    float* y;
+    atomic_int next;
+} TJob;
+
+#define TILE_CHUNK 4
+
+static void* tworker(void* arg) {
+    TJob* j = arg;
+    const int T = CPU_SEED4_T;
+    float out[CPU_SEED4_T];
+    for (;;) {
+        const int t0 = atomic_fetch_add(&j->next, TILE_CHUNK);
+        if (t0 >= j->m->tiles) break;
+        const int t1 = t0 + TILE_CHUNK < j->m->tiles ? t0 + TILE_CHUNK : j->m->tiles;
+        for (int tile = t0; tile < t1; ++tile) {
+            tile_rows(j->m, tile, j->table, j->x, j->xs, out);
+            const int r0 = tile * T, n = j->m->rows - r0 < T ? j->m->rows - r0 : T;
+            memcpy(j->y + r0, out, n * sizeof(float));
+        }
+    }
+    return NULL;
+}
+
+static void run_n(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads);
+void cpu_seed4_tiled_matvec_mt(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, float* y, int threads) {
+    if (m->p == 3) { run_n(m, table, x, 1, y, threads); return; }
+    float* xs = malloc(m->kb * sizeof(float));
+    block_sums(x, m->kb, xs);
+    TJob j = {m, table, x, xs, y, 0};
+    if (threads <= 1) {
+        tworker(&j);
+    } else {
+        pthread_t* th = malloc((threads - 1) * sizeof(pthread_t));
+        for (int i = 0; i < threads - 1; ++i) pthread_create(&th[i], NULL, tworker, &j);
+        tworker(&j);
+        for (int i = 0; i < threads - 1; ++i) pthread_join(th[i], NULL);
+        free(th);
+    }
+    free(xs);
+}
+
+// tile_rows for ntok tokens: the states of each block once (v[4c + p] = state 4c + p + 1), then each token's FMAs,
+// combine and accumulate in tile_rows' order.
+static void tile_rows_n(const CpuSeed4Tiled* m, int tile, const uint32_t* table, const float* x, const float* xs, int ntok,
+                        float* out) {
+    const int kb = m->kb, T = CPU_SEED4_T;
+    const uint16_t* sp = m->seeds + (size_t) tile * kb * T;
+    const uint16_t* qp = m->coefs + (size_t) tile * kb * T;
+    const uint8_t* cp = m->codes + (size_t) tile * (kb / 2) * T;
+    f16v acc[CPU_SEED4_MAX_TOK];
+    for (int k = 0; k < ntok; ++k) acc[k] = 0.0f;
+    for (int b = 0; b < kb; ++b) {
+        h16v s16, q16;
+        b16v c16;
+        memcpy(&s16, sp + (size_t) b * T, sizeof s16);
+        memcpy(&q16, qp + (size_t) b * T, sizeof q16);
+        memcpy(&c16, cp + (size_t) (b / 2) * T, sizeof c16);
+        const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
+        const u16v code = __builtin_convertvector(c16, u16v) >> ((b & 1) * 4) & 15u;
+        u16v t;
+        for (int i = 0; i < VW; ++i) t[i] = table[sp[(size_t) b * T + i]];
+        const u16v lo = s | t << 16;
+        f16v v[32];
+#define GEN(c)                                                                                   \
+        v[4 * (c)] = (f16v) VBITS(STATE(lo, t, 4 * (c) + 1));                                    \
+        v[4 * (c) + 1] = (f16v) VBITS(STATE(lo, t, 4 * (c) + 2));                                \
+        v[4 * (c) + 2] = (f16v) VBITS(STATE(lo, t, 4 * (c) + 3));                                \
+        v[4 * (c) + 3] = (f16v) VBITS(STATE(lo, t, 4 * (c) + 4));
+        GEN(0) GEN(1) GEN(2) GEN(3) GEN(4) GEN(5) GEN(6) GEN(7)
+#undef GEN
+        const i16v qi = (i16v) q;
+        const f16v q0 = __builtin_convertvector(qi << 28 >> 28, f16v), q1 = __builtin_convertvector(qi << 24 >> 28, f16v);
+        const f16v q2 = __builtin_convertvector(qi << 20 >> 28, f16v), q3 = __builtin_convertvector(qi << 16 >> 28, f16v);
+        const f16v qs = 1.5f * (((q0 + q1) + q2) + q3);
+        const f16v sc = (f16v) ((u16v) (m->bias + 16 + 127) + code << 23) * NSLM_R32;
+        for (int k = 0; k < ntok; ++k) {
+            const float* xb = x + (size_t) k * kb * 8 + 8 * b;
+            f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                const f16v xc = xb[c];
+                a0 = fma16(xc, v[4 * c], a0);
+                a1 = fma16(xc, v[4 * c + 1], a1);
+                a2 = fma16(xc, v[4 * c + 2], a2);
+                a3 = fma16(xc, v[4 * c + 3], a3);
+            }
+            const f16v d = (((a0 * q0 + a1 * q1) + a2 * q2) + a3 * q3) - qs * xs[(size_t) k * kb + b];
+            acc[k] = fma16(d, sc, acc[k]);
+        }
+    }
+    for (int k = 0; k < ntok; ++k) memcpy(out + (size_t) k * T, &acc[k], sizeof acc[k]);
+}
+
+// P = 3: states 1..24 (v[3c + p] = state 3c + p + 1), the nibble word's code and 3 coefficients; else as tile_rows_n.
+static void tile_rows3_n(const CpuSeed4Tiled* m, int tile, const uint32_t* table, const float* x, const float* xs, int ntok,
+                         float* out) {
+    const int kb = m->kb, T = CPU_SEED4_T;
+    const uint16_t* sp = m->seeds + (size_t) tile * kb * T;
+    const uint16_t* qp = m->coefs + (size_t) tile * kb * T;
+    f16v acc[CPU_SEED4_MAX_TOK];
+    for (int k = 0; k < ntok; ++k) acc[k] = 0.0f;
+    for (int b = 0; b < kb; ++b) {
+        h16v s16, q16;
+        memcpy(&s16, sp + (size_t) b * T, sizeof s16);
+        memcpy(&q16, qp + (size_t) b * T, sizeof q16);
+        const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
+        u16v t;
+        for (int i = 0; i < VW; ++i) t[i] = table[sp[(size_t) b * T + i]];
+        const u16v lo = s | t << 16;
+        f16v v[24];
+#define GEN(c)                                                                                   \
+        v[3 * (c)] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 1));                                    \
+        v[3 * (c) + 1] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 2));                                \
+        v[3 * (c) + 2] = (f16v) VBITS(STATE(lo, t, 3 * (c) + 3));
+        GEN(0) GEN(1) GEN(2) GEN(3) GEN(4) GEN(5) GEN(6) GEN(7)
+#undef GEN
+        const i16v qi = (i16v) q;
+        const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v);
+        const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);
+        const f16v qs = 1.5f * ((q0 + q1) + q2);
+        const f16v sc = (f16v) ((u16v) (m->bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32;
+        for (int k = 0; k < ntok; ++k) {
+            const float* xb = x + (size_t) k * kb * 8 + 8 * b;
+            f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+            for (int c = 0; c < 8; ++c) {
+                const f16v xc = xb[c];
+                a0 = fma16(xc, v[3 * c], a0);
+                a1 = fma16(xc, v[3 * c + 1], a1);
+                a2 = fma16(xc, v[3 * c + 2], a2);
+            }
+            const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - qs * xs[(size_t) k * kb + b];
+            acc[k] = fma16(d, sc, acc[k]);
+        }
+    }
+    for (int k = 0; k < ntok; ++k) memcpy(out + (size_t) k * T, &acc[k], sizeof acc[k]);
+}
+
+typedef struct {
+    const CpuSeed4Tiled* m;
+    const uint32_t* table;
+    const float *x, *xs;
+    float* y;
+    int ntok;
+    atomic_int next;
+} NJob;
+
+static void* nworker(void* arg) {
+    NJob* j = arg;
+    const int T = CPU_SEED4_T;
+    float out[CPU_SEED4_MAX_TOK * CPU_SEED4_T];
+    for (;;) {
+        const int t0 = atomic_fetch_add(&j->next, TILE_CHUNK);
+        if (t0 >= j->m->tiles) break;
+        const int t1 = t0 + TILE_CHUNK < j->m->tiles ? t0 + TILE_CHUNK : j->m->tiles;
+        for (int tile = t0; tile < t1; ++tile) {
+            (j->m->p == 3 ? tile_rows3_n : tile_rows_n)(j->m, tile, j->table, j->x, j->xs, j->ntok, out);
+            const int r0 = tile * T, n = j->m->rows - r0 < T ? j->m->rows - r0 : T;
+            for (int k = 0; k < j->ntok; ++k) memcpy(j->y + (size_t) k * j->m->rows + r0, out + (size_t) k * T, n * sizeof(float));
+        }
+    }
+    return NULL;
+}
+
+static void run_n(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads);
+
+void cpu_seed4_tiled_matmul_mt(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads) {
+    if (ntok == 1 && m->p == 4) cpu_seed4_tiled_matvec_mt(m, table, x, y, threads);   // 12% faster: no state array
+    else run_n(m, table, x, ntok, y, threads);
+}
+
+static void run_n(const CpuSeed4Tiled* m, const uint32_t* table, const float* x, int ntok, float* y, int threads) {
+    float* xs = malloc((size_t) ntok * m->kb * sizeof(float));
+    for (int k = 0; k < ntok; ++k) block_sums(x + (size_t) k * m->kb * 8, m->kb, xs + (size_t) k * m->kb);
+    NJob j = {m, table, x, xs, y, ntok, 0};
+    if (threads <= 1) {
+        nworker(&j);
+    } else {
+        pthread_t* th = malloc((threads - 1) * sizeof(pthread_t));
+        for (int i = 0; i < threads - 1; ++i) pthread_create(&th[i], NULL, nworker, &j);
+        nworker(&j);
+        for (int i = 0; i < threads - 1; ++i) pthread_join(th[i], NULL);
+        free(th);
+    }
+    free(xs);
+}
+
+void cpu_seed_xt(const float* x, int ntok, int kb, float* xt, float* xs) {
+    for (int k = 0; k < ntok; ++k)
+        for (int b = 0; b < kb; ++b) {
+            float sum = 0;
+            for (int c = 0; c < 8; ++c) sum += xt[((size_t) k * 8 + c) * kb + b] = x[(size_t) k * kb * 8 + 8 * b + c];
+            xs[(size_t) k * kb + b] = sum;
+        }
+}
+
+// One vector step of cpu_seed3_rows: blocks [b, b + NL) of the row for all tokens. NL < VW (a last step) loads zero lanes
+// (q = 0, x = 0), which add nothing; NL == VW gives fixed-size loads.
+#define ROWS3_STEP(NL)                                                                                      \
+    {                                                                                                       \
+        h16v s16 = 0, q16 = 0;                                                                              \
+        memcpy(&s16, sp + b, sizeof(uint16_t) * (size_t) (NL));                                             \
+        memcpy(&q16, qp + b, sizeof(uint16_t) * (size_t) (NL));                                             \
+        const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);          \
+        u16v t;                                                                                             \
+        for (int i = 0; i < VW; ++i) t[i] = table[s16[i]];                                                  \
+        const u16v lo = s | t << 16;                                                                        \
+        f16v v[24];                                                                                         \
+        for (int c = 0; c < 24; ++c) v[c] = (f16v) VBITS(STATE(lo, t, c + 1));                              \
+        const i16v qi = (i16v) q;                                                                           \
+        const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v); \
+        const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);                                      \
+        const f16v qs = 1.5f * ((q0 + q1) + q2);                                                            \
+        const f16v sc = (f16v) ((u16v) (bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32;                     \
+        for (int k = 0; k < ntok; ++k) {                                                                    \
+            const float* xk = xt + (size_t) k * 8 * kb + b;                                                 \
+            f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, xb = 0.0f;                                                \
+            for (int c = 0; c < 8; ++c) {                                                                   \
+                f16v xc = 0.0f;                                                                             \
+                memcpy(&xc, xk + (size_t) c * kb, sizeof(float) * (size_t) (NL));                           \
+                a0 = fma16(xc, v[3 * c], a0);                                                               \
+                a1 = fma16(xc, v[3 * c + 1], a1);                                                           \
+                a2 = fma16(xc, v[3 * c + 2], a2);                                                           \
+            }                                                                                               \
+            memcpy(&xb, xs + (size_t) k * kb + b, sizeof(float) * (size_t) (NL));                           \
+            const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - qs * xb;                                       \
+            acc[k] = fma16(d, sc, acc[k]);                                                                  \
+        }                                                                                                   \
+    }
+
+void cpu_seed3_rows(const uint16_t* seeds, const uint16_t* nibs, int bias, const uint32_t* table, const float* xt,
+                    const float* xs, int ntok, int kb, int r0, int r1, float* y, int ys) {
+    for (int r = r0; r < r1; ++r) {
+        const uint16_t* sp = seeds + (size_t) r * kb, *qp = nibs + (size_t) r * kb;
+        f16v acc[CPU_SEED4_MAX_TOK];
+        for (int k = 0; k < ntok; ++k) acc[k] = 0.0f;
+        int b = 0;
+        if (ntok == 1)   // one token: the states inside the dot products, no state array (as the tiled matvec)
+            for (; b + VW <= kb; b += VW) {
+                h16v s16, q16;
+                memcpy(&s16, sp + b, sizeof s16);
+                memcpy(&q16, qp + b, sizeof q16);
+                const u16v s = __builtin_convertvector(s16, u16v), q = __builtin_convertvector(q16, u16v);
+                u16v t;
+                for (int i = 0; i < VW; ++i) t[i] = table[sp[b + i]];
+                const u16v lo = s | t << 16;
+                f16v a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, xb;
+#define C1(c) { f16v xc; memcpy(&xc, xt + (size_t) (c) * kb + b, sizeof xc); \
+                a0 = fma16(xc, (f16v) VBITS(STATE(lo, t, 3 * (c) + 1)), a0); a1 = fma16(xc, (f16v) VBITS(STATE(lo, t, 3 * (c) + 2)), a1); \
+                a2 = fma16(xc, (f16v) VBITS(STATE(lo, t, 3 * (c) + 3)), a2); }
+                C1(0) C1(1) C1(2) C1(3) C1(4) C1(5) C1(6) C1(7)
+#undef C1
+                const i16v qi = (i16v) q;
+                const f16v q0 = __builtin_convertvector(qi << 24 >> 28, f16v), q1 = __builtin_convertvector(qi << 20 >> 28, f16v);
+                const f16v q2 = __builtin_convertvector(qi << 16 >> 28, f16v);
+                memcpy(&xb, xs + b, sizeof xb);
+                const f16v d = ((a0 * q0 + a1 * q1) + a2 * q2) - 1.5f * ((q0 + q1) + q2) * xb;
+                acc[0] = fma16(d, (f16v) ((u16v) (bias + 16 + 127) + (q & 15u) << 23) * NSLM_R32, acc[0]);
+            }
+        for (; b + VW <= kb; b += VW) ROWS3_STEP(VW)
+        if (b < kb) ROWS3_STEP(kb - b)
+        for (int k = 0; k < ntok; ++k) {
+            float sum = 0;
+            for (int i = 0; i < VW; ++i) sum += acc[k][i];
+            y[(size_t) k * ys + r] = sum;
+        }
+    }
+}
+#undef ROWS3_STEP
+// nslm/lib_emulate.c - see emulate.h.
+#include "emulate.h"
+
+#include <fcntl.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "gguf.h"
+#include "rows.h"
+
+uint16_t ns_f32_to_f16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    const uint32_t s = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+    if (a > 0x7F800000u) return (uint16_t) (s | 0x7E00u);    // NaN
+    if (a >= 0x477FF000u) return (uint16_t) (s | 0x7C00u);   // 65520 and above round to infinity
+    if (a >= 0x38800000u) {                                  // normal: 10 of 23 mantissa bits, rounded
+        const uint32_t r = a - 0x38000000u;
+        return (uint16_t) (s | ((r + 0xFFFu + ((r >> 13) & 1u)) >> 13));
+    }
+    const int sh = 126 - (int) (a >> 23);   // subnormal: the value in steps of 2^-24
+    if (sh > 24) return (uint16_t) s;
+    const uint32_t m = (a & 0x7FFFFFu) | 0x800000u, q = m >> sh, rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
+    return (uint16_t) (s | (q + (rem > half || (rem == half && (q & 1)))));
+}
+
+void ns_q8_0_row(const float* x, int n, uint8_t* out) {
+    for (int b = 0; b < n / 32; ++b, x += 32, out += 34) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) amax = fabsf(x[j]) > amax ? fabsf(x[j]) : amax;
+        const float d = amax / 127, id = d != 0.0f ? 1.0f / d : 0.0f;
+        const uint16_t h = ns_f32_to_f16(d);
+        out[0] = (uint8_t) h;
+        out[1] = (uint8_t) (h >> 8);
+        for (int j = 0; j < 32; ++j) out[2 + j] = (uint8_t) (int8_t) roundf(x[j] * id);
+    }
+}
+
+static float f16_to_f32(uint16_t h) {
+    const int e = h >> 10 & 31, m = h & 0x3FF;
+    const float v = e ? ldexpf(1.0f + (float) m / 1024.0f, e - 15) : ldexpf((float) m / 1024.0f, -14);
+    return h & 0x8000 ? -v : v;
+}
+
+// The engine's name of the shard's dense tensor g, else 0
+static int dense_name(const char* g, char* out, size_t len) {
+    static const char* kTop[][2] = {
+        {"output.weight", "language_model.lm_head.weight"}, {"token_embd.weight", "language_model.model.embed_tokens.weight"},
+        {"output_hc_up.weight", "language_model.model.hyper_connection_mixer.input_mix_weight_up.weight"},
+        {"output_hc_down.weight", "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight"}};
+    static const char* kBlk[][2] = {
+        {"attn_qkv", "linear_attn.in_proj_qkv"}, {"attn_gate", "linear_attn.in_proj_z"}, {"ssm_out", "linear_attn.out_proj"},
+        {"ssm_alpha", "linear_attn.in_proj_a"}, {"ssm_beta", "linear_attn.in_proj_b"}, {"attn_q", "self_attn.q_proj"},
+        {"attn_k", "self_attn.k_proj"}, {"attn_v", "self_attn.v_proj"}, {"attn_output", "self_attn.o_proj"},
+        {"ffn_gate_shexp", "mlp.shared_expert.gate_proj"}, {"ffn_up_shexp", "mlp.shared_expert.up_proj"},
+        {"ffn_down_shexp", "mlp.shared_expert.down_proj"}, {"hc_attn_up", "attn_hyper_connection.input_mix_weight_up"},
+        {"hc_attn_down", "attn_hyper_connection.input_mix_weight_down"}, {"hc_attn_inject", "attn_hyper_connection.block_inject_weight"},
+        {"hc_ffn_up", "mlp_hyper_connection.input_mix_weight_up"}, {"hc_ffn_down", "mlp_hyper_connection.input_mix_weight_down"},
+        {"hc_ffn_inject", "mlp_hyper_connection.block_inject_weight"}};
+    for (size_t i = 0; i < sizeof kTop / sizeof kTop[0]; ++i)
+        if (!strcmp(g, kTop[i][0])) return snprintf(out, len, "%s", kTop[i][1]) > 0;
+    char k[32];
+    int l = -1, at = 0;
+    if (sscanf(g, "blk.%d.%31[a-z_].weight%n", &l, k, &at) != 2 || g[at]) return 0;
+    for (size_t i = 0; i < sizeof kBlk / sizeof kBlk[0]; ++i)
+        if (!strcmp(k, kBlk[i][0])) return snprintf(out, len, "language_model.model.layers.%d.%s.weight", l, kBlk[i][1]) > 0;
+    return 0;
+}
+
+// A DeltaNet tensor's value-head axis: none, rows by head (a, b), rows by head block (z), the v rows of qkv, columns (out)
+enum { GDN_NONE, GDN_HEADS, GDN_BLOCKS, GDN_QKV, GDN_COLS };
+static int gdn_kind(const char* name) {
+    static const char* kSuf[] = {"in_proj_a.weight", "in_proj_b.weight", "in_proj_z.weight", "in_proj_qkv.weight", "out_proj.weight"};
+    static const int kKind[] = {GDN_HEADS, GDN_HEADS, GDN_BLOCKS, GDN_QKV, GDN_COLS};
+    const char* at = strstr(name, ".linear_attn.");
+    for (int i = 0; at && i < 5; ++i) if (!strcmp(at + 13, kSuf[i])) return kKind[i];
+    return GDN_NONE;
+}
+static int vhead(const NsGdnHeads* q, int h) { return h % q->hk * (q->hv / q->hk) + h / q->hk; }   // llama.cpp's h: MLX's
+static int gdn_ok(const NsGdnHeads* q, int kind, const NsTensor* t) {
+    const int vd = q->hv * q->dv;
+    return kind == GDN_HEADS ? t->rows == q->hv : kind == GDN_BLOCKS ? t->rows == vd : kind == GDN_QKV ? t->rows == 2 * q->hk * q->dk + vd :
+           kind == GDN_COLS ? t->cols == vd : 1;
+}
+// Row r of the shard's tensor from the pack's t, in llama.cpp's head order (tmp: t->cols floats for the columns)
+static void shard_row(const NsRows* nr, const NsTensor* t, const NsGdnHeads* q, int kind, int r, float* w, float* tmp) {
+    const int v0 = kind == GDN_QKV ? 2 * q->hk * q->dk : 0, dv = q ? q->dv : 1;
+    if (kind == GDN_COLS) {
+        ns_row_f32(nr, t, 0, r, 0, tmp);
+        for (int c = 0; c < t->cols; ++c) w[c] = tmp[vhead(q, c / dv) * dv + c % dv];
+        return;
+    }
+    const int src = kind == GDN_HEADS ? vhead(q, r) : (kind == GDN_BLOCKS || kind == GDN_QKV) && r >= v0 ?
+                    v0 + vhead(q, (r - v0) / dv) * dv + (r - v0) % dv : r;
+    ns_row_f32(nr, t, 0, src, 0, w);
+}
+
+typedef struct { const NsTensor* t[NS_EMU_PACKS]; uint64_t off; int lp; } EmTensor;   // lp: 3 L + p, or a DeltaNet kind   // + Q8_0 offset, 3 L + p
+typedef struct {
+    const EmTensor* t;
+    const uint8_t* map;
+    const NsRows* nr;
+    size_t len, cols;           // the largest tensor slice in bytes, the most columns
+    int fd, items, next, bad;   // item k: expert k % slices of tensor k / slices (all tensors of a shard share slices)
+    pthread_mutex_t mu;
+} Emu;
+
+static void* emu_worker(void* arg) {
+    Emu* m = (Emu*) arg;
+    uint8_t* buf = (uint8_t*) malloc(m->len);
+    float* w = (float*) malloc(4 * m->cols);
+    for (;;) {
+        pthread_mutex_lock(&m->mu);
+        const int k = m->bad ? m->items : m->next++;
+        pthread_mutex_unlock(&m->mu);
+        if (k >= m->items) break;
+        const EmTensor* et = &m->t[k / m->t[0].t[0]->slices];
+        const int e = k % et->t[0]->slices;
+        const NsTensor* t = et->t[m->map ? m->map[(size_t) et->lp * (size_t) et->t[0]->slices + (size_t) e] : 0];
+        const size_t rb = (size_t) t->cols / 32 * 34, len = rb * (size_t) t->rows;
+        for (int r = 0; r < t->rows; ++r) {
+            ns_row_f32(m->nr, t, e, r, 0, w);
+            ns_q8_0_row(w, t->cols, buf + rb * (size_t) r);
+        }
+        size_t done = 0;
+        const uint64_t at = et->off + (uint64_t) e * len;
+        while (done < len) {
+            const ssize_t n = pwrite(m->fd, buf + done, len - done, (off_t) (at + done));
+            if (n <= 0) break;
+            done += (size_t) n;
+        }
+        if (done < len) { pthread_mutex_lock(&m->mu); m->bad = 1; pthread_mutex_unlock(&m->mu); }
+    }
+    free(buf);
+    free(w);
+    return NULL;
+}
+
+int ns_emulate_gguf(const NsModel* const* packs, int np, const uint8_t* map, size_t map_len, const char* gguf, int workers,
+                    int* n, char* err, int errlen) {
+    static const char* kProj[3] = {"gate", "up", "down"};
+    *n = 0;
+    if (np < 1 || np > NS_EMU_PACKS) { snprintf(err, (size_t) errlen, "%d packs: 1 to %d", np, NS_EMU_PACKS); return -1; }
+    Gguf g;
+    if (gguf_open(&g, gguf, err, errlen)) return -1;
+    EmTensor* et = (EmTensor*) malloc(sizeof *et * (size_t) (g.n ? g.n : 1));
+    int nt = 0, rc = 0;
+    size_t len = 0, cols = 0;
+    for (int i = 0; i < g.n && !rc; ++i) {   // check every expert tensor first
+        const GgufTensor* gt = &g.t[i];
+        char proj[8], name[128];
+        int l = 0, at = 0, p = 0;
+        if (sscanf(gt->name, "blk.%d.ffn_%7[a-z]_exps.weight%n", &l, proj, &at) != 2 || gt->name[at]) continue;
+        while (p < 3 && strcmp(kProj[p], proj)) ++p;
+        if (p == 3) continue;
+        snprintf(name, sizeof name, "language_model.model.layers.%d.mlp.switch_mlp.%s_proj.weight", l, proj);
+        EmTensor x = {{NULL}, g.data + gt->offset, 3 * l + p};
+        for (int k = 0; k < np && !rc; ++k) {
+            const NsTensor* t = x.t[k] = ns_find(packs[k], name);
+            if (!t) rc = snprintf(err, (size_t) errlen, "%s: pack %d has no %s", gguf, k, name);
+            else if (gt->type != 8 || gt->ndim != 3 || gt->dims[0] != t->cols || gt->dims[1] != t->rows || gt->dims[2] != t->slices ||
+                     t->cols % 32 || t->enc == NS_SEED6P8 || (nt && t->slices != et[0].t[0]->slices) ||
+                     g.data + gt->offset + (uint64_t) t->slices * (uint64_t) t->rows * (uint64_t) (t->cols / 32) * 34 > g.size)
+                rc = snprintf(err, (size_t) errlen, "%s: %s is not Q8_0 [%d][%d][%d] like %s of pack %d", gguf, gt->name, t->slices,
+                              t->rows, t->cols, name, k);
+        }
+        if (rc) break;
+        const NsTensor* t0 = x.t[0];
+        const size_t E = (size_t) t0->slices, lp = (size_t) x.lp, rb = (size_t) t0->rows * (size_t) (t0->cols / 32) * 34;
+        if (map && (lp + 1) * E > map_len) rc = snprintf(err, (size_t) errlen, "the map has no %s", gt->name);
+        for (size_t e = 0; map && !rc && e < E; ++e)
+            if (map[lp * E + e] >= np) rc = snprintf(err, (size_t) errlen, "the map takes %s from pack %d", gt->name, map[lp * E + e]);
+        if (rc) break;
+        et[nt++] = x;
+        if (rb > len) len = rb;
+        if ((size_t) t0->cols > cols) cols = (size_t) t0->cols;
+    }
+    gguf_close(&g);   // before the writes: the mapping is read-only
+    if (rc || !nt) { free(et); return rc ? -1 : 0; }
+    NsRows* nr = (NsRows*) malloc(sizeof *nr);
+    ns_rows_init(nr);
+    Emu m = {et, map, nr, len, cols, open(gguf, O_RDWR), nt * et[0].t[0]->slices, 0, 0, PTHREAD_MUTEX_INITIALIZER};
+    if (m.fd < 0) rc = snprintf(err, (size_t) errlen, "%s: cannot open for writing", gguf);
+    else {
+        pthread_t th[64];
+        const int nw = workers < 1 ? 1 : workers > 64 ? 64 : workers;
+        for (int i = 0; i < nw; ++i) pthread_create(&th[i], NULL, emu_worker, &m);
+        for (int i = 0; i < nw; ++i) pthread_join(th[i], NULL);
+        if (close(m.fd) || m.bad) rc = snprintf(err, (size_t) errlen, "%s: a write failed", gguf);
+    }
+    free(nr);
+    free(et);
+    *n = rc ? 0 : nt;
+    return rc ? -1 : 0;
+}
+
+int ns_emulate_dense(const NsModel* pack, const NsGdnHeads*
