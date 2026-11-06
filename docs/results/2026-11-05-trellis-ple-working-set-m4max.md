@@ -1,9 +1,9 @@
 # Trellis K = 3 on the M4 Max: the pages that a session uses (2026-11-05)
 
-**Result.** A session of about 13,000 tokens with trellis K = 3 keeps about 55 GB of the pack's files in the page
-cache. That is 47.2 GB of trellis banks, 3.1 GB of other tensors and 5.0 GB of the 32.0 GB PLE table. The PLE
-part grows by about 0.5 MB for each generated token and 0.3 MB for each prompt token. With a cold PLE table, decode
-is about 10% slower while its rows come from the SSD. So K = 3 may fit a 64 GB Mac, but no 64 GB Mac is measured.
+**Result.** Trellis K = 3 needs 51.2 GB of resident weights: 47.2 GB of banks and 4.0 GB of other tensors. The
+32.0 GB PLE table stays on the SSD, and the page cache holds the rows that a session reads. In 13,000 tokens that
+was 5.0 GB, and decode was about 10% slower while the rows came from the SSD. So K = 3 may fit a 64 GB Mac, but no
+64 GB Mac is measured.
 
 **Status.** Current. It answers a note of [Trellis experts on the M4 Max](2026-11-05-trellis-speed-m4max.md).
 
@@ -53,13 +53,15 @@ second, against 48.1 to 48.8 with a warm page cache on the M4 Max page.
 
 ## Notes
 
+- Memory estimates count the PLE table as on the SSD, not in RAM. The page cache holds its hot rows.
+- The PLE pages grow by about 0.5 MB for each generated token and 0.3 MB for each prompt token.
 - Each token reads a few rows of the PLE table, at scattered places. So each row costs a full 16 KB page. 13,000
   tokens of varied text touched 16% of the table.
 - Of the other tensors, 3.10 of 4.00 GB are resident. The embedding and the output head are read only in part. The
   MTP head is not read without drafts.
 - A first script counted a page once for each tensor on it. It gave 3.13 GB of 5.73 GB for the other tensors and the
   head together. The tool corrects this. The PLE numbers do not change.
-- For a 64 GB Mac: about 50 GB stays fixed (the banks and the other tensors), and macOS needs about 8 to 10 GB. That
-  leaves a few GB for the hot PLE pages. A long session then reads cold PLE rows from the SSD again. This is an
-  estimate from the 128 GB Mac.
+- For a 64 GB Mac: 51.2 GB of weights and about 8 to 10 GB for macOS leave a few GB. The page cache uses them for
+  the hot PLE rows and reads cold rows from the SSD again. This is an estimate from the 128 GB Mac.
+- With MTP drafts, the head adds 1.73 GB, so K = 3 needs 52.9 GB.
 - The PLE pages are clean pages of a mapped file. So macOS can drop cold rows and read them again later.

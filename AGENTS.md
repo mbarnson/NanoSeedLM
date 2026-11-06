@@ -13,6 +13,7 @@ Rules for people and AI agents who change this repository.
 - Keep Metal and CUDA at parity. If a feature exists on one engine only, add it to the feature matrix in
   `docs/concepts/parity.md`.
 - Each benchmark records machine state: power, load and other CPU use. Run a noisy benchmark again.
+- Memory estimates count the PLE n-gram table as on disk, not in RAM. The page cache holds the rows that a run reads.
 
 ## Documentation layout
 
