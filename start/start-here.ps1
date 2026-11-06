@@ -67,6 +67,7 @@ $free = (Get-Item $dir).PSDrive.Free
 if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N0} GB free." -f ($need / 1GB), ($free / 1GB)) }
 Write-Host ("`n{0}: {1} files to check, {2:N1} GB to download into {3}" -f $repo, $check, ($need / 1GB), $dir)
 if ($need -gt 1GB -and -not $Pack -and (Read-Host "Start? [Y/n]") -match '^[nN]') { Write-Host "Stopped. Run START-HERE.bat again."; exit 0 }
+if ($need -gt 1GB -and $Pack) { Write-Host "The download starts in 5 s (Ctrl+C stops it)."; Start-Sleep 5 }   # a folder typo
 $i = 0
 foreach ($f in $files) {
     $i += 1

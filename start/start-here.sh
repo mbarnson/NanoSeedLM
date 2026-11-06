@@ -86,6 +86,8 @@ echo "$repo: $check files to check, $(awk -v n="$need" 'BEGIN {printf "%.1f", n 
 if [ "$need" -gt 1073741824 ] && [ -z "${1:-}" ]; then
     read -r -p "Start? [Y/n] " a
     case $a in [nN]*) echo "Stopped. Run start-here.sh again."; exit 0 ;; esac
+elif [ "$need" -gt 1073741824 ]; then
+    echo "The download starts in 5 s (Ctrl+C stops it)."; sleep 5   # a folder typo
 fi
 total=$(wc -l <<<"$list") i=0
 while read -r p s h; do
