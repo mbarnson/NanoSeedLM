@@ -498,7 +498,8 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         fail(e, "CUDA streams: %s", cudaGetErrorString(cudaGetLastError()));   // e.g. no CUDA-capable device
     e->g24 = (uint32_t*) dmem(e, e->rows.g24, sizeof e->rows.g24);
     e->g32 = (uint32_t*) dmem(e, e->rows.g32, sizeof e->rows.g32);
-    load_w(e, &e->embed, 0, "language_model.model.embed_tokens.weight");
+    // the embedding in mapped host memory: a token reads one row over PCIe, and its 0.4 to 0.7 GB go to the expert cache
+    load_w(e, &e->embed, 1, "language_model.model.embed_tokens.weight");
     load_w(e, &e->head, 0, "language_model.lm_head.weight");
     load_w(e, &e->mix_down, 0, "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight");
     load_w(e, &e->mix_up, 0, "language_model.model.hyper_connection_mixer.input_mix_weight_up.weight");
