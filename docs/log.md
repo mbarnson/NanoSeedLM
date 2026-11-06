@@ -914,3 +914,12 @@ plan](plans/2026-11-05-release-family.md).
 On the stock path of v0.1.0, the M4 Max decodes 4,096 tokens of TCQ4 at about 39 tokens per second, and also after
 30,000 tokens of prompt. Warm prompts run at about 480. The Q8_0 PLE table costs 0% to 4%: the host reads its rows on one
 thread. Read [Long decode on the M4 Max](results/2026-11-06-long-bench-m4max.md).
+
+## [2026-11-06] release | The TCQ repositories get their MLX model files
+
+The three TCQ repositories shipped without `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`, `nanoseedlm_trellis.py`, the
+`model_file` key and the LICENSE. So mlx-vlm and oMLX had nothing to load with Trust Remote Code. The packer learned to
+write them (`d56a17c`) after the release folders were built, and R5 uploaded the folders without a rebuild. The files
+are on the Hub now (TCQ4 `e53ffdd2`, TCQ3-D4 `30012655`, TCQ3 `d1353e4a`). They are the `17eeb5d` loaders that oMLX ran
+on TQ4's download. `tools/hf_release_publish.sh` now refuses a folder without them. The v0.1.0 start scripts pin the
+earlier revisions.
