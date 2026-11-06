@@ -57,7 +57,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `hf_release_pack.sh` | Build the trellis release folders (P3, oQ8e's 8-bit dense modules, the banks) into the bucket, run each twice and score each against BF16, on an HF Jobs GPU node |
 | `qwen4_release_card.py` | Write the release cards, with each pack's KL as shipped from the release job's llama.cpp logs |
 | `hf_release_publish.sh` | Upload the release folders and their cards from the bucket to private Hub repositories (a CPU job with the owner's token) |
-| `release-readme.txt` | The README of the engine archives (`.github/workflows/release.yml`) |
+| `release-readme.txt` | The README of the engine archives. A change of `VERSION` on `main` makes a draft release of them (`.github/workflows/release.yml`) |
 | `hf_qwen4_routes.sh` | Record routing traces of a pack on chat and code text, on an HF Jobs GPU node |
 | `qwen4_tier_map.py` | Write a per-expert tier map from routing traces (most used experts), at random, or by projection |
 | `qwen4_tier_sim.py` | Simulate a high tier that follows the routing: its share of router choices and its loads |

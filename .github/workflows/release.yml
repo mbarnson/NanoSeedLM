@@ -1,25 +1,39 @@
 # The engine binaries (nslm-chat, nslm-serve) for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal), as a GitHub
-# release. A pushed tag v* starts it as a draft, as does the Actions page. A draft stays private until it is published.
+# release. A change of VERSION on main starts it as a draft (tag v + VERSION), as does the Actions page. A draft stays
+# private until it is published on the releases page, which also makes its tag.
 name: release
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: [VERSION]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0"
-        required: true
+        description: "Release tag, for example v0.1.0 (empty: v + VERSION)"
+        required: false
       draft:
         description: "Keep the release as a draft"
         type: boolean
         default: true
 permissions:
   contents: read
-env:
-  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs: {tag: "${{ steps.t.outputs.tag }}"}
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        env: {INPUT_TAG: "${{ inputs.tag }}"}
+        run: |
+          t=${INPUT_TAG:-v$(tr -d ' \r\n' < VERSION)}
+          echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad tag $t"; exit 1; }
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+
   linux:
+    needs: meta
+    env: {TAG: "${{ needs.meta.outputs.tag }}"}
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04   # glibc 2.35
     timeout-minutes: 60
@@ -43,6 +57,8 @@ jobs:
         with: {name: linux, path: "nslm-*.tar.gz"}
 
   windows:
+    needs: meta
+    env: {TAG: "${{ needs.meta.outputs.tag }}"}
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -78,9 +94,11 @@ jobs:
         with: {name: windows, path: "nslm-*.zip"}
 
   macos:
+    needs: meta
     runs-on: macos-15
     timeout-minutes: 60
     env:
+      TAG: ${{ needs.meta.outputs.tag }}
       MACOSX_DEPLOYMENT_TARGET: "15.0"   # Metal 3.2
     steps:
       - uses: actions/checkout@v4
@@ -101,11 +119,12 @@ jobs:
         with: {name: macos, path: "nslm-*.tar.gz"}
 
   release:
-    needs: [linux, windows, macos]
+    needs: [meta, linux, windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
+      TAG: ${{ needs.meta.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       DRAFT: ${{ github.event_name == 'push' || inputs.draft }}
