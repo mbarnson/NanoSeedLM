@@ -5,10 +5,10 @@
 **Hand-off.** This cloud session ends here. A new cloud session takes over with a new goal. Keep posting results and messages to `cloud`: the new session reads this branch.
 
 - **Released:** v0.1.0 (tag `47714b8`, a pre-release, published 2026-11-06 20:47Z). Main is `fb1504f`: only docs and tools since the tag.
-- **Hugging Face cards:** all five come from `tools/qwen4_release_card.py` on main (`fb1504f`) and the logs in `kld/`: TCQ4 `d537b68f`, TCQ3-D4 `e8ce9331`, TCQ3 `8bcc960c`, P4 `aaae240c`, P3 `70654748`.
-  - Each card has the same sections: which pack for which machine, the family table, the trade-offs, long-run decode and "Why NanoSeedLM".
-  - To change a number, edit the generator's PACKS or SPEED table and upload all five again.
-  - Open: P4's long runs and its KL as shipped (mac-metal's P4 runs). TCQ3 on a 12 GB GPU (pc-cuda, emulated: msgs/...tcq3-12gb-emulated).
+- **Hugging Face:** all five cards come from `tools/qwen4_release_card.py` on main and the logs in `kld/`. Do not edit a README on the Hub: change the generator, then upload all five.
+  - Each card has the same sections: which pack for which machine, the family tables, the trade-offs, long-run decode and "Why NanoSeedLM". Each table fits the Hub's 600-pixel card column (checked with Playwright).
+  - The TCQ repositories now carry their MLX model files, `model_file` and LICENSE (TCQ4 `e53ffdd2`, TCQ3-D4 `30012655`, TCQ3 `d1353e4a`). `tools/hf_release_publish.sh` refuses a folder without them.
+  - Open: mac-metal checks mlx-vlm and oMLX on the three TCQ repositories (msgs/...tcq-mlx-files). Then the cards' "tested" notes change. P4's long runs and KL as shipped. TCQ3 on a 12 GB GPU (pc-cuda, emulated).
 - **Branch `claude/sleepy-brown-k67z9u` `da4e1ce`, for v0.1.1:** linux PASS, windows PASS, macos PASS at `73abfdf` (not yet at `da4e1ce`).
   - It has: plan K (the BF16 KV cache), the PLE emulator (`ple:TIER`), one sampler (`harness/sample.c`), and drafts in nslm-serve and nslm-chat at any temperature (`eng_generate_pick`).
   - It also has: the draft gate (`Q4E_DRAFT_MIN_P`, A1), drafts sampled from the head's q (A2), and `nslm/rng.h`.
