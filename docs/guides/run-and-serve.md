@@ -144,7 +144,8 @@ build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-P3 --ctx 32768
   counts the drafts that it kept.
 - The gain depends on the text and the machine. On the M4 Max, 2 drafts make code 46% faster, and 3 drafts make a short
   chat answer 13% slower than no drafts ([results](../results/2026-11-05-qwen38-mtp-chat-m4max.md)). On an RTX 4080,
-  2 drafts make `nslm-serve` slower ([plan](../plans/2026-11-06-serve-drafts.md), gate SC).
+  drafts in `nslm-serve` break even. With `Q4E_DRAFTS=2`, set `Q4E_DRAFT_MIN_P=0.5`
+  ([the gates](../results/2026-11-06-draft-gates-4080.md)).
 
 `nslm-qwen4-gen` runs one prompt through the engine, with greedy decoding and the options below.
 
