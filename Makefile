@@ -29,7 +29,7 @@ ENG_HDRS  := engine/engine_api.h engine/mova_ext.h engine/kernels_moe.metal nslm
              engine/engine_mova.h engine/engine_qwen4.h engine/engine_api_fns.h engine/engine_unname.h engine/qwen4_eng.h
 
 METALLIBS := $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib $(RES)/search.metallib $(RES)/search4.metallib \
-             $(RES)/searchp.metallib
+             $(RES)/searchp.metallib $(RES)/trellis.metallib
 ENG_TOOLS := nslm-chat nslm-serve nslm-mova-smoke nslm-mova-gen nslm-mova-score nslm-mova-plcheck nslm-mova-refcheck nslm-mova-routes \
              nslm-mova-mlacapture
 TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench nslm-moe nslm-dense nslm-mova-pack nslm-qwen4-pack nslm-qwen4-emulate nslm-bits-probe nslm-cpu-seed-bench \
@@ -39,7 +39,7 @@ C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/
                             tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_qwen4_mtp.c tests/test_qwen4_api_mtp.c tests/test_engine_dispatch.c tests/test_qwen4_metal.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
              $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels $(BIN)/test_qwen4_metal \
-             $(BIN)/test_qwen4_mtp $(BIN)/test_qwen4_api_mtp
+             $(BIN)/test_qwen4_mtp $(BIN)/test_qwen4_api_mtp $(BIN)/test_trellis_gpu
 
 .PHONY: all build test test-mlx clean
 all: build
@@ -62,6 +62,10 @@ $(RES)/search4.metallib: nslm/search4.metal nslm/search4_gpu.h nslm/lfsr.h
 $(RES)/searchp.metallib: nslm/searchp.metal nslm/searchp_gpu.h nslm/lfsr.h
 	@mkdir -p $(@D)
 	$(METAL) -fno-fast-math -Inslm -c $< -o $(@D)/searchp.air && xcrun -sdk macosx metallib $(@D)/searchp.air -o $@
+# the trellis encoder's Viterbi: its costs must equal nslm/lib_trellis.c's, so no fast math (and no contraction)
+$(RES)/trellis.metallib: nslm/trellis.metal
+	@mkdir -p $(@D)
+	$(METAL) -fno-fast-math -Inslm -c $< -o $(@D)/trellis.air && xcrun -sdk macosx metallib $(@D)/trellis.air -o $@
 
 # ---- objects: the engine (Metal), the shared harness and the C library ---------------------------------------------
 # engine_api.h for every model (option A): engine/engine.c picks the MoVA engine (engine/mova_gpu.m, its eng_* named
@@ -104,7 +108,7 @@ $(BIN)/nslm-mova-kbench: harness/nslm-mova-kbench.m harness/common.h engine/kern
 	$(CC) $(OBJCFLAGS) harness/nslm-mova-kbench.m $(LIBS) -o $@
 
 # ---- compressor: seed search (C + the Metal search glue) and the packer -------------------------------------------
-SEARCH_O  := $(OBJ)/search_metal.o $(OBJ)/search4_metal.o $(OBJ)/searchc_metal.o $(OBJ)/searchp_metal.o $(OBJ)/n_trellis_none.o
+SEARCH_O  := $(OBJ)/search_metal.o $(OBJ)/search4_metal.o $(OBJ)/searchc_metal.o $(OBJ)/searchp_metal.o $(OBJ)/trellis_metal.o
 $(OBJ)/%_metal.o: nslm/%_metal.m $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
@@ -149,6 +153,10 @@ $(BIN)/test_search_gpu: tests/test_search_gpu.c $(OBJ)/search_metal.o $(LIB_O) $
 $(BIN)/test_searchp_gpu: tests/test_searchp_gpu.c $(OBJ)/searchp_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/searchp.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(OBJ)/searchp_metal.o $(LIB_O) $(LIBS) -lpthread -o $@
+# the trellis encoder on Metal against nslm_tq_encode_row: the same test as the CUDA build's
+$(BIN)/test_trellis_gpu: tests/test_trellis_gpu.c $(OBJ)/trellis_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/trellis.metallib
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< $(OBJ)/trellis_metal.o $(LIB_O) $(LIBS) -lpthread -lm -o $@
 $(BIN)/test_search4_gpu: tests/test_search4_gpu.c $(OBJ)/search4_metal.o $(LIB_O) $(NSLM_HDRS) $(RES)/search4.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(OBJ)/search4_metal.o $(LIB_O) $(LIBS) -lpthread -o $@

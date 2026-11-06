@@ -1,5 +1,6 @@
-// nslm/trellis_gpu.h - the trellis encoder of nslm/trellis.h on CUDA (nslm/trellis.cu), plan T2: the same words, scales
-// and error as nslm_tq_encode_row, bit for bit (tests/test_trellis_gpu.c).  No Metal kernel yet (docs/concepts/parity.md).
+// nslm/trellis_gpu.h - the trellis encoder of nslm/trellis.h on CUDA (nslm/trellis.cu) and Metal (nslm/trellis.metal +
+// nslm/trellis_metal.m), plan T2: the same words, scales and error as nslm_tq_encode_row, bit for bit, on both
+// (tests/test_trellis_gpu.c).
 #pragma once
 #include <stdint.h>
 
@@ -7,7 +8,7 @@
 extern "C" {
 #endif
 typedef struct NslmTqGpu NslmTqGpu;
-NslmTqGpu* nslm_tq_gpu_open(char* err, int errlen);   // NULL with "no CUDA device" when there is none
+NslmTqGpu* nslm_tq_gpu_open(char* err, int errlen);   // NULL with "no CUDA device" / "no Metal device" when there is none
 // A tensor w[rows][cols] with importance h[cols] (NULL: all 1; the same for every row, as an imatrix), each row as
 // nslm_tq_encode_row(w + r cols, h, cols, T, ...) with L state bits and K bits a weight would encode it:
 // words[rows][nslm_tq_row_words(cols, T, L, K)], scales[rows][ceil(cols / T)] (BF16), err[rows] (optional: the row's

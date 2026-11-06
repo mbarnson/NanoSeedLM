@@ -65,6 +65,7 @@ same results as the engine.
 | OpenAI-compatible server | `nslm-serve` | `nslm-serve` | oMLX |
 | Seed search | Yes | Yes | No |
 | Seed search of other block sizes (C = 12 and 16, `searchc.cu`) | No | Yes | No |
+| Trellis encoder (`nslm_tq_gpu_encode`, `test_trellis_gpu`: the C encoder's words) | Yes (`trellis.metal`) | Yes (`trellis.cu`) | No |
 
 ## See also
 

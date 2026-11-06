@@ -1,4 +1,4 @@
-// tests/test_trellis_gpu.c - the trellis encoder on CUDA (nslm/trellis.cu) against the C reference (nslm_tq_encode_row):
+// tests/test_trellis_gpu.c - the trellis encoder on CUDA (nslm/trellis.cu) or Metal (nslm/trellis_metal.m) against the C reference (nslm_tq_encode_row):
 // the same words, scales and error, bit for bit, at L = 12 and 16, K = 2 to 4, gate/up (T = 256) and down (T = 320)
 // blocks, a short last block, with and without importance weights, a zero row (scale 0), and two threads at once.
 #include <math.h>
@@ -73,7 +73,7 @@ static void* par_run(void* arg) {
 int main(void) {
     char err[256];
     NslmTqGpu* g = nslm_tq_gpu_open(err, sizeof err);
-    if (!g && strstr(err, "no CUDA device")) { printf("SKIP: %s\n", err); return 77; }
+    if (!g && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); return 77; }
     if (!g) { printf("FAIL: %s\n", err); return 1; }
     one(g, 6, 600, 256, 12, 3, 0, 1);    // a short last block (88 weights), a zero row
     one(g, 4, 2560, 256, 12, 2, 1, 0);
