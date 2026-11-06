@@ -121,7 +121,7 @@ static int64_t jclamp(const Json* v, int64_t lo, int64_t hi) {
 typedef struct {
     sock_t fd;
     bool dead;       // the client went away: stop generating
-    char cors[384];  // the CORS lines of each reply (serve_guard.h)
+    char cors[512];  // the CORS lines of each reply (serve_guard.h): 155 bytes and an Origin of up to 255
 } Conn;
 
 static bool send_all(Conn* c, const void* p, size_t n) {

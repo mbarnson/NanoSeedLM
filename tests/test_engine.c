@@ -725,7 +725,7 @@ int main(void) {
     o.max_seqs = 1;
     o.kv_tokens = 1024;
     Eng* e = eng_open(&o, err, sizeof err);
-    if (!e && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); return 77; }   // a machine without a GPU
+    if (!e && (strstr(err, "no CUDA device") || strstr(err, "no Metal device"))) { printf("SKIP: %s\n", err); mova_ref_close(ref); return 77; }   // a machine without a GPU
     if (!e) { printf("FAIL: eng_open: %s\n", err); return 1; }
     printf("%s\n", eng_describe(e));
     const int V = eng_vocab(e), N = 48, NS = 4, TK = 4, TKV = 2;

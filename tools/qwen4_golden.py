@@ -9,6 +9,15 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from st_pad import pad8  # noqa: E402
+
+
+def save(path, w, **kw):   # mx.save_safetensors, then each tensor aligned for its type (the C readers)
+    mx.save_safetensors(path, w, **kw)
+    pad8(path)
+
+
 EOS = 7
 TEXT = dict(
     model_type="qwen4_exp_text", hidden_size=64, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
@@ -61,7 +70,7 @@ def main(out):
             quant[path] = {"group_size": 64, "bits": 8, "mode": "affine"}
     w = {k: (v if v.dtype in (mx.uint32, mx.int64) else v.astype(mx.bfloat16)) for k, v in tree_flatten(model.parameters())}
     os.makedirs(out, exist_ok=True)
-    mx.save_safetensors(f"{out}/model.safetensors", w, metadata={"format": "mlx"})
+    save(f"{out}/model.safetensors", w, metadata={"format": "mlx"})
     cfg["quantization"] = quant
     cfg["quantization_config"] = quant
     with open(f"{out}/config.json", "w") as f:
@@ -74,7 +83,7 @@ def main(out):
     language.ShardedEmbedding.__call__ = lambda self, idx: (rows.append(idx), call(self, idx))[1]
     logits = model.language_model(mx.array([IDS])).logits[0].astype(mx.float32)
     language.ShardedEmbedding.__call__ = call
-    mx.save_safetensors(f"{out}_golden.safetensors",
+    save(f"{out}_golden.safetensors",
                         {"ids": mx.array(IDS, dtype=mx.int32), "logits": logits, "ple_rows": rows[0][0].astype(mx.int64)})
     print(f"{out}: {len(w)} tensors, logits {logits.shape}, argmax {mx.argmax(logits, axis=-1).tolist()[:12]} ...")
 
@@ -96,7 +105,7 @@ def mtp_main(out):
     nn.quantize(mtp, group_size=32, bits=4,   # as the released head: the experts and hyper-connections in 4 bits
                 class_predicate=lambda p, m: hasattr(m, "to_quantized") and ("switch_mlp" in p or "hyper_connection" in p))
     w = {"mtp." + k: (v if v.dtype == mx.uint32 else v.astype(mx.bfloat16)) for k, v in tree_flatten(mtp.parameters())}
-    mx.save_safetensors(f"{out}/model-mtp.safetensors", w, metadata={"format": "mlx"})
+    save(f"{out}/model-mtp.safetensors", w, metadata={"format": "mlx"})
     mtp.update(tree_map(lambda v: v.astype(mx.bfloat16).astype(mx.float32) if mx.issubdtype(v.dtype, mx.floating) else v,
                         mtp.parameters()))   # the values the file holds
     o = model.language_model(mx.array([IDS]), return_hidden=True)
@@ -107,7 +116,7 @@ def mtp_main(out):
     logits = mtp._lm_head_fn(lh)[0].astype(mx.float32)
     mtp._seed_token, mtp._seed_hidden = mx.argmax(logits[-1:], axis=-1)[None], pre[:, -1:, :]
     drafts = mtp.draft_block(bonus, None, None, 4, None, greedy=True)[0].astype(mx.int32)
-    mx.save_safetensors(f"{out}_mtp_golden.safetensors", {"tok": tok[0], "logits": logits, "drafts": drafts})
+    save(f"{out}_mtp_golden.safetensors", {"tok": tok[0], "logits": logits, "drafts": drafts})
     print(f"{out}: MTP {len(w)} tensors, bonus {bonus}, drafts {drafts.tolist()}")
 
 

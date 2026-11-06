@@ -251,7 +251,12 @@ static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
     const NsTensor* t = ns_find(&e->nm, name);
     if (!t || t->enc != NS_BF16 || (int64_t) t->slices * t->rows * t->cols != n) { fail(e, "%s: missing, or not BF16 with %lld values", name, (long long) n); return NULL; }
     float* v = (float*) malloc(sizeof(float) * (size_t) n);
-    for (int64_t i = 0; i < n; ++i) { const uint32_t u = (uint32_t) ((const uint16_t*) t->s[0].p)[i] << 16; memcpy(&v[i], &u, 4); }
+    for (int64_t i = 0; i < n; ++i) {   // memcpy: a file's tensor need not be 2-byte aligned
+        uint16_t h;
+        memcpy(&h, t->s[0].p + 2 * i, 2);
+        const uint32_t u = (uint32_t) h << 16;
+        memcpy(&v[i], &u, 4);
+    }
     float* d = (float*) dmem(e, v, sizeof(float) * (size_t) n);
     free(v);
     return d;

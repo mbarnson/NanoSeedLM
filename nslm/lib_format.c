@@ -54,10 +54,19 @@ int st_open_file(StFile* s, const char* path, char* err, int errlen) {
     close(fd);
     if (m == MAP_FAILED) { snprintf(err, (size_t) errlen, "%s: mmap failed", path); return -1; }
     s->map = (const uint8_t*) m;
-    uint64_t hn;
-    memcpy(&hn, s->map, 8);
+    uint64_t hn = 0;
+    if (s->size >= 8) memcpy(&hn, s->map, 8);
+    if (s->size < 8 || hn > s->size - 8 || hn > (100u << 20)) {   // the format's limit: 100 MB of header
+        snprintf(err, (size_t) errlen, "%s: not a safetensors file (header of %llu bytes)", path, (unsigned long long) hn);
+        st_close_file(s);
+        return -1;
+    }
     s->data = 8 + hn;
-    const char* p = (const char*) s->map + 8, *e = p + hn;
+    char* hdr = (char*) malloc(hn + 1);   // a NUL-terminated copy: no read past the header, even at the end of the file
+    if (!hdr) { snprintf(err, (size_t) errlen, "%s: out of memory", path); st_close_file(s); return -1; }
+    memcpy(hdr, s->map + 8, hn);
+    hdr[hn] = 0;
+    const char* p = hdr, *e = p + hn;
     int cap = 512;
     s->e = (StEntry*) calloc((size_t) cap, sizeof(StEntry));
     p = skip_ws(p, e);
@@ -102,7 +111,7 @@ int st_open_file(StFile* s, const char* path, char* err, int errlen) {
                         if (*p == ']') { ++p; break; }
                         char* q;
                         const long long x = strtoll(p, &q, 10);
-                        if (q == p || k >= 8) goto bad;
+                        if (q == p || k >= 8 || x < 0) goto bad;
                         v[k++] = x;
                         p = skip_ws(q, e);
                         if (*p == ',') ++p;
@@ -119,8 +128,10 @@ int st_open_file(StFile* s, const char* path, char* err, int errlen) {
         p = skip_ws(p, e);
         if (*p == ',') ++p;
     }
+    free(hdr);
     return 0;
 bad:
+    free(hdr);
     snprintf(err, (size_t) errlen, "%s: cannot parse the safetensors header", path);
     st_close_file(s);
     return -1;

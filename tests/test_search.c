@@ -122,6 +122,7 @@ int main(void) {
         printf("weighted: ref == vec %s; unit weights == unweighted %s; %d/%d blocks choose a different seed under the weights\n",
                b1 ? "MISMATCH" : "identical", b2 ? "MISMATCH" : "identical", moved, nb);
         bad += b1 + b2;
+        free(w); free(ws); free(s1); free(s2); free(n1); free(n2); free(s3); free(n3); free(s4); free(n4);
     }
     assert(bad == 0);
     printf("test_search: PASS\n");

@@ -211,6 +211,33 @@ int main(void) {
         ns_close(&m);
         remove_dir(path);
     }
+    {   // crafted files: each is refused, and none reads past the file (ASan) or overflows (UBSan)
+        static const struct { const char* name; const char* head; long hn; } bad[] = {
+            {"shorter than the length", "", -1},
+            {"a header longer than the file", "{}", 1 << 20},
+            {"a header without its end", "{\"a\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8", 0},
+            {"a negative shape", "{\"a\":{\"dtype\":\"BF16\",\"shape\":[-2,2],\"data_offsets\":[0,8]}}", 0},
+            {"an offset past the file", "{\"a\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,800]}}", 0},
+            {"an end near 2^64", "{\"a\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[1,18446744073709551615]}}", 0},
+            {"a shape past 2^40 values", "{\"a\":{\"dtype\":\"BF16\",\"shape\":[1048577,1048577],\"data_offsets\":[0,8]}}", 0},
+        };
+        char path[512], file[600];
+        snprintf(path, sizeof path, "%s_crafted", dir);
+        snprintf(file, sizeof file, "%s/model.safetensors", path);
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+            mkdir(path, 0755);
+            uint8_t buf[256] = {0};
+            const size_t h = strlen(bad[i].head);
+            const uint64_t hn = bad[i].hn > 0 ? (uint64_t) bad[i].hn : h;
+            memcpy(buf, &hn, 8);
+            memcpy(buf + 8, bad[i].head, h);
+            CHECK(spit_file(file, buf, bad[i].hn < 0 ? 4 : (long) (8 + h + (bad[i].hn ? 0 : 8))) == 0, "write %s", bad[i].name);
+            NsModel cm;
+            err[0] = 0;
+            CHECK(ns_open(&cm, path, err, sizeof err) != 0 && err[0], "%s: opened", bad[i].name);
+            remove_dir(path);
+        }
+    }
 
     printf("test_model_st: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

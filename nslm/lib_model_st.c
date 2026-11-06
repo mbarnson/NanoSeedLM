@@ -115,7 +115,10 @@ static int dims(const StEntry* e, int want_last, int64_t* s, int64_t* r, int64_t
     else if (e->ndim == 2) { *s = 1; *r = e->shape[0]; *c = e->shape[1]; }
     else if (e->ndim == 1 && !want_last) { *s = 1; *r = 1; *c = e->shape[0]; }
     else return -1;
-    return 0;
+    // -2 unless each dimension fits an int and the tensor 2^40 values: the byte counts below cannot overflow
+    const int64_t lim = (int64_t) 1 << 40;
+    if (*s < 1 || *r < 1 || *c < 1 || *s > INT32_MAX / 16 || *r > INT32_MAX / 16 || *c > INT32_MAX / 64) return -2;
+    return *s * *r > lim || *s * *r * *c > lim ? -2 : 0;
 }
 
 static int add(NsModel* m, const NsModel* src, const Ref* refs, int nr, const char* base, const char* name, int enc,
@@ -157,7 +160,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
         m->nsh = i + 1;
         for (int k = 0; k < m->sh[i].n; ++k) {
             const StEntry* e = &m->sh[i].e[k];
-            if (e->begin > e->end || m->sh[i].data + e->end > m->sh[i].size) {
+            if (e->begin > e->end || e->end > m->sh[i].size - m->sh[i].data) {   // data <= size: st_open_file
                 snprintf(err, (size_t) errlen, "%s: %s is out of bounds", path, e->name);
                 goto done;
             }
@@ -168,7 +171,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
     int nr = 0;
     for (int i = 0; i < ns; ++i)
         for (int k = 0; k < m->sh[i].n; ++k) refs[nr++] = (Ref) {m->sh[i].e[k].name, i, &m->sh[i].e[k]};
-    qsort(refs, (size_t) nr, sizeof(Ref), ref_cmp);
+    if (nr) qsort(refs, (size_t) nr, sizeof(Ref), ref_cmp);
     for (int i = 1; i < nr; ++i)
         if (!strcmp(refs[i].name, refs[i - 1].name)) { snprintf(err, (size_t) errlen, "%s appears twice", refs[i].name); free(refs); goto done; }
     for (int i = 0; i < nr; ++i) {
@@ -210,12 +213,14 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
                 snprintf(k, sizeof k, "%.*s.scales", (int) (L - 7), nm);
                 if (lookup(refs, nr, k)) continue;
             }
-            if (dims(e, 0, &S, &R, &C)) continue;   // scalars and >3-D tensors are not model weights here
+            const int d = dims(e, 0, &S, &R, &C);
+            if (d == -1) continue;   // scalars and >3-D tensors are not model weights here
+            if (d) { snprintf(err, (size_t) errlen, "%s: bad shape", nm); free(refs); goto done; }
             if (add(m, m, refs, nr, nm, nm, NS_BF16, 0, S, R, C, err, errlen)) { free(refs); goto done; }
         }
     }
     free(refs);
-    qsort(m->t, (size_t) m->n, sizeof(NsTensor), ten_cmp);
+    if (m->n) qsort(m->t, (size_t) m->n, sizeof(NsTensor), ten_cmp);
     rc = 0;
 done:
     for (int i = 0; i < ns; ++i) free(names[i]);

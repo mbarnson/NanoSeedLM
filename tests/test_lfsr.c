@@ -77,7 +77,7 @@ int main(void) {
             assert(a == b);
             const double exact = (double) isum / 32767.0 * ldexp(1.0, e);
             const float rb = nslm_bf2f(nslm_f2bf(a));
-            const double ulp = ldexp(1.0, ilogb(exact) - 7);
+            const double ulp = exact != 0 ? ldexp(1.0, ilogb(exact) - 7) : 0;   // ilogb(0) is INT_MIN
             if (fabs(rb - exact) > 0.5 * ulp * (1 + 1e-6)) ++ties;
         }
         printf("decode exactness: ok (%d of 2000000 bf16 roundings differ from exact-real RNE by double rounding)\n", ties);
