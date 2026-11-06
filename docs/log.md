@@ -834,3 +834,10 @@ against BF16 is 0.182 for P3 and 0.185 for the trellis mix, not 0.060 and 0.062.
 HF jobs `6aed6ff3` and `6aed75a2`: the three release folders are in the bucket. They hold P3's tensors without its seed
 experts, oQ8e's 8-bit dense modules and the trellis banks. Their KL against BF16 is 0.0415 (TQ4), 0.0638 (TQ3-D4) and
 0.0778 (TQ3). TQ3 gives the same text in two runs on CUDA. Read [The release packs as shipped](results/2026-11-05-release-as-shipped.md).
+
+## [2026-11-06] plan | Dense plan: the 8-bit dense weights are the reference, and D2a ranks the kinds
+
+`8856cc4`: release 1 ships 8-bit dense weights, and oMLX's oQ packs (oQ2.5e to oQ8e) keep all dense tensors at 8 bits.
+So gate DB of the dense plan now compares with the 8-bit dense weights. These read about 4.5 GB a decode token. Step
+D2a puts one more dense kind at a time in P3's 4-bit MLX format over Q8_0 (`dense:KIND` in `tools/hf_llama_kld.sh`).
+The KL job waits for the next weekly budget. Read [Trellis-coded dense weights](plans/2026-11-05-trellis-dense.md).
