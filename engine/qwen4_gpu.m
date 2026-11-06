@@ -865,11 +865,11 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     e->queue = [e->dev newCommandQueue];
     e->pipes = [NSMutableDictionary new];
     e->buffers = [NSMutableArray new];
-    const char* res = getenv("NSLM_RES") ? getenv("NSLM_RES") : "out/res";
+    const char* res = getenv("NSLM_RES") ? getenv("NSLM_RES") : o && o->resource_dir && o->resource_dir[0] ? o->resource_dir : "out/res";
     NSError* nerr = nil;
     e->lib = [e->dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/kernels_moe.metallib", res]] error:&nerr];
     e->lib4 = [e->dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/kernels_qwen4.metallib", res]] error:&nerr];
-    if (!e->dev || !e->lib || !e->lib4) fail(e, "no Metal device, or no %s/kernels_moe.metallib and kernels_qwen4.metallib (NSLM_RES)", res);
+    if (!e->dev || !e->lib || !e->lib4) fail(e, "no Metal device, or no %s/kernels_moe.metallib and kernels_qwen4.metallib (--res, NSLM_RES)", res);
     if (!e->err[0]) check_shapes(e);
     if (!e->err[0] && o && o->ple_gguf) {
         if (ple_open(&e->pt, o->ple_gguf, "per_layer_token_embd.weight", e->err, sizeof e->err)) {
