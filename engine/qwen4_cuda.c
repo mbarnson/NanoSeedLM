@@ -109,6 +109,9 @@ struct Q4Eng {
     Layer M;
     W m_fe, m_fh, m_down, m_up;
     float *m_ne, *m_nh, *m_norm, *Hm, *ones, *mlog, *dprob, *hprob;   // dprob, hprob: the head's probability of each draft
+    float *dtu, *htu, *dqp, *hqp;   // a sampled q4e_draft: {temp, u[k]}, and each draft's q (KC_DRAFT_Q ids and probabilities)
+    int32_t *dqid, *hqid;
+    int dqn;                        // KC_DRAFT_Q after a sampled q4e_draft, else 0
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and state copies)
     int tail_skip, tail_renorm;           // Q4EOpts.tail_skip; Q4E_TAIL_RENORM=1 (an A/B): the kept weights scaled up
     int head_cached;                      // the MTP head's experts are the cache's sparse layer n_layer (layer 0's format)
@@ -126,7 +129,7 @@ struct Q4Eng {
     const uint8_t* arena_h;
     int32_t* ebias;   // [units][3]: each unit's exponent biases
     pthread_t cth;
-    cudaGraphExec_t dgraph[Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows
+    cudaGraphExec_t dgraph[2][Q4E_MAX_DRAFTS + 1];   // q4e_draft of k rows: [sampled][k]
     FILE* routes;     // Q4E_ROUTES=FILE: each forward's int32 T, then its routed experts [n_layer][T][top_k] (tools/qwen4_cache_sim.py)
     int32_t *droute, *hroute;
     float *Gb, *Ub;   // prompt rows: the gate and up outputs of the grouped GEMMs
@@ -561,6 +564,10 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         free(one);
         e->Hm = F(T * HD); e->mlog = F((size_t) c->vocab); e->dprob = F(Q4E_MAX_DRAFTS);
         e->hprob = (float*) pin(e, sizeof(float) * Q4E_MAX_DRAFTS);
+        e->dtu = F(1 + Q4E_MAX_DRAFTS); e->dqp = F(Q4E_MAX_DRAFTS * KC_DRAFT_Q); e->dqid = I(Q4E_MAX_DRAFTS * KC_DRAFT_Q);
+        e->htu = (float*) pin(e, sizeof(float) * (1 + Q4E_MAX_DRAFTS));
+        e->hqp = (float*) pin(e, sizeof(float) * Q4E_MAX_DRAFTS * KC_DRAFT_Q);
+        e->hqid = (int32_t*) pin(e, sizeof(int32_t) * Q4E_MAX_DRAFTS * KC_DRAFT_Q);
         for (int l = 0; l < c->n_layer; ++l) {
             Layer* L = &e->L[l];
             if (!c->attn[l]) { L->kconv = F(e->ndraft * qwen4_gdn_conv_len(c)); L->kS = F(e->ndraft * qwen4_gdn_state_len(c)); }
@@ -692,7 +699,8 @@ void q4e_close(Q4Eng* e) {
     for (int i = 0; i < e->ndev; ++i) cudaFree(e->dev[i]);
     for (int i = 0; i < e->nhost; ++i) cudaFreeHost(e->host[i]);
     for (int w = 0; w < 4; ++w) for (int t = 0; t <= MV_MAXT; ++t) if (e->graph[w][t]) cudaGraphExecDestroy(e->graph[w][t]);
-    for (int k = 0; k <= Q4E_MAX_DRAFTS; ++k) if (e->dgraph[k]) cudaGraphExecDestroy(e->dgraph[k]);
+    for (int s = 0; s < 2; ++s)
+        for (int k = 0; k <= Q4E_MAX_DRAFTS; ++k) if (e->dgraph[s][k]) cudaGraphExecDestroy(e->dgraph[s][k]);
     free(e->dev); free(e->host); free(e->ids);
     if (e->routes) fclose(e->routes);
     if (e->s) cudaStreamDestroy(e->s);
@@ -1249,8 +1257,8 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
 // ---- MTP: drafts, and verify forwards that keep each row's state -----------------------------------------------------
 
 // k head rows on din = {pos, bonus, ...}: row j at pos - 1 + j on token din[1 + j] and Hall[-1], then its own streams;
-// draft j to din[2 + j]
-static int draft_rows(Q4Eng* e, int k) {
+// draft j to din[2 + j]: the arg max, or sampled (a sample of q at dtu)
+static int draft_rows(Q4Eng* e, int k, int sampled) {
     const Qwen4Cfg* c = &e->c;
     float* H = e->H;
     for (int j = 0; j < k && !e->err[0]; ++j) {
@@ -1259,16 +1267,19 @@ static int draft_rows(Q4Eng* e, int k) {
         if (run_layer(e, &e->M, -1, 1, 1, 0, j - 1)) break;
         hc_mix(e, e->m_norm, &e->m_down, &e->m_up, 0, 1);
         mv(e, &e->head, e->x, e->mlog, 1);
-        kc_argmax_p(e->s, e->mlog, e->din + 2 + j, e->dprob + j, c->vocab, 1);
+        if (sampled) kc_draft_q(e->s, e->mlog, c->vocab, e->dtu, j, e->din + 2 + j, e->dqid + j * KC_DRAFT_Q, e->dqp + j * KC_DRAFT_Q, e->dprob + j);
+        else kc_argmax_p(e->s, e->mlog, e->din + 2 + j, e->dprob + j, c->vocab, 1);
         mark(e, ST_HEAD);
     }
     e->H = H;
     return e->err[0] ? -1 : 0;
 }
 
-int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, drafts); }
-int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
+typedef char q4e_draft_q_size[KC_DRAFT_Q == Q4E_DRAFT_Q ? 1 : -1];
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, 0, NULL, drafts); }
+int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, int32_t* drafts) {
     const Qwen4Cfg* c = &e->c;
+    const int sampled = temp > 0 && u;
     e->err[0] = 0;
     if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos || bonus >= c->vocab)
         return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : bonus >= c->vocab ? "bonus out of range" : "k out of range");
@@ -1276,21 +1287,31 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     e->hin[1] = bonus;
     cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t) * (bonus < 0 ? 1 : 2), cudaMemcpyHostToDevice, e->s);
     if (bonus < 0) kc_argmax(e->s, e->logits + (size_t) e->lrow * c->vocab, e->din + 1, c->vocab, 1);   // the bonus
-    cudaGraphExec_t* ge = &e->dgraph[k];
+    if (sampled) {
+        e->htu[0] = temp;
+        memcpy(e->htu + 1, u, sizeof(float) * (size_t) k);
+        cudaMemcpyAsync(e->dtu, e->htu, sizeof(float) * (size_t) (k + 1), cudaMemcpyHostToDevice, e->s);
+    }
+    cudaGraphExec_t* ge = &e->dgraph[sampled][k];
     if (!e->prof && !e->no_graph && !*ge) {   // a graph for each k: the positions come from din
         cudaGraph_t gr = NULL;
         if (cudaStreamBeginCapture(e->s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return fail(e, "CUDA graph capture failed");
         e->cap = 1;
-        const int rc = draft_rows(e, k);
+        const int rc = draft_rows(e, k, sampled);
         e->cap = 0;
         if (cudaStreamEndCapture(e->s, &gr) != cudaSuccess || rc) { if (gr) cudaGraphDestroy(gr); return fail(e, "CUDA graph capture failed"); }
         const cudaError_t ri = cudaGraphInstantiate(ge, gr, 0);
         cudaGraphDestroy(gr);
         if (ri != cudaSuccess) { *ge = NULL; return fail(e, "CUDA graph: %s", cudaGetErrorString(ri)); }
     }
-    if (*ge ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : draft_rows(e, k)) return fail(e, "CUDA: draft failed");
+    if (*ge ? cudaGraphLaunch(*ge, e->s) != cudaSuccess : draft_rows(e, k, sampled)) return fail(e, "CUDA: draft failed");
     cudaMemcpyAsync(e->hin + 1, e->din + 2, sizeof(int32_t) * (size_t) k, cudaMemcpyDeviceToHost, e->s);
     cudaMemcpyAsync(e->hprob, e->dprob, sizeof(float) * (size_t) k, cudaMemcpyDeviceToHost, e->s);
+    if (sampled) {
+        cudaMemcpyAsync(e->hqid, e->dqid, sizeof(int32_t) * (size_t) k * KC_DRAFT_Q, cudaMemcpyDeviceToHost, e->s);
+        cudaMemcpyAsync(e->hqp, e->dqp, sizeof(float) * (size_t) k * KC_DRAFT_Q, cudaMemcpyDeviceToHost, e->s);
+    }
+    e->dqn = sampled ? KC_DRAFT_Q : 0;
     if (cudaStreamSynchronize(e->s) != cudaSuccess || cudaGetLastError() != cudaSuccess)
         return fail(e, "CUDA: %s", cudaGetErrorString(cudaGetLastError()));
     memcpy(drafts, e->hin + 1, sizeof(int32_t) * (size_t) k);
@@ -1298,6 +1319,12 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     return 0;
 }
 
+int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p) {
+    if (!e->mtp || j < 0 || j >= e->ndraft) return -1;
+    memcpy(id, e->hqid + (size_t) j * KC_DRAFT_Q, sizeof(int32_t) * (size_t) e->dqn);
+    memcpy(p, e->hqp + (size_t) j * KC_DRAFT_Q, sizeof(float) * (size_t) e->dqn);
+    return e->dqn;
+}
 int q4e_draft_probs(const Q4Eng* e, int k, float* p) {
     if (!e->mtp || k < 1 || k > e->ndraft) return -1;
     memcpy(p, e->hprob, sizeof(float) * (size_t) k);

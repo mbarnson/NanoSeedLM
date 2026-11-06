@@ -2150,6 +2150,48 @@ __global__ void __launch_bounds__(1024) k_argmax(const float* logits, int32_t* o
     }
 }
 
+// A sampled draft (one block of 1024): q is the softmax at tu[0] of the row's top KC_DRAFT_Q logits (by value, then the
+// lowest id), found in KC_DRAFT_Q passes. The draft is q's sample at uniform tu[1 + j]. Writes q's ids, q and q(draft)
+__global__ void __launch_bounds__(1024) k_draft_q(const float* logits, int V, const float* tu, int j, int32_t* out, int32_t* qid,
+                                                  float* qp, float* prob) {
+    __shared__ float bv[32], tv[KC_DRAFT_Q];
+    __shared__ int bi[32], ti[KC_DRAFT_Q];
+    const int tid = threadIdx.x, lane = tid & 31, sgi = tid >> 5;
+    float pv = INFINITY;
+    int pi = -1;
+    for (int q = 0; q < KC_DRAFT_Q; ++q) {   // the largest (value, -id) below the previous pick
+        float best = -INFINITY;
+        int idx = V;
+        for (int i = tid; i < V; i += 1024) {
+            const float x = logits[i];
+            if ((x < pv || (x == pv && i > pi)) && (x > best || (x == best && i < idx))) { best = x; idx = i; }
+        }
+        for (int o = 16; o > 0; o /= 2) {
+            const float b2 = __shfl_down_sync(FULL, best, o);
+            const int i2 = __shfl_down_sync(FULL, idx, o);
+            if (b2 > best || (b2 == best && i2 < idx)) { best = b2; idx = i2; }
+        }
+        if (lane == 0) { bv[sgi] = best; bi[sgi] = idx; }
+        __syncthreads();
+        if (tid == 0) {
+            for (int s = 1; s < 32; ++s) if (bv[s] > best || (bv[s] == best && bi[s] < idx)) { best = bv[s]; idx = bi[s]; }
+            tv[q] = best; ti[q] = idx < V ? idx : ti[0];
+        }
+        __syncthreads();
+        pv = tv[q]; pi = ti[q];
+    }
+    if (tid) return;
+    float w[KC_DRAFT_Q], s = 0;
+    for (int q = 0; q < KC_DRAFT_Q; ++q) s += w[q] = __expf((tv[q] - tv[0]) / tu[0]);
+    const float u = tu[1 + j] * s;
+    float a = 0;
+    int d = KC_DRAFT_Q - 1;
+    for (int q = 0; q < KC_DRAFT_Q; ++q) { a += w[q]; if (a > u) { d = q; break; } }
+    *out = ti[d];
+    *prob = w[d] / s;
+    for (int q = 0; q < KC_DRAFT_Q; ++q) { qid[q] = ti[q]; qp[q] = w[q] / s; }
+}
+
 // BF16 input views reuse the native weight reconstruction, tile geometry and accumulation order.
 __global__ void k_pack_input_bf16(const float* x, uint16_t* y, size_t n) {
     const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -2674,6 +2716,9 @@ void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n) 
 }
 void kc_argmax_p(cudaStream_t s, const float* logits, int32_t* out, float* prob, int V, int n) {
     k_argmax<<<(unsigned) n, 1024, 0, s>>>(logits, out, prob, V);
+}
+void kc_draft_q(cudaStream_t s, const float* logits, int V, const float* tu, int j, int32_t* out, int32_t* qid, float* qp, float* prob) {
+    k_draft_q<<<1, 1024, 0, s>>>(logits, V, tu, j, out, qid, qp, prob);
 }
 
 }   // extern "C"

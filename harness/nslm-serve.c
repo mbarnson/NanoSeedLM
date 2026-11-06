@@ -55,6 +55,7 @@ typedef int sock_t;
 #include "chat_model.h"
 #include "engine_api.h"
 #include "qwen4_ext.h"
+#include "rng.h"
 #include "json.h"
 #include "kv_disk.h"
 #include "model_st.h"
@@ -655,7 +656,11 @@ static void* scheduler(void* arg) {
             const int left = eng_prefill_next(g_eng, pj->slot, n ? PREFILL_CHUNK : INT_MAX);
             pthread_mutex_lock(&g_lock);
             if (left < 0) { g_slots[pj->slot].len = 0; pj->failed = pj->done = true; pthread_cond_broadcast(&pj->cv); }
-            else if (left == 0) { pj->prefilled = true; pj->t_prefill = now_s(); }
+            else if (left == 0) {   // decode from here; drafts sampled at the request's temperature, from its own stream
+                pj->prefilled = true;
+                pj->t_prefill = now_s();
+                eng_draft_sampling(g_eng, (float) pj->temperature, ns_mix64(pj->rng));
+            }
             pthread_mutex_unlock(&g_lock);
         }
         if (n == 1 && g_drafts) {   // one decoding slot: up to g_drafts + 1 tokens a call, verified drafts

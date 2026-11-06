@@ -59,6 +59,7 @@ int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t
 int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32_t* out, EngStats* st) {   // qwen4_ext.h
     return e->qwen ? q4_eng_generate_pick(e->h, seq, n_new, pick, ctx, out, st) : -1;
 }
+int eng_draft_sampling(Eng* e, float temp, uint64_t seed) { return e->qwen ? q4_eng_draft_sampling(e->h, temp, seed) : -1; }
 int eng_step(Eng* e, int seq, float* logits) { return CALL(eng_step, seq, logits); }
 int eng_push(Eng* e, int seq, int32_t tok) { return CALL(eng_push, seq, tok); }
 int eng_step_batch(Eng* e, const int* seqs, int n, float* logits) { return CALL(eng_step_batch, seqs, n, logits); }

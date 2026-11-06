@@ -1,5 +1,6 @@
 // nslm/lib_qwen4_cfg.c - the qwen4_exp text configuration and the PLE n-gram rows (nslm/qwen4_cfg.h).
 #include "qwen4_cfg.h"
+#include "rng.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -108,13 +109,8 @@ int qwen4_cfg_load(Qwen4Cfg* c, const char* model_dir, char* err, int errlen) {
 
 // ---- PLE n-grams -------------------------------------------------------------------------------------------------------
 
-#define GAMMA 0x9E3779B97F4A7C15ull
-static uint64_t splitmix64(uint64_t v) {
-    v += GAMMA;
-    v = (v ^ (v >> 30)) * 0xBF58476D1CE4E5B9ull;
-    v = (v ^ (v >> 27)) * 0x94D049BB133111EBull;
-    return v ^ (v >> 31);
-}
+#define GAMMA NS_GOLDEN64
+static uint64_t splitmix64(uint64_t v) { return ns_mix64(v + GAMMA); }
 static int is_prime(int64_t v) {
     if (v < 2) return 0;
     if (v % 2 == 0) return v == 2;

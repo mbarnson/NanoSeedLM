@@ -9,12 +9,15 @@
 
 #include "qwen4_eng.h"
 #include "qwen4_ext.h"
+#include "rng.h"
 
 struct Eng {   // Q4Api: hist[0 .. n) committed; the engine holds hist[0 .. at), at = n - 1, or n after eng_step
     Q4Eng* q;
     int vocab, max_pos, cap, n, at;
     int drafts;    // Q4E_DRAFTS: eng_generate's MTP drafts a forward (0: none, and no MTP head)
     float min_p;   // Q4E_DRAFT_MIN_P: a forward verifies the drafts before the first of a lower head probability
+    float dtemp;   // eng_draft_sampling: the drafts' temperature (0: the head's arg max) and their own stream
+    uint64_t drng;
     int lrow;      // last holds the logits of hist[lrow] (-1: none), the engine's last row when lrow == at - 1
     int next;      // the token picked from last's first row (-1: not picked yet)
     int32_t* hist;
@@ -134,6 +137,8 @@ static int amax(const float* l, int n) {   // ties: the lowest id
     for (int v = 1; v < n; ++v) if (l[v] > x) { x = l[v]; b = v; }
     return b;
 }
+typedef char eng_draft_q_size[ENG_DRAFT_Q == Q4E_DRAFT_Q ? 1 : -1];
+int eng_draft_sampling(Eng* e, float temp, uint64_t seed) { e->dtemp = temp; e->drng = seed; return 0; }
 static int32_t pick_max(void* ctx, const float* l, int V, int32_t draft, const EngDraftQ* q) { (void) ctx; (void) draft; (void) q; return amax(l, V); }
 // Each token is the bonus (picked from the logits so far) or an accepted draft. With Q4E_DRAFTS = K, the forward of a
 // pending token whose row before it has logits carries up to K drafts of the MTP head, drafted on that token; a draft is
@@ -160,9 +165,10 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         if (k > n_new - j) k = n_new - j;
         if (k > e->max_pos - e->n) k = e->max_pos - e->n;   // the drafts' positions n .. n + k - 1
         int32_t row[Q4E_MAX_DRAFTS + 1];
-        float pr[Q4E_MAX_DRAFTS];
+        float pr[Q4E_MAX_DRAFTS], u[Q4E_MAX_DRAFTS];
+        for (int g = 0; g < k; ++g) u[g] = (float) (ns_splitmix64(&e->drng) >> 40) * 0x1p-24f;   // in [0, 1), exactly
         row[0] = e->hist[e->n - 1];
-        if (k && q4e_draft_from(e->q, row[0], k, row + 1)) { rc = fail_reset(e); break; }
+        if (k && q4e_draft_from(e->q, row[0], k, e->dtemp, u, row + 1)) { rc = fail_reset(e); break; }
         if (k && e->min_p > 0 && !q4e_draft_probs(e->q, k, pr))   // the gate: the drafts before the first unsure one
             for (int g = 0; g < k; ++g) if (pr[g] < e->min_p) { k = g; break; }
         if (!k) {   // the pending token alone
@@ -172,7 +178,11 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         }
         int m = 1, t = -1;
         if (q4e_forward_keep(e->q, row, k + 1, e->last)) { rc = fail_reset(e); break; }
-        while (m <= k && (t = pick(ctx, e->last + (size_t) (m - 1) * V, V, row[m], NULL)) == row[m]) ++m;   // rows 0 .. m - 1 hold
+        for (; m <= k; ++m) {   // rows 0 .. m - 1 hold
+            EngDraftQ q;
+            q.n = q4e_draft_q(e->q, m - 1, q.id, q.p);
+            if ((t = pick(ctx, e->last + (size_t) (m - 1) * V, V, row[m], q.n > 0 ? &q : NULL)) != row[m]) break;
+        }
         if (q4e_accept(e->q, m)) { rc = fail_reset(e); break; }
         if (m > 1) memmove(e->last, e->last + (size_t) (m - 1) * V, sizeof(float) * (size_t) V);
         memcpy(e->hist + e->n, row + 1, sizeof(int32_t) * (size_t) (m - 1));

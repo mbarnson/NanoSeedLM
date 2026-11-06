@@ -45,8 +45,12 @@ void q4e_reset(Q4Eng* e);   // an empty context
 // lowest id) and that row's streams; draft i + 1 on draft i and the head's own streams. The caller commits the bonus.
 #define Q4E_MAX_DRAFTS 3
 int q4e_draft(Q4Eng* e, int k, int32_t* drafts);
-// q4e_draft from a given bonus (a sampled token: the drafts of speculative sampling); bonus < 0: the arg max
-int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts);
+// q4e_draft from a given bonus (a sampled token; bonus < 0: the arg max). temp > 0 with k uniforms u in [0, 1): each
+// draft sampled from q, the softmax at temp of the head's top Q4E_DRAFT_Q logits (speculative sampling); else arg maxes
+#define Q4E_DRAFT_Q 20
+int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, int32_t* drafts);
+// Draft j's q of the last q4e_draft: its n ids and probabilities, n returned (0: an arg max, one point)
+int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p);
 // The head's softmax probability of drafts 1 .. k of the last q4e_draft; -1 where the engine has none (Metal: plan A1m)
 int q4e_draft_probs(const Q4Eng* e, int k, float* p);
 // q4e_forward of n <= Q4E_MAX_DRAFTS + 1 rows that keeps the recurrent state (DeltaNet, conv, PLE) after each row;

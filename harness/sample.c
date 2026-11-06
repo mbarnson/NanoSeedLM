@@ -4,13 +4,10 @@
 #include <math.h>
 #include <stdlib.h>
 
-uint64_t sample_rand(uint64_t* s) {
-    uint64_t z = (*s += 0x9E3779B97F4A7C15ull);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-}
-static double unit(Sampler* s) { return (double) (sample_rand(&s->rng) >> 11) * (1.0 / 9007199254740992.0); }
+#include "rng.h"
+
+uint64_t sample_rand(uint64_t* s) { return ns_splitmix64(s); }
+static double unit(Sampler* s) { return ns_unit(&s->rng); }
 
 typedef struct { float p; int id; } Cand;
 static int cand_cmp(const void* a, const void* b) {

@@ -176,6 +176,10 @@ void kc_mla_prefill(cudaStream_t s, MlaArgs a, const float* q, const float* qr, 
 void kc_kv_f32(cudaStream_t s, int fmt, const uint8_t* codes, const uint8_t* scales, int n, int rows, float* y);
 void kc_argmax(cudaStream_t s, const float* logits, int32_t* out, int V, int n);
 void kc_argmax_p(cudaStream_t s, const float* logits, int32_t* out, float* prob, int V, int n);   // and its softmax probability
+// A draft sampled from q, the softmax at tu[0] of one row's top KC_DRAFT_Q logits, with uniform tu[1 + j]: the draft to
+// out, q's ids and probabilities to qid and qp, q(draft) to prob
+#define KC_DRAFT_Q 20
+void kc_draft_q(cudaStream_t s, const float* logits, int V, const float* tu, int j, int32_t* out, int32_t* qid, float* qp, float* prob);
 
 #ifdef __cplusplus
 }

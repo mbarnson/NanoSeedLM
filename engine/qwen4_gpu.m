@@ -1081,9 +1081,10 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
 
 // ---- MTP: drafts, and verify forwards that keep each row's state -----------------------------------------------------
 
-int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, drafts); }
-int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, 0, NULL, drafts); }
+int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, int32_t* drafts) {   // plan A2m: temp, u
     const Qwen4Cfg* c = &e->c;
+    (void) temp; (void) u;   // arg maxes, q one point: exact, with fewer drafts kept
     e->err[0] = 0;
     if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos || bonus >= c->vocab)
         return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : bonus >= c->vocab ? "bonus out of range" : "k out of range");
@@ -1107,6 +1108,7 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     return 0;
 }
 
+int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p) { (void) e; (void) j; (void) id; (void) p; return 0; }   // plan A2m
 int q4e_draft_probs(const Q4Eng* e, int k, float* p) {   // plan A1m: the head's probabilities on Metal
     (void) e; (void) k; (void) p;
     return -1;

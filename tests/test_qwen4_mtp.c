@@ -52,6 +52,20 @@ static int ref_drafts(Qwen4Ref* r, const int32_t* ids, int n, int bonus, int32_t
     return clear;
 }
 
+// The reference head's logits for draft 1 after ids[0..n) and the bonus: as ref_drafts' first row
+static void ref_head_row(Qwen4Ref* r, const int32_t* ids, int n, int bonus, float* row) {
+    const int V = qwen4_ref_cfg(r)->vocab, HD = qwen4_ref_cfg(r)->hc * qwen4_ref_cfg(r)->d;
+    float* lg = (float*) malloc(sizeof(float) * (size_t) (n + 1) * V);
+    float* H = (float*) malloc(sizeof(float) * (size_t) (n + 1) * HD), *Hm = (float*) malloc(sizeof(float) * (size_t) (n + 1) * HD);
+    int32_t* tok = (int32_t*) malloc(sizeof(int32_t) * (size_t) (n + 1));
+    qwen4_ref_forward_h(r, ids, n, lg, H);
+    for (int t = 0; t + 1 < n; ++t) tok[t] = ids[t + 1];
+    tok[n - 1] = bonus;
+    qwen4_ref_mtp(r, tok, H, n, lg, Hm);
+    memcpy(row, lg + (size_t) (n - 1) * V, sizeof(float) * (size_t) V);
+    free(lg); free(H); free(Hm); free(tok);
+}
+
 // The prompt ids[0..n) in rows of at most `rows` (0: n - 1 rows without logits, then one), the last row's logits in lg
 static int prompt(Q4Eng* e, const int32_t* ids, int n, int rows, float* lg, float* buf) {
     q4e_reset(e);
@@ -136,12 +150,50 @@ int main(void) {
         for (int t = 1; t < 64 && b < 0; ++t) if ((ref[0] + t) % V != ref[0] && ref_drafts(r, ids, 45, (ref[0] + t) % V, want, NULL)) b = (ref[0] + t) % V;
         CHECK(b >= 0, "no other bonus with clear drafts in the reference");
         if (b >= 0) {
-            CHECK(prompt(e, ids, 45, 0, lg, buf) == 0 && q4e_draft_from(e, b, 3, d) == 0 && !memcmp(d, want + 1, sizeof d),
+            CHECK(prompt(e, ids, 45, 0, lg, buf) == 0 && q4e_draft_from(e, b, 3, 0, NULL, d) == 0 && !memcmp(d, want + 1, sizeof d),
                   "bonus %d: drafts %d %d %d, want %d %d %d (%s)", b, d[0], d[1], d[2], want[1], want[2], want[3], q4e_error(e));
-            CHECK(prompt(e, ids, 45, 0, lg, buf) == 0 && q4e_draft_from(e, -1, 3, d) == 0 && !memcmp(d, ref + 1, sizeof d),
+            CHECK(prompt(e, ids, 45, 0, lg, buf) == 0 && q4e_draft_from(e, -1, 3, 0, NULL, d) == 0 && !memcmp(d, ref + 1, sizeof d),
                   "q4e_draft_from(-1) is q4e_draft");
-            CHECK(q4e_draft_from(e, V, 1, d) == -1, "a bonus past the vocabulary");
+            CHECK(q4e_draft_from(e, V, 1, 0, NULL, d) == -1, "a bonus past the vocabulary");
         }
+    }
+    {   // Sampled drafts (temperature 1): q is the head's top Q4E_DRAFT_Q, and each draft is q's sample at its uniform
+        const float u[3] = {0.3f, 0.6f, 0.9f};
+        int32_t want[4], qid[Q4E_DRAFT_Q];
+        float qp[Q4E_DRAFT_Q], *row = (float*) malloc(sizeof(float) * (size_t) V);
+        ref_drafts(r, ids, 45, -1, want, NULL);
+        ref_head_row(r, ids, 45, want[0], row);
+        CHECK(prompt(e, ids, 45, 0, lg, buf) == 0 && q4e_draft_from(e, -1, 3, 1.0f, u, d) == 0, "sampled drafts: %s", q4e_error(e));
+        const int qn = q4e_draft_q(e, 0, qid, qp);
+        if (!qn) printf("no sampled drafts on this engine (plan A2m)\n");
+        for (int j = 0; qn && j < 3; ++j) {
+            CHECK(q4e_draft_q(e, j, qid, qp) == Q4E_DRAFT_Q, "draft %d: no q", j + 1);
+            double a = 0, sum = 0;
+            int pick = qid[Q4E_DRAFT_Q - 1];
+            for (int i = 0; i < Q4E_DRAFT_Q; ++i) sum += qp[i];
+            for (int i = 0; i < Q4E_DRAFT_Q; ++i) if ((a += qp[i]) > u[j] * sum) { pick = qid[i]; break; }
+            CHECK(fabs(sum - 1) < 1e-4 && d[j] == pick, "draft %d: %d, q's sample at %.1f is %d (q sums to %.6f)", j + 1, d[j], u[j], pick, sum);
+        }
+        if (qn) {   // draft 1's q against the reference's softmax of its top Q4E_DRAFT_Q (the first 5: BF16 keeps their order)
+            int32_t i20[Q4E_DRAFT_Q], top[Q4E_DRAFT_Q];
+            float p20[Q4E_DRAFT_Q];
+            double z = 0;
+            q4e_draft_q(e, 0, i20, p20);
+            for (int k = 0; k < Q4E_DRAFT_Q; ++k) {
+                top[k] = -1;
+                for (int v = 0; v < V; ++v) {
+                    int used = 0;
+                    for (int i = 0; i < k; ++i) used |= top[i] == v;
+                    if (!used && (top[k] < 0 || row[v] > row[top[k]])) top[k] = v;
+                }
+                z += exp((double) row[top[k]] - row[top[0]]);
+            }
+            for (int k = 0; k < 5; ++k) {
+                const double want_p = exp((double) row[top[k]] - row[top[0]]) / z;
+                CHECK(i20[k] == top[k] && fabs(p20[k] - want_p) < 0.05, "q rank %d: id %d p %.4f, the reference's id %d p %.4f", k, i20[k], p20[k], top[k], want_p);
+            }
+        }
+        free(row);
     }
     {   // the drafts run as a CUDA graph for each k: without graphs, the same drafts
         set_env("NSLM_NO_GRAPH", "1");

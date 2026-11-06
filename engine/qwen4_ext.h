@@ -16,3 +16,6 @@ typedef int32_t (*EngPick)(void* ctx, const float* logits, int vocab, int32_t dr
 // to K MTP drafts, drafted on the pending token.  Returns the tokens committed (< n_new after a stop), or -1 (also for
 // the MoVA engine).
 int eng_generate_pick(struct Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32_t* out, EngStats* st);
+// eng_generate_pick's drafts from now on: sampled from the head at temp (its top ENG_DRAFT_Q), with their own random
+// stream from seed, so a seeded request repeats.  temp <= 0: the head's arg max.  -1: the MoVA engine
+int eng_draft_sampling(struct Eng* e, float temp, uint64_t seed);

@@ -12,6 +12,7 @@
 #include "json.h"
 #include "platform.h"
 #include "qwen4_ext.h"
+#include "rng.h"
 #include "tokenizer.h"
 
 typedef struct { Sampler s; const ChatModel* cm; } Pick;   // a stop token is a stop (-1)
@@ -123,6 +124,7 @@ int main(int argc, char** argv) {
     int32_t got[ENG_MAX_DRAFTS + 1];   // a call's tokens
     const int drafts = !dk || atoi(dk) < 1 || eng_generate_pick(e, 0, 0, chat_pick, &pk, got, NULL) ? 0 :
                        atoi(dk) < ENG_MAX_DRAFTS ? atoi(dk) : ENG_MAX_DRAFTS;
+    if (drafts) eng_draft_sampling(e, (float) temp, ns_mix64(seed));   // drafts sampled at temp, from their own stream
     EngStats gs;
     memset(&gs, 0, sizeof gs);
 

@@ -99,6 +99,19 @@ int main(void) {
           "a seeded sampler with drafts differs between runs");
     CHECK(eng_prefill(e3, 0, ids, 20) == 0 && eng_generate_pick(e3, 0, NT, sample_engpick, &sg, got, NULL) == NT && !memcmp(got, plain, sizeof plain),
           "the sampler at temperature 0 is not greedy decode");
+
+    // Drafts sampled from the head's q (eng_draft_sampling): a seeded request repeats; at temperature 0, greedy decode
+    EngStats s1, s2;
+    memset(&s1, 0, sizeof s1);
+    memset(&s2, 0, sizeof s2);
+    sa = sb = (Sampler) {1.0, 0.95, 0, 20, 0, 7};
+    CHECK(eng_draft_sampling(e3, 1.0f, 11) == 0 && eng_prefill(e3, 0, ids, 20) == 0 && eng_generate_pick(e3, 0, NT, sample_engpick, &sa, a, &s1) == NT &&
+          eng_draft_sampling(e3, 1.0f, 11) == 0 && eng_prefill(e3, 0, ids, 20) == 0 && eng_generate_pick(e3, 0, NT, sample_engpick, &sb, b, &s2) == NT &&
+          !memcmp(a, b, sizeof a) && s1.accepted == s2.accepted, "sampled drafts with the same seeds differ between runs");
+    printf("sampled drafts at temperature 1.0: %lld of %lld kept\n", (long long) s1.accepted, (long long) s1.proposals);
+    sg = (Sampler) {0, 1, 0, 0, 0, 7};
+    CHECK(eng_draft_sampling(e3, 0, 11) == 0 && eng_prefill(e3, 0, ids, 20) == 0 && eng_generate_pick(e3, 0, NT, sample_engpick, &sg, got, NULL) == NT &&
+          !memcmp(got, plain, sizeof plain), "draft temperature 0 is not greedy decode");
     CHECK(eng_generate_pick(e3, 0, 1, NULL, NULL, got, NULL) == -1, "no pick");
 
     eng_close(e3);
