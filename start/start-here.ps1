@@ -44,7 +44,8 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 $hdr = @{}
 $auth = @()
 if ($env:HF_TOKEN) { $hdr['Authorization'] = "Bearer $env:HF_TOKEN"; $auth = @('-H', "Authorization: Bearer $env:HF_TOKEN") }
-$files = Invoke-RestMethod -Headers $hdr "https://huggingface.co/api/models/$repo/tree/$($rev)?recursive=true" | Where-Object { $_.type -eq 'file' -and -not $_.path.StartsWith('.') }
+$tree = Invoke-RestMethod -Headers $hdr "https://huggingface.co/api/models/$repo/tree/$($rev)?recursive=true"   # PowerShell 5.1: one array object
+$files = @($tree | Where-Object { $_.type -eq 'file' -and -not $_.path.StartsWith('.') })
 $okf = Join-Path $dir '.nslm-verified'
 $ok = @{}
 if (Test-Path $okf) { Get-Content $okf | ForEach-Object { $ok[$_] = 1 } }
@@ -63,7 +64,7 @@ foreach ($f in $files) {
     if (Test-Path $dst) { $have = (Get-Item $dst).Length }
     Write-Host ("[{0}/{1}] {2} ({3:N1} GB)" -f $i, $files.Count, $f.path, ($f.size / 1GB))
     if ($have -ne $f.size) {
-        & curl.exe -fL --retry 5 -C - -# @auth -o $dst "https://huggingface.co/$repo/resolve/$rev/$($f.path)"
+        & curl.exe -fL --retry 5 -C - --progress-bar @auth -o $dst "https://huggingface.co/$repo/resolve/$rev/$($f.path)"
         if ($LASTEXITCODE) { Fail "The download of $($f.path) stopped (curl $LASTEXITCODE). Run START-HERE.bat again to resume." }
     }
     if ((Get-Item $dst).Length -ne $f.size) { Fail "$($f.path) has the wrong size. Run START-HERE.bat again." }
