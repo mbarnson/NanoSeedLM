@@ -160,6 +160,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   about 2% faster than P3, prompts at its speed. K = 4 has a third less KL at P3's speed.
 - [2026-11-05: The VRAM reserve on the RTX 4080](results/2026-11-05-vram-reserve-4080.md): 1,024 MB instead of 2,560 on
   a display GPU gives the expert cache about 20% more slots and decode 8% to 9% more speed.
+- [2026-11-05: Trellis K = 3 on the M4 Max: the pages that a session uses](results/2026-11-05-trellis-ple-working-set-m4max.md):
+  13,000 tokens keep about 55 GB in the page cache, 5.0 GB of it from the 32 GB PLE table.
 
 ## For contributors and agents
 

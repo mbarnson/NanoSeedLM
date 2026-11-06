@@ -6,7 +6,8 @@ The gains on a Mac are size and quality. Trellis K = 4 has a KL of 0.0398 agains
 1.9 GB more. Trellis K = 3 needs 13.2 GB less for its experts.
 
 **Status.** Current. Gate TC of the [trellis plan](../plans/2026-11-05-trellis-experts.md) (step T3) on the M4 Max.
-Read [Trellis experts on the RTX 4080](2026-11-05-trellis-speed-4080.md) for the GPU with a cache.
+Read [Trellis experts on the RTX 4080](2026-11-05-trellis-speed-4080.md) for the GPU with a cache. Read
+[The pages that a session uses](2026-11-05-trellis-ple-working-set-m4max.md) for the resident size of the PLE table.
 
 ## Setup
 

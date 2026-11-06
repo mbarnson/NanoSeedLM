@@ -52,6 +52,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `hf_qwen4_kld.sh` | Score packs with `nslm-qwen4-kld` against a reference model on wikitext-2, on an HF Jobs GPU node |
 | `hf_llama_kld.sh` | Score Unsloth packs and emulated seed or trellis packs against BF16 in llama.cpp. `REF` keeps the BF16 reference for later jobs |
 | `gguf_expert_bytes.py` | The routed experts' bytes and bits for each weight of a GGUF pack on the Hub, from its headers only |
+| `page_resident.py` | How much of a pack's files is in the page cache, by kind (`mincore`). `--drop` evicts the shards first |
 | `hf_qwen4_routes.sh` | Record routing traces of a pack on chat and code text, on an HF Jobs GPU node |
 | `qwen4_tier_map.py` | Write a per-expert tier map from routing traces (most used experts), at random, or by projection |
 | `qwen4_tier_sim.py` | Simulate a high tier that follows the routing: its share of router choices and its loads |

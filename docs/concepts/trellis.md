@@ -37,7 +37,9 @@ free on a display GPU, not 2,560. So the cache holds about 20% more experts. Rea
 The units are tokens per second. The percentages compare with P3 at the same reserve.
 
 On the M4 Max all experts stay in unified memory. There, every trellis pack decodes about 2% faster than P3 and reads
-prompts at P3's speed. Read [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md).
+prompts at P3's speed. Read [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md). A Mac needs
+a page cache that holds the files that a session reads. For K = 3 and 13,000 tokens that is about 55 GB, 5.0 GB of it
+from the PLE table. Read [The pages that a session uses](../results/2026-11-05-trellis-ple-working-set-m4max.md).
 
 Speed of one expert matvec call (gate and up, one token, 10 experts). These are kernel benches, not decode in the
 engine.

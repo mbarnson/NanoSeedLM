@@ -773,3 +773,11 @@ The expert cache now keeps 1,024 MB free on a GPU that drives a display, not 2,5
 RTX 4080 that gives about 20% more slots and 8% to 9% faster decode, for P3 (42.2 tokens per second) and the trellis
 packs (the mix 54.4, K = 3 61.3). 512 MB is slower, because WDDM pages VRAM. Read
 [The VRAM reserve on the RTX 4080](results/2026-11-05-vram-reserve-4080.md).
+
+## [2026-11-05] result | Trellis K = 3 on the M4 Max: the pages that a session uses
+
+`39afe70` (`tools/page_resident.py`), mac-metal's M4 Max: a session of about 13,000 tokens keeps about 55 GB of the
+K = 3 pack in the page cache. That is 47.2 GB of banks, 3.1 GB of other tensors and 5.0 GB of the 32 GB PLE table.
+The PLE part grows by about 0.5 MB for each generated token. A cold PLE table makes decode about 10% slower. So K = 3
+may fit a 64 GB Mac, but no 64 GB Mac is measured. Read
+[The pages that a session uses](results/2026-11-05-trellis-ple-working-set-m4max.md).
