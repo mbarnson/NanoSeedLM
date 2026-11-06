@@ -155,4 +155,4 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 ||
               gh release create "$TAG" --target "$GITHUB_SHA" --title "NanoSeedLM engine $TAG" --notes-file notes.txt --prerelease --draft
           gh release upload "$TAG" dist/* --clobber
-          gh release edit "$TAG" --draft="$DRAFT"
+          gh release edit "$TAG" --target "$GITHUB_SHA" --notes-file notes.txt --draft="$DRAFT"   # the tag and notes of this build
