@@ -781,3 +781,10 @@ K = 3 pack in the page cache. That is 47.2 GB of banks, 3.1 GB of other tensors 
 The PLE part grows by about 0.5 MB for each generated token. A cold PLE table makes decode about 10% slower. So K = 3
 may fit a 64 GB Mac, but no 64 GB Mac is measured. Read
 [The pages that a session uses](results/2026-11-05-trellis-ple-working-set-m4max.md).
+
+## [2026-11-05] plan | Trellis-coded dense weights
+
+A plan to code the dense weights with the trellis, with more bits for a kind only where its KL needs them. Every KL of
+the trellis packs so far uses Unsloth's Q8_0 dense weights. The engine runs the 4-bit MLX ones, and their KL is not
+measured, so step D0 measures the mix as shipped. On the M4 Max the dense matvecs take 8.77 ms of an 18.7 ms decode
+token. Read [Trellis-coded dense weights](plans/2026-11-05-trellis-dense.md).
