@@ -788,3 +788,10 @@ A plan to code the dense weights with the trellis, with more bits for a kind onl
 the trellis packs so far uses Unsloth's Q8_0 dense weights. The engine runs the 4-bit MLX ones, and their KL is not
 measured, so step D0 measures the mix as shipped. On the M4 Max the dense matvecs take 8.77 ms of an 18.7 ms decode
 token. Read [Trellis-coded dense weights](plans/2026-11-05-trellis-dense.md).
+
+## [2026-11-05] plan | An LFSR code for the trellis
+
+Matt asked whether SeedLM has a future beside the trellis. The trellis packs replace every seed expert, and they are
+ahead on each axis that we measured. But the trellis also computes its code from a pseudo-random function of its
+state. This plan tests the trellis with NanoSeedLM's LFSR as that function, on KL and decode speed. At L = 12 the
+LFSR code had the weighted error of 1MAD within 1%. Read [An LFSR code for the trellis](plans/2026-11-05-lfsr-trellis.md).

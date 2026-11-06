@@ -52,6 +52,8 @@ Work that is not done yet, with its gates and hypotheses.
   draft. Cheaper decode rows: the MTP head in the cache, a matvec by expert, the tail skip, and the CPU for misses.
 - [2026-11-05: Trellis-coded dense weights](plans/2026-11-05-trellis-dense.md): draft. The dense weights in the trellis,
   with more bits where the KL needs them, and a KL of each pack as shipped.
+- [2026-11-05: An LFSR code for the trellis](plans/2026-11-05-lfsr-trellis.md): draft. The trellis with NanoSeedLM's
+  LFSR as its code generator in place of 1MAD, tested on KL and decode speed.
 - [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
   engine keeps the session's hot experts in P4 and the rest in S3 or P3.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
