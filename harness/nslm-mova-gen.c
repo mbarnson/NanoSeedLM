@@ -19,15 +19,9 @@
 #include "engine_api.h"
 #include "json.h"
 #include "platform.h"
+#include "sample.h"
 #include "suite.h"
 
-static uint64_t splitmix(uint64_t* s) {
-    *s += 0x9E3779B97F4A7C15ull;
-    uint64_t z = *s;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-}
 
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
@@ -53,7 +47,6 @@ int main(int argc, char** argv) {
     if (!e) { fprintf(stderr, "eng_open: %s\n", err); return 1; }
     const int V = eng_vocab(e);
     float* lg = (float*) malloc((size_t) V * 4);
-    double* cum = (double*) malloc((size_t) V * 8);
     printf("%s\n", eng_describe(e));
     char* modes = strdup(opt(argc, argv, "--modes", "greedy"));
     for (int pi = 0; pi < su.n; ++pi) {
@@ -67,7 +60,7 @@ int main(int argc, char** argv) {
             snprintf(path, sizeof path, "%s/%s.%s.json", outd, q->id, mode);
             FILE* ex = fopen(path, "rb");
             if (ex) { fclose(ex); continue; }
-            uint64_t rng = q->seed;
+            Sampler sp = {q->temperature, 1, 0, 0, 1, q->seed};   // the MLX sampler (harness/sample.h)
             const double t0 = now_s();
             if (eng_prefill(e, 0, q->ids, q->n)) { fprintf(stderr, "%s: prefill failed\n", q->id); return 1; }
             const double t1 = now_s();
@@ -81,14 +74,7 @@ int main(int argc, char** argv) {
                     else if (b2 < 0 || lg[v] > lg[b2]) b2 = v;
                 }
                 int pick = b;
-                if (!greedy) {
-                    double c = 0;
-                    for (int v = 0; v < V; ++v) { c += exp(((double) lg[v] - (double) lg[b]) / q->temperature); cum[v] = c; }
-                    const double u = (double) (splitmix(&rng) >> 11) * (1.0 / 9007199254740992.0) * c;
-                    int lo = 0, hi = V;   // first index with cum > u (numpy searchsorted, side right)
-                    while (lo < hi) { const int mid = (lo + hi) / 2; if (cum[mid] > u) hi = mid; else lo = mid + 1; }
-                    pick = lo < V ? lo : b;
-                }
+                if (!greedy) pick = sample_pick(&sp, lg, V, -1);
                 if (pick == 1 || pick == 250019) { finish = "stop"; break; }
                 Json* t = json_new(J_INT);
                 t->i = pick;
@@ -130,7 +116,7 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
     }
-    free(modes); free(lg); free(cum);
+    free(modes); free(lg);
     suite_free(&su);
     eng_close(e);
     return 0;
