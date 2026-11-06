@@ -18,15 +18,15 @@ ORDER = ["TCQ4", "TCQ3-D4", "TCQ3", "P4", "P3"]
 # name: expert code, bits for each expert weight, expert GB, dense weights, download GB, resident GB (PLE on disk),
 # KL against BF16 as shipped (TCQ: from the logs; None: not measured), the experts' KL with Q8_0 dense, runtimes
 PACKS = {
-    "TCQ4": ("trellis, K = 4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
-    "TCQ3-D4": ("trellis, K = 3, `down_proj` K = 4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
-    "TCQ3": ("trellis, K = 3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
-    "P4": ("SeedLM seeds, P = 4", 4.5, 68.0, "4-bit", 105.7, 74, None, 0.0408, "NanoSeedLM CUDA engine, mlx-vlm, oMLX with the fix"),
-    "P3": ("SeedLM seeds, P = 3", 4.0, 60.4, "4-bit", 98.2, 66, 0.182, 0.0600, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
+    "TCQ4": ("Trellis K4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "Engines, mlx-vlm, oMLX"),
+    "TCQ3-D4": ("Trellis K3, down K4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "Engines, mlx-vlm, oMLX"),
+    "TCQ3": ("Trellis K3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "Engines, mlx-vlm, oMLX"),
+    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 105.7, 74, None, 0.0408, "CUDA engine, mlx-vlm, oMLX"),
+    "P3": ("Seeds P3", 4.0, 60.4, "4-bit", 98.2, 66, 0.182, 0.0600, "Engines, mlx-vlm, oMLX"),
 }
 # Decode of 4,096 tokens and after 30K, prompt tok/s at 30K, in nslm-serve's long runs (absent: not measured)
-M4 = "M4 Max (128 GB), Metal"
-RTX = "RTX 4080 (16 GB), CUDA"
+M4 = "M4 Max, Metal"
+RTX = "RTX 4080, CUDA"
 SPEED = {
     "TCQ4": {M4: ("39.0", "38.8", "475"), RTX: ("31.4", "30.2", "1,725")},
     "TCQ3-D4": {RTX: ("38.0", "36.0", "1,824")},
@@ -63,8 +63,8 @@ def kl(v):
 def family(here):
     """The sections that each card shares: which pack, the packs side by side, the trade-offs, decode, the background."""
     L = lambda n: f"**{n}**" if n == here else f"[{n}]({HF}{n})"
-    rows = "\n".join(f"| {L(n)} | {p[0]} | {p[1]:.3f} | {p[2]} | {p[3]} | {p[4]} | about {p[5]} | {kl(p[6])} | {p[8]} |"
-                     for n in ORDER for p in [PACKS[n]])
+    t1 = "\n".join(f"| {L(n)} | {p[0]} | {p[1]:.3f} | {p[5]} | {kl(p[6])} |" for n in ORDER for p in [PACKS[n]])
+    t2 = "\n".join(f"| {L(n)} | {p[2]} | {p[3]} | {p[4]} | {p[8]} |" for n in ORDER for p in [PACKS[n]])
     dec = "\n".join(f"| {L(n)} | {SPEED[n].get(M4, ('not measured',))[0]} | {SPEED[n].get(RTX, ('not measured',))[0]} |"
                     for n in ORDER)
     return f"""## Which pack
@@ -74,24 +74,38 @@ expert weights, their dense weights, and the runtimes that load them.
 
 | Your machine | Pack | Why |
 |---|---|---|
-| A PC with a GPU of 24 GB or more and 96 to 128 GB of RAM | {L("TCQ4")} | The lowest KL. The experts (62.3 GB) stay in RAM, and the GPU caches the experts in use |
-| A PC with a 16 GB GPU and 96 to 128 GB of RAM | {L("TCQ3-D4")} | The middle KL, 10 GB smaller than TCQ4. The GPU caches more of its experts |
-| A PC with a 12 or 16 GB GPU and 64 GB of RAM | {L("TCQ3")} | The only pack whose experts (47.2 GB) leave room for the system in 64 GB of RAM. We did not test a 12 GB GPU or a 64 GB PC yet. A 12 GB GPU caches fewer experts than a 16 GB GPU, so it decodes slower |
-| A 128 GB Mac | {L("TCQ4")} | The lowest KL, in the NanoSeedLM engine, oMLX or mlx-vlm |
-| A 128 GB Mac, for speed | {L("P3")} | In the NanoSeedLM engine it decodes about 20% faster than TCQ4, at about 4 times the KL |
-| A 96 GB Mac | {L("TCQ3-D4")} | It leaves room for a long context and other programs |
-| Research on seed experts | {L("P4")} or {L("P3")} | SeedLM seeds at 4.5 or 4.0 bits for each expert weight |
-| Less than 64 GB of RAM | None | The experts of each pack must fit in RAM |
+| PC: a GPU of 24 GB or more, 96 to 128 GB of RAM | {L("TCQ4")} | The lowest KL |
+| PC: a 16 GB GPU, 96 to 128 GB of RAM | {L("TCQ3-D4")} | The middle KL, 10 GB smaller |
+| PC: a 12 or 16 GB GPU, 64 GB of RAM | {L("TCQ3")} | The only pack for 64 GB of RAM |
+| Mac: 128 GB | {L("TCQ4")} | The lowest KL |
+| Mac: 128 GB, for speed | {L("P3")} | About 20% faster, 4 times the KL |
+| Mac: 96 GB | {L("TCQ3-D4")} | Room for long contexts |
+| Research on seeds | {L("P4")}, {L("P3")} | SeedLM seeds |
+| Less than 64 GB of RAM | None | The experts must fit in RAM |
 
-The NanoSeedLM [engine release]({GITHUB}/releases) has a start script that checks the machine and picks a TCQ pack.
+- On a PC, the experts stay in RAM, and the GPU caches the experts in use. A smaller pack lets the GPU cache more of
+  its experts.
+- We did not test TCQ3 on a 12 GB GPU or a 64 GB PC yet. A 12 GB GPU caches fewer experts than a 16 GB GPU, so it
+  decodes slower.
+- P3 is faster on a Mac because its dense weights are 4-bit. They are also why its KL is 4 times that of TCQ4.
+- The start script of the NanoSeedLM [engine release]({GITHUB}/releases) checks the machine and picks a TCQ pack.
 
-| Pack | Experts | Bits for each expert weight | Expert GB | Dense weights | Download GB | Memory GB | KL against BF16, as shipped | Runtimes |
-|---|---|---|---|---|---|---|---|---|
-{rows}
+## The family
 
-Memory counts the weights that stay resident. The PLE n-gram table stays on the disk, and the page cache holds the
-rows that a session reads. The KL is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2. Lower is
-closer to the original model.
+| Pack | Experts | Bits | Memory GB | KL as shipped |
+|---|---|---|---|---|
+{t1}
+
+| Pack | Expert GB | Dense weights | Download GB | Runtimes |
+|---|---|---|---|---|
+{t2}
+
+- **Bits** are the bits for each expert weight. **Memory** counts the weights that stay resident, about. The PLE
+  n-gram table stays on the disk, and the page cache holds the rows that a session reads.
+- **KL as shipped** is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2. Lower is closer to the
+  original model. P4 as shipped is not measured yet.
+- **Engines** are the NanoSeedLM engines: CUDA on Linux and Windows, Metal on macOS. oMLX needs the fix in
+  [jundot/omlx#5112]({OMLX_PR}). We tested oMLX with P3 and TCQ4, and P4 in the CUDA engine only.
 
 **The trade-offs.**
 
@@ -103,13 +117,14 @@ closer to the original model.
   weights. The cost is speed: they read 1.84 GB more for each token. On the M4 Max, TCQ4 decodes about 15% slower than
   P3.
 - **Runtimes.** Each pack carries its MLX model files, so mlx-vlm runs it with Trust Remote Code. oMLX runs it with
-  the fix in [jundot/omlx#5112]({OMLX_PR}). The NanoSeedLM engines run each pack too: CUDA on Linux and Windows, Metal
-  on macOS. The start scripts of the engine release prepare the TCQ packs.
+  the fix in [jundot/omlx#5112]({OMLX_PR}). The NanoSeedLM engines run each pack too. The start scripts of the engine
+  release prepare the TCQ packs.
 - **The PLE table.** Each pack carries the 4-bit MLX PLE table (32 GB). In the NanoSeedLM engines, Unsloth's Q8_0 table
   (54.4 GB) lowers the KL by about 0.006, and the start scripts download it.
 
 Decode in tokens per second: `nslm-serve --ctx 32768` with the Q8_0 PLE table, 4,096 tokens, thinking on, temperature
-0, without MTP drafts, the mean of two runs. Read the runs on [the M4 Max]({DOCS}2026-11-06-long-bench-m4max.md) and
+0, without MTP drafts, the mean of two runs. The machines are an M4 Max with 128 GB and an RTX 4080 (16 GB) with
+128 GB of RAM. Read the runs on [the M4 Max]({DOCS}2026-11-06-long-bench-m4max.md) and
 [the RTX 4080]({DOCS}2026-11-06-long-bench-4080.md).
 
 | Pack | {M4} | {RTX} |
@@ -230,10 +245,13 @@ memory, and a cache keeps the experts in use in VRAM.
 This pack's experts and dense weights are written into Unsloth's Q8_0 GGUF, so llama.cpp runs this pack's weights. The
 PLE table is Unsloth's Q8_0.
 
-| | Mean KLD | Median KLD | 99th percentile KLD | Top-1 agreement | Perplexity |
+| | Mean KLD | Median KLD | 99% KLD | Top-1 | Perplexity |
 |---|---|---|---|---|---|
-| This pack | {k['mean']:.4f} ± {k['err']:.4f} | {k['med']:.4f} | {k['p99']:.3f} | {k['top1']:.2f}% | {k['ppl']:.3f} |
+| {name} | {k['mean']:.4f} | {k['med']:.4f} | {k['p99']:.3f} | {k['top1']:.2f}% | {k['ppl']:.3f} |
 | BF16 | 0 | 0 | 0 | 100% | 3.802 |
+
+The mean KLD's standard error is {k['err']:.4f}. "99% KLD" is the 99th percentile. "Top-1" is the share of positions
+where the pack's likeliest token is BF16's.
 
 Unsloth's packs, measured in the same way (with their own dense weights):
 
@@ -305,7 +323,8 @@ def seeds(name):
     p = 4 if name == "P4" else 3
     off = 100 * (kq8 / curve(bits) - 1)
     rel = f"{abs(off):.0f}% {'above' if off > 0 else 'below'}"
-    shipped_row = kl(shipped) if shipped else "not measured yet. In P3, the 4-bit dense weights add 0.12"
+    shipped_row = kl(shipped) if shipped else "Not measured yet"
+    shipped_note = "" if shipped else " In P3, the 4-bit dense weights add 0.12 to the KL."
     lead = {"P4": f"Its experts are on Unsloth's quality curve: {kq8:.4f} at 4.5 bits, {rel} it.",
             "P3": f"As shipped, its KL against BF16 is {kl(shipped)}, and its 4-bit dense weights cause most of it."}[name]
     run = "" if name == "P3" else "We tested P4 in the CUDA engine, not in the Metal engine yet. "
@@ -330,18 +349,24 @@ the error of each weight by the mean square of its input activation, from Unslot
 unchanged from [mlx-community/Qwen3.8-Flash-Next-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp)
 (4-bit affine, group size 32), with its MTP head.
 
-| Part | This pack | mlx-community 4-bit |
+| Part | {name} | mlx-community 4-bit |
 |---|---|---|
-| Routed experts (120.8 B weights, 48 layers x 512) | SeedLM P = {p}, {bits:.1f} bits for each weight | 4-bit affine, group 32 (5.0 bits for each weight) |
-| Attention, DeltaNet, shared experts, routers, PLE table, embedding, LM head, vision, MTP head | The same tensors | 4-bit affine (group 32), 8-bit routers (group 64), BF16 |
+| Routed experts | Seeds P{p}, {bits:.1f} bits | 4-bit affine, 5.0 bits |
+| All other weights | The same tensors | 4-bit affine, 8-bit routers |
 | Size | {dl} GB | 113.3 GB |
+
+The routed experts are 120.8 B weights (48 layers of 512 experts). The other weights are attention, DeltaNet, the shared
+experts and the routers. They also include the PLE table, the embedding, the LM head, the vision tower and the MTP head. The 4-bit affine
+weights use groups of 32 and the routers groups of 64.
 
 ## Quality
 
-| Weights | Mean KL divergence against BF16 |
+| {name} | Mean KLD against BF16 |
 |---|---|
-| This pack's experts, with Unsloth's Q8_0 dense weights | {kq8:.4f} |
-| This pack as shipped (its 4-bit MLX dense weights) | {shipped_row} |
+| The experts, with 8-bit dense weights | {kq8:.4f} |
+| As shipped, with 4-bit dense weights | {shipped_row} |
+
+The 8-bit dense weights of the first row are Unsloth's Q8_0, in llama.cpp.{shipped_note}
 
 With the same dense weights, Unsloth's packs give {curve(bits):.4f} at {bits:.1f} bits: the straight line between their two
 packs nearest in bits. This pack's experts are {rel} that line. Read [KL against BF16]({DOCS}2026-11-04-qwen38-kld-vs-bf16.md)
