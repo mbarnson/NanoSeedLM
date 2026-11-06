@@ -16,4 +16,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI fb31f8c (6aed3b7a0e0338d1bb80d9cb): nslm-qwen4-gen --prompt-file | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.45 |
 
-Left this week: about $19.55.
+| Linux CI e752917 (6aed4fefc78863f9c633d4db): the VRAM reserve | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.53 |
+
+Left this week: about $19.47.
