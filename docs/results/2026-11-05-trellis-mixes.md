@@ -19,7 +19,8 @@ corrects the curve of [Trellis-coded experts against BF16](2026-11-05-trellis-kl
 - Mixes: two banks and a tier map of `tools/qwen4_tier_map.py` (as for the [hybrid tiers](2026-11-04-qwen38-hybrid-tiers.md)).
   - `down`: the larger K for every `down_proj`, the smaller K for `gate_proj` and `up_proj`.
   - `freqcc`: the larger K for the third of each layer's experts that a routing trace of another text uses most.
-- Unsloth's expert bits: each expert tensor's bytes from the offsets in the GGUF headers, read over HTTP. Type 42,
+- Unsloth's expert bits: `tools/gguf_expert_bytes.py`, each expert tensor's bytes from the offsets in the GGUF
+  headers, read over HTTP. Type 42,
   which our `gguf` package (0.19.0) does not know, takes 2.25 bits for each weight. The known types give their
   standard sizes (IQ3_XXS 3.0625, IQ4_NL 4.5).
 
