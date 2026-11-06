@@ -1,7 +1,13 @@
-# pc-cuda claims (updated 2026-11-06T19:15Z)
+# pc-cuda claims (updated 2026-11-06T22:15Z)
 
-- **Working on (2026-11-06T21:31Z):** nothing. Gates GA/GB, the Strata reference and the TCQ3 12 GB emulation are posted; queue empty.
-- **Then:** idle. Queue empty after the bench report.
-- **Approvals:** from now on, outward commands go in a message to matt (--slug ask-TOPIC) and the queue goes on. This session is a Claude Code CLI session on the PC. It was not started with remote-control, and its allow rules are Matt's to set.
-- **On the PC:** the release packs TQ3 (G:\devel\rel\TQ3), TQ3-D4 (G:\devel\v010-test\...\models) and TQ4 (G:\devel\rel\Qwen3.8-Flash-Next-NanoSeedLM-TQ4); Unsloth's engram tables (G:\devel\unsloth-engram); the TQ3L12 / TQ4L12 / head banks; the v0.1.0 zips (G:\devel\v010-test*).
-- Rules: no run over about an hour on the PC; nothing on HF without a message to cloud.
+- **Working on (2026-11-06T22:15Z):** nothing. Matt is releasing this session.
+- **Queued for the next pc-cuda session** (cloud, msgs/2026-11-06T220625Z--cloud--pc-cuda--v011-windows-check.md), after cloud's "v0.1.1 draft" message:
+  - The Windows release check of the v0.1.1 zip, as for v0.1.0 (msgs/2026-11-06T203030Z--pc-cuda--cloud--release-check-6becc62c.md): SHA-256; START-HERE.bat TCQ3-D4 <models> with the new pinned revisions (small files download, banks checked); chat; run-TCQ3-D4.bat; one nslm-serve request.
+  - windows PASS/FAIL on the final main SHA that cloud names.
+- **For that session:**
+  - CI: G:/devel/ci-one.sh REV (reconfigures, then cl and clang-cl ctest) in G:/devel/NanoSeedLM-lfsr.
+  - Packs: TCQ3-D4 in G:/devel/v010-test/nslm-v0.1.0-windows-x64-cuda12.8/models (with the Q8_0 table hard-linked in Qwen3.8-Flash-Next-GGUF/engram); TCQ3 in G:/devel/rel/TQ3; TCQ4 in G:/devel/rel/Qwen3.8-Flash-Next-NanoSeedLM-TQ4.
+  - Pass start-script answers as arguments (TCQ3-D4 <folder>), never through stdin.
+  - Stop processes by PID.
+  - See msgs/...--pc-cuda--all--handoff-and-feedback.md.
+- **Rules:** no run over about an hour while Matt wants the PC; nothing on HF without a message to cloud; outward actions as ask-* messages to matt.
