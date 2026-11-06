@@ -67,4 +67,8 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | nslm-kld-ple4 (6aee1d9dc78863f9c634fd46): Q8_0 0.01991; Q8_0 with P3's 4-bit MLX PLE table 0.02588 (the saved BF16 reference) | rtx-pro-6000x2 ($5.50/h) | 7.3 | about $0.66 | about $22.98 |
 
-Left this week: about $2.02.
+| Linux CI f9353b3 (6aee28540e0338d1bb820865): serve-drafts S1-S3, build failed (test_serve_splitter) | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.06 |
+
+| Linux CI 765538e (6aee2912c78863f9c63517fd): serve-drafts S1-S3, 45 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.14 |
+
+Left this week: about $1.86.
