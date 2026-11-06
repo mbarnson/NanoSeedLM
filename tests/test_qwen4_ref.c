@@ -129,6 +129,23 @@ int main(void) {
         printf("logits: max |C - mlx-vlm| %.2e (row %d) of max |logit| %.3f, argmax differs in %d of %d rows\n", worst, worst_t,
                scale, argmax_diff, n);
         CHECK(worst < 1e-5 * scale && argmax_diff == 0, "logits differ from mlx-vlm");
+        qwen4_ref_kv_bf16(ref, 1);   // keys and values rounded to BF16 (plan K): near the f32 cache's logits, not equal
+        CHECK(qwen4_ref_forward(ref, ids, n, got) == 0, "forward, BF16 KV: %s", qwen4_ref_error(ref));
+        double kw = 0;
+        int kad = 0;
+        for (int t = 0; t < n; ++t) {
+            int a = 0, b = 0;
+            for (int v = 0; v < V; ++v) {
+                const double d = fabs((double) got[t * V + v] - want[t * V + v]);
+                if (d > kw) kw = d;
+                if (got[t * V + v] > got[t * V + a]) a = v;
+                if (want[t * V + v] > want[t * V + b]) b = v;
+            }
+            kad += a != b;
+        }
+        printf("logits with the BF16 KV cache: max |C - mlx-vlm| %.2e of max |logit| %.3f, argmax differs in %d of %d rows\n", kw, scale, kad, n);
+        CHECK(kw > 0 && kw < 2e-2 * scale && kad == 0, "the BF16 KV cache: logits %.2e from mlx-vlm's", kw);
+        qwen4_ref_kv_bf16(ref, 0);
         free(got);
         mtp_case(ref, ids, n, V);
         qwen4_ref_close(ref);

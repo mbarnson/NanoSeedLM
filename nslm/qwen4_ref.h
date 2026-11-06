@@ -18,3 +18,4 @@ int qwen4_ref_forward_h(Qwen4Ref* r, const int32_t* ids, int n, float* logits, f
 // later draft) -> logits[n][vocab] and the head's streams before its mixer, Hout[n][hc d] (may be NULL)
 int qwen4_ref_mtp(Qwen4Ref* r, const int32_t* tok, const float* Hin, int n, float* logits, float* Hout);
 const char* qwen4_ref_error(const Qwen4Ref* r);
+void qwen4_ref_kv_bf16(Qwen4Ref* r, int on);   // keys (after RoPE) and values rounded to BF16, as the engines' BF16 cache

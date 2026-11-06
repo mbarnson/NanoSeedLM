@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "lfsr.h"   // nslm_f2bf, nslm_bf2f
 #include "model_st.h"
 #include "moe.h"
 #include "qwen4_ops.h"
@@ -18,6 +19,7 @@ struct Qwen4Ref {
     NsModel nm;
     NsRows rows;
     Qwen4Ngram ng[QWEN4_MAX_LAYERS];   // by PLE index
+    int kv_bf16;                       // qwen4_ref_kv_bf16
     char err[256];
 };
 
@@ -152,6 +154,10 @@ static void attention(Qwen4Ref* r, const char* lp, const float* x, int n, float*
         qwen4_head_norm_rope(c, qp + (size_t) t * Hq * 2 * hd, Hq, 2 * hd, hd, qn, t);
         qwen4_head_norm_rope(c, kp + (size_t) t * Hkv * hd, Hkv, hd, hd, kn, t);
     }
+    for (size_t i = 0; r->kv_bf16 && i < (size_t) n * Hkv * hd; ++i) {   // the cache's precision: round to nearest even
+        kp[i] = nslm_bf2f(nslm_f2bf(kp[i]));
+        vp[i] = nslm_bf2f(nslm_f2bf(vp[i]));
+    }
     for (int j = 0; j < n / R; ++j) {   // block keys from the raw indexer keys (after the query heads)
         for (int u = 0; u < R; ++u) memcpy(raw + (size_t) u * D, ix + (size_t) (j * R + u) * iw + c->ix_heads * D, sizeof(float) * (size_t) D);
         qwen4_qsa_block(c, raw, ikn, j, blk + (size_t) j * D);
@@ -253,6 +259,7 @@ void qwen4_ref_close(Qwen4Ref* r) {
     free(r);
 }
 const Qwen4Cfg* qwen4_ref_cfg(const Qwen4Ref* r) { return &r->c; }
+void qwen4_ref_kv_bf16(Qwen4Ref* r, int on) { r->kv_bf16 = on != 0; }
 const char* qwen4_ref_error(const Qwen4Ref* r) { return r->err; }
 
 // One decoder layer named lp on the streams H: the attention (or DeltaNet layer l) and the MoE, each through its HC
