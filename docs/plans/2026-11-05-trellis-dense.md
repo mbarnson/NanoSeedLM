@@ -56,11 +56,11 @@ reads one row of the embedding (0.40 GB).
 | `self_attn.q_proj`, `k_proj`, `v_proj`, `o_proj` | `attn_q`, `attn_k`, `attn_v`, `attn_output` |
 | `mlp.shared_expert.gate_proj`, `up_proj`, `down_proj` | `ffn_gate_shexp`, `ffn_up_shexp`, `ffn_down_shexp` |
 | `attn_hc` and `mlp_hc` `input_mix_weight_up`, `_down`, `block_inject` | `hc_attn_up`, `_down`, `_inject` and `hc_ffn_*` |
-| `lm_head` | `output` |
+| `lm_head`, `embed_tokens` | `output`, `token_embd` |
 
 - The emulator decodes each tensor and writes it as Q8_0. It compares each tensor with Unsloth's Q8_0 tensor of that
   name. A relative error above 0.3 means that the rows have another order, and the emulator stops.
-- The routers (F32 in Unsloth's Q8_0), the norms, `conv1d`, the indexer and the embedding stay as they are.
+- The routers (F32 in Unsloth's Q8_0), the norms, `conv1d` and the indexer stay as they are.
 
 ## Hypotheses
 

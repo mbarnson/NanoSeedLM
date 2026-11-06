@@ -6,7 +6,9 @@ generator.
 
 **Status.** Draft. Matt asked on 2026-11-05 whether SeedLM has a future beside the trellis. L2 is done: the LFSR
 code is within 0.6% of 1MAD at K = 3, and 1.5% higher for `down_proj` at K = 4
-([the probe](../results/2026-11-05-lfsr-trellis-probe.md)).
+([the probe](../results/2026-11-05-lfsr-trellis-probe.md)). LA fails on Metal: a table code is slower than the
+computed 1MAD. An LFSR code through two tables would cost about 15% of decode
+([tables on the M4 Max](../results/2026-11-05-table-code-metal.md)). L3 waits for Matt's decision.
 
 ## Why
 

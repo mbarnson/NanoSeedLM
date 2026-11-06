@@ -801,3 +801,16 @@ LFSR code had the weighted error of 1MAD within 1%. Read [An LFSR code for the t
 On the trellis probe's rows, at L = 12, the LFSR code has the weighted error of 1MAD within 0.6% at K = 3. At K = 4 it
 is within 0.2% for `gate_proj` and `up_proj`, and 1.5% higher for `down_proj`. Step L2 of the LFSR plan. Read
 [The LFSR code against 1MAD](results/2026-11-05-lfsr-trellis-probe.md).
+
+## [2026-11-05] result | MTP drafts with trellis experts on the RTX 4080
+
+`7e42e52`, pc-cuda's RTX 4080: `ns_add_banks` now takes a bank L48 as the MTP head's. With its experts in trellis
+banks, the head joins the expert cache. Drafts then cost 236 to 301 slots, not 976 to 1,120, and they break even.
+The mix is 5% faster with one draft and 1% slower with two. K = 3 is 2% slower with two. Before, drafts were 6% to 12%
+slower. Drafts stay off by default on CUDA. Read [MTP drafts with trellis experts](results/2026-11-05-drafts-trellis-head-4080.md).
+
+## [2026-11-05] result | Trellis codes from tables on the M4 Max
+
+mac-metal's kernel bench: a 4,096-value table in threadgroup memory makes the trellis gathers slower than the computed
+1MAD (84 against 59 us a call). An LFSR code through two 64-value tables takes 95 us, about -15% in decode. So gate LA
+of the LFSR plan fails on Metal. Read [Trellis codes from tables](results/2026-11-05-table-code-metal.md).

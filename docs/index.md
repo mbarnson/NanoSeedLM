@@ -168,6 +168,10 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   K = 3 needs 51.2 GB of resident weights. The 32 GB PLE table stays on the SSD, and 13,000 tokens read 5.0 GB of it.
 - [2026-11-05: The LFSR code against 1MAD at L = 12](results/2026-11-05-lfsr-trellis-probe.md): weight error within
   0.6% at K = 3, and 1.5% higher for `down_proj` at K = 4.
+- [2026-11-05: MTP drafts with trellis experts on the RTX 4080](results/2026-11-05-drafts-trellis-head-4080.md): with
+  the head in trellis banks, drafts break even (-2% to +5%), against -6% to -12% before.
+- [2026-11-05: Trellis codes from tables on the M4 Max](results/2026-11-05-table-code-metal.md): slower than the
+  computed 1MAD. An LFSR code through two tables makes the gathers about 60% slower.
 
 ## For contributors and agents
 
