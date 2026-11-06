@@ -849,3 +849,9 @@ runs on the RTX 4080. The 8-bit dense weights cost speed there: TQ3-D4 decodes a
 with 4-bit dense weights, because the expert cache has 23% fewer slots. `00918f0` keeps the token embedding in host
 memory: 39.6 tokens per second, the same text. Read
 [The release packs from the Hub on the RTX 4080](results/2026-11-06-release-downloads-4080.md).
+
+## [2026-11-06] result | VRAM that grows with the context on the RTX 4080
+
+`354e2e1`: at 32K positions the RTX 4080's expert cache had 2,530 slots, not 4,431. The layer-major pass kept 1.3 GB.
+Passes of at most 8,192 rows give 474 more slots, decode +8% and prompts +43% to +47%, with the same text. That is now
+the default under 32 GB of VRAM. Read [VRAM that grows with the context](results/2026-11-06-context-vram-4080.md).

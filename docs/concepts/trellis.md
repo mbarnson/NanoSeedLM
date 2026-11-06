@@ -40,7 +40,9 @@ The units are tokens per second. The percentages compare with P3 at the same res
 
 The release packs have 8-bit dense weights. On the RTX 4080 these take about 23% of the cache's slots. So TQ3-D4
 decodes at 39.6 tokens per second and TQ3 at 43, with the token embedding in host memory. Read
-[The release packs from the Hub on the RTX 4080](../results/2026-11-06-release-downloads-4080.md).
+[The release packs from the Hub on the RTX 4080](../results/2026-11-06-release-downloads-4080.md). A long context takes
+VRAM from the cache too: at 32K, `nslm-serve` has 3,004 slots with passes of 8,192 rows (the default under 32 GB). Read
+[VRAM that grows with the context](../results/2026-11-06-context-vram-4080.md).
 
 On the M4 Max all experts stay in unified memory. There, every trellis pack decodes about 2% faster than P3 and reads
 prompts at P3's speed. Read [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md). Memory
@@ -114,6 +116,8 @@ shared memory, then uses the same tensor-core GEMM as the seeds. The Metal kerne
 - [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md): decode, prompt and the files' sizes.
 - [The release packs from the Hub on the RTX 4080](../results/2026-11-06-release-downloads-4080.md): download tests
   and the speed with 8-bit dense weights.
+- [VRAM that grows with the context on the RTX 4080](../results/2026-11-06-context-vram-4080.md): the pass, forward
+  and KV buffers at 32K.
 
 ## See also
 
