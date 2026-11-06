@@ -75,4 +75,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 69c7238 (6aee305dc78863f9c6352521): serve draft log line, 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.30 |
 
-Left this week: about $1.70.
+| Linux CI 73abfdf (6aee31f80e0338d1bb821943): nslm-chat drafts at any temperature, 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.38 |
+
+Left this week: about $1.62.
