@@ -77,4 +77,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 73abfdf (6aee31f80e0338d1bb821943): nslm-chat drafts at any temperature, 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.38 |
 
-Left this week: about $1.62.
+| Linux CI 304d415 (6aee38a8c78863f9c635314f): draft confidence gate (A1), 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.46 |
+
+Left this week: about $1.54.
