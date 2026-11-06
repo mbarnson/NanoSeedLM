@@ -106,7 +106,7 @@ expert weights, their dense weights, and the runtimes that load them.
 - **KL as shipped** is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2. Lower is closer to the
   original model. P4 as shipped is not measured yet.
 - **Engines** are the NanoSeedLM engines: CUDA on Linux and Windows, Metal on macOS. oMLX needs the fix in
-  [jundot/omlx#5112]({OMLX_PR}). We tested oMLX with P3, P4 and TCQ4, and mlx-vlm with P3 and TCQ4.
+  [jundot/omlx#5112]({OMLX_PR}). We tested each pack in oMLX, and P3 and TCQ4 in mlx-vlm.
 
 **The trade-offs.**
 
@@ -131,6 +131,11 @@ Decode in tokens per second: `nslm-serve --ctx 32768` with the Q8_0 PLE table, 4
 | Pack | {M4} | {RTX} |
 |---|---|---|
 {dec}
+
+**MTP drafts** (engine v0.1.1). Set `Q4E_DRAFTS=2` and `Q4E_DRAFT_MIN_P=0.3`. Then the M4 Max decodes TCQ4 32% faster
+at temperature 0 and 16% faster at 1.0. At temperature 0 the text does not change. On the RTX 4080, drafts break even,
+so they stay off there. The start script turns them on for a Mac. Read the gates on
+[the M4 Max]({DOCS}2026-11-06-draft-gates-m4max.md) and [the RTX 4080]({DOCS}2026-11-06-draft-gates-4080.md).
 
 ## Why NanoSeedLM
 
@@ -233,8 +238,8 @@ def tcq(name, k):
              "TCQ3": "K = 3 for `gate_proj`, `up_proj` and `down_proj`"}[name]
     m, (d, d30, _) = next(iter(SPEED[name].items()))
     uns = "\n".join(f"| Unsloth {n} | {b:.3f} | {v:.4f} |" for n, b, v in UNSLOTH)
-    omlx_note = ("We tested this repository's files in oMLX and in mlx-vlm 0.7.12. In oMLX, MTP on gives the same text "
-                 "as MTP off, and the PLE table stays on the SSD.") if name == "TCQ4" else "We tested this fix with TCQ4, not with this pack yet."
+    omlx_note = "We tested this repository's files in oMLX: MTP on gives the same text as MTP off, and the PLE table stays on the SSD." + \
+        (" We also tested them in mlx-vlm 0.7.12." if name == "TCQ4" else "")
     tested = ("- We emulated a 12 GB GPU on the RTX 4080, with 4 GB more of VRAM kept free. We did not test a PC with 64 GB\n"
               "  of RAM yet. There, close other large programs: the experts and the page cache need most of the RAM.\n") if name == "TCQ3" else ""
     return f"""{yaml(name)}

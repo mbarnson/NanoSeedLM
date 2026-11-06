@@ -934,3 +934,9 @@ per second, against 38, mostly by decode without drafts. Read [the gates](result
 
 On the RTX 4080 with 4 GB more of VRAM kept free, TCQ3 decodes at 27 tokens per second, against 44 with all 16 GB. Read
 [TCQ3 on a 12 GB GPU](results/2026-11-06-tcq3-12gb.md).
+
+## [2026-11-06] result | MTP drafts in nslm-serve on the M4 Max
+
+With A1m, A2m and the merged projections (`b911cb5`), 2 drafts at `Q4E_DRAFT_MIN_P=0.3` make TCQ4 decode 32% faster at
+temperature 0, with the same text, and 16% faster at 1.0. The start script of v0.1.1 turns them on for a Mac. Read
+[the gates on the M4 Max](results/2026-11-06-draft-gates-m4max.md).
