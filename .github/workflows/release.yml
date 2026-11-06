@@ -79,18 +79,25 @@ jobs:
         env:
           NSLM_CMAKE_ARGS: -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
         run: win\build.bat
+      - name: smoke test
+        shell: cmd
+        run: |
+          build\bin\nslm-serve.exe > serve.log 2>&1
+          set rc=%errorlevel%
+          type serve.log
+          echo nslm-serve exit code %rc% (2: the usage, so the binary starts)
+          if not "%rc%"=="2" exit /b 1
       - name: package
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $false   # PowerShell 7: a native exit code is not an error here
-          & build\bin\nslm-serve.exe *> $null; if ($LASTEXITCODE -ne 2) { throw "nslm-serve did not start ($LASTEXITCODE)" }
           $d = "nslm-$env:TAG-windows-x64-cuda12.8"
           New-Item -ItemType Directory "$d\build\bin" | Out-Null
           Copy-Item build\bin\nslm-chat.exe, build\bin\nslm-serve.exe "$d\build\bin\"
           Copy-Item LICENSE, start\START-HERE.bat, start\start-here.ps1 $d
           (Get-Content tools\release-readme.txt) -replace '@TAG@', $env:TAG -replace '@SHA@', $env:GITHUB_SHA | Set-Content "$d\README.txt"
+          Get-ChildItem -Recurse $d | ForEach-Object { Write-Host $_.FullName $_.Length }
           Compress-Archive -Path $d -DestinationPath "$d.zip"
+          Get-Item "$d.zip" | ForEach-Object { Write-Host $_.Name $_.Length }
       - uses: actions/upload-artifact@v4
         with: {name: windows, path: "nslm-*.zip"}
 
