@@ -62,6 +62,8 @@ Work that is not done yet, with its gates and hypotheses.
   64, 96 and 128 GB of RAM and a 12 GB GPU. Each must match an Unsloth V3.1 pack.
 - [2026-11-05: Prompt attention that loads each key tile once for several rows](plans/2026-11-05-qwen38-shared-tile-attention.md):
   stopped: 2.7 times fewer key loads, but 1.7 times slower.
+- [2026-11-06: The KV cache of Qwen3.8-Flash-Next in BF16](plans/2026-11-06-qwen4-kv-bf16.md): draft. About 0.8 GB at
+  32K for the expert cache, on CUDA and Metal.
 
 ## Results
 

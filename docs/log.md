@@ -855,3 +855,9 @@ memory: 39.6 tokens per second, the same text. Read
 `354e2e1`: at 32K positions the RTX 4080's expert cache had 2,530 slots, not 4,431. The layer-major pass kept 1.3 GB.
 Passes of at most 8,192 rows give 474 more slots, decode +8% and prompts +43% to +47%, with the same text. That is now
 the default under 32 GB of VRAM. Read [VRAM that grows with the context](results/2026-11-06-context-vram-4080.md).
+
+## [2026-11-06] plan | The KV cache of Qwen3.8-Flash-Next in BF16
+
+Both engines keep the keys and values of the 12 attention layers in f32: 48 KB a position, about 1.6 GB at 32K. The
+plan stores them in BF16, as MLX does, and gives the RTX 4080's expert cache about 300 more slots at 32K. Read
+[The KV cache in BF16](plans/2026-11-06-qwen4-kv-bf16.md).
