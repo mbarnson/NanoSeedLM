@@ -11,6 +11,7 @@
 
 #include "emulate.h"
 #include "moe.h"
+#include "qwen4_cfg.h"
 
 static uint8_t* read_map(const char* path, size_t* n) {
     FILE* f = fopen(path, "rb");
@@ -61,7 +62,9 @@ int main(int argc, char** argv) {
         if (ns_open(&m[k], dirs[k], err, sizeof err) && ns_open_bank(&m[k], dirs[k], err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
         pk[k] = &m[k];
     }
-    if (densef && ns_open(&dm, densef, err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
+    Qwen4Cfg cfg;
+    if (densef && (ns_open(&dm, densef, err, sizeof err) || qwen4_cfg_load(&cfg, densef, err, sizeof err))) { fprintf(stderr, "%s\n", err); return 1; }
+    const NsGdnHeads gh = densef ? (NsGdnHeads) {cfg.lin_hk, cfg.lin_hv, cfg.lin_dk, cfg.lin_dv} : (NsGdnHeads) {0, 0, 0, 0};
     int want = 0, done = 0, rc = 0;
     double bytes = 0, weights = 0;
     for (int i = 0; np && i < m[0].n; ++i) {   // the main layers: the GGUF keeps the MTP layer in another file
@@ -83,7 +86,7 @@ int main(int argc, char** argv) {
         const time_t t0 = time(NULL);
         int n = 0, nd = 0;
         if (np && (rc = ns_emulate_gguf(pk, np, map, ml, files[f], workers, &n, err, sizeof err))) fprintf(stderr, "%s\n", err);
-        else if (densef && (rc = ns_emulate_dense(&dm, files[f], &nd, err, sizeof err))) fprintf(stderr, "%s\n", err);
+        else if (densef && (rc = ns_emulate_dense(&dm, &gh, files[f], &nd, err, sizeof err))) fprintf(stderr, "%s\n", err);
         else printf("%s: %d expert tensors, %d dense tensors, %ld s\n", files[f], n, nd, (long) (time(NULL) - t0));
         fflush(stdout);
         done += n;

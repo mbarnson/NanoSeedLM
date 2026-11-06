@@ -81,6 +81,19 @@ static void write_dense_gguf(const char* path, const uint8_t* qkv, size_t nq, co
     fclose(f);
 }
 
+// Two Q8_0 tensors of 32 columns, rows0 and rows1 rows, back to back (rows0 * 34 is a multiple of 32)
+static void write_gguf2(const char* path, const char* n0, int rows0, const char* n1, int rows1, const uint8_t* data, size_t n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { printf("FAIL: cannot write %s\n", path); exit(1); }
+    put(f, "GGUF", 4); put_u32(f, 3); put_u64(f, 2); put_u64(f, 1);
+    put_str(f, "general.alignment"); put_u32(f, 4); put_u32(f, 32);
+    put_str(f, n0); put_u32(f, 2); put_u64(f, 32); put_u64(f, rows0); put_u32(f, 8); put_u64(f, 0);
+    put_str(f, n1); put_u32(f, 2); put_u64(f, 32); put_u64(f, rows1); put_u32(f, 8); put_u64(f, (uint64_t) rows0 * 34);
+    while (ftell(f) % 32) fputc(0, f);
+    put(f, data, n);
+    fclose(f);
+}
+
 int main(void) {
     mkdir("out", 0755);
     // f16: nearest, ties to even, subnormals, overflow
@@ -195,7 +208,7 @@ int main(void) {
             for (int r = 0; r < RQ; ++r) memcpy(q2 + r * 68, qkv + (c ? RQ - 1 - r : r) * 68, 68);
             write_dense_gguf(dp, q2, sizeof q2, out, sizeof out);
             int nt = 0;
-            const int rc = ns_emulate_dense(&dm, dp, &nt, err, sizeof err);
+            const int rc = ns_emulate_dense(&dm, NULL, dp, &nt, err, sizeof err);
             Gguf g;
             CHECK(gguf_open(&g, dp, err + 256, 256) == 0, "reopen the dense shard");
             const uint8_t* at = g.map + g.data;
@@ -205,6 +218,43 @@ int main(void) {
             gguf_close(&g);
         }
         ns_close(&dm);
+    }
+
+    // DeltaNet: llama.cpp tiles the value heads (head g hk + k) where MLX groups them (head k hv / hk + g)
+    {
+        const NsGdnHeads gh = {2, 4, 8, 8};   // hk, hv, dk, dv: in_proj_qkv 2 hk dk + hv dv = 64 rows, out_proj 32 columns
+        const char* gn[2] = {"language_model.model.layers.0.linear_attn.in_proj_qkv.weight", "language_model.model.layers.0.linear_attn.out_proj.weight"};
+        const NsSpec sp[2] = {{gn[0], NS_BF16, 1, 64, 32}, {gn[1], NS_BF16, 1, 32, 32}};
+        NsModel gm;
+        mkdir("out/test_emulate_gdn", 0755);
+        CHECK(ns_write("out/test_emulate_gdn", sp, 2, 1u << 20, NULL, bf16_fill, NULL, err, sizeof err) == 0 &&
+              ns_open(&gm, "out/test_emulate_gdn", err, sizeof err) == 0, "gdn pack: %s", err);
+        static const int vh[4] = {0, 2, 1, 3};   // the MLX head of llama.cpp's value head h
+        uint8_t want[96 * 34], shard[96 * 34];   // attn_qkv's 64 rows, then ssm_out's 32 (llama.cpp's order)
+        float w[32], u[32];
+        for (int r = 0; r < 96; ++r) {   // qkv: q and k as MLX's, v in head blocks of 8; out_proj: columns in head blocks
+            if (r < 64) ns_row_f32(nr, ns_find(&gm, gn[0]), 0, r < 32 ? r : 32 + vh[(r - 32) / 8] * 8 + (r - 32) % 8, 0, w);
+            else {
+                ns_row_f32(nr, ns_find(&gm, gn[1]), 0, r - 64, 0, u);
+                for (int c = 0; c < 32; ++c) w[c] = u[vh[c / 8] * 8 + c % 8];
+            }
+            ns_q8_0_row(w, 32, want + r * 34);
+            for (int c = 0; c < 32; ++c) w[c] *= 1.0f + 0.01f * (float) ((int) (next() % 3) - 1);
+            ns_q8_0_row(w, 32, shard + r * 34);
+        }
+        const char* gp = "out/test_emulate_gdn.gguf";
+        for (int c = 0; c < 2; ++c) {   // with the heads: written as llama.cpp's order; without: refused
+            write_gguf2(gp, "blk.0.attn_qkv.weight", 64, "blk.0.ssm_out.weight", 32, shard, sizeof shard);
+            int nt = 0;
+            const int rc = ns_emulate_dense(&gm, c ? NULL : &gh, gp, &nt, err, sizeof err);
+            Gguf g;
+            CHECK(gguf_open(&g, gp, err + 256, 256) == 0, "reopen the gdn shard");
+            const uint8_t* at = g.map + g.data;
+            if (!c) CHECK(rc == 0 && nt == 2 && !memcmp(at, want, sizeof want), "gdn: rc %d, %d tensors, %s", rc, nt, err);
+            else CHECK(rc != 0 && strstr(err, "row order"), "gdn without heads: rc %d, %s", rc, err);
+            gguf_close(&g);
+        }
+        ns_close(&gm);
     }
 
     for (int i = 0; i < 2; ++i) ns_close(&m[i]);

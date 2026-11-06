@@ -4,7 +4,8 @@
 them, as Unsloth's dynamic packs do. Then a decode token reads fewer bytes than with the 4-bit MLX dense weights, and
 every pack has a KL measured as it is shipped.
 
-**Status.** Draft. Matt asked for it on 2026-11-05 and approved the HF jobs within the weekly cap.
+**Status.** Draft. Matt asked for it on 2026-11-05 and approved the HF jobs within the weekly cap. D0's emulator is
+on `main`. It maps DeltaNet's value heads, which llama.cpp keeps in another order (see How the emulation works).
 
 ## Why
 
@@ -60,6 +61,10 @@ reads one row of the embedding (0.40 GB).
 
 - The emulator decodes each tensor and writes it as Q8_0. It compares each tensor with Unsloth's Q8_0 tensor of that
   name. A relative error above 0.3 means that the rows have another order, and the emulator stops.
+- llama.cpp tiles DeltaNet's 48 value heads (head g x 16 + k), and MLX groups them by key head (head 3 k + g). The
+  emulator maps the rows of `in_proj_a`, `in_proj_b` and `in_proj_z`, the v rows of `in_proj_qkv` and the columns of
+  `out_proj`. Rows of P3 and of Unsloth's Q8_0 shards, read over HTTP, then agree within 0.08 to 0.10 for every kind
+  in layers 0 and 20. Without the map, the DeltaNet tensors differ by 0.5 to 1.4.
 - The routers (F32 in Unsloth's Q8_0), the norms, `conv1d` and the indexer stay as they are.
 
 ## Hypotheses

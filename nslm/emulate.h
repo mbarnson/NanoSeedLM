@@ -13,7 +13,10 @@ void ns_q8_0_row(const float* x, int n, uint8_t* out);   // llama.cpp quantize_r
 // packs[0] when map is NULL.  All are checked before any is written.  *n: tensors written.  0, or -1 with err.
 int ns_emulate_gguf(const NsModel* const* packs, int np, const uint8_t* map, size_t map_len, const char* gguf, int workers,
                     int* n, char* err, int errlen);
+typedef struct { int hk, hv, dk, dv; } NsGdnHeads;   // Gated DeltaNet key and value heads and their widths (lin_*)
 // Each Q8_0 dense tensor of the shard with an engine name (DeltaNet, attention, shared experts, hyper-connections,
-// lm_head, embedding) from the pack's tensor of that name, as Q8_0 rows.  All are checked first: a tensor whose sampled
-// rows differ from the shard's own by more than 0.3 (relative) has another row order, and nothing is written.
-int ns_emulate_dense(const NsModel* pack, const char* gguf, int* n, char* err, int errlen);
+// lm_head, embedding) from the pack's tensor of that name, as Q8_0 rows.  llama.cpp tiles DeltaNet's value heads (head
+// g hk + k) where MLX groups them (head k hv / hk + g): gdn maps them (NULL: no DeltaNet).  All are checked first: a
+// tensor whose sampled rows differ from the shard's own by more than 0.3 (relative) has another order, and nothing is
+// written.  *n: tensors written.  0, or -1 with err.
+int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* gguf, int* n, char* err, int errlen);

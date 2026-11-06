@@ -71,7 +71,35 @@ static int dense_name(const char* g, char* out, size_t len) {
     return 0;
 }
 
-typedef struct { const NsTensor* t[NS_EMU_PACKS]; uint64_t off; int lp; } EmTensor;   // + Q8_0 offset, 3 L + p
+// A DeltaNet tensor's value-head axis: none, rows by head (a, b), rows by head block (z), the v rows of qkv, columns (out)
+enum { GDN_NONE, GDN_HEADS, GDN_BLOCKS, GDN_QKV, GDN_COLS };
+static int gdn_kind(const char* name) {
+    static const char* kSuf[] = {"in_proj_a.weight", "in_proj_b.weight", "in_proj_z.weight", "in_proj_qkv.weight", "out_proj.weight"};
+    static const int kKind[] = {GDN_HEADS, GDN_HEADS, GDN_BLOCKS, GDN_QKV, GDN_COLS};
+    const char* at = strstr(name, ".linear_attn.");
+    for (int i = 0; at && i < 5; ++i) if (!strcmp(at + 13, kSuf[i])) return kKind[i];
+    return GDN_NONE;
+}
+static int vhead(const NsGdnHeads* q, int h) { return h % q->hk * (q->hv / q->hk) + h / q->hk; }   // llama.cpp's h: MLX's
+static int gdn_ok(const NsGdnHeads* q, int kind, const NsTensor* t) {
+    const int vd = q->hv * q->dv;
+    return kind == GDN_HEADS ? t->rows == q->hv : kind == GDN_BLOCKS ? t->rows == vd : kind == GDN_QKV ? t->rows == 2 * q->hk * q->dk + vd :
+           kind == GDN_COLS ? t->cols == vd : 1;
+}
+// Row r of the shard's tensor from the pack's t, in llama.cpp's head order (tmp: t->cols floats for the columns)
+static void shard_row(const NsRows* nr, const NsTensor* t, const NsGdnHeads* q, int kind, int r, float* w, float* tmp) {
+    const int v0 = kind == GDN_QKV ? 2 * q->hk * q->dk : 0, dv = q ? q->dv : 1;
+    if (kind == GDN_COLS) {
+        ns_row_f32(nr, t, 0, r, 0, tmp);
+        for (int c = 0; c < t->cols; ++c) w[c] = tmp[vhead(q, c / dv) * dv + c % dv];
+        return;
+    }
+    const int src = kind == GDN_HEADS ? vhead(q, r) : (kind == GDN_BLOCKS || kind == GDN_QKV) && r >= v0 ?
+                    v0 + vhead(q, (r - v0) / dv) * dv + (r - v0) % dv : r;
+    ns_row_f32(nr, t, 0, src, 0, w);
+}
+
+typedef struct { const NsTensor* t[NS_EMU_PACKS]; uint64_t off; int lp; } EmTensor;   // lp: 3 L + p, or a DeltaNet kind   // + Q8_0 offset, 3 L + p
 typedef struct {
     const EmTensor* t;
     const uint8_t* map;
@@ -170,34 +198,37 @@ int ns_emulate_gguf(const NsModel* const* packs, int np, const uint8_t* map, siz
     return rc ? -1 : 0;
 }
 
-int ns_emulate_dense(const NsModel* pack, const char* gguf, int* n, char* err, int errlen) {
+int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* gguf, int* n, char* err, int errlen) {
     *n = 0;
     Gguf g;
     if (gguf_open(&g, gguf, err, errlen)) return -1;
     EmTensor* et = (EmTensor*) malloc(sizeof *et * (size_t) (g.n ? g.n : 1));
     NsRows* nr = (NsRows*) malloc(sizeof *nr);
     ns_rows_init(nr);
-    float* w = NULL;
+    float* w = NULL, *tmp = NULL;
     uint8_t* buf = NULL;
     int nt = 0, rc = 0;
+    if (gdn && (gdn->hk < 1 || gdn->hv % gdn->hk || gdn->dv < 1)) rc = snprintf(err, (size_t) errlen, "DeltaNet heads %d / %d", gdn->hk, gdn->hv);
     for (int i = 0; i < g.n && !rc; ++i) {   // check every dense tensor first
         const GgufTensor* gt = &g.t[i];
         char name[160];
         if (!dense_name(gt->name, name, sizeof name)) continue;
         const NsTensor* t = ns_find(pack, name);
         const size_t rb = t ? (size_t) t->cols / 32 * 34 : 0;
-        if (!t || gt->type != 8 || gt->ndim != 2 || gt->dims[0] != t->cols || gt->dims[1] != t->rows ||
+        const int kind = gdn ? gdn_kind(name) : GDN_NONE;
+        if (!t || gt->type != 8 || gt->ndim != 2 || gt->dims[0] != t->cols || gt->dims[1] != t->rows || !(gdn ? gdn_ok(gdn, kind, t) : 1) ||
             t->slices != 1 || t->cols % 32 || g.data + gt->offset + rb * (uint64_t) t->rows > g.size) {
             rc = snprintf(err, (size_t) errlen, "%s: %s is not Q8_0 like the pack's %s", gguf, gt->name, name);
             break;
         }
         w = (float*) realloc(w, sizeof(float) * (size_t) t->cols);
+        tmp = (float*) realloc(tmp, sizeof(float) * (size_t) t->cols);
         double e2 = 0, w2 = 0;
         const int ns = t->rows < 16 ? t->rows : 16;
         for (int k = 0; k < ns; ++k) {   // the row order: 16 rows spread over the tensor, against the shard's own
             const int r = (int) ((int64_t) k * t->rows / ns);
             const uint8_t* q = (const uint8_t*) gguf_data(&g, gt) + rb * (size_t) r;
-            ns_row_f32(nr, t, 0, r, 0, w);
+            shard_row(nr, t, gdn, kind, r, w, tmp);
             for (int c = 0; c < t->cols; ++c) {
                 const uint8_t* b = q + (size_t) c / 32 * 34;
                 const double v = (double) f16_to_f32((uint16_t) (b[0] | b[1] << 8)) * (int8_t) b[2 + c % 32];
@@ -209,7 +240,7 @@ int ns_emulate_dense(const NsModel* pack, const char* gguf, int* n, char* err, i
             rc = snprintf(err, (size_t) errlen, "%s: %s is %.2f from the pack's %s: another row order", gguf, gt->name, sqrt(e2 / (w2 > 0 ? w2 : 1)), name);
             break;
         }
-        et[nt++] = (EmTensor) {{t}, g.data + gt->offset, 0};
+        et[nt++] = (EmTensor) {{t}, g.data + gt->offset, kind};
     }
     gguf_close(&g);   // before the writes: the mapping is read-only
     const int fd = rc || !nt ? -1 : open(gguf, O_RDWR);
@@ -218,15 +249,16 @@ int ns_emulate_dense(const NsModel* pack, const char* gguf, int* n, char* err, i
         const NsTensor* t = et[i].t[0];
         const size_t rb = (size_t) t->cols / 32 * 34;
         w = (float*) realloc(w, sizeof(float) * (size_t) t->cols);
+        tmp = (float*) realloc(tmp, sizeof(float) * (size_t) t->cols);
         buf = (uint8_t*) realloc(buf, rb);
         for (int r = 0; !rc && r < t->rows; ++r) {
-            ns_row_f32(nr, t, 0, r, 0, w);
+            shard_row(nr, t, gdn, et[i].lp, r, w, tmp);
             ns_q8_0_row(w, t->cols, buf);
             if (pwrite(fd, buf, rb, (off_t) (et[i].off + rb * (uint64_t) r)) != (ssize_t) rb) rc = snprintf(err, (size_t) errlen, "%s: a write failed", gguf);
         }
     }
     if (fd >= 0 && close(fd) && !rc) rc = snprintf(err, (size_t) errlen, "%s: a write failed", gguf);
-    free(w); free(buf); free(nr); free(et);
+    free(w); free(tmp); free(buf); free(nr); free(et);
     *n = rc ? 0 : nt;
     return rc ? -1 : 0;
 }
