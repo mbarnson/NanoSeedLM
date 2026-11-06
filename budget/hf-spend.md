@@ -24,7 +24,7 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 7eb5d9b (6aed60c8c78863f9c633dadc): the DeltaNet head order | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.77 |
 
-| nslm-kld-d0 (6aed6158c78863f9c633db32), running: Q8_0, the mix /mlx, P3 /mlx against BF16 (saves the reference to /b/kld-ref) | rtx-pro-6000x4 ($11/h) | expected about 30, at most 50 | expected about $5.50, at most $9.17 | |
+| nslm-kld-d0 (6aed6158c78863f9c633db32): Q8_0, the mix /mlx, P3 /mlx against BF16 (saved the reference to /b/kld-ref) | rtx-pro-6000x4 ($11/h) | 24.9 | $4.56 | about $10.41 |
 
 | Linux CI 99cf18a (6aed64300e0338d1bb80e49a): nslm-qwen4-pack --tq | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | |
 | nslm-kld-r3 (6aed64480e0338d1bb80e4a3), running: Q8_0, TQ3 /mlx, TQ4 /mlx with the saved reference | rtx-pro-6000x2 ($5.50/h) | expected about 30, at most 50 | expected about $3, at most $4.58 | |
