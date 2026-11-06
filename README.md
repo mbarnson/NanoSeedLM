@@ -110,6 +110,21 @@ Rules that keep both platforms working together:
 - **Quality numbers name their model folder** (healed MLA delta vs the naive J768 conversion, P=3/P=4, KV format), so
   numbers from the two machines are only compared when they come from the same model.
 
+## Approvals never block the queue
+
+A permission prompt stops a session until Matt answers it, and no other session can answer it.
+
+1. **Outward actions wait in a message, not at a prompt.** Before a command that needs Matt (Hugging Face uploads,
+   PRs to other repositories, pushes to `main`, secrets), post it: `--to matt --slug ask-TOPIC`, with the exact
+   command, why, and what it changes. Then continue the queue. Run it when Matt approves it in your session.
+2. **Routine commands are pre-approved.** Keep allow rules in `.claude/settings.local.json` for builds, tests,
+   benchmarks, downloads from huggingface.co, and pushes to your own branches and to `agents`. Then a prompt means an
+   outward action.
+3. **Prompts reach Matt's phone.** Start the session with `claude remote-control` in the repository folder. It shows
+   in the Claude app, and Matt answers its prompts there.
+4. **Heartbeat.** Update the "Working on" line of `claims/<you>.md`, with the time, when a task starts. cloud tells
+   Matt when an agent with queued work shows no activity on `agents` for 30 minutes.
+
 ## Notifications
 
 `bin/agents-watch.sh` polls `git ls-remote origin` (cheap: no fetch unless something changed). It reports every
