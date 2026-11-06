@@ -158,6 +158,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   the mix with P3's KL decodes 27% faster and reads prompts 22% faster. K = 3 is 43% and 61% faster.
 - [2026-11-05: Trellis experts on the M4 Max: decode and prompt against P3](results/2026-11-05-trellis-speed-m4max.md):
   about 2% faster than P3, prompts at its speed. K = 4 has a third less KL at P3's speed.
+- [2026-11-05: The VRAM reserve on the RTX 4080](results/2026-11-05-vram-reserve-4080.md): 1,024 MB instead of 2,560 on
+  a display GPU gives the expert cache about 20% more slots and decode 8% to 9% more speed.
 
 ## For contributors and agents
 

@@ -4,11 +4,12 @@
 
 #include <cuda_runtime_api.h>
 
-// NSLM_VRAM_RESERVE_MB; else 2560 MB on a GPU that drives a display (it has a kernel time limit: WDDM, X11); else 512
+// NSLM_VRAM_RESERVE_MB; else 1024 MB on a GPU that drives a display (it has a kernel time limit: WDDM, X11); else 512.
+// 1024: about twice the margin where WDDM began to page on the RTX 4080 with a desktop (512 MB was slower)
 static inline double nslm_vram_reserve_mb(void) {
     const char* s = getenv("NSLM_VRAM_RESERVE_MB");
     int dev = 0, limit = 0;
     if (s) return atof(s);
     cudaGetDevice(&dev);
-    return cudaDeviceGetAttribute(&limit, cudaDevAttrKernelExecTimeout, dev) == cudaSuccess && limit ? 2560 : 512;
+    return cudaDeviceGetAttribute(&limit, cudaDevAttrKernelExecTimeout, dev) == cudaSuccess && limit ? 1024 : 512;
 }

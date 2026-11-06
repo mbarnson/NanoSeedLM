@@ -17,7 +17,7 @@
 
 | Variable | Default | Use |
 |---|---|---|
-| `NSLM_VRAM_RESERVE_MB` | 512. Qwen3.8-Flash-Next: 2560 on a GPU that drives a display | VRAM to keep free. The Qwen3.8-Flash-Next expert cache shrinks to keep it |
+| `NSLM_VRAM_RESERVE_MB` | 512. Qwen3.8-Flash-Next: 1024 on a GPU that drives a display | VRAM to keep free. The Qwen3.8-Flash-Next expert cache shrinks to keep it. Set it higher if another program on the GPU needs VRAM while the model runs |
 | `NSLM_EXPERT_MIN_MB` | 6144 | VRAM to keep for experts when the KV cache is large |
 | `NSLM_KV_VRAM_MB`, `NSLM_EXPERT_VRAM_MB` | | Fixed VRAM shares for the KV cache and the experts |
 | `NSLM_CACHE_STATS=1` | off | Write the expert cache hits at exit |

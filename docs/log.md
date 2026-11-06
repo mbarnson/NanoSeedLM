@@ -766,3 +766,10 @@ K = 3 decode at 49.7 tokens per second, against P3's 39.1 (+27%). Prompts are 22
 8,506-token prompt at P3's speed. All experts stay in unified memory, so there is no PCIe copy to save. Trellis K = 4
 has a KL of 0.0398 against P3's 0.0600 for 1.9 GB more, and K = 3 needs 13.2 GB less. Read
 [Trellis experts on the M4 Max](results/2026-11-05-trellis-speed-m4max.md).
+
+## [2026-11-05] engine | The VRAM reserve of a display GPU: 1,024 MB
+
+The expert cache now keeps 1,024 MB free on a GPU that drives a display, not 2,560 (`engine/vram.h`). On pc-cuda's
+RTX 4080 that gives about 20% more slots and 8% to 9% faster decode, for P3 (42.2 tokens per second) and the trellis
+packs (the mix 54.4, K = 3 61.3). 512 MB is slower, because WDDM pages VRAM. Read
+[The VRAM reserve on the RTX 4080](results/2026-11-05-vram-reserve-4080.md).
