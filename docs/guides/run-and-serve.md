@@ -75,6 +75,26 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 - **Sampling.** The defaults are `temperature` 1.0 and `top_p` 0.95, as IFM recommends. `temperature` 0 gives greedy
   decode. `top_k`, `min_p` and `seed` are per request.
 
+### Access
+
+By default the server listens on 127.0.0.1, and only programs on this machine can use it.
+
+- **No key (the default).** The server takes a request only with a Host header of `localhost`, `127.0.0.1` or `[::1]`.
+  So a web page cannot reach it through DNS rebinding.
+- **Browser pages.** The server refuses a request with an `Origin` header, so a page in your browser cannot use it.
+  For a web UI on this machine, give its origin: `--allow-origin http://localhost:3000`.
+- **Other machines.** To listen on a LAN address or 0.0.0.0, set an API key. Without one, the server does not start.
+  Set the key in `NSLM_API_KEY`, not in `--api-key`: other users of the machine can read the command line. Clients
+  send `Authorization: Bearer KEY`. With a key, the server takes any Host header.
+
+```bash
+NSLM_API_KEY=$(openssl rand -hex 24) out/bin/nslm-serve --model MODEL_DIR --host 0.0.0.0 --port 8080
+```
+
+- Use TLS from a reverse proxy (for example Caddy or nginx) when the server is reachable from a network that you do not
+  control. The server itself speaks plain HTTP.
+- `tools/serve_guard_check.sh URL [KEY [ORIGIN]]` checks these rules against a running server.
+
 ### Continuous batching
 
 Requests that arrive at the same time share the GPU.

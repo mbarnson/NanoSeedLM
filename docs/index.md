@@ -70,6 +70,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
 
 - [2026-11-06: MTP drafts in nslm-serve, with sampling](plans/2026-11-06-serve-drafts.md): draft. Speculative sampling with
   the MTP head's drafts, so the server drafts at any temperature with its sampler's distribution.
+- [2026-11-06: An nslm-serve that a stranger cannot use](plans/2026-11-06-server-hardening.md): in progress. An API key
+  off loopback, no wildcard CORS, a loopback Host, sanitizers in CI, hardening flags.
 - [2026-11-06: MTP drafts that the sampler keeps more often](plans/2026-11-06-draft-acceptance.md): draft. Drafts sampled
   from the head's distribution, as Strata does, and a confidence gate. For the RTX 4080's bar of 60 tokens per second.
 - [2026-10-06: GQA seed model against BF16 and Q4](results/2026-10-06-gqa-seed-model.md): seeded experts against

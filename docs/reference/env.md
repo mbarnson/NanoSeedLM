@@ -5,6 +5,7 @@
 | Variable | Default | Use |
 |---|---|---|
 | `NSLM_MODEL_DIR` | | The model folder for the tests (Windows build) |
+| `NSLM_API_KEY=KEY` | | `nslm-serve`: each request needs `Authorization: Bearer KEY`. Needed to listen off loopback (`--host`) |
 
 ## Metal engine
 

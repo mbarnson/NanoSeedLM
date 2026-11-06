@@ -49,6 +49,23 @@ else()
   add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off> $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>)
   set(PLATFORM_LIBS pthread m)
 endif()
+# -DNSLM_SANITIZE=ON: host code with AddressSanitizer and UndefinedBehaviorSanitizer (LeakSanitizer with them on Linux),
+# for the sanitizer CI job. Otherwise the hardening flags of a release: stack protector, FORTIFY_SOURCE, full RELRO, CFG.
+option(NSLM_SANITIZE "Host code with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(NSLM_SANITIZE AND MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/fsanitize=address>)
+elseif(NSLM_SANITIZE)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address,undefined> $<$<COMPILE_LANGUAGE:C,CXX>:-fno-sanitize-recover=undefined>
+                      $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>)
+  add_link_options(-fsanitize=address,undefined)
+elseif(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>)
+  add_link_options(LINKER:/guard:cf)
+else()
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fstack-protector-strong>
+                      $<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<NOT:$<CONFIG:Debug>>>:-D_FORTIFY_SOURCE=2>)
+  add_link_options(LINKER:-z,relro,-z,now)
+endif()
 # device code: the kernels decide where FMA is allowed (__fmul_rn / __fadd_rn where it is not)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
 
@@ -93,6 +110,8 @@ set_tests_properties(test_mova_cfg PROPERTIES SKIP_RETURN_CODE 77)   # 77: no mo
 if(NSLM_MODEL_DIR)
   set_tests_properties(test_mova_cfg PROPERTIES ENVIRONMENT "MOVA_DIR=${NSLM_MODEL_DIR}")
 endif()
+add_executable(test_serve_guard tests/test_serve_guard.c)   # who may use nslm-serve (harness/serve_guard.h)
+add_test(NAME test_serve_guard COMMAND test_serve_guard WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_executable(test_sample tests/test_sample.c harness/sample.c)   # the sampler and its draft rule (harness/sample.h)
 target_include_directories(test_sample PRIVATE engine nslm)
 target_link_libraries(test_sample ${PLATFORM_LIBS})

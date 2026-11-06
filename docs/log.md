@@ -953,3 +953,9 @@ temperature 0, with the same text, and 16% faster at 1.0. The start script of v0
 mac-metal's pool for the PLE rows (`c9fcca7`) gives the same text and no speed beyond the noise, so it does not join
 v0.1.1. The Q8_0 table's difference with drafts comes from its draft counts, not from row reads. Read
 [the PLE rows on a host pool](results/2026-11-06-ple-pool-m4max.md).
+
+## [2026-11-06] plan | An nslm-serve that a stranger cannot use
+
+pc-cuda found that any web page could use the server: replies allowed every origin, and there was no key or Host
+check. The plan adds an API key off loopback, a loopback Host, origins only by `--allow-origin`, a sanitizer job and
+hardening flags for v0.1.1. Fuzzing and CodeQL follow. Read [the plan](plans/2026-11-06-server-hardening.md).

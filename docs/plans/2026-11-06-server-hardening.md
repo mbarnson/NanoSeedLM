@@ -1,0 +1,43 @@
+# Plan: an nslm-serve that a stranger cannot use (2026-11-06)
+
+**Goal.** A user can run `nslm-serve` as a server, and another person cannot easily take advantage of it. That person
+can be a web page in the user's browser, a machine on the same network, or a crafted request or model file. Matt's
+words: "if someone sets this up as a server they aren't easily taken advantage of."
+
+**Status.** In progress, for v0.1.1. H1 to H3 are written. H4 and H5 run on the PC and the Mac.
+
+## Why
+
+pc-cuda's review of `harness/nslm-serve.c` (`msgs/2026-11-06T232556Z--pc-cuda--cloud--security-tooling-v011.md`):
+
+- The server binds 127.0.0.1 by default, caps a body at 16 MB, and times out slow clients. That part holds.
+- Each reply had `Access-Control-Allow-Origin: *`, and the server had no key. So any web page in the user's browser
+  could send a prompt to `http://127.0.0.1:8080` and read the answer.
+- The server did not check the Host header. So a page could reach it through DNS rebinding as well.
+- No sanitizer or static check ran in CI on the C code that reads requests and model files.
+
+## Steps and gates
+
+| Step | Work | Who | Gate |
+|---|---|---|---|
+| H1 | `harness/serve_guard.h`: an API key (`NSLM_API_KEY`), needed off loopback. Without a key, only a loopback Host. A browser `Origin` only with `--allow-origin`. No wildcard CORS | cloud | HA, HE |
+| H2 | `-DNSLM_SANITIZE=ON` (ASan, UBSan, LSan) and `.github/workflows/sanitize.yml`, which runs the tests with it on each push | cloud | HB |
+| H3 | Hardening flags in each build: `-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO, Control Flow Guard (MSVC) | cloud | HC |
+| H4 | compute-sanitizer (memcheck, racecheck, initcheck) over the GPU tests, and an MSVC `/fsanitize=address` build of the CPU tests | pc-cuda | HD |
+| H5 | `tools/serve_guard_check.sh` against a running server of the release candidate: no key, a key, `--allow-origin` | pc-cuda, mac-metal | HE |
+| H6 | Fuzz targets (libFuzzer with ASan) for the HTTP reader, the JSON parser, the chat template and the model file readers | cloud | v0.1.2 |
+| H7 | CodeQL code scanning on each push to `main` | cloud | v0.1.2 |
+
+- **HA.** `test_serve_guard` passes on the three platforms. It covers the loopback names, foreign Hosts, keys that
+  differ by one byte, and origins.
+- **HB.** The sanitizer job passes on the release candidate, or each finding is fixed first.
+- **HC.** The release builds have the flags (`checksec` on Linux, `dumpbin /headers` on Windows), and the tests pass.
+- **HD.** No finding, or each finding is fixed or explained before the release.
+- **HE.** `serve_guard_check.sh` passes in each mode, on Windows and macOS. `--host 0.0.0.0` without a key does not
+  start.
+
+## Costs
+
+- Clients on the same machine do not change: the start scripts serve on 127.0.0.1 without a key.
+- A web UI in a browser needs `--allow-origin` now. A server on a LAN address needs a key.
+- The sanitizer job uses GitHub's free Linux runners. No HF jobs.

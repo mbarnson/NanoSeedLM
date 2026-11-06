@@ -62,6 +62,7 @@ typedef int sock_t;
 #include "mova_cfg.h"
 #include "platform.h"
 #include "sample.h"
+#include "serve_guard.h"
 #include "tokenizer.h"
 #include "tool_calls.h"
 
@@ -75,6 +76,7 @@ typedef int sock_t;
 #define IO_TIMEOUT_MS 60000      // one stalled recv / send (a client that stops reading ends its generation)
 
 static char g_model_id[256];
+static ServeGuard g_guard;   // --api-key (NSLM_API_KEY) and --allow-origin
 static Eng* g_eng;
 static Tok* g_tok;
 static ChatModel g_cm;
@@ -118,7 +120,8 @@ static int64_t jclamp(const Json* v, int64_t lo, int64_t hi) {
 
 typedef struct {
     sock_t fd;
-    bool dead;   // the client went away: stop generating
+    bool dead;       // the client went away: stop generating
+    char cors[384];  // the CORS lines of each reply (serve_guard.h)
 } Conn;
 
 static bool send_all(Conn* c, const void* p, size_t n) {
@@ -133,17 +136,15 @@ static bool send_all(Conn* c, const void* p, size_t n) {
     return true;
 }
 static bool send_cstr(Conn* c, const char* s) { return send_all(c, s, strlen(s)); }
-static const char* kCors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\n"
-                           "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 static void send_json(Conn* c, int status, Json* obj) {   // consumes obj
     char* body = json_dumps(obj, 1);
     json_free(obj);
-    const char* reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 404 ? "Not Found"
-                       : status == 408 ? "Request Timeout" : status == 413 ? "Payload Too Large"
-                       : status == 503 ? "Service Unavailable" : "Internal Server Error";
-    char head[512];
-    snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%sConnection: close\r\n\r\n",
-             status, reason, strlen(body), kCors);
+    const char* reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 401 ? "Unauthorized"
+                       : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : status == 408 ? "Request Timeout"
+                       : status == 413 ? "Payload Too Large" : status == 503 ? "Service Unavailable" : "Internal Server Error";
+    char head[768];
+    snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s%sConnection: close\r\n\r\n",
+             status, reason, strlen(body), status == 401 ? "WWW-Authenticate: Bearer\r\n" : "", c->cors);
     send_cstr(c, head);
     send_cstr(c, body);
     free(body);
@@ -157,8 +158,8 @@ static void send_error(Conn* c, int status, const char* msg) {
     send_json(c, status, o);
 }
 static bool sse_begin(Conn* c) {
-    char head[512];
-    snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%sConnection: close\r\n\r\n", kCors);
+    char head[640];
+    snprintf(head, sizeof head, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%sConnection: close\r\n\r\n", c->cors);
     return send_cstr(c, head);
 }
 static bool sse_event(Conn* c, Json* obj) {   // consumes obj
@@ -171,6 +172,7 @@ static bool sse_event(Conn* c, Json* obj) {   // consumes obj
 
 typedef struct {
     char method[16], path[512];
+    char host[256], origin[256], auth[512];   // the headers serve_guard.h reads
     char* body;
     size_t body_len;
 } Request;
@@ -215,6 +217,9 @@ static int read_request(Conn* c, Request* r) {
                 while (ve && (*ve == ' ' || *ve == '\t')) ++ve;
                 bad_len = ve == v || (ve && *ve) || len < 0;
             }
+            if (!strcmp(l, "host")) snprintf(r->host, sizeof r->host, "%s", v);
+            if (!strcmp(l, "origin")) snprintf(r->origin, sizeof r->origin, "%s", v);
+            if (!strcmp(l, "authorization")) snprintf(r->auth, sizeof r->auth, "%s", v);
             if (!strcmp(l, "expect")) {
                 char lv[32];
                 snprintf(lv, sizeof lv, "%s", v);
@@ -1055,9 +1060,14 @@ static void* handle_conn(void* arg) {
     if (rc) { sock_close(c.fd); return NULL; }
     const char* m = r.method, *p = r.path;
     char msg[600];
-    if (!strcmp(m, "OPTIONS")) {
-        char head[512];
-        snprintf(head, sizeof head, "HTTP/1.1 204 No Content\r\n%sContent-Length: 0\r\nConnection: close\r\n\r\n", kCors);
+    guard_cors(&g_guard, r.origin, c.cors, sizeof c.cors);
+    const int deny = guard_check(&g_guard, m, r.host, r.origin, r.auth);
+    if (deny) {
+        send_error(&c, deny, deny == 401 ? "this server needs its API key: Authorization: Bearer KEY"
+                                         : "this Origin or Host may not use the server (nslm-serve --allow-origin ORIGIN)");
+    } else if (!strcmp(m, "OPTIONS")) {
+        char head[640];
+        snprintf(head, sizeof head, "HTTP/1.1 204 No Content\r\n%sContent-Length: 0\r\nConnection: close\r\n\r\n", c.cors);
         send_cstr(&c, head);
     } else if (!strcmp(m, "GET") && (!strcmp(p, "/v1/models") || !strcmp(p, "/models"))) {
         Json* md = jobj();
@@ -1150,6 +1160,9 @@ static int default_max_seqs(const char* model, int kv_format) {
 int main(int argc, char** argv) {
     plat_init(&argc, &argv);
     const char *model = opt(argc, argv, "--model", NULL), *host = opt(argc, argv, "--host", "127.0.0.1");
+    g_guard.api_key = opt(argc, argv, "--api-key", getenv("NSLM_API_KEY"));   // the variable keeps the key out of ps
+    if (g_guard.api_key && !*g_guard.api_key) g_guard.api_key = NULL;
+    g_guard.allow_origin = opt(argc, argv, "--allow-origin", NULL);
     char err[512] = "", tpath[1100];
     cm_open(&g_cm, model, NULL, err, sizeof err);   // the template's model (K2 without --model); stop tokens below
     if (opt(argc, argv, "--render", NULL)) return render_file(opt(argc, argv, "--render", NULL));
@@ -1159,6 +1172,7 @@ int main(int argc, char** argv) {
     if (!model || g_ctx < 64) {
         fprintf(stderr, "usage: nslm-serve --model DIR [--res out/res] [--host 127.0.0.1] [--port 8080] "
                         "[--ctx 65536] [--max-seqs N] [--kv bf16|q8|fp8|fp4] [--model-id ID] [--quiet]\n"
+                        "                  [--api-key KEY (or NSLM_API_KEY): needed off loopback] [--allow-origin ORIGIN|*]\n"
                         "                  [--kv-disk DIR] [--kv-disk-gb 32] [--kv-disk-min 2048] [--kv-disk-days 30]\n       nslm-serve --render REQUEST.json [--model DIR]\n");
         return 2;
     }
@@ -1264,8 +1278,15 @@ int main(int argc, char** argv) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t) port);
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { fprintf(stderr, "bad --host %s\n", host); return 2; }
+    if (!guard_loopback_ip(host) && !g_guard.api_key) {
+        fprintf(stderr, "nslm-serve: --host %s is reachable from other machines, so it needs an API key: set NSLM_API_KEY "
+                        "(or --api-key KEY). Clients send \"Authorization: Bearer KEY\".\n", host);
+        return 2;
+    }
     if (bind(ls, (struct sockaddr*) &addr, sizeof addr) || listen(ls, 64)) { fprintf(stderr, "nslm-serve: cannot listen on %s:%d\n", host, port); return 1; }
-    fprintf(stderr, "nslm-serve: http://%s:%d/v1, model \"%s\", %d sequences of %d tokens\n", host, port, g_model_id, g_max_seqs, g_ctx);
+    fprintf(stderr, "nslm-serve: http://%s:%d/v1, model \"%s\", %d sequences of %d tokens%s%s%s\n", host, port, g_model_id, g_max_seqs,
+            g_ctx, g_guard.api_key ? ", API key required" : "", g_guard.allow_origin ? ", browser origin " : "",
+            g_guard.allow_origin ? g_guard.allow_origin : "");
     for (;;) {
         const sock_t fd = accept(ls, NULL, NULL);
         if (fd == INVALID_SOCKET) continue;
