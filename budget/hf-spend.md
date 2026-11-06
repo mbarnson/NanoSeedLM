@@ -5,6 +5,9 @@ No HF job or bucket upload starts without Matt's OK, with its flavor, minutes an
 Linux CI: cloud only, once for each commit that changes code (about $0.07 on rtx-pro-6000).
 Cost = running seconds x the flavor's price (hf jobs hardware). Scheduling time is free.
 
+Before the cap (not counted): mac-metal's Linux CI 6aed21b3 (00:39Z, about 3 min) and 6aed2643 (00:58Z, cancelled at
+about 1 min), rtx-pro-6000, about $0.15 together.
+
 ## Week 1: 2026-11-05 17:00 to 2026-11-12 17:00 Pacific
 
 | Job | Flavor | Minutes | Cost | Running total |
