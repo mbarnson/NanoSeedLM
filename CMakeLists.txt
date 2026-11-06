@@ -228,6 +228,10 @@ add_executable(test_qwen4_api_mtp tests/test_qwen4_api_mtp.c)   # eng_generate w
 target_link_libraries(test_qwen4_api_mtp nslm_engine)
 add_test(NAME test_qwen4_api_mtp COMMAND test_qwen4_api_mtp WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(test_qwen4_api_mtp PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_qwen4_pick tests/test_qwen4_pick.c harness/sample.c)   # eng_generate_pick: drafts with any pick (plan serve-drafts)
+target_link_libraries(test_qwen4_pick nslm_engine)
+add_test(NAME test_qwen4_pick COMMAND test_qwen4_pick WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_qwen4_pick PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_engine_dispatch tests/test_engine_dispatch.c)   # engine/engine.c: qwen4 or MoVA by config.json
 target_link_libraries(test_engine_dispatch nslm_engine)
 add_test(NAME test_engine_dispatch COMMAND test_engine_dispatch WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

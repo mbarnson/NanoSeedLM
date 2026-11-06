@@ -139,7 +139,7 @@ static int32_t pick_max(void* ctx, const float* l, int V, int32_t draft) { (void
 // distribution: with pick_max, greedy decode's tokens, bit for bit (gate MB). Other pending tokens (a prompt's last)
 // forward alone. The last bonus waits uncomputed (at == n - 1), as after eng_push, so the next call drafts on it.
 int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32_t* out, EngStats* st) {
-    if (seq || n_new < 0 || !pick) return -1;
+    if (seq || n_new < 0 || !pick || e->drafts > ENG_MAX_DRAFTS) return -1;
     const int V = e->vocab;
     int64_t fw = 0, rows = 0, bonus = 0, prop = 0, acc = 0;
     int j = 0, rc = 0;
@@ -147,8 +147,10 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         if (e->n < 1 || e->at < e->n - 1 || reserve(e, e->n + e->drafts + 1)) { rc = -1; break; }
         if (e->at == e->n) {   // the bonus
             if (e->n >= e->max_pos) { rc = -1; break; }
-            out[j++] = e->hist[e->n++] = e->next >= 0 ? e->next : pick(ctx, e->last, V, -1);
+            const int32_t t = e->next >= 0 ? e->next : pick(ctx, e->last, V, -1);
             e->next = -1;
+            if (t < 0) break;   // a stop
+            out[j++] = e->hist[e->n++] = t;
             ++bonus;
             continue;
         }
@@ -175,13 +177,14 @@ int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32
         e->lrow = e->n - 1;
         e->next = m <= k ? t : -1;   // a rejected draft: row m - 1's pick takes its place
         ++fw; rows += k + 1; prop += k; acc += m - 1;
+        if (m <= k && t < 0) break;   // a stop in place of draft m
     }
     if (st) { st->tokens += j; st->forwards += fw; st->rows += rows; st->cycles += bonus; st->proposals += prop; st->accepted += acc; }
-    return rc;
+    return rc ? -1 : j;
 }
 int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t* out, EngStats* st) {
     (void) mode;   // every mode commits greedy decode's tokens: here, greedy decode with Q4E_DRAFTS drafts a forward
-    return nseq != 1 ? -1 : eng_generate_pick(e, seqs[0], n_new, pick_max, NULL, out, st);
+    return nseq != 1 || eng_generate_pick(e, seqs[0], n_new, pick_max, NULL, out, st) != n_new ? -1 : 0;
 }
 
 int64_t eng_kv_bytes(Eng* e) { (void) e; return 0; }   // no KV files: the recurrent state is not in the KV cache

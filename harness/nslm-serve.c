@@ -54,6 +54,7 @@ typedef int sock_t;
 
 #include "chat_model.h"
 #include "engine_api.h"
+#include "qwen4_ext.h"
 #include "json.h"
 #include "kv_disk.h"
 #include "model_st.h"
@@ -78,6 +79,7 @@ static Tok* g_tok;
 static ChatModel g_cm;
 static int g_ctx = 65536;
 static int g_max_seqs = 1;
+static int g_drafts;   // Q4E_DRAFTS: a single decoding slot decodes with the MTP head's drafts (qwen4_ext.h)
 static KvDisk* g_kvd;      // the cold cache, or NULL
 static int g_kv_min = 2048;
 static int g_verbose = 1;
@@ -447,7 +449,7 @@ typedef struct Job {
     int nout, cached, slot;
     int rs_next, rs_end, restored;    // cold-cache blocks still to restore [rs_next, rs_end); tokens restored
     uint8_t (*h)[32];                 // the prompt's block hashes (cold cache)
-    bool prefilled, done, eos, failed, cancel, released;
+    bool prefilled, done, eos, failed, cancel, released, hit_stop;   // hit_stop: the scheduler's own
     double t_admit, t_prefill;
     pthread_cond_t cv;                // signalled with new tokens, at the end and on release
     struct Job* next;                 // the queue
@@ -556,12 +558,13 @@ static bool read_reasoning_budget(const Json* req, int* budget) {
     *budget = (int) n;
     return true;
 }
-static int sample_job(Job* j, const float* l, int V) {
+// The job's next token; draft >= 0: the draft, or its replacement (speculative sampling, harness/sample.h)
+static int sample_job(Job* j, const float* l, int V, int32_t draft) {
     int t = 0;
     if (j->thinking && j->reasoning_tokens >= j->reasoning_budget) t = j->reasoning_close;
     else {
         Sampler sp = {j->temperature, j->top_p, j->min_p, j->top_k, 0, j->rng};
-        t = sample_pick(&sp, l, V, -1);
+        t = sample_pick(&sp, l, V, draft);
         j->rng = sp.rng;
     }
     if (j->thinking) {
@@ -570,6 +573,13 @@ static int sample_job(Job* j, const float* l, int V) {
         if (close) j->thinking = false;
         else ++j->reasoning_tokens;
     }
+    return t;
+}
+// eng_generate_pick's pick: the job's token, or -1 at its stop token (not committed)
+static int32_t serve_pick(void* ctx, const float* l, int V, int32_t draft) {
+    Job* j = (Job*) ctx;
+    const int t = sample_job(j, l, V, draft);
+    if (cm_stop(&g_cm, t)) { j->hit_stop = true; return -1; }
     return t;
 }
 
@@ -646,10 +656,25 @@ static void* scheduler(void* arg) {
             else if (left == 0) { pj->prefilled = true; pj->t_prefill = now_s(); }
             pthread_mutex_unlock(&g_lock);
         }
-        if (n) {
+        if (n == 1 && g_drafts) {   // one decoding slot: up to g_drafts + 1 tokens a call, verified drafts
+            Job* j = dec[0];
+            int32_t got[ENG_MAX_DRAFTS + 1];
+            const int want = j->max_tokens - j->nout < g_drafts + 1 ? j->max_tokens - j->nout : g_drafts + 1;
+            const int cnt = eng_generate_pick(g_eng, seqs[0], want, serve_pick, j, got, NULL);
+            for (int k = 0; k < cnt; ++k) slot_push(&g_slots[seqs[0]], got[k]);
+            pthread_mutex_lock(&g_lock);
+            if (cnt < 0) { g_slots[seqs[0]].len = 0; j->failed = j->done = true; }
+            else {
+                for (int k = 0; k < cnt; ++k) j->out[j->nout++] = got[k];
+                if (j->hit_stop) j->eos = j->done = true;
+                else j->done = j->nout >= j->max_tokens;
+            }
+            pthread_cond_broadcast(&j->cv);
+            pthread_mutex_unlock(&g_lock);
+        } else if (n) {
             const int rc = eng_step_batch(g_eng, seqs, n, logits);
             for (int k = 0; k < n && !rc; ++k) {
-                tok[k] = sample_job(dec[k], logits + (size_t) k * V, V);
+                tok[k] = sample_job(dec[k], logits + (size_t) k * V, V, -1);
                 if (!cm_stop(&g_cm, tok[k]) && dec[k]->nout < dec[k]->max_tokens) {
                     eng_push(g_eng, seqs[k], tok[k]);
                     slot_push(&g_slots[seqs[k]], tok[k]);
@@ -1156,6 +1181,9 @@ int main(int argc, char** argv) {
     const double t0 = now_s();
     g_eng = eng_open(&o, err, sizeof err);
     if (!g_eng) { fprintf(stderr, "engine: %s\n", err); return 1; }
+    const char* dk = getenv("Q4E_DRAFTS");   // the qwen4 engine opens its MTP head for them; MoVA has no eng_generate_pick
+    g_drafts = dk && atoi(dk) > 0 ? (atoi(dk) < ENG_MAX_DRAFTS ? atoi(dk) : ENG_MAX_DRAFTS) : 0;
+    if (g_drafts && eng_generate_pick(g_eng, 0, 0, serve_pick, NULL, NULL, NULL) < 0) g_drafts = 0;
     EngMem m;
     eng_mem(g_eng, &m);
     fprintf(stderr, "nslm-serve: loaded in %.1f s: %s", now_s() - t0, eng_describe(g_eng));

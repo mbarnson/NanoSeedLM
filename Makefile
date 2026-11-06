@@ -36,10 +36,10 @@ TOOLS     := $(addprefix $(BIN)/,$(ENG_TOOLS) nslm-mova-bench nslm-mova-kbench n
                              nslm-qwen4-gen)
 C_TESTS   := $(filter-out tests/test_engine.c tests/test_engine_formats.c tests/test_serve_splitter.c tests/test_search_gpu.c tests/test_search4_gpu.c tests/test_searchc_gpu.c tests/test_searchp_gpu.c tests/test_trellis_gpu.c tests/test_tq_mv_gpu.c \
                             tests/test_mova_kernels.c tests/test_qwen4_kernels.c \
-                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_qwen4_mtp.c tests/test_qwen4_api_mtp.c tests/test_engine_dispatch.c tests/test_qwen4_metal.c,$(wildcard tests/test_*.c))
+                            tests/test_qwen4_engine.c tests/test_qwen4_api.c tests/test_qwen4_mtp.c tests/test_qwen4_api_mtp.c tests/test_qwen4_pick.c tests/test_engine_dispatch.c tests/test_qwen4_metal.c,$(wildcard tests/test_*.c))
 TESTS     := $(patsubst tests/%.c,$(BIN)/%,$(C_TESTS)) $(BIN)/test_engine $(BIN)/test_serve_splitter $(BIN)/test_search_gpu \
              $(BIN)/test_search4_gpu $(BIN)/test_searchp_gpu $(BIN)/test_mova_kernels $(BIN)/test_qwen4_kernels $(BIN)/test_qwen4_metal \
-             $(BIN)/test_qwen4_mtp $(BIN)/test_qwen4_api_mtp $(BIN)/test_trellis_gpu
+             $(BIN)/test_qwen4_mtp $(BIN)/test_qwen4_api_mtp $(BIN)/test_qwen4_pick $(BIN)/test_trellis_gpu
 
 .PHONY: all build test test-mlx clean
 all: build
@@ -181,6 +181,9 @@ $(BIN)/test_qwen4_mtp: tests/test_qwen4_mtp.c $(Q4E_O) $(LIB_O) $(NSLM_HDRS) $(R
 $(BIN)/test_qwen4_api_mtp: tests/test_qwen4_api_mtp.c $(ENG_O) $(LIB_O) $(ENG_HDRS) $(NSLM_HDRS) $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(ENG_O) $(LIB_O) $(LIBS) -lm -lpthread -o $@
+$(BIN)/test_qwen4_pick: tests/test_qwen4_pick.c harness/sample.c $(ENG_O) $(LIB_O) $(ENG_HDRS) $(NSLM_HDRS) $(RES)/kernels_moe.metallib $(RES)/kernels_qwen4.metallib
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< harness/sample.c $(ENG_O) $(LIB_O) $(LIBS) -lm -lpthread -o $@
 $(BIN)/nslm-qwen4-gen: harness/nslm-qwen4-gen.c $(Q4E_O) $(HARN_O) $(LIB_O) $(HARN_HDRS) $(NSLM_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< $(Q4E_O) $(HARN_O) $(LIB_O) $(LIBS) $(HLIBS) -lm -lpthread -o $@
