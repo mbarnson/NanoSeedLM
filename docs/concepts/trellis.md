@@ -9,14 +9,17 @@ also beat Unsloth's packs of the same size. The GPU computes each weight from it
 ## Key numbers
 
 KL against BF16 in llama.cpp, with the experts emulated in Unsloth's Q8_0 shards. The last column interpolates
-Unsloth's two nearest packs in log KL. Read [Trellis-coded experts against BF16](../results/2026-11-05-trellis-kld.md).
+Unsloth's two nearest packs in log KL. Read [Trellis packs and Unsloth's curve](../results/2026-11-05-trellis-mixes.md).
 
 | Experts | Bits for each expert weight | Expert GB | Mean KLD | Unsloth's curve at those bits |
 |---|---|---|---|---|
-| Trellis K = 4, L = 12 | 4.125 | 62.3 | 0.0398 | 0.0474 |
-| P4 seeds | 4.50 | 68.0 | 0.0408 | 0.0400 |
-| P3 seeds | 4.00 | 60.4 | 0.0600 | 0.0502 |
-| Trellis K = 3, L = 12 | 3.125 | 47.2 | 0.0765 | about 0.080 (extrapolated) |
+| Trellis K = 4, L = 12 | 4.125 | 62.3 | 0.0398 | 0.0480 |
+| P4 seeds | 4.50 | 68.0 | 0.0408 | 0.0403 |
+| P3 seeds | 4.00 | 60.4 | 0.0600 | 0.0509 |
+| Trellis K = 3 + 4 (`down_proj` at K = 4) | 3.458 | 52.2 | 0.0619 | 0.0685 |
+| Trellis K = 3, L = 12 | 3.125 | 47.2 | 0.0765 | 0.0916 |
+| Trellis K = 2 + 3 (used experts at K = 3) | 2.465 | 37.2 | 0.164 | (no Unsloth pack this small) |
+| Trellis K = 2, L = 12 | 2.133 | 32.2 | 0.204 | (no Unsloth pack this small) |
 
 Speed of one expert matvec call (gate and up, one token, 10 experts). These are kernel benches, not decode in the
 engine.
@@ -79,6 +82,7 @@ shared memory, then uses the same tensor-core GEMM as the seeds. The Metal kerne
 
 - [Trellis-coded experts: weight error](../results/2026-11-05-trellis-probe.md): one layer, against ggml's types.
 - [Trellis-coded experts against BF16](../results/2026-11-05-trellis-kld.md): the whole model in llama.cpp.
+- [Trellis packs and Unsloth's curve](../results/2026-11-05-trellis-mixes.md): 2 to 4 bits, mixes, the corrected curve.
 
 ## See also
 

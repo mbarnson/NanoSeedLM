@@ -5,8 +5,10 @@ P4 seeds at 4.5 bits (0.0408), and 16% below Unsloth's curve at the same bits. A
 about 4% below an extrapolation of Unsloth's curve, and 4% above UD-IQ3_XXS at 3.28 bits. A Q8_0 PLE table adds no KL
 that we can measure.
 
-**Status.** Current. Step T2 of the [trellis plan](../plans/2026-11-05-trellis-experts.md), at L = 12. Gate TB passes
-at both bit rates, narrowly at 3.125 bits. The PLE result is part of step T5 (gate TP).
+**Status.** Current for the trellis rows and the PLE result. Unsloth's curve below is replaced by
+[the corrected curve](2026-11-05-trellis-mixes.md): Unsloth's expert sizes here were too small. On that curve the
+trellis is 16% below it at 3.125 bits (not 4%) and 17% below at 4.125 bits (not 16%). Step T2 of the
+[trellis plan](../plans/2026-11-05-trellis-experts.md), at L = 12. The PLE result is part of step T5 (gate TP).
 
 ## Setup
 

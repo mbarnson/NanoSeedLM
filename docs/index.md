@@ -152,6 +152,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   has less weighted error than ggml's IQ3_S (3.44 bits) and IQ4_XS (4.25 bits). It saves about 0.4 to 0.5 bits a weight.
 - [2026-11-05: Trellis-coded experts against BF16: KL](results/2026-11-05-trellis-kld.md): at 4.125 bits the KL is
   0.0398, 16% below Unsloth's curve and below P4's. At 3.125 bits it is 0.0765, near the curve. A Q8_0 PLE table adds no KL.
+- [2026-11-05: Trellis packs at 2 to 4 bits and Unsloth's curve, corrected](results/2026-11-05-trellis-mixes.md): 16%
+  and 17% below the curve at 3.125 and 4.125 bits. `down_proj` at K = 4 gives 0.0619 at 3.46 bits.
 
 ## For contributors and agents
 

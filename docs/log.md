@@ -745,3 +745,10 @@ than the PCIe 4 copy it saves. Plan step D4 closes. Read
 L = 12 in about 5 minutes a K. At K = 4 (4.125 bits, 62.3 GB) the KL is 0.0398, against P4's 0.0408 at 4.5 bits, and 16% below
 Unsloth's curve. At K = 3 (3.125 bits, 47.2 GB) it is 0.0765, about 4% below an extrapolation of the curve. A Q8_0 PLE
 table changes the KL by 0.00005. Read [Trellis-coded experts against BF16](results/2026-11-05-trellis-kld.md).
+
+## [2026-11-05] result | Trellis packs at 2 to 4 bits, and Unsloth's curve corrected
+
+`7e442c7`: Unsloth's expert sizes were too small on earlier pages, because a new GGUF type counted as 0 bytes. On
+the corrected curve, the trellis is 16% below it at 3.125 bits and 17% below at 4.125 bits. K = 4 for `down_proj` and
+K = 3 for the rest gives 0.0619 at 3.46 bits, 10% below. K = 2 gives 0.204 at 2.13 bits. Read
+[Trellis packs and Unsloth's curve](results/2026-11-05-trellis-mixes.md).

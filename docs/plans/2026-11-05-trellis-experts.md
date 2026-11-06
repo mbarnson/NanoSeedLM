@@ -4,11 +4,11 @@
 NanoSeedLM gets better quality and speed at a given VRAM or RAM footprint. On the RTX 4080, 2-bit experts would also
 double the expert cache's slots.
 
-**Status.** T1 done ([weight error](../results/2026-11-05-trellis-probe.md)). T2 done at L = 12
-([KL against BF16](../results/2026-11-05-trellis-kld.md)). Gate TB passes. K = 4 (4.125 bits) has a KL of 0.0398,
-16% below Unsloth's curve and below P4's 0.0408. K = 3 (3.125 bits) has 0.0765, 4% below an extrapolated curve. The
-CUDA encoder on 8 GPUs encodes one K in about 5 minutes, so encodes run on HF. Next: T3 (decode in the engine) and T4
-(packs mixed by layer or by use). A Q8_0 PLE table passes gate TP in llama.cpp (T5).
+**Status.** T1 and T2 done, T4 in part ([KL against BF16](../results/2026-11-05-trellis-kld.md),
+[mixes and the corrected curve](../results/2026-11-05-trellis-mixes.md)). Gate TB passes at every bit rate that
+Unsloth's curve covers. K = 4 (4.125 bits) is 17% below the curve, and K = 3 (3.125 bits) is 16% below. K = 4 for
+`down_proj` with K = 3 for the rest (3.46 bits) is 10% below. K = 2 (2.13 bits) has a KL of 0.204. Next: T3, decode
+speed in the engine on the RTX 4080 and the M4 Max. Then T6 with a 2-bit mix that has more K = 3.
 
 ## The method
 
