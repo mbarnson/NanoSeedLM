@@ -93,6 +93,9 @@ set_tests_properties(test_mova_cfg PROPERTIES SKIP_RETURN_CODE 77)   # 77: no mo
 if(NSLM_MODEL_DIR)
   set_tests_properties(test_mova_cfg PROPERTIES ENVIRONMENT "MOVA_DIR=${NSLM_MODEL_DIR}")
 endif()
+add_executable(test_sample tests/test_sample.c harness/sample.c)   # the sampler and its draft rule (harness/sample.h)
+target_link_libraries(test_sample m)
+add_test(NAME test_sample COMMAND test_sample WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 foreach(t chat_template tool_calls qwen4_template qwen4_tools)
   add_executable(test_${t} tests/test_${t}.c harness/chat_template.c harness/chat_qwen.c harness/tool_calls.c)
   target_link_libraries(test_${t} nslm)
@@ -111,7 +114,7 @@ add_test(NAME test_tq_mv_gpu COMMAND test_tq_mv_gpu WORKING_DIRECTORY ${CMAKE_SO
 set_tests_properties(test_tq_mv_gpu PROPERTIES SKIP_RETURN_CODE 77)   # 77: no GPU
 
 # ---- the tools ------------------------------------------------------------------------------------------------------
-add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/chat_model.c harness/tool_calls.c harness/kv_disk.c
+add_library(nslm_harness STATIC harness/platform.c harness/tokenizer.c harness/chat_template.c harness/chat_qwen.c harness/chat_model.c harness/tool_calls.c harness/kv_disk.c harness/sample.c
             $<IF:$<BOOL:${APPLE}>,harness/telemetry.m,harness/telemetry_nvml.c>)
 target_include_directories(nslm_harness PUBLIC harness)
 if(WIN32)

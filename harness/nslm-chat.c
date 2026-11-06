@@ -11,18 +11,12 @@
 #include <string.h>
 
 #include "chat_model.h"
+#include "sample.h"
 #include "engine_api.h"
 #include "json.h"
 #include "platform.h"
 #include "tokenizer.h"
 
-static uint64_t splitmix(uint64_t* s) {
-    *s += 0x9E3779B97F4A7C15ull;
-    uint64_t z = *s;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-}
 
 static int usage(void) {
     fprintf(stderr, "usage: nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N] [--system TEXT]\n"
@@ -121,8 +115,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "%s\nloaded in %.1f s\n", eng_describe(e), now_s() - tl);
     const int V = eng_vocab(e);
     float* lg = (float*) malloc(sizeof(float) * (size_t) V);
-    double* cum = (double*) malloc(sizeof(double) * (size_t) V);
-    uint64_t rng = seed;
+    Sampler sp = {temp, 1, 0, 0, 1, seed};   // the MLX sampler
     const char* dk = getenv("Q4E_DRAFTS");
     const int drafts = temp > 0 || !dk || atoi(dk) < 1 ? 0 : atoi(dk) < 3 ? atoi(dk) : 3, seq0 = 0;
     EngStats gs;
@@ -140,19 +133,7 @@ int main(int argc, char** argv) {
         int ng = 1, stepped = !drafts || !ngen;
         if (stepped) {
             if (eng_step(e, 0, lg)) { fprintf(stderr, "step failed\n"); return 1; }
-            int b = 0;
-            float x = lg[0];
-            for (int v = 1; v < V; ++v) if (lg[v] > x) { x = lg[v]; b = v; }   // the running max: about half the time of lg[b]
-            int pick = b;
-            if (temp > 0) {
-                double c = 0;
-                for (int v = 0; v < V; ++v) { c += exp(((double) lg[v] - (double) lg[b]) / temp); cum[v] = c; }
-                const double u = (double) (splitmix(&rng) >> 11) * (1.0 / 9007199254740992.0) * c;
-                int lo = 0, hi = V;   // first index with cum > u
-                while (lo < hi) { const int mid = (lo + hi) / 2; if (cum[mid] > u) hi = mid; else lo = mid + 1; }
-                pick = lo < V ? lo : b;
-            }
-            got[0] = pick;
+            got[0] = sample_pick(&sp, lg, V, -1);
         } else {
             ng = max_tokens - ngen < drafts + 1 ? max_tokens - ngen : drafts + 1;
             if (eng_generate(e, &seq0, 1, ng, ENG_MODE_DEFAULT, got, &gs)) { fprintf(stderr, "generate failed\n"); return 1; }
@@ -186,7 +167,7 @@ int main(int argc, char** argv) {
     if (drafts)
         fprintf(stderr, "%d MTP draft%s a forward: %lld forwards, %.2f tokens a forward, %lld of %lld drafts accepted\n", drafts, drafts > 1 ? "s" : "",
                 (long long) gs.forwards, gs.forwards ? (double) gs.tokens / (double) gs.forwards : 0.0, (long long) gs.accepted, (long long) gs.proposals);
-    free(pend); free(lg); free(cum); free(ids);
+    free(pend); free(lg); free(ids);
     eng_close(e);
     tok_close(tok);
     return 0;

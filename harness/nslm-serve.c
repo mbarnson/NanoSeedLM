@@ -59,6 +59,7 @@ typedef int sock_t;
 #include "model_st.h"
 #include "mova_cfg.h"
 #include "platform.h"
+#include "sample.h"
 #include "tokenizer.h"
 #include "tool_calls.h"
 
@@ -432,42 +433,6 @@ static bool emit_upto(Conn* c, Gen* g, Splitter* sp, const char* b, size_t upto,
     return true;
 }
 
-static uint64_t splitmix64(uint64_t* x) {
-    uint64_t z = (*x += 0x9E3779B97F4A7C15ull);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-}
-typedef struct { float p; int id; } Cand;
-static int cand_cmp(const void* a, const void* b) {
-    const Cand *x = (const Cand*) a, *y = (const Cand*) b;
-    return x->p > y->p ? -1 : x->p < y->p ? 1 : x->id - y->id;
-}
-// Temperature, top_p, top_k and min_p (tokens of at least min_p x the top probability) from one logits row.  Tokens
-// below max - temp * ln(1e8) are left out (< 1e-8 each).
-static int sample_row(const float* l, int V, double temp, double top_p, int top_k, double min_p, uint64_t* rng) {
-    static Cand* c = NULL;
-    if (!c) c = (Cand*) malloc(sizeof(Cand) * (size_t) V);
-    float mx = l[0];
-    for (int i = 1; i < V; ++i) mx = l[i] > mx ? l[i] : mx;
-    const float th = mx - (float) (temp * 18.420681);
-    int n = 0;
-    double tot = 0;
-    for (int i = 0; i < V; ++i)
-        if (l[i] >= th) { c[n].p = (float) exp(((double) l[i] - mx) / temp); c[n].id = i; tot += c[n].p; ++n; }
-    qsort(c, (size_t) n, sizeof(Cand), cand_cmp);
-    int keep = n;
-    double cum = 0;
-    for (int i = 0; i < n; ++i) { cum += c[i].p / tot; if (cum >= top_p) { keep = i + 1; break; } }
-    if (top_k > 0 && keep > top_k) keep = top_k;
-    while (keep > 1 && c[keep - 1].p < min_p) --keep;   // c[i].p = p_i / p_max
-    double ks = 0;
-    for (int i = 0; i < keep; ++i) ks += c[i].p;
-    const double u = (double) (splitmix64(rng) >> 11) * (1.0 / 9007199254740992.0) * ks;
-    double a = 0;
-    for (int i = 0; i < keep; ++i) { a += c[i].p; if (a > u) return c[i].id; }
-    return c[keep - 1].id;
-}
 // ---- scheduler ----
 
 // A request as the scheduler sees it: the connection thread fills the inputs and submits it, then reads the outputs
@@ -594,8 +559,11 @@ static bool read_reasoning_budget(const Json* req, int* budget) {
 static int sample_job(Job* j, const float* l, int V) {
     int t = 0;
     if (j->thinking && j->reasoning_tokens >= j->reasoning_budget) t = j->reasoning_close;
-    else if (j->temperature > 0) t = sample_row(l, V, j->temperature, j->top_p, j->top_k, j->min_p, &j->rng);
-    else for (int i = 1; i < V; ++i) if (l[i] > l[t]) t = i;
+    else {
+        Sampler sp = {j->temperature, j->top_p, j->min_p, j->top_k, 0, j->rng};
+        t = sample_pick(&sp, l, V, -1);
+        j->rng = sp.rng;
+    }
     if (j->thinking) {
         bool close = false;
         for (int i = 0; i < 3; ++i) close |= t == j->reasoning_closes[i];
