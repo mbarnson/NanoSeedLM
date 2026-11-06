@@ -133,6 +133,7 @@ build/bin/nslm-qwen4-gen --model Qwen3.8-Flash-Next-NanoSeedLM-P4 --prompt "Why 
 | `--expert-cache-gb N` | Cache N GB of the host experts in VRAM (least recently used), at least one layer's. -1: all free VRAM. The cache leaves `NSLM_VRAM_RESERVE_MB` free (2560 on a GPU that drives a display) |
 | `--stream-experts` | With a cache: read the missing experts from the model files. Use it when RAM is smaller than the experts |
 | `--ple-gguf FILE` | Read the PLE table from an Unsloth engram GGUF (BF16, Q8_0, Q5_1 or IQ4_NL) |
+| `--prompt-file FILE` | Read the prompt from a file. Use it for prompts too long for the command line (about 32,000 characters on Windows) |
 | `--ctx N` | Context positions (4096) |
 | `--prompt-rows N` | Prompt rows of one forward: 4096, or 16384 on GPUs of 64 GB or more, at most the context. A row takes about 0.25 MB of VRAM |
 | `--drafts K` | The MTP head drafts K tokens (1 to 3), and one forward verifies them. The text does not change. VRAM: 115 MB a draft, and the head's routed experts share the expert cache (else 1.4 GB). On an RTX 4080 it is not faster ([results](../results/2026-11-05-qwen38-mtp-4080-rerun.md)) |

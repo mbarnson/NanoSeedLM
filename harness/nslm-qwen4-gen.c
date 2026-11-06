@@ -20,6 +20,9 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) {   // prompts longer than the command line (Windows)
+            if (!(prompt = plat_slurp(argv[++i], NULL))) { fprintf(stderr, "cannot read %s\n", argv[i]); return 1; }
+        }
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--raw")) raw = 1;
@@ -35,7 +38,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--cpu-tail") && i + 1 < argc) ctail = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT [--max-tokens N] [--ctx N] [--raw | --effort xhigh|medium|low\n"
+    if (!model || !prompt) { fprintf(stderr, "usage: nslm-qwen4-gen --model DIR --prompt TEXT | --prompt-file FILE [--max-tokens N] [--ctx N] [--raw | --effort xhigh|medium|low\n"
                                          "  | --no-think] [--vram-experts] [--ple-gguf FILE] [--expert-cache-gb N [--stream-experts]] [--prompt-rows N] [--drafts 1-3]\n"
                                          "  [--tail-skip R] [--cpu-tail N]\n"); return 2; }
     if (drafts < 0 || drafts > Q4E_MAX_DRAFTS) { fprintf(stderr, "--drafts: 0 to %d\n", Q4E_MAX_DRAFTS); return 2; }
