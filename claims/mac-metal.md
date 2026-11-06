@@ -1,8 +1,8 @@
-# mac-metal claims (updated 2026-11-05T23:19:22Z)
+# mac-metal claims (updated 2026-11-06T00:47:33Z)
 
 
-- **Running (cloud's go, 22:36Z):** the full trellis encode, K = 3, L = 12, all 48 layers (gate, up, down), on the Mac CPU. nslm-moe from 41a8fe6 in ~/devel/nslm-tq, --workers 12, under caffeinate, pid 98044. Started 2026-11-05T22:51:38Z, estimate 08:40Z. Output in ~/models/Qwen3.8-Flash-Next-tq-k3-l12. The bucket sync waits for Matt's OK in this session (script ~/models/sync-tq.sh).
-- **Now:** the Metal trellis encoder, mac/trellis-metal acc4090 on pc/trellis-cuda 82882e2 (local; I push after the rebase onto main once pc/trellis-cuda lands). Exact: test_trellis_gpu passes unchanged, and an L 6..16 sweep shows no differences. L 12 at 11 to 13 M weights a second; L 16 still slow, so its layout is next. Files: nslm/trellis.metal, nslm/trellis_metal.m; shared lines in trellis_gpu.h, test_trellis_gpu.c, the Makefile and parity.md (cloud's go).
-- **Proposed:** nslm-moe --gpu for the tq codec, then K = 4 on the GPU (about 3 h).
+- **Now (cloud's T3 split):** trellis experts on Metal. First the k_tq_mv_gu / k_tq_mv_sel gathers in engine/kernels_moe.metal (MF_TCQ = 8, the exact rint form from my bench, the same output rounding as k_mv_gu / k_mv). Then MF_TCQ in tests/kernel_backend_metal.m, so tcq_case runs on Metal. Then trellis experts in engine/qwen4_gpu.m, in the shape of cloud's 41f75cc (W.group, tq_experts in moe(), ns_add_banks at open). Then gate TC decode on the M4 Max against P3.
+- **Waiting for main:** the Metal trellis encoder (850f337, as 54a7130 in cloud's head; macos on 54a7130 running).
+- **Stopped:** the Mac's CPU encode of K = 3, L = 12 (a duplicate of HF's TQ3L12). Its 24 sha256 are posted for cloud's cross-check, and the folder stays until then.
 - **Done (on main):** MTP drafts on Metal and in nslm-chat (Q4E_DRAFTS); the day's Metal decode and prompt kernels; the T3 preview (trellis matvec as fast as P3's seeds, exact).
 - **Mine:** engine/*.metal, engine/qwen4_gpu.m, engine/mova_gpu.m, tests/kernel_backend_metal.m, tests/test_qwen4_metal.c, tests/test_qwen4_api_mtp.c, nslm/trellis.metal, nslm/trellis_metal.m.
