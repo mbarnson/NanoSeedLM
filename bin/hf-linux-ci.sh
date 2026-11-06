@@ -16,7 +16,7 @@ echo "warnings: $(grep -c warning /tmp/build.log || true)"
 ctest --test-dir build --output-on-failure >/tmp/ctest.log 2>&1 || true
 grep -E "FAIL" /tmp/ctest.log | grep -v "tests FAILED" | head -20 || true
 tail -25 /tmp/ctest.log
-./build/bin/test_qwen4_engine 2>&1 | grep -i "cpu_tail" || true'
+./build/bin/test_qwen4_engine 2>&1 | grep -i "cpu_tail\|trellis" || true'
 hf jobs run --detach --flavor "$FLAVOR" --timeout 30m --name "nslm-linux-ci-$REV" -e NSLM_REV="$REV" \
     nvidia/cuda:12.8.1-devel-ubuntu24.04 bash -c "$JOB"
 echo "then: hf jobs wait <id> && hf jobs logs <id>"
