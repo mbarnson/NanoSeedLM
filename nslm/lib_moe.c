@@ -168,6 +168,20 @@ int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen) {
     return 0;
 }
 
+// The folder's tensor that bank tensor b replaces. A bank of layer n, in a folder with layer n - 1 and an MTP head but
+// no layer n, is the head's (the packer's rule): b is renamed mtp.layers.0.mlp.switch_mlp.*
+static const NsTensor* bank_target(const NsModel* v, NsTensor* b) {
+    const NsTensor* t = ns_find(v, b->name);
+    int l = -1, at = 0;
+    if (t || sscanf(b->name, "language_model.model.layers.%d.mlp.switch_mlp.%n", &l, &at) != 1 || !at || l < 1) return t;
+    char prev[sizeof b->name], head[sizeof b->name];
+    snprintf(prev, sizeof prev, "language_model.model.layers.%d.mlp.switch_mlp.%s", l - 1, b->name + at);
+    snprintf(head, sizeof head, "mtp.layers.0.mlp.switch_mlp.%s", b->name + at);
+    if (!ns_find(v, prev) || !(t = ns_find(v, head))) return NULL;
+    memcpy(b->name, head, sizeof head);
+    return t;
+}
+
 int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen) {
     NsModel b;
     const int rc = ns_open_bank(&b, dir, err, errlen);
@@ -175,7 +189,7 @@ int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen) {
     m->t = (NsTensor*) realloc(m->t, sizeof(NsTensor) * (size_t) (m->n + b.n));
     NsModel v = *m;   // the folder's own tensors, still sorted: bank names never repeat
     for (int i = 0; i < b.n; ++i) {
-        const NsTensor* t = ns_find(&v, b.t[i].name);
+        const NsTensor* t = bank_target(&v, &b.t[i]);
         m->t[t ? (int) (t - m->t) : m->n++] = b.t[i];   // a bank replaces the folder's tensor of that name
     }
     qsort(m->t, (size_t) m->n, sizeof(NsTensor), bank_cmp);

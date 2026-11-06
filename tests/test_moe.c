@@ -14,6 +14,7 @@
 #include "trellis.h"
 
 static int fails = 0;
+static int zero_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) { (void) ctx; (void) t; (void) s; memset(dst, 0, len); return 0; }
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 int main(void) {
@@ -215,6 +216,26 @@ int main(void) {
                 same &= !memcmp(out, y + (size_t) C * (e * R + r), sizeof out);
             }
         CHECK(same, "trellis rows differ from the encoder's output");
+        ns_close(&m);
+        // A bank of layer n in a folder of layers 0 to n - 1 with an MTP head is the head's (the packer's rule)
+        const NsSpec sp[2] = {{"language_model.model.layers.2.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1},
+                              {"mtp.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1}};
+        const NsRaw rw[2] = {{"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}};
+        mkdir("out/test_moe_thead", 0755);
+        CHECK(ns_write_raw("out/test_moe_thead", sp, rw, 2, 1u << 20, NULL, zero_fill, NULL, berr, sizeof berr) == 0, "head folder: %s", berr);
+        const char* bk[2] = {"out/test_moe_thead/L3_up_proj.blkt", "out/test_moe_thead/L1_up_proj.blkt"};   // L1: no layer 0
+        for (int i = 0; i < 2; ++i) {
+            f = fopen(bk[i], "wb");
+            fwrite(&h, sizeof h, 1, f); fwrite(rel, 4, 2 * E, f); fwrite(words, 4, nw * E * R, f); fwrite(sc, 2, E * R * NB, f);
+            fclose(f);
+        }
+        CHECK(ns_open(&m, "out/test_moe_thead", berr, sizeof berr) == 0 && ns_add_banks(&m, "out/test_moe_thead", berr, sizeof berr) == 0,
+              "head banks: %s", berr);
+        t = ns_find(&m, "mtp.layers.0.mlp.switch_mlp.up_proj.weight");
+        CHECK(t && t->enc == NS_TCQ && !ns_find(&m, "language_model.model.layers.3.mlp.switch_mlp.up_proj.weight"),
+              "bank L3 is not the MTP head's");
+        t = ns_find(&m, "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight");
+        CHECK(t && t->enc == NS_TCQ && m.n == 3, "bank L1 (no layer 0) not added as layer 1 (%d tensors)", m.n);
         ns_close(&m);
         free(nr); free(words); free(y);
     }
