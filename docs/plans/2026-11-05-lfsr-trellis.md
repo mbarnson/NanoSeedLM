@@ -4,7 +4,9 @@
 of QTIP's 1MAD hash. If it does, the packs stay as SeedLM made them: no stored codebook, and the LFSR as the
 generator.
 
-**Status.** Draft. Matt asked on 2026-11-05 whether SeedLM has a future beside the trellis.
+**Status.** Draft. Matt asked on 2026-11-05 whether SeedLM has a future beside the trellis. L2 is done: the LFSR
+code is within 0.6% of 1MAD at K = 3, and 1.5% higher for `down_proj` at K = 4
+([the probe](../results/2026-11-05-lfsr-trellis-probe.md)).
 
 ## Why
 

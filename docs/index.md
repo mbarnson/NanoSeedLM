@@ -166,6 +166,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   a display GPU gives the expert cache about 20% more slots and decode 8% to 9% more speed.
 - [2026-11-05: Trellis K = 3 on the M4 Max: the pages that a session uses](results/2026-11-05-trellis-ple-working-set-m4max.md):
   K = 3 needs 51.2 GB of resident weights. The 32 GB PLE table stays on the SSD, and 13,000 tokens read 5.0 GB of it.
+- [2026-11-05: The LFSR code against 1MAD at L = 12](results/2026-11-05-lfsr-trellis-probe.md): weight error within
+  0.6% at K = 3, and 1.5% higher for `down_proj` at K = 4.
 
 ## For contributors and agents
 

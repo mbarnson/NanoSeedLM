@@ -795,3 +795,9 @@ Matt asked whether SeedLM has a future beside the trellis. The trellis packs rep
 ahead on each axis that we measured. But the trellis also computes its code from a pseudo-random function of its
 state. This plan tests the trellis with NanoSeedLM's LFSR as that function, on KL and decode speed. At L = 12 the
 LFSR code had the weighted error of 1MAD within 1%. Read [An LFSR code for the trellis](plans/2026-11-05-lfsr-trellis.md).
+
+## [2026-11-05] result | The LFSR code against 1MAD at L = 12
+
+On the trellis probe's rows, at L = 12, the LFSR code has the weighted error of 1MAD within 0.6% at K = 3. At K = 4 it
+is within 0.2% for `gate_proj` and `up_proj`, and 1.5% higher for `down_proj`. Step L2 of the LFSR plan. Read
+[The LFSR code against 1MAD](results/2026-11-05-lfsr-trellis-probe.md).
