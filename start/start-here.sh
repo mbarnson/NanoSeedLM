@@ -10,7 +10,7 @@ fail() { printf '\n%s\n' "$*" >&2; exit 1; }
 # download GB. NSLM_PACKS: another table
 PACKS=${NSLM_PACKS:-"TCQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4 25339937b55f9efbe384a3f8cb2bc92d86ecfa32 96 24 128 102
 TCQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4 7e5edb2be58071fbe5a5133421ab6c1f2f0de58f 96 16 96 92
-TCQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3 5f2a859927d2215081a7ac5684dbae5da6517104 64 16 96 87"}
+TCQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3 5f2a859927d2215081a7ac5684dbae5da6517104 64 12 96 87"}
 # Unsloth's Q8_0 PLE table: the KL on the model cards is with it. NSLM_PLE=pack keeps the pack's 4-bit table
 E_REPO=unsloth/Qwen3.8-Flash-Next-GGUF E_REV=d96201194f103c906994f283f504209dc8d2a10c
 E_FILE=engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file
@@ -52,7 +52,7 @@ echo
 echo "Packs (KL against BF16: lower is closer to the original model):"
 echo "  TCQ4     0.0415  a GPU of 24 GB or more with 96 to 128 GB of RAM, or a 128 GB Mac (102 GB download)"
 echo "  TCQ3-D4  0.0638  a 16 GB GPU with 96 to 128 GB of RAM, or a 96 GB Mac (92 GB download)"
-echo "  TCQ3     0.0778  a 16 GB GPU with 64 GB of RAM, or a 96 GB Mac (87 GB download)"
+echo "  TCQ3     0.0778  a 12 or 16 GB GPU with 64 GB of RAM, or a 96 GB Mac (87 GB download)"
 echo "Each pack runs with Unsloth's Q8_0 PLE table (54.4 GB more), as on the model cards. NSLM_PLE=pack skips it."
 pick=${1:-}   # given: no questions
 [ -n "$pick" ] || read -r -p "Pack [$rec] " pick
@@ -107,9 +107,9 @@ while read -r k p s _; do
     need=$((need + s - have))
 done <<<"$list"
 free=$(( $(df -Pk "$dir" | awk 'NR == 2 {print $4}') * 1024 ))
-[ "$need" -le "$free" ] || fail "The download needs $((need / 1073741824)) GB and the disk has $((free / 1073741824)) GB free."
+[ "$need" -le "$free" ] || fail "The download needs $((need / 1000000000)) GB and the disk has $((free / 1000000000)) GB free."
 echo
-echo "$check files to check, $(awk -v n="$need" 'BEGIN {printf "%.1f", n / 1073741824}') GB to download into ${root:-$here/models}"
+echo "$check files to check, $(awk -v n="$need" 'BEGIN {printf "%.1f", n / 1e9}') GB to download into ${root:-$here/models}"
 if [ "$need" -gt 1073741824 ] && [ -z "${1:-}" ]; then
     read -r -p "Start? [Y/n] " a
     case $a in [nN]*) echo "Stopped. Run start-here.sh again."; exit 0 ;; esac
@@ -123,18 +123,19 @@ while read -r k p s h; do
     grep -qxF "$p" "$d/.nslm-verified" && continue
     dst=$d/$p
     mkdir -p "$(dirname "$dst")"
-    echo "[$i/$total] $p ($((s / 1048576)) MB)"
+    echo "[$i/$total] $p ($(awk -v n="$s" 'BEGIN {if (n < 1e9) printf "%.0f MB", n / 1e6; else printf "%.1f GB", n / 1e9}'))"
     have=0
     [ -f "$dst" ] && have=$(( $(wc -c <"$dst") ))
     if [ "$have" -ne "$s" ]; then
-        curl -fL --retry 5 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst" "https://huggingface.co/$r/resolve/$v/$p" </dev/null ||
+        curl -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst" \
+            "https://huggingface.co/$r/resolve/$v/$p" </dev/null ||   # a stalled connection: a new one resumes
             fail "The download of $p stopped. Run start-here.sh again to resume."
     fi
     [ $(( $(wc -c <"$dst") )) -eq "$s" ] || fail "$p has the wrong size. Run start-here.sh again."
     if [ "$h" != - ] && [ "$(sha "$dst")" != "$h" ]; then rm -f "$dst"; fail "$p failed its SHA-256 check and was removed. Run start-here.sh again."; fi
     echo "$p" >>"$d/.nslm-verified"
 done <<<"$list"
-pline=   # run-PACK.sh's line for the table
+pline="# the pack's own PLE table"   # run-PACK.sh's line for the table
 [ "$ple" = q8 ] && export Q4E_PLE_GGUF="$edir/$E_FILE" && pline="export Q4E_PLE_GGUF=\"$Q4E_PLE_GGUF\""
 
 echo
