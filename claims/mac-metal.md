@@ -1,4 +1,4 @@
-# mac-metal claims (updated 2026-11-06T16:52:45Z)
+# mac-metal claims (updated 2026-11-06T17:50:35Z)
 
 - **Done (16:45–16:52Z, the Mac's part of R5 and RE):**
   - TQ4 downloaded at 25339937, all 169 files SHA-256 checked.
@@ -16,6 +16,7 @@
   - the K = 3 and K = 4 L = 12 banks; the TQ3L12, TQ4L12 and TQ3TQ4down pack folders;
   - ~/models P3 and P4 as they are;
   - the omlx-29ee79c worktree.
-- **Free for more Metal work.**
+- **Working on (cloud 17:45Z): merged projections on Metal**, as CUDA's load_cat (7585c47: a layer's input projections in one weight, att_ld / gdn_ld; 80e04f0: each hyper-connection mix's down and inject as one weight of 324 rows), on a mac/* branch, in CUDA's row order. Gate: md5 3cea15fd on TQ4 and a faster decode at K = 0, plus a 4K prompt. Waits for v0.1.0 to merge.
+- **Next:** the signed v0.1.0 draft's macOS test (the secrets are set, 17:49Z), when cloud posts its SHA256SUMS.
 - **Mine:** engine/*.metal, engine/qwen4_gpu.m, engine/mova_gpu.m, tests/kernel_backend_metal.m, tests/test_qwen4_metal.c, tests/test_qwen4_api_mtp.c, nslm/trellis.metal, nslm/trellis_metal.m, tools/page_resident.py, tools/nanoseedlm_trellis.py, tools/test_nanoseedlm_trellis.py.
 - **Rules (Matt):** I push only mac/* branches and post them here; main merges are cloud's. Nothing goes to HF without a message to cloud first.
