@@ -82,6 +82,7 @@ static void slices(const KtWeight* w, WSlice* out, const uint32_t** G) {
             const int L = w->group & 255, KB = w->group >> 8 & 255, T = w->group >> 16;
             o->p[0] = W + (size_t) s * w->R * nslm_tq_row_words(w->K, T, L, KB) * 4;
             o->p[1] = S + (size_t) s * w->R * (size_t) (w->K / T) * 2;
+            o->gs = w->group;   // the GEMM's tile loader reads L, K, T here
             break;
         }
         case MF_Q8: case MF_Q4:

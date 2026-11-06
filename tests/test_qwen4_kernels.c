@@ -179,6 +179,34 @@ static void tcq_case(int L, int KB, int T, int R, int K, int P, int xdiv) {
     CHECK(rc == 0, "tcq gather L %d K %d T %d failed", L, KB, T);
     printf("  tcq gather  L %d K %d T %d, %d x %d, %d pairs: %.1e\n", L, KB, T, R, K, P, rel(y_k, y, (size_t) P * R));
     CHECK(rel(y_k, y, (size_t) P * R) < 1e-2, "tcq gather L %d K %d T %d differs", L, KB, T);
+    {   // the prompt path: the grouped GEMM over GP pairs (each its own input row), weights exact (f32) and as BF16
+        const int GP = 70, BN = kt_mm_tile();
+        int32_t* perm = (int32_t*) malloc(sizeof(int32_t) * GP);
+        MmTile* tl = (MmTile*) malloc(sizeof(MmTile) * (size_t) (GP + S));
+        int np = 0, nt = 0;
+        for (int s = 0; s < S; ++s) {
+            const int st = np;
+            for (int p = 0; p < GP; ++p) if ((p * 7) % S == s) perm[np++] = p;
+            for (int o = st; o < np; o += BN) tl[nt++] = (MmTile) {s, o, np - o < BN ? np - o : BN, 0};
+        }
+        float *gx = rnd((size_t) GP * K, -1, 1), *gy = rnd((size_t) GP * R, 0, 0), *gk = rnd((size_t) GP * R, 0, 0);
+        for (int p = 0; p < GP; ++p)
+            for (int r = 0; r < R; ++r) {
+                double acc = 0;   // the GEMM's inputs are BF16
+                for (int k = 0; k < K; ++k) acc += (double) dec[((size_t) ((p * 7) % S) * R + r) * K + k] * bf2f(f2bf(gx[(size_t) p * K + k]));
+                gy[(size_t) p * R + r] = bf2f(f2bf((float) acc));
+            }
+        for (int exact = 1; exact >= 0; --exact) {
+            if (!exact && !kt_seed_gemm_exact(0)) break;
+            kt_seed_gemm_exact(exact);
+            rc = kt_mm_grouped(&w, GP, 1, perm, tl, nt, gx, gk);
+            CHECK(rc == 0, "tcq GEMM L %d K %d T %d failed", L, KB, T);
+            printf("  tcq GEMM    L %d K %d T %d, %d x %d, %d pairs, weights %s: %.1e\n", L, KB, T, R, K, GP, exact ? "f32 " : "BF16", rel(gk, gy, (size_t) GP * R));
+            CHECK(rel(gk, gy, (size_t) GP * R) < (exact ? 8e-3 : 2e-2), "tcq GEMM L %d K %d T %d (%s weights) differs", L, KB, T, exact ? "f32" : "BF16");
+        }
+        kt_seed_gemm_exact(0);
+        free(perm); free(tl); free(gx); free(gy); free(gk);
+    }
     free(words); free(sc); free(dec); free(sel); free(x); free(y); free(y_k);
 }
 

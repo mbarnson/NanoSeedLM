@@ -383,6 +383,20 @@ static __device__ __forceinline__ void tile_weights(int fmt, const WSlice* w, co
             o[i] = __fmul_rn(__fadd_rn(__fadd_rn(__fmul_rn(cstate(st, 3 * i + 1), q0), __fmul_rn(cstate(st, 3 * i + 2), q1)),
                                        __fmul_rn(cstate(st, 3 * i + 3), q2)),
                              sc);
+    } else if (fmt == MF_TCQ) {   // trellis rows (format v0): WSlice gs = L | K << 8 | T << 16; T is a multiple of 8
+        const int L = w->gs & 255, KB = w->gs >> 8 & 255, T = w->gs >> 16, NB = KB * T + L - KB, nb = K / T;
+        const size_t nw = ((size_t) nb * NB + 31) / 32 + 1;
+        const int c0 = 8 * j, b = c0 / T;
+        const uint32_t o0 = (uint32_t) b * NB + (uint32_t) (KB * (c0 - b * T)), sh = o0 & 31u;
+        const uint32_t* p = (const uint32_t*) w->p[0] + (size_t) r * nw + (o0 >> 5);
+        const uint32_t w0 = p[0], w1 = p[1], w2 = sh + (uint32_t) (7 * KB + L) > 64u ? p[2] : 0u;   // as tq_block
+        const uint64_t v = (uint64_t) __funnelshift_r(w0, w1, sh) | (uint64_t) __funnelshift_r(w1, w2, sh) << 32;
+        const float sc = bf(((const uint16_t*) w->p[1])[(size_t) r * nb + b]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {   // scale x q in f32 is exact (8 + 10 bits): the decoded weight of nslm_tq_decode_row
+            const uint32_t st = (uint32_t) (v >> (KB * i)) & ((1u << L) - 1u);
+            o[i] = sc * (__uint_as_float(__dp4a(st * 34038481u + 76625530u, 0x01010101u, 0x4B000000u)) - 8389118.0f);
+        }
     } else wblock(fmt, w, r, K, j, o);
 #pragma unroll
     for (int i = 0; i < 8; ++i) dst[i] = o[i];
@@ -651,6 +665,12 @@ __global__ void __launch_bounds__(MMT_THREADS) k_mm3(MmArgs a, WSlice wd, const 
     mm_body<3>(F, a, wd, ws, X, Y, perm, tiles, ntiles, G);
 }
 static const MmKernel MM3_K[5] = {k_mm_bf16, k_mm3<MF_SEED4>, k_mm_q8, k_mm_q4, k_mm3<MF_SEED4P4>};
+// trellis experts (MF_TCQ = 8, outside the tables above): weights as BF16 (NT 1), or exact in f32 (NT 3) as the seeds
+__global__ void __launch_bounds__(MMT_THREADS) k_mm_tcq(MmArgs a, WSlice wd, const WSlice* ws, const float* X, float* Y,
+                                                        const int32_t* perm, const MmTile* tiles, const int32_t* ntiles,
+                                                        const uint32_t* G) {
+    mm_body<1>(MF_TCQ, a, wd, ws, X, Y, perm, tiles, ntiles, G);
+}
 
 // ---- embedding, norm ---------------------------------------------------------------------------------------------------
 __global__ void k_embed(int fmt, WSlice w, int d, const int32_t* ids, float* x) {
@@ -2132,8 +2152,10 @@ PACKED_MM(MF_SEED4, seed4)
 PACKED_MM(MF_Q8, q8)
 PACKED_MM(MF_Q4, q4)
 PACKED_MM(MF_SEED4P4, seed4p4)
+PACKED_MM(MF_TCQ, tcq)
 #undef PACKED_MM
 static const MmKernel PACKED_MM_K[] = {k_mm_packed_bf16, k_mm_packed_seed4, k_mm_packed_q8, k_mm_packed_q4, k_mm_packed_seed4p4};
+static MmKernel packed_mm_kernel(int fmt) { return fmt == MF_TCQ ? k_mm_packed_tcq : PACKED_MM_K[fmt]; }
 
 // ---- launchers ---------------------------------------------------------------------------------------------------------
 // ---- trellis-coded experts (nslm/trellis.h format v0, plan T3): decode gathers ------------------------------------
@@ -2274,7 +2296,10 @@ int kc_tq_mv_sel(cudaStream_t s, int L, int KB, int T, const WSlice* ws, int K, 
 
 static int g_seed_exact;
 void kc_seed_gemm_f32(int on) { g_seed_exact = on; }
-static MmKernel mm_kernel(int fmt) { return (g_seed_exact ? MM3_K : MM_K)[fmt]; }
+static MmKernel mm_kernel(int fmt) {
+    if (fmt == MF_TCQ) return g_seed_exact ? k_mm3<MF_TCQ> : k_mm_tcq;
+    return (g_seed_exact ? MM3_K : MM_K)[fmt];
+}
 void kc_mm(cudaStream_t s, int fmt, WSlice w, int K, int R, const float* x, int xs, float* y, int ys, int T, int add,
            const uint32_t* G) {
     MmArgs a = {K, R, T, xs, ys, 1, add, 0};
@@ -2302,13 +2327,13 @@ void kc_pack_input_bf16(cudaStream_t s, const float* x, uint16_t* y, size_t n) {
 void kc_mm_packed(cudaStream_t s, int fmt, WSlice w, int K, int R, const uint16_t* x, int xs, float* y, int ys, int T, int add,
                   const uint32_t* G) {
     MmArgs a = {K, R, T, xs, ys, 1, add, 0};
-    PACKED_MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), MMT_THREADS, 0, s>>>(
+    packed_mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) (T + MMT_BN - 1) / MMT_BN), MMT_THREADS, 0, s>>>(
         a, w, NULL, (const float*) x, y, NULL, NULL, NULL, G);
 }
 void kc_mm_grouped_packed(cudaStream_t s, int fmt, const WSlice* ws, int K, int R, const uint16_t* x, int xs, float* y, int ys,
                          int xdiv, const int32_t* perm, const MmTile* tiles, const int32_t* nt, int max_tiles, const uint32_t* G) {
     MmArgs a = {K, R, 0, xs, ys, xdiv, 0, 0}; WSlice none = {};
-    PACKED_MM_K[fmt]<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), MMT_THREADS, 0, s>>>(
+    packed_mm_kernel(fmt)<<<dim3((unsigned) (R + MMT_BM - 1) / MMT_BM, (unsigned) max_tiles), MMT_THREADS, 0, s>>>(
         a, none, ws, (const float*) x, y, perm, tiles, nt, G);
 }
 void kc_bucket(cudaStream_t s, const int32_t* inds, int count, int n, int32_t* perm, MmTile* tiles, int32_t* ntiles) {
