@@ -35,7 +35,7 @@
 | `NSLM_PLE=pack` | `q8` | The start scripts: use the pack's 4-bit PLE table, and do not download Unsloth's Q8_0 table |
 | `Q4E_ROWS=N` | 4096 or 16384 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --prompt-rows N` |
 | `Q4E_PASS_ROWS=N` | 32768, or 8192 under 32 GB of VRAM | Qwen3.8-Flash-Next on CUDA: the most prompt rows of one layer-major pass. Each row keeps 40 KB of VRAM |
-| `Q4E_DRAFTS=K` | 0 | Qwen3.8-Flash-Next in `nslm-chat` at temperature 0: `nslm-qwen4-gen --drafts K` (1 to 3 MTP drafts a forward, the same text). Set, it opens the MTP head, which every forward runs. `nslm-serve` does not draft |
+| `Q4E_DRAFTS=K` | 0 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: 1 to 3 MTP drafts a forward, as `nslm-qwen4-gen --drafts K`. Each token keeps the sampler's distribution. At temperature 0 the text does not change. Set, it opens the MTP head, which every forward runs. `nslm-serve` drafts while one request decodes |
 | `NSLM_SEED_GEMM_F32=1` | off | Keep seed weights in f32 in the prompt GEMM. This changed neither KLD nor NLL, and it costs about 30% of prompt speed at 4K |
 | `NSLM_PREFILL_RANGE` | 8192, or 32768 when the KV cache is partly in host memory | Prompt rows that the engine computes layer by layer at a time. Each range copies the earlier host rows again |
 | `NSLM_MLA_DEC_KEYS` | 8192 (128 MiB of VRAM) | MLA keys that the engine decompresses at a time for prompt rows. 0 attends prompts absorbed, as decode does |

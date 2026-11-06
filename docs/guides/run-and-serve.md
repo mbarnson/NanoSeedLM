@@ -137,10 +137,13 @@ build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-P3 --ctx 32768
   prompt again: its DeltaNet state cannot go back.
 - The expert cache takes the free VRAM. `NSLM_EXPERT_VRAM_MB` sets its size. The `Q4E_*` variables set the other
   engine options ([Environment variables](../reference/env.md)).
-- `Q4E_DRAFTS=K` makes `nslm-chat` draft K tokens a forward with the MTP head (1 to 3) at temperature 0, as
-  `nslm-qwen4-gen --drafts K` does. The text does not change. Drafts are off by default, and you choose K. The gain
-  depends on the text. On the M4 Max, 2 drafts make code 46% faster, and 3 drafts make a short chat answer 13% slower
-  than no drafts ([results](../results/2026-11-05-qwen38-mtp-chat-m4max.md)). `nslm-serve` does not draft.
+- `Q4E_DRAFTS=K` makes `nslm-chat` and `nslm-serve` draft K tokens a forward with the MTP head (1 to 3), as
+  `nslm-qwen4-gen --drafts K` does. Each token keeps the distribution of the sampler. At temperature 0 the text does not
+  change. Drafts are off by default, and you choose K. `nslm-serve` drafts while one request decodes, and its log line
+  counts the drafts that it kept.
+- The gain depends on the text and the machine. On the M4 Max, 2 drafts make code 46% faster, and 3 drafts make a short
+  chat answer 13% slower than no drafts ([results](../results/2026-11-05-qwen38-mtp-chat-m4max.md)). On an RTX 4080,
+  2 drafts make `nslm-serve` slower ([plan](../plans/2026-11-06-serve-drafts.md), gate SC).
 
 `nslm-qwen4-gen` runs one prompt through the engine, with greedy decoding and the options below.
 

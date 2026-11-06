@@ -1,10 +1,6 @@
 // harness/nslm-chat.c - one chat turn with K2-Horizon-MoVA or Qwen3.8-Flash-Next, streamed to stdout (usage() lists options).
-// temp > 0 is the MLX sampler: p ~ exp((l - l_max) / T) in f64, u = (splitmix64 seeded with --seed >> 11) 2^-53 sum, the
-// first index whose cumulative sum exceeds u. temp 0: the arg max, ties to the lowest id. With Q4E_DRAFTS = K (1 to 3,
-// Qwen3.8-Flash-Next's MTP drafts) temp 0 decodes the tokens after the first through eng_generate, K + 1 at a call: the
-// same tokens, in forwards that verify up to K drafts each (eng_generate drafts across its calls, so short calls cost
-// nothing). A call's tokens after a stop (at most K) are not shown; the engine keeps them, since the turn ends there (on
-// Qwen3.8-Flash-Next an eng_rewind would compute the whole context again).
+// Tokens come from harness/sample.h's MLX sampler (temp 0: the arg max). With Q4E_DRAFTS = K (1 to 3), Qwen3.8-Flash-Next
+// decodes K + 1 tokens a call of eng_generate_pick, whose forwards verify up to K MTP drafts: the sampler's distribution.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +11,15 @@
 #include "engine_api.h"
 #include "json.h"
 #include "platform.h"
+#include "qwen4_ext.h"
 #include "tokenizer.h"
 
+typedef struct { Sampler s; const ChatModel* cm; } Pick;   // a stop token is a stop (-1)
+static int32_t chat_pick(void* ctx, const float* l, int V, int32_t draft) {
+    Pick* p = (Pick*) ctx;
+    const int32_t t = sample_pick(&p->s, l, V, draft);
+    return cm_stop(p->cm, t) ? -1 : t;
+}
 
 static int usage(void) {
     fprintf(stderr, "usage: nslm-chat --model DIR [--res out/res] [--max-tokens 512] [--temp 0] [--seed N] [--system TEXT]\n"
@@ -115,9 +118,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "%s\nloaded in %.1f s\n", eng_describe(e), now_s() - tl);
     const int V = eng_vocab(e);
     float* lg = (float*) malloc(sizeof(float) * (size_t) V);
-    Sampler sp = {temp, 1, 0, 0, 1, seed};   // the MLX sampler
+    Pick pk = {{temp, 1, 0, 0, 1, seed}, &cm};   // the MLX sampler
     const char* dk = getenv("Q4E_DRAFTS");
-    const int drafts = temp > 0 || !dk || atoi(dk) < 1 ? 0 : atoi(dk) < 3 ? atoi(dk) : 3, seq0 = 0;
+    int32_t got[ENG_MAX_DRAFTS + 1];   // a call's tokens
+    const int drafts = !dk || atoi(dk) < 1 || eng_generate_pick(e, 0, 0, chat_pick, &pk, got, NULL) ? 0 :
+                       atoi(dk) < ENG_MAX_DRAFTS ? atoi(dk) : ENG_MAX_DRAFTS;
     EngStats gs;
     memset(&gs, 0, sizeof gs);
 
@@ -129,19 +134,13 @@ int main(int argc, char** argv) {
     double t1 = t0;
     if (eng_prefill(e, 0, ids, n)) { fprintf(stderr, "prefill failed\n"); return 1; }
     while (ngen < max_tokens) {
-        int32_t got[4];   // this round's tokens: one by eng_step, or a chunk of eng_generate's (at most 3 + 1)
-        int ng = 1, stepped = !drafts || !ngen;
-        if (stepped) {
-            if (eng_step(e, 0, lg)) { fprintf(stderr, "step failed\n"); return 1; }
-            got[0] = sample_pick(&sp, lg, V, -1);
-        } else {
-            ng = max_tokens - ngen < drafts + 1 ? max_tokens - ngen : drafts + 1;
-            if (eng_generate(e, &seq0, 1, ng, ENG_MODE_DEFAULT, got, &gs)) { fprintf(stderr, "generate failed\n"); return 1; }
-        }
+        const int left = max_tokens - ngen, want = !drafts || !ngen ? 1 : left < drafts + 1 ? left : drafts + 1;   // TTFT: 1
+        int keep;
+        if (drafts) keep = eng_generate_pick(e, 0, want, chat_pick, &pk, got, &gs);
+        else if (eng_step(e, 0, lg)) keep = -1;
+        else keep = (got[0] = chat_pick(&pk, lg, V, -1)) < 0 ? 0 : eng_push(e, 0, got[0]) ? -1 : 1;
+        if (keep < 0) { fprintf(stderr, "decode failed\n"); return 1; }
         if (ngen == 0) t1 = now_s();
-        int keep = 0;
-        while (keep < ng && !cm_stop(&cm, got[keep])) ++keep;
-        if (stepped && keep) eng_push(e, 0, got[0]);
         for (int i = 0; i < keep; ++i) {
             char* piece = tok_decode(tok, got + i, 1, NULL);
             const size_t k = strlen(piece);
@@ -156,7 +155,7 @@ int main(int argc, char** argv) {
         fflush(stdout);
         memmove(pend, pend + ok, npend - ok);
         npend -= ok;
-        if (keep < ng) { finish = "stop"; break; }
+        if (keep < want) { finish = "stop"; break; }
     }
     const double t2 = now_s();
     if (npend) fwrite(pend, 1, npend, stdout);
