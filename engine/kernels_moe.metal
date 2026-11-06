@@ -554,27 +554,59 @@ static inline float mv_lane(short fmt, device const uchar* W, device const ushor
 // blocks, block b a stream of NB = K T + L - K bits from bit b NB of the row's words (row_words = ceil(C / T NB / 32) + 1,
 // the spare word included). Lane l takes the W = T / 32 weights from l W of each block: one 3-word read (the third only when
 // its window reaches it), shifted to its first bit, then each state s at a compile-time shift. q(s), the byte sum of
-// 34038481 s + 76625530 less 510, is exact in f32 as rint(255 (sum of unpack_unorm4x8)) - 510 (all 65,536 states checked).
-// Each block's sum times its BF16 scale.
+// 34038481 s + 76625530 less 510, is taken as 255 (sum of unpack_unorm4x8) - 510, with the 255 and the 510 applied once a
+// block: s_b (255 sum u x - 510 sum x). That is within ~1e-7 of the exact q a weight (the rint form, exact, was 9 to 15%
+// slower on the M4 Max: Metal has no byte dot product), far below the BF16 rounding of the outputs.
+static inline void tq_window(device const uint* row, int b, uint lane, thread uint& u0, thread uint& u1) {
+    const int W = TQ_T / 32, NB = TQ_KB * TQ_T + TQ_L - TQ_KB;
+    const uint o = uint(b) * uint(NB) + uint(TQ_KB * W) * lane, sh = o & 31u;
+    device const uint* p = row + (o >> 5);
+    const uint w0 = p[0], w1 = p[1], w2 = sh + uint(TQ_KB * (W - 1) + TQ_L) > 64u ? p[2] : 0u;
+    u0 = uint(((ulong(w1) << 32) | ulong(w0)) >> sh);
+    u1 = uint(((ulong(w2) << 32) | ulong(w1)) >> sh);
+}
+static inline float tq_unit(uint u0, uint u1, int off) {   // (q(s) + 510) / 255 of the state at bit off of the window
+    const uint st = (off + TQ_L <= 32 ? u0 >> uint(off) : off >= 32 ? u1 >> uint(off - 32) : (u0 >> uint(off)) | (u1 << uint(32 - off))) &
+                    ((1u << TQ_L) - 1u);
+    const float4 u = unpack_unorm4x8_to_float(st * 34038481u + 76625530u);
+    return (u.x + u.y) + (u.z + u.w);
+}
 static inline float tq_row_lane(device const uint* row, device const ushort* sc, int C, uint lane, device const float* xb) {
-    const int W = TQ_T / 32, NB = TQ_KB * TQ_T + TQ_L - TQ_KB, nb = C / TQ_T;
+    const int W = TQ_T / 32, nb = C / TQ_T;
     float acc = 0;
     for (int b = 0; b < nb; ++b) {
-        const uint o = uint(b) * uint(NB) + uint(TQ_KB * W) * lane, sh = o & 31u;
-        device const uint* p = row + (o >> 5);
-        const uint w0 = p[0], w1 = p[1], w2 = sh + uint(TQ_KB * (W - 1) + TQ_L) > 64u ? p[2] : 0u;
-        const uint u0 = uint(((ulong(w1) << 32) | ulong(w0)) >> sh), u1 = uint(((ulong(w2) << 32) | ulong(w1)) >> sh);
+        uint u0, u1;
+        tq_window(row, b, lane, u0, u1);
         device const float* xp = xb + b * TQ_T + int(lane) * W;
-        float s = 0;
+        float s = 0, xs = 0;
         for (int i = 0; i < TQ_WMAX; ++i) {
             if (i >= W) break;
-            const int off = TQ_KB * i;
-            const uint st = (off + TQ_L <= 32 ? u0 >> uint(off) : off >= 32 ? u1 >> uint(off - 32) : (u0 >> uint(off)) | (u1 << uint(32 - off))) &
-                            ((1u << TQ_L) - 1u);
-            const float4 u = unpack_unorm4x8_to_float(st * 34038481u + 76625530u);
-            s += (rint((u.x + u.y + u.z + u.w) * 255.0f) - 510.0f) * xp[i];
+            s += tq_unit(u0, u1, TQ_KB * i) * xp[i];
+            xs += xp[i];
         }
-        acc += bf(sc[b]) * s;
+        acc += bf(sc[b]) * (255.0f * s - 510.0f * xs);
+    }
+    return acc;
+}
+// Gate and up of one row in one loop: each lane's x loads and sum x serve both
+static inline float2 tq_rows_lane2(device const uint* rg, device const ushort* sg, device const uint* ru, device const ushort* su, int C,
+                                   uint lane, device const float* xb) {
+    const int W = TQ_T / 32, nb = C / TQ_T;
+    float2 acc = 0;
+    for (int b = 0; b < nb; ++b) {
+        uint g0, g1, v0, v1;
+        tq_window(rg, b, lane, g0, g1);
+        tq_window(ru, b, lane, v0, v1);
+        device const float* xp = xb + b * TQ_T + int(lane) * W;
+        float pg = 0, pu = 0, xs = 0;
+        for (int i = 0; i < TQ_WMAX; ++i) {
+            if (i >= W) break;
+            const float xv = xp[i];
+            pg += tq_unit(g0, g1, TQ_KB * i) * xv;
+            pu += tq_unit(v0, v1, TQ_KB * i) * xv;
+            xs += xv;
+        }
+        acc += float2(bf(sg[b]), bf(su[b])) * (255.0f * float2(pg, pu) - 510.0f * xs);
     }
     return acc;
 }
@@ -822,8 +854,9 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
         const int p0 = (int) tg.y, nb = a.K / TQ_T;
         const ulong row = (ulong) sel[p0] * a.R + r, nw = tq_row_words(a.K);
         device const float* xb = x + (ulong) (p0 / a.xdiv) * a.xs;
-        const float g = simd_sum(tq_row_lane((device const uint*) W + row * nw, S + row * (ulong) nb, a.K, lane, xb));
-        const float u = simd_sum(tq_row_lane((device const uint*) Wu + row * nw, Su + row * (ulong) nb, a.K, lane, xb));
+        const float2 gu = tq_rows_lane2((device const uint*) W + row * nw, S + row * (ulong) nb, (device const uint*) Wu + row * nw,
+                                        Su + row * (ulong) nb, a.K, lane, xb);
+        const float g = simd_sum(gu.x), u = simd_sum(gu.y);
         if (lane == 0) y[(ulong) p0 * a.ys + r] = bfr(silu_bf(bfr(g)) * bfr(u));
         return;
     }
@@ -935,8 +968,8 @@ static inline void seed6p8_block(device const uchar* W, device const ushort* S, 
 }
 static inline void tile_weights(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, device const uint* G,
                                 int slice, ulong row, int K, int j, int ebias, threadgroup float* dst, device const uchar* EN) {
-    if (fmt == MF_TCQ) {   // 8 weights of a trellis row (T a multiple of 8, so one block): a guarded 3-word window, as tq_row_lane;
-        const int c0 = 8 * j, b = c0 / TQ_T, NB = TQ_KB * TQ_T + TQ_L - TQ_KB;   // scale x q is exact in f32
+    if (fmt == MF_TCQ) {   // 8 weights of a trellis row (T a multiple of 8, so one block): a guarded 3-word window, as tq_window;
+        const int c0 = 8 * j, b = c0 / TQ_T, NB = TQ_KB * TQ_T + TQ_L - TQ_KB;   // exact: rint, as q is used once a tile
         const uint o = uint(b) * uint(NB) + uint(TQ_KB * (c0 % TQ_T)), sh = o & 31u;
         device const uint* p = (device const uint*) W + row * tq_row_words(K) + (o >> 5);
         const uint w0 = p[0], w1 = p[1], w2 = sh + uint(TQ_KB * 7 + TQ_L) > 64u ? p[2] : 0u;
