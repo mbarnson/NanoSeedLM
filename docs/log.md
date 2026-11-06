@@ -875,3 +875,10 @@ passes gate RE. `373499f` fixes the pack choice of the start scripts on 64 GB PC
 `4373d30` adds `nslm-qwen4-emulate --ple`. In HF job `6aee1d9d`, the 4-bit MLX PLE table that the packs ship gives a KL
 of 0.0259 on Q8_0. Unsloth's Q8_0 table gives 0.0199. `ff92415` makes the start scripts download the Q8_0 table
 by default. Read [The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md).
+
+## [2026-11-06] release | The trellis packs are TCQ4, TCQ3-D4 and TCQ3
+
+The three repositories moved from `-TQ4`, `-TQ3-D4` and `-TQ3` to `-TCQ4`, `-TCQ3-D4` and `-TCQ3`, at the same
+revisions. TCQ is trellis-coded quantization. In oMLX and in the community, TQ means TurboQuant. The Hub redirects the
+old names. The start scripts, the cards and the current pages use the new names. The dated results pages keep the
+names of their measurements.

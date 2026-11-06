@@ -4,10 +4,10 @@
 # repositories, with its token as a job secret (the data goes from the bucket to the Hub, not over the caller's link).
 # Each folder goes to the local disk first: hf upload of the mounted bucket fails with EIO, as a memory map gives SIGBUS:
 #   hf jobs run --flavor cpu-xl --timeout 4h --secrets HF_TOKEN -v hf://buckets/txgsync/nslm-qwen38:/b \
-#       [-e PACKS="TQ3 TQ3-D4 TQ4"] python:3.12 bash /b/src-REV/tools/hf_release_publish.sh
+#       [-e PACKS="TCQ3 TCQ3-D4 TCQ4"] python:3.12 bash /b/src-REV/tools/hf_release_publish.sh
 # Make a repository public later on its settings page, after the download tests.
 set -euo pipefail
-OUT=${OUT:-/b/release} CARDS=${CARDS:-/b/release/cards} PACKS=${PACKS:-"TQ3 TQ3-D4 TQ4"}
+OUT=${OUT:-/b/release} CARDS=${CARDS:-/b/release/cards} PACKS=${PACKS:-"TCQ3 TCQ3-D4 TCQ4"}
 pip install -q "huggingface_hub[hf_xet]" >/dev/null 2>&1
 for P in $PACKS; do
     R=txgsync/Qwen3.8-Flash-Next-NanoSeedLM-$P

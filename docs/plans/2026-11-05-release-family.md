@@ -4,14 +4,15 @@
 gives a folder that the NanoSeedLM engines run on a PC (CUDA, Linux or Windows) and on a Mac (Metal). Each card states
 the pack's KL against BF16 as shipped, its speed and the machine that it is for.
 
-**Status.** Current: the three repositories are public (2026-11-06). Matt approved the release on 2026-11-05. D0 of the
+**Status.** Current: the three repositories are public (2026-11-06). Their names are TCQ4, TCQ3-D4 and TCQ3
+(trellis-coded quantization), not TQ: in oMLX, TQ means TurboQuant. Matt approved the release on 2026-11-05. D0 of the
 dense plan changed release 1: P3's 4-bit MLX dense weights triple the KL ([packs as
 shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit dense weights (step R2b). R1 to R4 are
-done, and the folders are in the bucket. Their KL as shipped is 0.0415 (TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3) ([the
+done, and the folders are in the bucket. Their KL as shipped is 0.0415 (TCQ4), 0.0638 (TCQ3-D4) and 0.0778 (TCQ3) ([the
 release packs as shipped](../results/2026-11-05-release-as-shipped.md)). The first R5 job failed: `hf upload` of the
-bucket mount gives EIO. The script now copies each folder to the local disk first (`29a76aa`). R5's upload is done (TQ3
-`5f2a8599`, TQ3-D4 `7e5edb2b`, TQ4 `25339937`), and Matt made them public on 2026-11-06. RD passes on the RTX 4080 ([the
-release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). RD and RE pass on the M4 Max ([the
+bucket mount gives EIO. The script now copies each folder to the local disk first (`29a76aa`). R5's upload is done (TCQ3
+`5f2a8599`, TCQ3-D4 `7e5edb2b`, TCQ4 `25339937`), and Matt made them public on 2026-11-06. RD passes on the RTX 4080
+([the release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). RD and RE pass on the M4 Max ([the
 release packs from the Hub on the M4 Max](../results/2026-11-06-release-downloads-m4max.md)). R6 is a draft release of
 the engines (v0.1.0) with the start scripts. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the
 risk of a stale loader is closed for them.
@@ -23,9 +24,9 @@ rows that a run reads.
 
 | Repository (`txgsync/...`) | Experts | Expert GB | Memory | KL, Q8_0 dense | For |
 |---|---|---|---|---|---|
-| `Qwen3.8-Flash-Next-NanoSeedLM-TQ4` | K = 4 | 62.3 | about 66 GB | 0.0398 | A 128 GB Mac. A GPU of 24 GB or more with 96 to 128 GB of RAM |
-| `Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4` | K = 3, `down_proj` at K = 4 | 52.2 | about 56 GB | 0.0619 | A 16 GB GPU with 96 to 128 GB of RAM. A 96 GB Mac |
-| `Qwen3.8-Flash-Next-NanoSeedLM-TQ3` | K = 3 | 47.2 | about 51 GB | 0.0765 | A 16 GB GPU with 64 GB of RAM. A 64 GB Mac |
+| `Qwen3.8-Flash-Next-NanoSeedLM-TCQ4` | K = 4 | 62.3 | about 66 GB | 0.0398 | A 128 GB Mac. A GPU of 24 GB or more with 96 to 128 GB of RAM |
+| `Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4` | K = 3, `down_proj` at K = 4 | 52.2 | about 56 GB | 0.0619 | A 16 GB GPU with 96 to 128 GB of RAM. A 96 GB Mac |
+| `Qwen3.8-Flash-Next-NanoSeedLM-TCQ3` | K = 3 | 47.2 | about 51 GB | 0.0765 | A 16 GB GPU with 64 GB of RAM. A 64 GB Mac |
 
 - The KL column uses Unsloth's Q8_0 dense weights. Step R3 measures each pack as shipped, with its 4-bit MLX dense
   weights.
@@ -62,7 +63,7 @@ oMLX cannot load these packs in this release.
 
 - **RA.** The engine opens a packed folder of the tiny model, and its logits equal those of the same banks beside the
   full folder.
-- **RB.** Each pack's KL as shipped is on its card. The KL of TQ3-D4 as shipped is at most 5% above its KL with
+- **RB.** Each pack's KL as shipped is on its card. The KL of TCQ3-D4 as shipped is at most 5% above its KL with
   Q8_0 dense weights (0.0619).
 - **RC.** Each folder gives the same text in two runs.
 - **RD.** On the RTX 4080 and the M4 Max, `hf download` and one command give the same text as RC.
@@ -85,7 +86,7 @@ R8 after v0.1.0, in order:
 
 ## Costs
 
-- R3: one KL job of TQ3 and TQ4 as shipped, with the saved BF16 reference, `rtx-pro-6000x2`, about $2.50. The mix
+- R3: one KL job of TCQ3 and TCQ4 as shipped, with the saved BF16 reference, `rtx-pro-6000x2`, about $2.50. The mix
   and P3 come from the D0 job of [the dense plan](2026-11-05-trellis-dense.md).
 - R4: a CPU job to build about 275 GB of folders, and three runs on `rtx-pro-6000`, about $3 in all.
 - R5: an upload job on an HF CPU (`cpu-xl`, about 3 hours), as for P3 and P4. The PC starts it with Matt's HF token

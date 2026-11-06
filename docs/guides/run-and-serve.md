@@ -10,7 +10,7 @@ The [releases](https://github.com/mbarnson/NanoSeedLM/releases) have built engin
 1. Download the archive for your machine, and unpack it.
 2. On Windows, double-click `START-HERE.bat`. On Linux or macOS, run `./start-here.sh`.
 3. Answer two questions: the pack (Enter takes the recommended pack) and the model folder. To skip the questions, give
-   them as arguments, for example `START-HERE.bat TQ3-D4 D:\models` or `./start-here.sh TQ4 ~/models`.
+   them as arguments, for example `START-HERE.bat TCQ3-D4 D:\models` or `./start-here.sh TCQ4 ~/models`.
 
 The script checks the GPU, the driver, the RAM and the disk. It downloads the pack from Hugging Face and checks the
 SHA-256 of each file. It asks before a download of more than 1 GB. Then it runs one short chat, writes `run-PACK.bat` (or `run-PACK.sh`) and starts `nslm-serve` on

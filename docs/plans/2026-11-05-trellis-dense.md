@@ -6,7 +6,7 @@ every pack has a KL measured as it is shipped.
 
 **Status.** Draft. Matt asked for it on 2026-11-05 and approved the HF jobs within the weekly cap. D0 is done: the 4-bit MLX dense weights add about 0.12 of
 KL (P3 0.182, the mix 0.185), so HD1 holds ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). Release 1
-ships 8-bit MLX dense weights: TQ4 gives 0.0415 ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
+ships 8-bit MLX dense weights: TCQ4 gives 0.0415 ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
 oMLX's own oQ packs (oQ2.5e to oQ8e) also keep every dense tensor at 8 bits. So gate DB now compares with the 8-bit
 dense weights, and they read about 4.5 GB a token. Step D2a (code done) ranks the kinds by their KL at 4 bits.
 

@@ -10,12 +10,12 @@ REPO = "txgsync/Qwen3.8-Flash-Next-NanoSeedLM-"
 # name: experts, expert bits, expert GB, resident GB (PLE on disk), KL with Q8_0 dense (trellis mixes page), machines,
 #       RTX 4080 decode and M4 Max decode with 4-bit dense (tok/s), the K of each projection
 PACKS = {
-    "TQ4": ("trellis K = 4", 4.125, 62.3, 70, 0.0398, "A 128 GB Mac. A GPU of 24 GB or more with 96 to 128 GB of RAM",
+    "TCQ4": ("trellis K = 4", 4.125, 62.3, 70, 0.0398, "A 128 GB Mac. A GPU of 24 GB or more with 96 to 128 GB of RAM",
             "35.7 (at the old 2,560 MB reserve)", "48.9", "K = 4 for `gate_proj`, `up_proj` and `down_proj`"),
-    "TQ3-D4": ("trellis K = 3, `down_proj` at K = 4", 3.458, 52.2, 60, 0.0619,
+    "TCQ3-D4": ("trellis K = 3, `down_proj` at K = 4", 3.458, 52.2, 60, 0.0619,
                "A 16 GB GPU with 96 to 128 GB of RAM. A 96 GB Mac", "54.4", "48.8",
                "K = 3 for `gate_proj` and `up_proj`, K = 4 for `down_proj`"),
-    "TQ3": ("trellis K = 3", 3.125, 47.2, 55, 0.0765, "A 16 GB GPU with 64 GB of RAM. A 96 GB Mac (a 64 GB Mac is not tested)", "61.3", "48.8",
+    "TCQ3": ("trellis K = 3", 3.125, 47.2, 55, 0.0765, "A 16 GB GPU with 64 GB of RAM. A 96 GB Mac (a 64 GB Mac is not tested)", "61.3", "48.8",
             "K = 3 for `gate_proj`, `up_proj` and `down_proj`"),
 }
 UNSLOTH = [("UD-Q4_K_XL", 5.101, 0.0304), ("UD-IQ4_XS", 3.999, 0.0509), ("UD-Q3_K_XL", 3.720, 0.0593),
