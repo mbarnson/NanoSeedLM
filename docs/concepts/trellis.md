@@ -23,14 +23,18 @@ Unsloth's two nearest packs in log KL. Read [Trellis packs and Unsloth's curve](
 | Trellis K = 2, L = 12 | 2.133 | 32.2 | 0.204 | (no Unsloth pack this small) |
 
 Decode and prompt in the engine on the RTX 4080, with the automatic expert cache. Read
-[Trellis experts on the RTX 4080](../results/2026-11-05-trellis-speed-4080.md).
+[Trellis experts on the RTX 4080](../results/2026-11-05-trellis-speed-4080.md). The engine now keeps 1,024 MB of VRAM
+free on a display GPU, not 2,560. So the cache holds about 20% more experts. Read
+[The VRAM reserve on the RTX 4080](../results/2026-11-05-vram-reserve-4080.md).
 
-| Experts | Decode, tokens per second | Prompt of 2,994 tokens, tokens per second |
-|---|---|---|
-| P3 seeds | 39.1 | 642 |
-| Trellis K = 4 | 35.7 (-8%) | 608 |
-| Trellis K = 3 + 4 (`down_proj` at K = 4) | 49.7 (+27%) | 781 (+22%) |
-| Trellis K = 3 | 56.0 (+43%) | 1,036 (+61%) |
+| Experts | Decode, 2,560 MB free | Decode, 1,024 MB free (the default) | Prompt of 2,994 tokens, 2,560 MB free |
+|---|---|---|---|
+| P3 seeds | 39.1 | 42.2 | 642 |
+| Trellis K = 4 | 35.7 (-8%) | not measured | 608 |
+| Trellis K = 3 + 4 (`down_proj` at K = 4) | 49.7 (+27%) | 54.4 (+29%) | 781 (+22%) |
+| Trellis K = 3 | 56.0 (+43%) | 61.3 (+45%) | 1,036 (+61%) |
+
+The units are tokens per second. The percentages compare with P3 at the same reserve.
 
 On the M4 Max all experts stay in unified memory. There, every trellis pack decodes about 2% faster than P3 and reads
 prompts at P3's speed. Read [Trellis experts on the M4 Max](../results/2026-11-05-trellis-speed-m4max.md).
