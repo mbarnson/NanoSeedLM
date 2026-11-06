@@ -894,3 +894,9 @@ caller. Read [MTP drafts in nslm-serve](plans/2026-11-06-serve-drafts.md).
 The model cards get long runs in place of 256-token decodes. On the stock path of v0.1.0 (the Q8_0 PLE table, 32K
 context), the RTX 4080 decodes 4,096 tokens at 44 (TCQ3), 38 (TCQ3-D4) and 31 (TCQ4) tokens per second. After 30K
 tokens of prompt it decodes at 42, 36 and 30. Read [Long decode on the RTX 4080](results/2026-11-06-long-bench-4080.md).
+
+## [2026-11-06] plan | MTP drafts that the sampler keeps more often
+
+At temperature 1.0 on the RTX 4080, 2 drafts in `nslm-serve` keep 38% to 46% and make decode 16% slower (gate SC). The
+plan takes Strata's rule: drafts sampled from the head's distribution, kept with min(1, p / q), and a confidence gate.
+Cheaper verify rows need a plan of their own. Read [Drafts the sampler keeps](plans/2026-11-06-draft-acceptance.md).
