@@ -1,11 +1,12 @@
 # The engine binaries (nslm-chat, nslm-serve) for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal), as a GitHub
-# release draft (tag v + VERSION). A change of VERSION, this file, start/ or the README on main starts it, as does the
-# Actions page. Publishing the draft on the releases page makes its tag. A published release stays as it is.
+# release draft (tag v + VERSION) that follows main: a change of the sources, the start scripts or VERSION rebuilds it.
+# Publishing the draft on the releases page makes its tag. After that nothing is built until VERSION changes.
 name: release
 on:
   push:
     branches: [main]
-    paths: [VERSION, .github/workflows/release.yml, start/**, tools/release-readme.txt]
+    paths: [VERSION, .github/workflows/release.yml, start/**, tools/release-readme.txt, engine/**, harness/**, nslm/**, win/**,
+            CMakeLists.txt, Makefile]
   workflow_dispatch:
     inputs:
       tag:
@@ -21,18 +22,22 @@ permissions:
 jobs:
   meta:
     runs-on: ubuntu-latest
-    outputs: {tag: "${{ steps.t.outputs.tag }}"}
+    outputs: {tag: "${{ steps.t.outputs.tag }}", build: "${{ steps.t.outputs.build }}"}
     steps:
       - uses: actions/checkout@v4
       - id: t
-        env: {INPUT_TAG: "${{ inputs.tag }}"}
+        env: {INPUT_TAG: "${{ inputs.tag }}", GH_TOKEN: "${{ github.token }}", GH_REPO: "${{ github.repository }}"}
         run: |
           t=${INPUT_TAG:-v$(tr -d ' \r\n' < VERSION)}
           echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad tag $t"; exit 1; }
           echo "tag=$t" >> "$GITHUB_OUTPUT"
+          if [ "$(gh release view "$t" --json isDraft -q .isDraft 2>/dev/null)" = false ]; then
+            echo "$t is published: nothing to build (change VERSION for a new release)"; echo "build=no" >> "$GITHUB_OUTPUT"
+          else echo "build=yes" >> "$GITHUB_OUTPUT"; fi
 
   linux:
     needs: meta
+    if: needs.meta.outputs.build == 'yes'
     env: {TAG: "${{ needs.meta.outputs.tag }}"}
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04   # glibc 2.35
@@ -58,6 +63,7 @@ jobs:
 
   windows:
     needs: meta
+    if: needs.meta.outputs.build == 'yes'
     env: {TAG: "${{ needs.meta.outputs.tag }}"}
     runs-on: windows-2022
     timeout-minutes: 90
@@ -103,6 +109,7 @@ jobs:
 
   macos:
     needs: meta
+    if: needs.meta.outputs.build == 'yes'
     runs-on: macos-26   # the macOS 26 SDK (Metal 4, behind @available)
     timeout-minutes: 60
     env:
