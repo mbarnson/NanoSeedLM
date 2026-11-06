@@ -13,8 +13,9 @@ release packs as shipped](../results/2026-11-05-release-as-shipped.md)). The fir
 bucket mount gives EIO. The script now copies each folder to the local disk first (`29a76aa`). R5's upload is done (TCQ3
 `5f2a8599`, TCQ3-D4 `7e5edb2b`, TCQ4 `25339937`), and Matt made them public on 2026-11-06. RD passes on the RTX 4080
 ([the release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). RD and RE pass on the M4 Max ([the
-release packs from the Hub on the M4 Max](../results/2026-11-06-release-downloads-m4max.md)). R6 is a draft release of
-the engines (v0.1.0) with the start scripts. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the
+release packs from the Hub on the M4 Max](../results/2026-11-06-release-downloads-m4max.md)). R6 is the engine release
+[v0.1.0](https://github.com/mbarnson/NanoSeedLM/releases/tag/v0.1.0) with the start scripts, from `47714b8`. Matt
+published it on 2026-11-06 as a pre-release, after the stock-path tests on the M4 Max and the RTX 4080. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the
 risk of a stale loader is closed for them.
 
 ## The family

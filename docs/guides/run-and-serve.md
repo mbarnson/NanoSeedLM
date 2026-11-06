@@ -5,7 +5,8 @@
 ## Start from a release
 
 The [releases](https://github.com/mbarnson/NanoSeedLM/releases) have built engines for Windows x64 and Linux x64
-(CUDA 12.8), and for macOS on Apple Silicon (Metal). You do not need a build.
+(CUDA 12.8), and for macOS on Apple Silicon (Metal). The first one is
+[v0.1.0](https://github.com/mbarnson/NanoSeedLM/releases/tag/v0.1.0). You do not need a build.
 
 1. Download the archive for your machine, and unpack it.
 2. On Windows, double-click `START-HERE.bat`. On Linux or macOS, run `./start-here.sh`.

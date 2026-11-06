@@ -900,3 +900,11 @@ tokens of prompt it decodes at 42, 36 and 30. Read [Long decode on the RTX 4080]
 At temperature 1.0 on the RTX 4080, 2 drafts in `nslm-serve` keep 38% to 46% and make decode 16% slower (gate SC). The
 plan takes Strata's rule: drafts sampled from the head's distribution, kept with min(1, p / q), and a confidence gate.
 Cheaper verify rows need a plan of their own. Read [Drafts the sampler keeps](plans/2026-11-06-draft-acceptance.md).
+
+## [2026-11-06] release | NanoSeedLM engine v0.1.0
+
+Matt published [v0.1.0](https://github.com/mbarnson/NanoSeedLM/releases/tag/v0.1.0) as a pre-release. The tag is
+`47714b8`. It has `nslm-chat` and `nslm-serve` for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal, signed and
+notarized), with the start scripts. The scripts download a TCQ pack and Unsloth's Q8_0 PLE table. The stock path passes
+on the M4 Max (tarball `003648f3`) and on the RTX 4080 (zip `6becc62c`). Read [the release
+plan](plans/2026-11-05-release-family.md).

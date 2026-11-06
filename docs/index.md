@@ -54,7 +54,7 @@ Work that is not done yet, with its gates and hypotheses.
   with more bits where the KL needs them, and a KL of each pack as shipped.
 - [2026-11-05: An LFSR code for the trellis](plans/2026-11-05-lfsr-trellis.md): draft. The trellis with NanoSeedLM's
   LFSR as its code generator in place of 1MAD, tested on KL and decode speed.
-- [2026-11-05: The trellis family on Hugging Face](plans/2026-11-05-release-family.md): draft. Three public packs (TCQ4,
+- [2026-11-05: The trellis family on Hugging Face](plans/2026-11-05-release-family.md): current. Three public packs (TCQ4,
   TCQ3-D4, TCQ3) that one `hf download` gets and the engines run, each with its KL as shipped.
 - [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
   engine keeps the session's hot experts in P4 and the rest in S3 or P3.
