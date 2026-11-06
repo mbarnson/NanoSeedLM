@@ -21,16 +21,17 @@ PACKS = {
     "TCQ4": ("Trellis K4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "Engines, mlx-vlm, oMLX"),
     "TCQ3-D4": ("Trellis K3, down K4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "Engines, mlx-vlm, oMLX"),
     "TCQ3": ("Trellis K3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "Engines, mlx-vlm, oMLX"),
-    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 105.7, 74, None, 0.0408, "CUDA engine, mlx-vlm, oMLX"),
+    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 105.7, 74, None, 0.0408, "Engines, mlx-vlm, oMLX"),
     "P3": ("Seeds P3", 4.0, 60.4, "4-bit", 98.2, 66, 0.182, 0.0600, "Engines, mlx-vlm, oMLX"),
 }
 # Decode of 4,096 tokens and after 30K, prompt tok/s at 30K, in nslm-serve's long runs (absent: not measured)
 M4 = "M4 Max, Metal"
 RTX = "RTX 4080, CUDA"
+R12 = "RTX 4080 as a 12 GB GPU, CUDA"   # NSLM_VRAM_RESERVE_MB=5120: 4 GB more kept free
 SPEED = {
     "TCQ4": {M4: ("39.0", "38.8", "475"), RTX: ("31.4", "30.2", "1,725")},
     "TCQ3-D4": {RTX: ("38.0", "36.0", "1,824")},
-    "TCQ3": {RTX: ("44.0", "43.1", "2,004")},
+    "TCQ3": {RTX: ("44.0", "43.1", "2,004"), R12: ("27.4", "25.9", "1,237")},
     "P4": {},
     "P3": {M4: ("46.9", "45.1", "462")},
 }
@@ -85,8 +86,8 @@ expert weights, their dense weights, and the runtimes that load them.
 
 - On a PC, the experts stay in RAM, and the GPU caches the experts in use. A smaller pack lets the GPU cache more of
   its experts.
-- We did not test TCQ3 on a 12 GB GPU or a 64 GB PC yet. A 12 GB GPU caches fewer experts than a 16 GB GPU, so it
-  decodes slower.
+- A 12 GB GPU caches fewer experts than a 16 GB GPU. On an RTX 4080 limited to 12 GB, TCQ3 decodes at 27 tokens per
+  second, against 44 with all 16 GB. We did not test a PC with 64 GB of RAM yet.
 - P3 is faster on a Mac because its dense weights are 4-bit. They are also why its KL is 4 times that of TCQ4.
 - The start script of the NanoSeedLM [engine release]({GITHUB}/releases) checks the machine and picks a TCQ pack.
 
@@ -105,7 +106,7 @@ expert weights, their dense weights, and the runtimes that load them.
 - **KL as shipped** is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2. Lower is closer to the
   original model. P4 as shipped is not measured yet.
 - **Engines** are the NanoSeedLM engines: CUDA on Linux and Windows, Metal on macOS. oMLX needs the fix in
-  [jundot/omlx#5112]({OMLX_PR}). We tested oMLX with P3 and TCQ4, and P4 in the CUDA engine only.
+  [jundot/omlx#5112]({OMLX_PR}). We tested oMLX with P3, P4 and TCQ4, and mlx-vlm with P3 and TCQ4.
 
 **The trade-offs.**
 
@@ -125,7 +126,7 @@ expert weights, their dense weights, and the runtimes that load them.
 Decode in tokens per second: `nslm-serve --ctx 32768` with the Q8_0 PLE table, 4,096 tokens, thinking on, temperature
 0, without MTP drafts, the mean of two runs. The machines are an M4 Max with 128 GB and an RTX 4080 (16 GB) with
 128 GB of RAM. Read the runs on [the M4 Max]({DOCS}2026-11-06-long-bench-m4max.md) and
-[the RTX 4080]({DOCS}2026-11-06-long-bench-4080.md).
+[the RTX 4080]({DOCS}2026-11-06-long-bench-4080.md). The 12 GB GPU is [the RTX 4080 with 4 GB kept free]({DOCS}2026-11-06-tcq3-12gb.md).
 
 | Pack | {M4} | {RTX} |
 |---|---|---|
@@ -176,6 +177,28 @@ def speed(name):
 """
 
 
+def view(name):
+    """The SSD-PLE folder view of mlx-vlm. It copies each file but the shards, so the TCQ banks are linked instead."""
+    src, dst = f"Qwen3.8-Flash-Next-NanoSeedLM-{name}", f"Qwen3.8-Flash-Next-NanoSeedLM-{name}-ssd-ple"
+    if not name.startswith("TCQ"):
+        return f"""```python
+from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
+prepare_external_ple_model("{src}", "{dst}")
+```"""
+    banks = {"TCQ4": 63.6, "TCQ3-D4": 53.3, "TCQ3": 48.2}[name]   # the .blkt files, the MTP head's included
+    return f"""The view copies each file that is not a shard, and the trellis banks are {banks} GB. This snippet links the
+banks in place of copying them, so the view takes no more disk. Make the view on the disk that holds the pack.
+
+```python
+import os, shutil
+from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
+copy2 = shutil.copy2
+shutil.copy2 = lambda s, d, **k: os.link(s, d) if str(s).endswith(".blkt") else copy2(s, d, **k)   # link the banks
+prepare_external_ple_model("{src}", "{dst}")
+shutil.copy2 = copy2
+```"""
+
+
 def mlx(name, note):
     """The mlx-vlm and oMLX sections of a card (each pack carries its model files)."""
     dl = PACKS[name][4]
@@ -189,10 +212,7 @@ python -m mlx_vlm.generate --model txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} 
 The pack is {dl} GB, and macOS gives the GPU about three quarters of its memory. So keep the PLE table on the SSD: make
 a folder view with mlx-vlm, and run that folder.
 
-```python
-from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
-prepare_external_ple_model("Qwen3.8-Flash-Next-NanoSeedLM-{name}", "Qwen3.8-Flash-Next-NanoSeedLM-{name}-ssd-ple")
-```
+{view(name)}
 
 ### oMLX
 
@@ -213,11 +233,10 @@ def tcq(name, k):
              "TCQ3": "K = 3 for `gate_proj`, `up_proj` and `down_proj`"}[name]
     m, (d, d30, _) = next(iter(SPEED[name].items()))
     uns = "\n".join(f"| Unsloth {n} | {b:.3f} | {v:.4f} |" for n, b, v in UNSLOTH)
-    omlx_note = ("We tested TCQ4's download in oMLX with these model files "
-                 "([the runs]({DOCS}2026-11-06-release-downloads-m4max.md)). The PLE table stayed on the SSD, and the "
-                 "head's trellis banks gave the MTP drafts. We did not test mlx-vlm with it yet.").format(DOCS=DOCS) if name == "TCQ4" else "We tested this fix with TCQ4, not with this pack yet."
-    tested = ("- We tested this pack on an RTX 4080 with 128 GB of RAM, not on a 12 GB GPU or a 64 GB PC yet. With 64 GB,\n"
-              "  close other large programs: the experts and the page cache need most of the RAM.\n") if name == "TCQ3" else ""
+    omlx_note = ("We tested this repository's files in oMLX and in mlx-vlm 0.7.12. In oMLX, MTP on gives the same text "
+                 "as MTP off, and the PLE table stays on the SSD.") if name == "TCQ4" else "We tested this fix with TCQ4, not with this pack yet."
+    tested = ("- We emulated a 12 GB GPU on the RTX 4080, with 4 GB more of VRAM kept free. We did not test a PC with 64 GB\n"
+              "  of RAM yet. There, close other large programs: the experts and the page cache need most of the RAM.\n") if name == "TCQ3" else ""
     return f"""{yaml(name)}
 # Qwen3.8-Flash-Next-NanoSeedLM-{name}
 
@@ -327,8 +346,8 @@ def seeds(name):
     shipped_note = "" if shipped else " In P3, the 4-bit dense weights add 0.12 to the KL."
     lead = {"P4": f"Its experts are on Unsloth's quality curve: {kq8:.4f} at 4.5 bits, {rel} it.",
             "P3": f"As shipped, its KL against BF16 is {kl(shipped)}, and its 4-bit dense weights cause most of it."}[name]
-    run = "" if name == "P3" else "We tested P4 in the CUDA engine, not in the Metal engine yet. "
-    omlx_note = "SSD PLE and MTP work." if name == "P3" else "We tested this fix with P3, not with P4 yet."
+    run = ""
+    omlx_note = "SSD PLE and MTP work, and MTP on gives the same text as MTP off."
     return f"""{yaml(name)}
 # Qwen3.8-Flash-Next-NanoSeedLM-{name}
 

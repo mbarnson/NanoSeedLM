@@ -923,3 +923,14 @@ write them (`d56a17c`) after the release folders were built, and R5 uploaded the
 are on the Hub now (TCQ4 `e53ffdd2`, TCQ3-D4 `30012655`, TCQ3 `d1353e4a`). They are the `17eeb5d` loaders that oMLX ran
 on TQ4's download. `tools/hf_release_publish.sh` now refuses a folder without them. The v0.1.0 start scripts pin the
 earlier revisions.
+
+## [2026-11-06] result | MTP drafts in nslm-serve on the RTX 4080
+
+Drafts sampled from the head's distribution keep 63% of 2 drafts at temperature 1.0, against 38% to 46% before. The
+confidence gate raises that to 77% to 84%. Decode is break-even, within 2%. Strata decodes the same request at 71 tokens
+per second, against 38, mostly by decode without drafts. Read [the gates](results/2026-11-06-draft-gates-4080.md).
+
+## [2026-11-06] result | TCQ3 on a 12 GB GPU
+
+On the RTX 4080 with 4 GB more of VRAM kept free, TCQ3 decodes at 27 tokens per second, against 44 with all 16 GB. Read
+[TCQ3 on a 12 GB GPU](results/2026-11-06-tcq3-12gb.md).

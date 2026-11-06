@@ -4,7 +4,7 @@
 distribution of its sampler without drafts. On the M4 Max, `nslm-chat` decodes TCQ4 at about 40 tokens per second, and
 at 67 to 69 with 2 drafts. The server is what most users run.
 
-**Status.** Draft. For v0.1.1, after v0.1.0.
+**Status.** Done on CUDA, for v0.1.1. Gate SC fails on the RTX 4080, so drafts stay off by default ([the gates](../results/2026-11-06-draft-gates-4080.md)). The M4 Max's part follows.
 
 ## Why the server does not draft
 

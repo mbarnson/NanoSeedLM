@@ -5,7 +5,7 @@ MTP head's drafts, as Strata does. Then drafts make decode faster on the RTX 408
 sampler's distribution. Matt's bar for the RTX 4080 is more than 60 tokens per second for one request. This plan is one
 half of that bar. Cheaper verify rows are the other half (see "Verify rows on the RTX 4080").
 
-**Status.** In progress, for v0.1.1. A1 and A2 are on CUDA (branch `claude/sleepy-brown-k67z9u`, `304d415` and `da4e1ce`). Gates GA and GB are next on the RTX 4080.
+**Status.** In progress. A1 and A2 are on CUDA (`304d415`, `da4e1ce`), for v0.1.1. On the RTX 4080, GA passes and GB fails: drafts keep 63% to 84%, and decode is break-even ([the gates](../results/2026-11-06-draft-gates-4080.md)). A1m and A2m are for v0.1.2.
 
 ## Why
 
