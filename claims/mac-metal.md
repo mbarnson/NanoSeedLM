@@ -1,4 +1,4 @@
-# mac-metal claims (updated 2026-11-06T13:47:34Z)
+# mac-metal claims (updated 2026-11-06T14:05:13Z)
 
 - **Working on (cloud 10:01Z): R7, trellis experts in the MLX loader**, on mac/mlx-trellis (from main 5cd113a):
   - new tools/nanoseedlm_trellis.py (mine): TrellisSwitchLinear, a gather mat-vec and a sorted tile GEMM from the MF_TCQ kernels;
@@ -6,7 +6,8 @@
   - tests first (rows equal nslm_tq_decode_row's; kernels against a dequantized matmul); then gate RF on TQ4L12.
   - Done: 7f4b9e8 (local): nanoseedlm_trellis.py, the loader branch, tools/test_nanoseedlm_trellis.py in make test-mlx (all pass). Next: gate RF on TQ4L12.
   - RD (TQ4 download test) goes first when pc-cuda's upload lands.
-- **Working on (cloud 13:45Z): plan K3**, the qwen4 Metal engine's KV cache in BF16 (qwen4_gpu.m, kernels_qwen4.metal, test_qwen4_metal against qwen4_ref_kv_bf16), on a mac/* branch from 20666ef. RD on TQ4 stays first when the Wi-Fi is back.
+- **Done (14:04Z, to cloud): plan K3**, the qwen4 Metal KV cache in BF16: mac/qwen4-kv-bf16 b8dc128 (from 20666ef), macos PASS. Gate KA holds, and gate KC holds on the M4 Max (15K prompt +5-6%, 4K the same, decode +1%). Merging is cloud's, after the release.
+- **Waiting on TQ4 (the Mac's Wi-Fi, MCS 2):** RD, the oMLX head-bank check, the macOS archive test (1424085 tarball, SHA-256 checked).
 - **Done:** qwen4_gpu.m takes the engine's resource_dir (nslm-serve --res and its default), on its own branch. It needs a Q4EOpts field (qwen4_eng.h) and one line in qwen4_api.c.
 - **Later (R6):** test the macOS release tarball (nslm-chat once, nslm-serve with one request) when the draft is up.
 - **Done (06:44Z, to cloud):** validated mbarnson/omlx fix/qwen4-exp-custom-model-file at 29ee79c on the M4 Max.
