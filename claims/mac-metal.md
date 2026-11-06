@@ -1,8 +1,9 @@
-# mac-metal claims (updated 2026-11-06T01:31:39Z)
+# mac-metal claims (updated 2026-11-06T03:54:28Z)
 
 
-- **Running (cloud's go):** the trellis encodes for gate TC on the Mac, on the Metal GPU (nslm-moe b301be5, 2 workers). K = 3, L = 12 is at 68 of 144 at 01:31Z, ETA about 02:25Z (~/models/Qwen3.8-Flash-Next-tq-k3-l12). Then K = 4 starts by itself, ETA about 04:10Z (~/models/Qwen3.8-Flash-Next-tq-k4-l12). No Mac benchmarks while they run.
-- **Next:** gate TC on the M4 Max, decode and prompt against P3 for TQ3L12, TQ4L12 and the "down" mix (TQ3 gate/up + TQ4 down, as cloud's 01:16Z message to pc-cuda). Code and chat, 256 tokens, two rounds, K = 0 and drafts, Q4E_PROFILE=3 on the experts, plus prompt runs.
-- **Done (main 6f90957):** trellis experts on Metal (gathers, prompt GEMM, qwen4_gpu.m); the Metal trellis encoder; MTP drafts on Metal and in nslm-chat; the day's Metal decode and prompt kernels.
+- **Done:** gate TC on the M4 Max (msgs 03:54Z): P3, TQ3L12, TQ4L12 and the down mix. At K = 0 the trellis packs decode 1.7 to 2.3% faster than P3, and prompts run at P3's speed warm. The memory line is the pack's files (P3 98.2, TQ3 84.9, mix 90.0, TQ4 100.1 GB).
+- **Kept on the Mac:** ~/models/Qwen3.8-Flash-Next-tq-k3-l12 and -tq-k4-l12 (my Metal-GPU encodes, byte-equal to the bucket's), with the TQ3L12, TQ4L12 and TQ3TQ4down pack folders of links.
+- **Offered:** the PLE table's working set (resident pages after a long run), which decides whether TQ3 fits a 64 GB Mac. Also the L = 16 Metal encoder speed (a layout with 8x fewer threadgroup reads).
+- **Done (main):** trellis experts on Metal; the Metal trellis encoder; MTP drafts on Metal and in nslm-chat; the day's Metal decode and prompt kernels.
 - **Mine:** engine/*.metal, engine/qwen4_gpu.m, engine/mova_gpu.m, tests/kernel_backend_metal.m, tests/test_qwen4_metal.c, tests/test_qwen4_api_mtp.c, nslm/trellis.metal, nslm/trellis_metal.m.
-- **Rule (Matt):** I push only mac/* branches and post them here; main merges are cloud's. Nothing on HF without a message to cloud first.
+- **Rules (Matt):** I push only mac/* branches and post them here; main merges are cloud's. Nothing on HF without a message to cloud first.
