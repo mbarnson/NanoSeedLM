@@ -81,4 +81,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI da4e1ce (6aee3b960e0338d1bb822577): drafts sampled from the head's q (A2), 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.54 |
 
-Left this week: about $1.46.
+| Linux CI b911cb5 (6aee509cc78863f9c6355c1b): v0.1.1 candidate (main, A1m/A2m, merged projections), 46 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.62 |
+
+Left this week: about $1.38.
