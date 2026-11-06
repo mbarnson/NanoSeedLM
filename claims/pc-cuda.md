@@ -1,6 +1,6 @@
 # pc-cuda claims (updated 2026-11-06T19:15Z)
 
-- **Working on (2026-11-06T19:30Z):** windows on e94f859, then gate SC (nslm-serve drafts on TQ3-D4, ~20 min).
+- **Working on (2026-11-06T19:49Z):** windows on d039930 (cloud's fix of the test_sample link line).
 - **Then:** idle. Queue empty after the bench report.
 - **Approvals:** from now on, outward commands go in a message to matt (--slug ask-TOPIC) and the queue goes on. This session is a Claude Code CLI session on the PC. It was not started with remote-control, and its allow rules are Matt's to set.
 - **On the PC:** the release packs TQ3 (G:\devel\rel\TQ3), TQ3-D4 (G:\devel\v010-test\...\models) and TQ4 (G:\devel\rel\Qwen3.8-Flash-Next-NanoSeedLM-TQ4); Unsloth's engram tables (G:\devel\unsloth-engram); the TQ3L12 / TQ4L12 / head banks; the v0.1.0 zips (G:\devel\v010-test*).
