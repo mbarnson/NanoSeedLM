@@ -1265,14 +1265,16 @@ static int draft_rows(Q4Eng* e, int k) {
     return e->err[0] ? -1 : 0;
 }
 
-int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, drafts); }
+int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     const Qwen4Cfg* c = &e->c;
     e->err[0] = 0;
-    if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos)
-        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
+    if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos || bonus >= c->vocab)
+        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : bonus >= c->vocab ? "bonus out of range" : "k out of range");
     e->hin[0] = e->pos;
-    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t), cudaMemcpyHostToDevice, e->s);
-    kc_argmax(e->s, e->logits + (size_t) e->lrow * c->vocab, e->din + 1, c->vocab, 1);   // the bonus
+    e->hin[1] = bonus;
+    cudaMemcpyAsync(e->din, e->hin, sizeof(int32_t) * (bonus < 0 ? 1 : 2), cudaMemcpyHostToDevice, e->s);
+    if (bonus < 0) kc_argmax(e->s, e->logits + (size_t) e->lrow * c->vocab, e->din + 1, c->vocab, 1);   // the bonus
     cudaGraphExec_t* ge = &e->dgraph[k];
     if (!e->prof && !e->no_graph && !*ge) {   // a graph for each k: the positions come from din
         cudaGraph_t gr = NULL;

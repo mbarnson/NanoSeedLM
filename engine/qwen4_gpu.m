@@ -1081,15 +1081,16 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
 
 // ---- MTP: drafts, and verify forwards that keep each row's state -----------------------------------------------------
 
-int q4e_draft(Q4Eng* e, int k, int32_t* drafts) {
+int q4e_draft(Q4Eng* e, int k, int32_t* drafts) { return q4e_draft_from(e, -1, k, drafts); }
+int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, int32_t* drafts) {
     const Qwen4Cfg* c = &e->c;
     e->err[0] = 0;
-    if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos)
-        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : "k out of range");
+    if (!e->mtp || e->lrow < 0 || k < 1 || k > e->ndraft || e->pos + k > e->max_pos || bonus >= c->vocab)
+        return fail(e, "q4e_draft: %s", !e->mtp ? "no MTP head" : e->lrow < 0 ? "no logits of the last row" : bonus >= c->vocab ? "bonus out of range" : "k out of range");
     const float* l = (const float*) e->logits.contents + (size_t) e->lrow * c->vocab;
     int32_t* dt = (int32_t*) e->dtok.contents;
-    dt[0] = 0;   // the bonus: the last row's arg max (ties: the lowest id)
-    for (int v = 1; v < c->vocab; ++v) if (l[v] > l[dt[0]]) dt[0] = v;
+    dt[0] = bonus < 0 ? 0 : bonus;   // the bonus: given, or the last row's arg max (ties: the lowest id)
+    for (int v = 1; bonus < 0 && v < c->vocab; ++v) if (l[v] > l[dt[0]]) dt[0] = v;
     int32_t* done = (int32_t*) e->done.contents;
     int32_t* nsel = (int32_t*) e->nsel.contents;
     for (int j = 0; j < k; ++j) {   // head row j at pos - 1 + j

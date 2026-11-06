@@ -13,6 +13,7 @@ struct Q4Api;
 #include "engine_unname.h"
 #include "engine_qwen4.h"
 #include "engine_api_fns.h"
+#include "qwen4_ext.h"
 #include "engine_unname.h"
 
 struct Eng {
@@ -54,6 +55,9 @@ void eng_free(Eng* e, int seq) { CALL(eng_free, seq); }
 int eng_len(Eng* e, int seq) { return CALL(eng_len, seq); }
 int eng_generate(Eng* e, const int* seqs, int nseq, int n_new, int mode, int32_t* out, EngStats* st) {
     return CALL(eng_generate, seqs, nseq, n_new, mode, out, st);
+}
+int eng_generate_pick(Eng* e, int seq, int n_new, EngPick pick, void* ctx, int32_t* out, EngStats* st) {   // qwen4_ext.h
+    return e->qwen ? q4_eng_generate_pick(e->h, seq, n_new, pick, ctx, out, st) : -1;
 }
 int eng_step(Eng* e, int seq, float* logits) { return CALL(eng_step, seq, logits); }
 int eng_push(Eng* e, int seq, int32_t tok) { return CALL(eng_push, seq, tok); }

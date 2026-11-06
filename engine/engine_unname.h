@@ -14,6 +14,7 @@
 #undef eng_free
 #undef eng_len
 #undef eng_generate
+#undef eng_generate_pick
 #undef eng_step
 #undef eng_push
 #undef eng_step_batch

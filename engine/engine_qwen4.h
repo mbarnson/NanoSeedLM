@@ -15,6 +15,7 @@
 #define eng_free q4_eng_free
 #define eng_len q4_eng_len
 #define eng_generate q4_eng_generate
+#define eng_generate_pick q4_eng_generate_pick
 #define eng_step q4_eng_step
 #define eng_push q4_eng_push
 #define eng_step_batch q4_eng_step_batch

@@ -65,3 +65,4 @@ int32_t sample_pick(Sampler* s, const float* l, int V, int32_t draft) {
     if (draft < 0 || unit(s) * tot >= wd) return pick_run(NULL, c, keep, draft, unit(s) * (tot - wd));
     return draft;
 }
+int32_t sample_engpick(void* s, const float* l, int V, int32_t draft) { return sample_pick((Sampler*) s, l, V, draft); }
