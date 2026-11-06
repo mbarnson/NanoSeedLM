@@ -51,6 +51,10 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 00918f0 (6aedb2170e0338d1bb810657): the embedding in host memory, 44 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $21.58 |
 
+| nslm-rel-linux (6aedb3e40e0338d1bb810784): cancelled at start (my wrong archive path) | rtx-pro-6000 ($2.75/h) | under 1 | about $0.02 | about $21.60 |
+
+| nslm-rel-linux (6aedb3f3c78863f9c634082f): the v0.1.0 Linux archive on Ubuntu 22.04 with TQ3: chat and serve pass | rtx-pro-6000 ($2.75/h) | 8.7 | about $0.40 | about $22.00 |
+
 | nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda): TQ3 5f2a8599, TQ3-D4 7e5edb2b, TQ4 25339937 (each copy about 8 min, each upload about 1 min: Xet found the chunks) | cpu-xl ($1.00/h) | 29.1 | about $0.49 | about $21.50 |
 
-Left this week: about $3.42.
+Left this week: about $3.00.
