@@ -5,7 +5,10 @@ them, as Unsloth's dynamic packs do. Then a decode token reads fewer bytes than 
 every pack has a KL measured as it is shipped.
 
 **Status.** Draft. Matt asked for it on 2026-11-05 and approved the HF jobs within the weekly cap. D0 is done: the 4-bit MLX dense weights add about 0.12 of
-KL (P3 0.182, the mix 0.185), so HD1 holds ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)).
+KL (P3 0.182, the mix 0.185), so HD1 holds ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). Release 1
+ships 8-bit MLX dense weights: TQ4 gives 0.0415 ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
+oMLX's own oQ packs (oQ2.5e to oQ8e) also keep every dense tensor at 8 bits. So gate DB now compares with the 8-bit
+dense weights, and they read about 4.5 GB a token. Step D2a (code done) ranks the kinds by their KL at 4 bits.
 
 ## Why
 
@@ -35,6 +38,7 @@ reads one row of the embedding (0.40 GB).
 | Step | Work | Who | Gate |
 |---|---|---|---|
 | D0 | The KL of the mix as shipped: its 4-bit MLX dense weights in place of Unsloth's Q8_0 dense weights | cloud (code), HF (KL) | Report only |
+| D2a | One kind more at a time in P3's 4-bit MLX format, over Q8_0 (`dense:KIND` in `tools/hf_llama_kld.sh`) | cloud, HF (KL) | Report only |
 | D1 | `nslm-dense --codec tq`: the trellis for a dense matrix, with the imatrix | cloud | DA |
 | D2 | The sweep: one kind at K = 3 and at K = 4, the other kinds at Q8_0, with the mix's experts | pc-cuda (encode), HF (KL) | Report only |
 | D3 | The allocation: the K of each kind from D2, then the whole pack's KL | cloud, HF (KL) | DB |
@@ -42,7 +46,8 @@ reads one row of the embedding (0.40 GB).
 
 - **DA.** The C, CUDA and Metal encoders write the same bytes, as for the expert banks. At K = 4, the weighted error of
   each kind is below that of its 4-bit MLX weights.
-- **DB.** The pack's KL is at most D0's, and a decode token reads at most 2.2 GB of dense weights.
+- **DB.** The pack's KL is at most 5% above its KL with the 8-bit MLX dense weights. A decode token reads at most 2.2 GB
+  of dense weights.
 - **DC.** Decode is at least 5% faster on the M4 Max and not slower on the RTX 4080. The text is the same from run to
   run.
 
@@ -78,6 +83,8 @@ reads one row of the embedding (0.40 GB).
 ## Costs
 
 - D0: one KL job of two packs with the saved BF16 reference, `rtx-pro-6000x2`, about 15 minutes, about $1.50.
+- D2a: one KL job of Q8_0 and six kinds, `rtx-pro-6000x2`, about 45 minutes, about $4. If a few small kinds carry
+  the KL, an affine mix (4 bits for the others) needs no new kernels.
 - D2: about 10 packs (5 kinds, K = 3 and 4), about 40 minutes on `rtx-pro-6000x2`, about $4. The encode of about
   5 G dense weights takes a few minutes on the RTX 4080.
 - D3: one KL job, about $1.

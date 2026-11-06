@@ -203,18 +203,19 @@ int main(void) {
         }
         for (int r = 0; r < RO; ++r) { ns_row_f32(nr, ns_find(&dm, dn[1]), 0, r, 0, w); ns_q8_0_row(w, CO, out + r * 34); }
         const char* dp = "out/test_emulate_dense.gguf";
-        for (int c = 0; c < 2; ++c) {   // as is, then with the rows of attn_qkv reversed: refused, the file unchanged
+        for (int c = 0; c < 3; ++c) {   // as is; the rows of attn_qkv reversed: refused, the file unchanged; lm_head only
             uint8_t q2[sizeof qkv];
-            for (int r = 0; r < RQ; ++r) memcpy(q2 + r * 68, qkv + (c ? RQ - 1 - r : r) * 68, 68);
+            for (int r = 0; r < RQ; ++r) memcpy(q2 + r * 68, qkv + (c == 1 ? RQ - 1 - r : r) * 68, 68);
             write_dense_gguf(dp, q2, sizeof q2, out, sizeof out);
             int nt = 0;
-            const int rc = ns_emulate_dense(&dm, NULL, dp, &nt, err, sizeof err);
+            const int rc = ns_emulate_dense(&dm, NULL, c == 2 ? "lm_head" : NULL, dp, &nt, err, sizeof err);
             Gguf g;
             CHECK(gguf_open(&g, dp, err + 256, 256) == 0, "reopen the dense shard");
             const uint8_t* at = g.map + g.data;
             if (!c) CHECK(rc == 0 && nt == 2 && !memcmp(at, want, sizeof want) && !memcmp(at + kDOff[2], out, sizeof out) && at[kDOff[1]] == 0xAB,
                           "dense: rc %d, %d tensors, %s", rc, nt, err);
-            else CHECK(rc != 0 && strstr(err, "row order") && !memcmp(at, q2, sizeof q2), "reversed rows: rc %d, %s", rc, err);
+            else if (c == 1) CHECK(rc != 0 && strstr(err, "row order") && !memcmp(at, q2, sizeof q2), "reversed rows: rc %d, %s", rc, err);
+            else CHECK(rc == 0 && nt == 1 && !memcmp(at, q2, sizeof q2) && !memcmp(at + kDOff[2], out, sizeof out), "lm_head only: rc %d, %d tensors, %s", rc, nt, err);
             gguf_close(&g);
         }
         ns_close(&dm);
@@ -246,7 +247,7 @@ int main(void) {
         for (int c = 0; c < 2; ++c) {   // with the heads: written as llama.cpp's order; without: refused
             write_gguf2(gp, "blk.0.attn_qkv.weight", 64, "blk.0.ssm_out.weight", 32, shard, sizeof shard);
             int nt = 0;
-            const int rc = ns_emulate_dense(&gm, c ? NULL : &gh, gp, &nt, err, sizeof err);
+            const int rc = ns_emulate_dense(&gm, c ? NULL : &gh, NULL, gp, &nt, err, sizeof err);
             Gguf g;
             CHECK(gguf_open(&g, gp, err + 256, 256) == 0, "reopen the gdn shard");
             const uint8_t* at = g.map + g.data;

@@ -198,7 +198,7 @@ int ns_emulate_gguf(const NsModel* const* packs, int np, const uint8_t* map, siz
     return rc ? -1 : 0;
 }
 
-int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* gguf, int* n, char* err, int errlen) {
+int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* only, const char* gguf, int* n, char* err, int errlen) {
     *n = 0;
     Gguf g;
     if (gguf_open(&g, gguf, err, errlen)) return -1;
@@ -212,7 +212,7 @@ int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* ggu
     for (int i = 0; i < g.n && !rc; ++i) {   // check every dense tensor first
         const GgufTensor* gt = &g.t[i];
         char name[160];
-        if (!dense_name(gt->name, name, sizeof name)) continue;
+        if (!dense_name(gt->name, name, sizeof name) || (only && !strstr(name, only))) continue;
         const NsTensor* t = ns_find(pack, name);
         const size_t rb = t ? (size_t) t->cols / 32 * 34 : 0;
         const int kind = gdn ? gdn_kind(name) : GDN_NONE;

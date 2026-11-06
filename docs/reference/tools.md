@@ -32,7 +32,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 | `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, or (`--tq`) without the routed experts and with trellis banks, from an MLX base folder |
-| `nslm-qwen4-emulate` | Write seed or trellis experts into Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them. A map takes each expert from one of several packs. `--dense DIR` also writes the dense tensors of a model folder |
+| `nslm-qwen4-emulate` | Write seed or trellis experts into Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them. A map takes each expert from one of several packs. `--dense DIR` also writes the dense tensors of a model folder. `--dense-only SUBSTR` writes those whose names contain SUBSTR |
 
 Read [Make a model folder](../guides/make-a-model.md).
 
@@ -50,7 +50,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `hf_cuda_test.sh` | Build and run CUDA tests on an HF Jobs GPU node |
 | `hf_qwen4_gen.sh` | Run a Qwen3.8-Flash-Next pack through `nslm-qwen4-gen` on an HF Jobs GPU node |
 | `hf_qwen4_kld.sh` | Score packs with `nslm-qwen4-kld` against a reference model on wikitext-2, on an HF Jobs GPU node |
-| `hf_llama_kld.sh` | Score Unsloth packs and emulated seed or trellis packs against BF16 in llama.cpp. `REF` keeps the BF16 reference for later jobs |
+| `hf_llama_kld.sh` | Score Unsloth packs and emulated seed or trellis packs against BF16 in llama.cpp. `REF` keeps the BF16 reference for later jobs. `dense:KIND` puts P3's 4-bit dense tensors of one kind over Q8_0 |
 | `gguf_expert_bytes.py` | The routed experts' bytes and bits for each weight of a GGUF pack on the Hub, from its headers only |
 | `page_resident.py` | How much of a pack's files is in the page cache, by kind (`mincore`). `--drop` evicts the shards first |
 | `hf_release_pack.sh` | Build the trellis release folders (P3, oQ8e's 8-bit dense modules, the banks) into the bucket, run each twice and score each against BF16, on an HF Jobs GPU node |

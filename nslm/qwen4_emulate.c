@@ -2,8 +2,9 @@
 // Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them (an emulated pack, nslm/emulate.h).  With several
 // packs, MAP (uint8 [layer][gate, up, down][expert], tools/qwen4_tier_map.py) names the pack of each expert.  A pack is a
 // model folder (with the banks beside its shards), or a folder of S3 seed or trellis banks (nslm-moe).  --dense DIR: also the
-// dense tensors of model folder DIR (attention, DeltaNet, shared experts, hyper-connections, lm_head, embedding).
-//   nslm-qwen4-emulate [--pack DIR ...] [--map FILE] [--dense DIR] [--workers 8] SHARD.gguf [SHARD.gguf ...]
+// dense tensors of model folder DIR (attention, DeltaNet, shared experts, hyper-connections, lm_head, embedding), with
+// --dense-only SUBSTR those whose engine name contains SUBSTR (dense plan D2a: one kind at a time).
+//   nslm-qwen4-emulate [--pack DIR ...] [--map FILE] [--dense DIR [--dense-only SUBSTR]] [--workers 8] SHARD.gguf ...
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,18 +39,19 @@ static double slice_bytes(const NsTensor* t, int* lp) {
 int main(int argc, char** argv) {
     const char* dirs[NS_EMU_PACKS];
     const char* files[64];
-    const char* mapf = NULL, *densef = NULL;
+    const char* mapf = NULL, *densef = NULL, *only = NULL;
     int workers = 8, nf = 0, np = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--pack") && i + 1 < argc && np < NS_EMU_PACKS) dirs[np++] = argv[++i];
         else if (!strcmp(argv[i], "--map") && i + 1 < argc) mapf = argv[++i];
         else if (!strcmp(argv[i], "--dense") && i + 1 < argc) densef = argv[++i];
+        else if (!strcmp(argv[i], "--dense-only") && i + 1 < argc) only = argv[++i];
         else if (!strcmp(argv[i], "--workers") && i + 1 < argc) workers = atoi(argv[++i]);
         else if (argv[i][0] != '-' && nf < 64) files[nf++] = argv[i];
         else { nf = 0; break; }
     }
-    if ((!np && !densef) || !nf || (np > 1) != (mapf != NULL)) {
-        fprintf(stderr, "usage: nslm-qwen4-emulate [--pack DIR [--pack DIR ... --map FILE]] [--dense DIR] [--workers 8] SHARD.gguf ...\n");
+    if ((!np && !densef) || !nf || (np > 1) != (mapf != NULL) || (only && !densef)) {
+        fprintf(stderr, "usage: nslm-qwen4-emulate [--pack DIR [--pack DIR ... --map FILE]] [--dense DIR [--dense-only SUBSTR]] [--workers 8] SHARD.gguf ...\n");
         return 2;
     }
     size_t ml = 0;
@@ -87,14 +89,14 @@ int main(int argc, char** argv) {
         const time_t t0 = time(NULL);
         int n = 0, nd = 0;
         if (np && (rc = ns_emulate_gguf(pk, np, map, ml, files[f], workers, &n, err, sizeof err))) fprintf(stderr, "%s\n", err);
-        else if (densef && (rc = ns_emulate_dense(&dm, &gh, files[f], &nd, err, sizeof err))) fprintf(stderr, "%s\n", err);
+        else if (densef && (rc = ns_emulate_dense(&dm, &gh, only, files[f], &nd, err, sizeof err))) fprintf(stderr, "%s\n", err);
         else printf("%s: %d expert tensors, %d dense tensors, %ld s\n", files[f], n, nd, (long) (time(NULL) - t0));
         fflush(stdout);
         done += n;
         dense += nd;
     }
     printf("%d of the pack's %d expert tensors written", done, want);
-    if (densef) printf(", %d dense tensors from %s", dense, densef);
+    if (densef) printf(", %d dense tensors from %s%s%s", dense, densef, only ? " matching " : "", only ? only : "");
     printf("\n");
     for (int k = 0; k < np; ++k) ns_close(&m[k]);
     if (densef) ns_close(&dm);

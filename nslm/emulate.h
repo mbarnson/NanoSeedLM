@@ -18,5 +18,5 @@ typedef struct { int hk, hv, dk, dv; } NsGdnHeads;   // Gated DeltaNet key and v
 // lm_head, embedding) from the pack's tensor of that name, as Q8_0 rows.  llama.cpp tiles DeltaNet's value heads (head
 // g hk + k) where MLX groups them (head k hv / hk + g): gdn maps them (NULL: no DeltaNet).  All are checked first: a
 // tensor whose sampled rows differ from the shard's own by more than 0.3 (relative) has another order, and nothing is
-// written.  *n: tensors written.  0, or -1 with err.
-int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* gguf, int* n, char* err, int errlen);
+// written.  only: the tensors whose engine name contains it (NULL: all).  *n: tensors written.  0, or -1 with err.
+int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* only, const char* gguf, int* n, char* err, int errlen);
