@@ -1,5 +1,6 @@
-# start/start-here.ps1 - NanoSeedLM's start on a Windows PC (START-HERE.bat runs it from the engine folder): check the PC,
+# start/start-here.ps1 [PACK [MODEL_FOLDER]] - NanoSeedLM's start on a Windows PC (START-HERE.bat runs it): check the PC,
 # pick a pack, download and check it, chat once, write run-PACK.bat and start the server. Run it again to resume.
+param([string]$Pack, [string]$ModelDir)   # given: no questions
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false   # PowerShell 7: the script reads curl's and nslm-chat's exit codes
 $ProgressPreference = 'SilentlyContinue'
@@ -32,10 +33,12 @@ Write-Host "`nPacks (KL against BF16: lower is closer to the original model):"
 Write-Host "  TQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TQ4'][4]) GB download)"
 Write-Host "  TQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TQ3-D4'][4]) GB download)"
 Write-Host "  TQ3     0.0778  for a 16 GB GPU with 64 GB of RAM ($($packs['TQ3'][4]) GB download)"
-$pick = Read-Host "Pack [$rec]"
+$pick = $Pack
+if (-not $pick) { $pick = Read-Host "Pack [$rec]" }
 if (-not $pick) { $pick = $rec }
 if (-not $packs.Contains($pick)) { Fail "Unknown pack $pick. Use TQ4, TQ3-D4 or TQ3." }
-$root = Read-Host "Model folder [$here\models]"
+$root = $ModelDir
+if (-not $root -and -not $Pack) { $root = Read-Host "Model folder [$here\models]" }
 if (-not $root) { $root = "$here\models" }
 $repo, $rev = $packs[$pick][0], $packs[$pick][1]
 $dir = Join-Path $root ($repo.Split('/')[1])
@@ -50,11 +53,20 @@ $files = @($tree | Where-Object { $_.type -eq 'file' -and -not $_.path.StartsWit
 $okf = Join-Path $dir '.nslm-verified'
 $ok = @{}
 if (Test-Path $okf) { Get-Content $okf | ForEach-Object { $ok[$_] = 1 } }
-$need = 0
-foreach ($f in $files) { if (-not $ok.ContainsKey($f.path)) { $need += $f.size } }
+$check, $need = 0, 0   # files to check; bytes to download (a partial file resumes)
+foreach ($f in $files) {
+    if ($ok.ContainsKey($f.path)) { continue }
+    $check += 1
+    $dst = Join-Path $dir $f.path
+    $have = 0
+    if (Test-Path $dst) { $have = (Get-Item $dst).Length }
+    if ($have -gt $f.size) { Remove-Item $dst; $have = 0 }
+    $need += $f.size - $have
+}
 $free = (Get-Item $dir).PSDrive.Free
-if ($need -gt $free) { Fail ("The download needs {0:N0} GB more and the disk has {1:N0} GB free." -f ($need / 1GB), ($free / 1GB)) }
-Write-Host ("`nDownloading {0} ({1:N0} GB to go) into {2}" -f $repo, ($need / 1GB), $dir)
+if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N0} GB free." -f ($need / 1GB), ($free / 1GB)) }
+Write-Host ("`n{0}: {1} files to check, {2:N1} GB to download into {3}" -f $repo, $check, ($need / 1GB), $dir)
+if ($need -gt 1GB -and -not $Pack -and (Read-Host "Start? [Y/n]") -match '^[nN]') { Write-Host "Stopped. Run START-HERE.bat again."; exit 0 }
 $i = 0
 foreach ($f in $files) {
     $i += 1

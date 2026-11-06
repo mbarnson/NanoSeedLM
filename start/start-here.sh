@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# start/start-here.sh - NanoSeedLM's start on Linux (CUDA) and macOS (Metal), from the engine folder: check the machine,
-# pick a pack, download and check it, chat once, write run-PACK.sh and start the server. Run it again to resume.
+# start/start-here.sh [PACK [MODEL_FOLDER]] - NanoSeedLM's start on Linux (CUDA) and macOS (Metal), from the engine
+# folder: check the machine, pick a pack, download and check it, chat once, write run-PACK.sh and serve. Rerun: resume.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
@@ -40,12 +40,14 @@ echo "Packs (KL against BF16: lower is closer to the original model):"
 echo "  TQ4     0.0415  a GPU of 24 GB or more with 96 to 128 GB of RAM, or a 128 GB Mac (102 GB download)"
 echo "  TQ3-D4  0.0638  a 16 GB GPU with 96 to 128 GB of RAM, or a 96 GB Mac (92 GB download)"
 echo "  TQ3     0.0778  a 16 GB GPU with 64 GB of RAM, or a 96 GB Mac (87 GB download)"
-read -r -p "Pack [$rec] " pick
+pick=${1:-}   # given: no questions
+[ -n "$pick" ] || read -r -p "Pack [$rec] " pick
 pick=${pick:-$rec}
 line=$(awk -v n="$pick" '$1 == n' <<<"$PACKS")
 [ -n "$line" ] || fail "Unknown pack $pick. Use TQ4, TQ3-D4 or TQ3."
 read -r _ repo rev _ <<<"$line"
-read -r -p "Model folder [$here/models] " root
+root=${2:-}
+[ -n "$root" ] || [ -n "${1:-}" ] || read -r -p "Model folder [$here/models] " root
 dir=${root:-$here/models}/${repo#*/}
 mkdir -p "$dir"
 
@@ -69,12 +71,22 @@ else   # macOS without python3: plutil reads JSON
 fi
 okf=$dir/.nslm-verified
 touch "$okf"
-need=0
-while read -r p s _; do grep -qxF "$p" "$okf" || need=$((need + s)); done <<<"$list"
+check=0 need=0   # files to check; bytes to download (a partial file resumes)
+while read -r p s _; do
+    grep -qxF "$p" "$okf" && continue
+    check=$((check + 1)) have=0
+    [ -f "$dir/$p" ] && have=$(( $(wc -c <"$dir/$p") ))
+    if [ "$have" -gt "$s" ]; then rm -f "$dir/$p"; have=0; fi
+    need=$((need + s - have))
+done <<<"$list"
 free=$(( $(df -Pk "$dir" | awk 'NR == 2 {print $4}') * 1024 ))
-[ "$need" -le "$free" ] || fail "The download needs $((need / 1073741824)) GB more and the disk has $((free / 1073741824)) GB free."
+[ "$need" -le "$free" ] || fail "The download needs $((need / 1073741824)) GB and the disk has $((free / 1073741824)) GB free."
 echo
-echo "Downloading $repo ($((need / 1073741824)) GB to go) into $dir"
+echo "$repo: $check files to check, $(awk -v n="$need" 'BEGIN {printf "%.1f", n / 1073741824}') GB to download into $dir"
+if [ "$need" -gt 1073741824 ] && [ -z "${1:-}" ]; then
+    read -r -p "Start? [Y/n] " a
+    case $a in [nN]*) echo "Stopped. Run start-here.sh again."; exit 0 ;; esac
+fi
 total=$(wc -l <<<"$list") i=0
 while read -r p s h; do
     i=$((i + 1))

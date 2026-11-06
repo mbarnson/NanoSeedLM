@@ -7,7 +7,8 @@ Requirements:
 
 To start: double-click START-HERE.bat (Windows), or run ./start-here.sh (Linux, macOS). It checks this machine,
 recommends a pack, downloads and checks it, chats once, writes run-PACK.bat (or run-PACK.sh) and starts the server on
-http://127.0.0.1:8080/v1. Run it again to resume a download.
+http://127.0.0.1:8080/v1. Run it again to resume a download. Arguments skip the questions, for example
+START-HERE.bat TQ3-D4 D:\models or ./start-here.sh TQ4 ~/models.
 
 To run by hand, run the commands from this folder. The binaries are in build/bin (Windows, Linux) or out/bin
 (macOS, with the Metal kernels in out/res). Download a model first, for example:
