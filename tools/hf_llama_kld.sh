@@ -11,8 +11,10 @@
 # A pack is an Unsloth folder, a seed or trellis tier (P3, P4, S3, TQ{K}L{L}: the Q8_0 shards with those experts,
 # nslm-qwen4-emulate; TQ3L12 is the folder TQBANK/TQ3L12 of nslm-moe --codec tq banks, as tools/hf_seedbank.sh writes), or
 # LOW+HIGH@NAME: experts from two tiers by the tier map MAPS/NAME.bin (tools/qwen4_tier_map.py), e.g. S3+P3@down, or
-# Q8_0-PLE: Q8_0 with its own Q8_0 PLE table in place of BF16's (the PLE format's own KL; it must come before the tiers).  The
-# reference logits: BF16 on the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
+# Q8_0-PLE: Q8_0 with its own Q8_0 PLE table in place of BF16's (the PLE format's own KL; it must come before the tiers).
+# NAME/mlx: a tier with P3's 4-bit MLX dense tensors too (the pack as shipped, nslm-qwen4-emulate --dense); /mlx packs come
+# last, as they change the Q8_0 dense tensors in place.  The reference logits: BF16 on the first CHUNKS windows of 2,048
+# tokens of wikitext-2 (test).
 set -uo pipefail
 UREPO=unsloth/Qwen3.8-Flash-Next-GGUF
 UREV=${UREV:-d96201194f103c906994f283f504209dc8d2a10c}
@@ -87,13 +89,15 @@ for pk in $PACKS; do
             mkdir -p /m/Q8_0-PLE && hf download "$UREPO" --revision "$UREV" --include "Q8_0/*-00003-of-00006.gguf" --local-dir /m/q8ple >/dev/null
             for f in /m/Q8_0/*.gguf; do ln -sf "$f" /m/Q8_0-PLE/; done
             ln -sf /m/q8ple/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf /m/Q8_0-PLE/; dir=/m/Q8_0-PLE ;;
-        P3|P4|S3|TQ*|*+*@*)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
-            t1=$(date +%s)
-            if [[ $pk == *@* ]]; then
-                lo=${pk%%+*} hi=${pk#*+}; hi=${hi%@*}
-                seed "$lo"; seed "$hi"; args=(--pack "/m/seed-$lo" --pack "/m/seed-$hi" --map "$MAPS/${pk#*@}.bin")
-            else seed "$pk"; args=(--pack "/m/seed-$pk"); fi
-            if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack"; then
+        P3|P4|S3|TQ*|*+*@*|*/mlx)   # the experts of the Q8_0 folder replaced: Q8_0 must come first
+            t1=$(date +%s) base=${pk%/mlx}
+            if [[ -n ${MLX:-} && $pk != */mlx ]]; then echo "== $pk: after a /mlx pack the dense tensors are P3's: put /mlx packs last"; continue; fi
+            if [[ $base == *@* ]]; then
+                lo=${base%%+*} hi=${base#*+}; hi=${hi%@*}
+                seed "$lo"; seed "$hi"; args=(--pack "/m/seed-$lo" --pack "/m/seed-$hi" --map "$MAPS/${base#*@}.bin")
+            else seed "$base"; args=(--pack "/m/seed-$base"); fi
+            if [[ $pk == */mlx ]]; then seed P3; args+=(--dense /m/seed-P3); MLX=1; fi
+            if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack|dense"; then
                 echo "== $pk: emulate failed"; continue
             fi
             [ -n "$PLE" ] && stamp "$PLE" 3 6
@@ -104,7 +108,7 @@ for pk in $PACKS; do
         *) echo "unknown pack $pk"; continue ;;
     esac
     echo "== $pk"
-    ppl "$dir" "$OUT/${pk//[+@]/_}.log" --kl-divergence-base /w/ref.kld --kl-divergence
+    ppl "$dir" "$OUT/${pk//[+@\/]/_}.log" --kl-divergence-base /w/ref.kld --kl-divergence
     [[ $pk == UD-* ]] && rm -rf "/m/$pk"
 done
 uptime

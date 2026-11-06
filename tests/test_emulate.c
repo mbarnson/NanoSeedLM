@@ -1,5 +1,5 @@
 // tests/test_emulate.c - emulated packs (nslm/emulate.h): f32 -> f16 rounding, Q8_0 rows as llama.cpp quantizes them,
-// and a pack's experts written over the Q8_0 expert tensors of a small GGUF, in place.
+// and a pack's experts (and dense tensors) written over the Q8_0 tensors of a small GGUF, in place.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +47,37 @@ static void write_gguf(const char* path, int rows) {
     put_str(f, "blk.0.ffn_down_exps.weight"); put_u32(f, 3); put_u64(f, CD); put_u64(f, rows); put_u64(f, E); put_u32(f, 8); put_u64(f, kOff[2]);
     while (ftell(f) % 32) fputc(0, f);
     for (int i = 0; i < 640 + E * R * 34; ++i) fputc(0xAB, f);   // 544 + 32 pad, 64 norm, 272 down
+    fclose(f);
+}
+
+static int bf16_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) {   // BF16 weights in [-0.05, 0.05)
+    (void) ctx; (void) t; (void) s;
+    for (uint64_t i = 0; i + 2 <= len; i += 2) {
+        const float v = ((float) (next() % 1000) - 500.0f) * 1e-4f;
+        uint32_t u;
+        memcpy(&u, &v, 4);
+        dst[i] = (uint8_t) (u >> 16);
+        dst[i + 1] = (uint8_t) (u >> 24);
+    }
+    return 0;
+}
+
+// A dense shard: attn_qkv (Q8_0, 64 x 3), a norm (F32, kept) and output (Q8_0, 32 x 2) at aligned offsets
+static const uint64_t kDOff[3] = {0, 224, 288};
+static void write_dense_gguf(const char* path, const uint8_t* qkv, size_t nq, const uint8_t* out, size_t no) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { printf("FAIL: cannot write %s\n", path); exit(1); }
+    put(f, "GGUF", 4); put_u32(f, 3); put_u64(f, 3); put_u64(f, 1);
+    put_str(f, "general.alignment"); put_u32(f, 4); put_u32(f, 32);
+    put_str(f, "blk.0.attn_qkv.weight"); put_u32(f, 2); put_u64(f, 64); put_u64(f, 3); put_u32(f, 8); put_u64(f, kDOff[0]);
+    put_str(f, "blk.0.attn_norm.weight"); put_u32(f, 1); put_u64(f, 16); put_u32(f, 0); put_u64(f, kDOff[1]);
+    put_str(f, "output.weight"); put_u32(f, 2); put_u64(f, 32); put_u64(f, 2); put_u32(f, 8); put_u64(f, kDOff[2]);
+    while (ftell(f) % 32) fputc(0, f);
+    const long d0 = ftell(f);
+    put(f, qkv, nq);
+    while (ftell(f) < d0 + (long) kDOff[1]) fputc(0, f);
+    for (int i = 0; i < 64; ++i) fputc(0xAB, f);
+    put(f, out, no);
     fclose(f);
 }
 
@@ -138,6 +169,42 @@ int main(void) {
         Gguf g;
         CHECK(gguf_open(&g, path, err, sizeof err) == 0 && g.map[g.data] == 0xAB, "case %d: the file changed", c);
         gguf_close(&g);
+    }
+
+    // Dense tensors (D0 of the dense plan): a BF16 pack's rows over a shard's Q8_0 tensors of the same values, by name
+    {
+        enum { RQ = 3, CQ = 64, RO = 2, CO = 32 };   // attn_qkv (in_proj_qkv), output (lm_head)
+        const char* dn[2] = {"language_model.model.layers.0.linear_attn.in_proj_qkv.weight", "language_model.lm_head.weight"};
+        const NsSpec sp[2] = {{dn[0], NS_BF16, 1, RQ, CQ}, {dn[1], NS_BF16, 1, RO, CO}};
+        NsModel dm;
+        mkdir("out/test_emulate_dense", 0755);
+        CHECK(ns_write("out/test_emulate_dense", sp, 2, 1u << 20, NULL, bf16_fill, NULL, err, sizeof err) == 0 &&
+              ns_open(&dm, "out/test_emulate_dense", err, sizeof err) == 0, "dense pack: %s", err);
+        uint8_t qkv[RQ * 2 * 34], out[RO * 34], want[RQ * 2 * 34];
+        float w[64];
+        for (int r = 0; r < RQ; ++r) {   // the shard: the same weights with 1% noise; want: the pack's own rows
+            ns_row_f32(nr, ns_find(&dm, dn[0]), 0, r, 0, w);
+            ns_q8_0_row(w, CQ, want + r * 2 * 34);
+            for (int c = 0; c < CQ; ++c) w[c] *= 1.0f + 0.01f * (float) ((int) (next() % 3) - 1);
+            ns_q8_0_row(w, CQ, qkv + r * 2 * 34);
+        }
+        for (int r = 0; r < RO; ++r) { ns_row_f32(nr, ns_find(&dm, dn[1]), 0, r, 0, w); ns_q8_0_row(w, CO, out + r * 34); }
+        const char* dp = "out/test_emulate_dense.gguf";
+        for (int c = 0; c < 2; ++c) {   // as is, then with the rows of attn_qkv reversed: refused, the file unchanged
+            uint8_t q2[sizeof qkv];
+            for (int r = 0; r < RQ; ++r) memcpy(q2 + r * 68, qkv + (c ? RQ - 1 - r : r) * 68, 68);
+            write_dense_gguf(dp, q2, sizeof q2, out, sizeof out);
+            int nt = 0;
+            const int rc = ns_emulate_dense(&dm, dp, &nt, err, sizeof err);
+            Gguf g;
+            CHECK(gguf_open(&g, dp, err + 256, 256) == 0, "reopen the dense shard");
+            const uint8_t* at = g.map + g.data;
+            if (!c) CHECK(rc == 0 && nt == 2 && !memcmp(at, want, sizeof want) && !memcmp(at + kDOff[2], out, sizeof out) && at[kDOff[1]] == 0xAB,
+                          "dense: rc %d, %d tensors, %s", rc, nt, err);
+            else CHECK(rc != 0 && strstr(err, "row order") && !memcmp(at, q2, sizeof q2), "reversed rows: rc %d, %s", rc, err);
+            gguf_close(&g);
+        }
+        ns_close(&dm);
     }
 
     for (int i = 0; i < 2; ++i) ns_close(&m[i]);

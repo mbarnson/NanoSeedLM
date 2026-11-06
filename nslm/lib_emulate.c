@@ -40,6 +40,37 @@ void ns_q8_0_row(const float* x, int n, uint8_t* out) {
     }
 }
 
+static float f16_to_f32(uint16_t h) {
+    const int e = h >> 10 & 31, m = h & 0x3FF;
+    const float v = e ? ldexpf(1.0f + (float) m / 1024.0f, e - 15) : ldexpf((float) m / 1024.0f, -14);
+    return h & 0x8000 ? -v : v;
+}
+
+// The engine's name of the shard's dense tensor g, else 0
+static int dense_name(const char* g, char* out, size_t len) {
+    static const char* kTop[][2] = {
+        {"output.weight", "language_model.lm_head.weight"}, {"token_embd.weight", "language_model.model.embed_tokens.weight"},
+        {"output_hc_up.weight", "language_model.model.hyper_connection_mixer.input_mix_weight_up.weight"},
+        {"output_hc_down.weight", "language_model.model.hyper_connection_mixer.input_mix_weight_down.weight"}};
+    static const char* kBlk[][2] = {
+        {"attn_qkv", "linear_attn.in_proj_qkv"}, {"attn_gate", "linear_attn.in_proj_z"}, {"ssm_out", "linear_attn.out_proj"},
+        {"ssm_alpha", "linear_attn.in_proj_a"}, {"ssm_beta", "linear_attn.in_proj_b"}, {"attn_q", "self_attn.q_proj"},
+        {"attn_k", "self_attn.k_proj"}, {"attn_v", "self_attn.v_proj"}, {"attn_output", "self_attn.o_proj"},
+        {"ffn_gate_shexp", "mlp.shared_expert.gate_proj"}, {"ffn_up_shexp", "mlp.shared_expert.up_proj"},
+        {"ffn_down_shexp", "mlp.shared_expert.down_proj"}, {"hc_attn_up", "attn_hyper_connection.input_mix_weight_up"},
+        {"hc_attn_down", "attn_hyper_connection.input_mix_weight_down"}, {"hc_attn_inject", "attn_hyper_connection.block_inject_weight"},
+        {"hc_ffn_up", "mlp_hyper_connection.input_mix_weight_up"}, {"hc_ffn_down", "mlp_hyper_connection.input_mix_weight_down"},
+        {"hc_ffn_inject", "mlp_hyper_connection.block_inject_weight"}};
+    for (size_t i = 0; i < sizeof kTop / sizeof kTop[0]; ++i)
+        if (!strcmp(g, kTop[i][0])) return snprintf(out, len, "%s", kTop[i][1]) > 0;
+    char k[32];
+    int l = -1, at = 0;
+    if (sscanf(g, "blk.%d.%31[a-z_].weight%n", &l, k, &at) != 2 || g[at]) return 0;
+    for (size_t i = 0; i < sizeof kBlk / sizeof kBlk[0]; ++i)
+        if (!strcmp(k, kBlk[i][0])) return snprintf(out, len, "language_model.model.layers.%d.%s.weight", l, kBlk[i][1]) > 0;
+    return 0;
+}
+
 typedef struct { const NsTensor* t[NS_EMU_PACKS]; uint64_t off; int lp; } EmTensor;   // + Q8_0 offset, 3 L + p
 typedef struct {
     const EmTensor* t;
@@ -135,6 +166,67 @@ int ns_emulate_gguf(const NsModel* const* packs, int np, const uint8_t* map, siz
     }
     free(nr);
     free(et);
+    *n = rc ? 0 : nt;
+    return rc ? -1 : 0;
+}
+
+int ns_emulate_dense(const NsModel* pack, const char* gguf, int* n, char* err, int errlen) {
+    *n = 0;
+    Gguf g;
+    if (gguf_open(&g, gguf, err, errlen)) return -1;
+    EmTensor* et = (EmTensor*) malloc(sizeof *et * (size_t) (g.n ? g.n : 1));
+    NsRows* nr = (NsRows*) malloc(sizeof *nr);
+    ns_rows_init(nr);
+    float* w = NULL;
+    uint8_t* buf = NULL;
+    int nt = 0, rc = 0;
+    for (int i = 0; i < g.n && !rc; ++i) {   // check every dense tensor first
+        const GgufTensor* gt = &g.t[i];
+        char name[160];
+        if (!dense_name(gt->name, name, sizeof name)) continue;
+        const NsTensor* t = ns_find(pack, name);
+        const size_t rb = t ? (size_t) t->cols / 32 * 34 : 0;
+        if (!t || gt->type != 8 || gt->ndim != 2 || gt->dims[0] != t->cols || gt->dims[1] != t->rows ||
+            t->slices != 1 || t->cols % 32 || g.data + gt->offset + rb * (uint64_t) t->rows > g.size) {
+            rc = snprintf(err, (size_t) errlen, "%s: %s is not Q8_0 like the pack's %s", gguf, gt->name, name);
+            break;
+        }
+        w = (float*) realloc(w, sizeof(float) * (size_t) t->cols);
+        double e2 = 0, w2 = 0;
+        const int ns = t->rows < 16 ? t->rows : 16;
+        for (int k = 0; k < ns; ++k) {   // the row order: 16 rows spread over the tensor, against the shard's own
+            const int r = (int) ((int64_t) k * t->rows / ns);
+            const uint8_t* q = (const uint8_t*) gguf_data(&g, gt) + rb * (size_t) r;
+            ns_row_f32(nr, t, 0, r, 0, w);
+            for (int c = 0; c < t->cols; ++c) {
+                const uint8_t* b = q + (size_t) c / 32 * 34;
+                const double v = (double) f16_to_f32((uint16_t) (b[0] | b[1] << 8)) * (int8_t) b[2 + c % 32];
+                e2 += (w[c] - v) * (w[c] - v);
+                w2 += v * v;
+            }
+        }
+        if (e2 > 0.09 * w2) {
+            rc = snprintf(err, (size_t) errlen, "%s: %s is %.2f from the pack's %s: another row order", gguf, gt->name, sqrt(e2 / (w2 > 0 ? w2 : 1)), name);
+            break;
+        }
+        et[nt++] = (EmTensor) {{t}, g.data + gt->offset, 0};
+    }
+    gguf_close(&g);   // before the writes: the mapping is read-only
+    const int fd = rc || !nt ? -1 : open(gguf, O_RDWR);
+    if (!rc && nt && fd < 0) rc = snprintf(err, (size_t) errlen, "%s: cannot open for writing", gguf);
+    for (int i = 0; fd >= 0 && !rc && i < nt; ++i) {
+        const NsTensor* t = et[i].t[0];
+        const size_t rb = (size_t) t->cols / 32 * 34;
+        w = (float*) realloc(w, sizeof(float) * (size_t) t->cols);
+        buf = (uint8_t*) realloc(buf, rb);
+        for (int r = 0; !rc && r < t->rows; ++r) {
+            ns_row_f32(nr, t, 0, r, 0, w);
+            ns_q8_0_row(w, t->cols, buf);
+            if (pwrite(fd, buf, rb, (off_t) (et[i].off + rb * (uint64_t) r)) != (ssize_t) rb) rc = snprintf(err, (size_t) errlen, "%s: a write failed", gguf);
+        }
+    }
+    if (fd >= 0 && close(fd) && !rc) rc = snprintf(err, (size_t) errlen, "%s: a write failed", gguf);
+    free(w); free(buf); free(nr); free(et);
     *n = rc ? 0 : nt;
     return rc ? -1 : 0;
 }

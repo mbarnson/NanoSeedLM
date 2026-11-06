@@ -32,7 +32,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 | `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, from an MLX base folder |
-| `nslm-qwen4-emulate` | Write seed experts into Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them. A map takes each expert from one of several packs |
+| `nslm-qwen4-emulate` | Write seed or trellis experts into Unsloth's Q8_0 GGUF shards in place, so that llama.cpp runs them. A map takes each expert from one of several packs. `--dense DIR` also writes the dense tensors of a model folder |
 
 Read [Make a model folder](../guides/make-a-model.md).
 
