@@ -11,6 +11,8 @@
                              // layer's compute (fewer: mostly unused experts; it pays from about 3,000 rows here)
 #define Q4E_PASS_ROWS 32768  // most prompt rows of one layer-major pass (the context, rounded up to chunks): each layer's
                              // missing experts cross PCIe once a pass
+#define Q4E_SMALL_PASS_ROWS 8192 // the default under 32 GB of VRAM: the pass keeps 40 KB a row, which the expert cache
+                             // needs more (RTX 4080 at 32K: 474 more slots, decode +8%, prompts +43% to +47%)
 
 #include "qwen4_cfg.h"
 
@@ -30,7 +32,7 @@ typedef struct {
                             // from the pinned arena, beside the GPU's copies (exact; P = 3 seeds; 0: off; at most 16)
     const char* resource_dir; // Metal: the folder of kernels_moe.metallib and kernels_qwen4.metallib (EngOpts.resource_dir,
                             // the harnesses' --res; NULL: out/res). NSLM_RES, when set, overrides it
-    int pass_rows;          // most rows of a layer-major pass (0: Q4E_PASS_ROWS); CUDA: each row keeps 40 KB of VRAM
+    int pass_rows;          // most rows of a layer-major pass (0: Q4E_PASS_ROWS, or Q4E_SMALL_PASS_ROWS under 32 GB of VRAM)
 } Q4EOpts;
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen);
