@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,47 @@ int nslm_moe_index_lookup(const char* index_json, const char* name, char* file, 
         return 0;
     }
     return -1;
+}
+
+static int desc_f(const void* a, const void* b) {
+    const float x = *(const float*) a, y = *(const float*) b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+double nslm_h_top_share(const float* h, int n, double frac) {
+    if (n < 1) return 0.0;
+    int k = (int) floor((double) n * frac + 1e-9);
+    if (k < 1) k = 1;
+    float* s = (float*) malloc(sizeof(float) * (size_t) n);
+    if (!s) return 0.0;
+    memcpy(s, h, sizeof(float) * (size_t) n);
+    qsort(s, (size_t) n, sizeof(float), desc_f);
+    double top = 0, all = 0;
+    for (int c = 0; c < n; ++c) { all += s[c]; if (c < k) top += s[c]; }
+    free(s);
+    return all > 0 ? top / all : 0.0;
+}
+double nslm_h_temper(float* h, int n, double thresh, double gamma) {
+    if (thresh > 1.0 || !(nslm_h_top_share(h, n, 0.01) > thresh)) return 1.0;
+    for (int c = 0; c < n; ++c) h[c] = h[c] > 0.0f ? (float) pow((double) h[c], gamma) : 0.0f;
+    return gamma;
+}
+int nslm_h_temper_parse(const char* s, double* thresh, double* gamma) {
+    if (!s) return -1;
+    if (!strcmp(s, "off")) { *thresh = 2.0; *gamma = 1.0; return 0; }
+    if (!strcmp(s, "auto")) { *thresh = 0.5; *gamma = 0.5; return 0; }
+    char* end;
+    const double t = strtod(s, &end);
+    double g = 0.5;
+    if (end == s || !(t >= 0.0 && t <= 1.0)) return -1;
+    if (*end == ':') {
+        const char* gs = end + 1;
+        g = strtod(gs, &end);
+        if (end == gs || !(g > 0.0 && g <= 1.0)) return -1;
+    }
+    if (*end) return -1;
+    *thresh = t;
+    *gamma = g;
+    return 0;
 }
 
 void nslm_moe_blend(const double* sum, int64_t n, const double* prior, double n0, int dim, float* h) {

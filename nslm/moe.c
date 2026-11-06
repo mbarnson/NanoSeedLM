@@ -16,6 +16,8 @@
 //       (nslm-mova-mlacapture --xtx DIR: L{l}_{x,v,q,o}.xtx), H dampened by damp * mean(diag H); the heads of a per-head
 //       map with one exponent bias search together; --codec p3 / p8 in place of --p4: P = 3 (.blk, SEED4 nibble words) or
 //       P = 8 (.blk8: 32-bit coefficient words, then the exponent codes) blocks (nslm/searchp.h, nslm/gptq.h)
+//   --h-temper off|auto|SHARE[:GAMMA] (default off): importance h -> h^GAMMA (default 1/2) for each expert matrix whose
+//       top 1% of input channels hold more than SHARE of sum h; auto is 0.5:0.5 (nslm_h_temper, every codec)
 //   --codec s3 (CUDA): C = 12, P = 4 blocks, 3 bits a weight (nslm/searchc_gpu.h), written as .blks: as .blk4 with
 //       nb = rows * ceil(cols / 12), a row's last block padded (ns_open_bank reads them)
 //   --codec tq [--tq-k 3] [--tq-l 12] (the GPU encoder when there is one, else the CPU; the same words): trellis-coded
@@ -269,7 +271,7 @@ static void imat_h(int l, int p, int e, double n0, float* h) {
 
 // h (cols floats) of expert e of projection p in layer l, with the shrinkage prior.
 static int g_w2;   // --weighting w2: weight each routed token by its routing weight squared
-static void act_h(int l, int p, int e, double n0, float* h) {
+static void act_h_raw(int l, int p, int e, double n0, float* h) {
     if (g_imat.map) { imat_h(l, p, e, n0, h); return; }
     if (p >= P_KAX) {   // MLA: each input column's mean square over the calibration rows (every row reaches every layer)
         const int n = proj_cols(l, p);
@@ -304,6 +306,17 @@ static void act_h(int l, int p, int e, double n0, float* h) {
         for (int c = 0; c < 2560; ++c) prior[c] = a->v_all[c] / (double) g_tokens;
         nslm_moe_blend(a->v + (size_t) e * 2560, a->vcount[e], prior, n0, 2560, h);
     }
+}
+
+// --h-temper (nslm_h_temper_parse): h -> h^gamma for an expert matrix whose top 1% of input channels hold more than the
+// threshold share of sum h.  Off by default, so the packs do not change.  Counts the tempered matrices.
+static double g_temper_th = 2.0, g_temper_ga = 1.0;
+static atomic_int g_h_seen, g_h_tempered;
+static void act_h(int l, int p, int e, double n0, float* h) {
+    act_h_raw(l, p, e, n0, h);
+    if (g_temper_th > 1.0) return;
+    atomic_fetch_add(&g_h_seen, 1);
+    if (nslm_h_temper(h, proj_cols(l, p), g_temper_th, g_temper_ga) != 1.0) atomic_fetch_add(&g_h_tempered, 1);
 }
 
 // ---- search jobs ----------------------------------------------------------------------------------------------------
@@ -916,6 +929,11 @@ int main(int argc, char** argv) {
     const double n0 = atof(opt(argc, argv, "--n0", "64"));
     g_w2 = !strcmp(opt(argc, argv, "--weighting", "plain"), "w2");
     if (g_w2 && imat) { fprintf(stderr, "--weighting w2 needs --act (routing weights)\n"); return 2; }
+    if (nslm_h_temper_parse(opt(argc, argv, "--h-temper", "off"), &g_temper_th, &g_temper_ga)) {
+        fprintf(stderr, "--h-temper off|auto|SHARE[:GAMMA] (SHARE in [0, 1], GAMMA in (0, 1])\n");
+        return 2;
+    }
+    if (g_temper_th <= 1.0) printf("importance: h^%g where the top 1%% of input channels hold more than %g of sum h\n", g_temper_ga, g_temper_th);
     char lib[1024];
     snprintf(lib, sizeof lib, "%s/search.metallib", opt(argc, argv, "--res", "out/res"));
     g_p4 = has_flag(argc, argv, "--p4");
@@ -982,5 +1000,6 @@ int main(int argc, char** argv) {
     for (int i = 0; i < workers && i < 64; ++i) pthread_join(th[i], NULL);
     if (atomic_load(&j.failed)) return 1;
     printf("moe_total_s=%.1f (%d jobs, %d workers)\n", now_s() - t0, n, workers);
+    if (g_temper_th <= 1.0) printf("importance tempered for %d of %d expert matrices\n", atomic_load(&g_h_tempered), atomic_load(&g_h_seen));
     return 0;
 }

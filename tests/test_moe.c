@@ -62,6 +62,33 @@ int main(void) {
         CHECK(fabs(h[c] - want) < 1e-6 * (want + 1e-9), "imatrix h c%d %g want %g", c, h[c], want);
     }
 
+    // ---- skew-aware importance (--h-temper): the top 1% share of sum h, and h^gamma above a threshold share ----
+    {
+        enum { N = 100 };
+        float hs[N], hm[N];
+        for (int c = 0; c < N; ++c) { hs[c] = 1.0f; hm[c] = 2.0f; }
+        hs[37] = 100.0f;   // one channel of 100 holds 100 / 199 of sum h
+        CHECK(fabs(nslm_h_top_share(hs, N, 0.01) - 100.0 / 199.0) < 1e-9, "top share %g", nslm_h_top_share(hs, N, 0.01));
+        CHECK(fabs(nslm_h_top_share(hm, N, 0.01) - 0.01) < 1e-9, "top share flat %g", nslm_h_top_share(hm, N, 0.01));
+        CHECK(fabs(nslm_h_top_share(hm, 50, 0.01) - 1.0 / 50.0) < 1e-9, "top share n 50: at least one channel");
+        const float z[3] = {0, 0, 0};
+        CHECK(nslm_h_top_share(z, 3, 0.01) == 0.0, "top share of zeros");
+        double th, ga;
+        CHECK(nslm_h_temper_parse("off", &th, &ga) == 0 && th > 1.0, "parse off");
+        CHECK(nslm_h_temper_parse("auto", &th, &ga) == 0 && th == 0.5 && ga == 0.5, "parse auto");
+        CHECK(nslm_h_temper_parse("0.3:0.25", &th, &ga) == 0 && th == 0.3 && ga == 0.25, "parse 0.3:0.25");
+        CHECK(nslm_h_temper_parse("0.3", &th, &ga) == 0 && th == 0.3 && ga == 0.5, "parse 0.3 (gamma 1/2)");
+        CHECK(nslm_h_temper_parse("x", &th, &ga) != 0 && nslm_h_temper_parse("0.3:2", &th, &ga) != 0, "parse bad");
+        float t[N];
+        memcpy(t, hm, sizeof t);
+        CHECK(nslm_h_temper(t, N, 0.5, 0.5) == 1.0 && !memcmp(t, hm, sizeof t), "mild skew: h unchanged");
+        memcpy(t, hs, sizeof t);
+        CHECK(nslm_h_temper(t, N, 2.0, 0.5) == 1.0 && !memcmp(t, hs, sizeof t), "off: h unchanged");
+        CHECK(nslm_h_temper(t, N, 0.5, 0.5) == 0.5 && t[37] == 10.0f && t[0] == 1.0f, "skewed: h^1/2 (%g %g)", t[37], t[0]);
+        float tz[3] = {0, 4, 0};
+        CHECK(nslm_h_temper(tz, 3, 0.0, 0.5) == 0.5 && tz[0] == 0.0f && tz[1] == 2.0f, "zeros stay zero");
+    }
+
     // ---- .blk4 -> SEED4P4 streams: seeds, coefficient words, int32 bias per slice, exponent codes 2 per byte ----
     {
         enum { E = 2, R = 2, C = 16, NB = R * C / 8 };

@@ -59,6 +59,18 @@ int nslm_qwen_experts(const char* config_json, int* d, int* ff, int* n_exp, int*
 // over all experts' tokens.
 void nslm_imatrix_h(const float* sum, const float* cnt, int E, int cols, int e, double n0, float* h);
 
+// Skew-aware importance (nslm-moe --h-temper; docs/plans/2026-11-06-skew-aware-importance.md).  When a few input
+// channels hold most of sum h, the importance-weighted search fits them and neglects the rest: on SmolLM2-135M the
+// trellis with weights h gave 7 to 12 times the KL of no weights, and h^1/2 the lowest KL
+// (docs/results/2026-11-06-search-objective-kl.md).
+// The share of sum h in the largest floor(frac n) channels (at least one); 0 when sum h <= 0.
+double nslm_h_top_share(const float* h, int n, double frac);
+// h[c] <- h[c]^gamma (0 for h[c] <= 0) when the top 1% share of h is above thresh.  Returns gamma, or 1 (h unchanged).
+double nslm_h_temper(float* h, int n, double thresh, double gamma);
+// --h-temper values: "off" (thresh 2, gamma 1: never), "auto" (0.5, 0.5), or "SHARE[:GAMMA]" with SHARE in [0, 1] and
+// GAMMA in (0, 1] (default 0.5).  0, or -1 for a bad value.
+int nslm_h_temper_parse(const char* s, double* thresh, double* gamma);
+
 // Writes one BF16 tensor `name` of shape [d0][d1][d2] as a safetensors file (atomic: temp file + rename).
 int nslm_st_write_bf16_3d(const char* path, const char* name, int d0, int d1, int d2, const uint16_t* data, char* err,
                           int errlen);
