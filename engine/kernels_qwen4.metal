@@ -4,11 +4,11 @@
 #ifndef NSLM_KERNELS_QWEN4_METAL
 #define NSLM_KERNELS_QWEN4_METAL
 
-typedef struct { int cd, K, T, keep; } Q4ConvArgs;                   // GDN causal conv: channels, kernel, tokens; keep: below
-typedef struct { int cd, kd, vd, hv, rep, dv, T, keep; } Q4GdnArgs;   // GDN step: conv_dim, hk * dk, hv * dv, ...
-typedef struct { int hv, dv; float eps; int pad; } Q4GNormArgs;       // GDN output norm
+typedef struct { int cd, K, T, keep, ld, pad[3]; } Q4ConvArgs;      // GDN causal conv: channels, kernel, tokens; keep: below; ld: qkv's row stride (0: cd)
+typedef struct { int cd, kd, vd, hv, rep, dv, T, keep, abld, pad[3]; } Q4GdnArgs;   // GDN step: conv_dim, hk * dk, hv * dv, ...; abld: a / b row stride (0: hv)
+typedef struct { int hv, dv; float eps; int zld; } Q4GNormArgs;       // GDN output norm; zld: z's row stride (0: hv dv)
 typedef struct { int len, g; float eps; int parts; } Q4NormArgs;      // RMSNorm (1 + w) in groups of g, each written by parts threadgroups
-typedef struct { int hc, d, n; float inv_hc; } Q4HcArgs;              // hyper-connection pointwise steps
+typedef struct { int hc, d, n; float inv_hc; int w, ld, pad[2]; } Q4HcArgs;   // hyper-connection pointwise steps; ld > 0: n values in rows of w, ld apart
 typedef struct { int rs, hs, hd, rot, pos0, pstep; float eps; int pad; } Q4RopeArgs;   // row t at pos0 + t * pstep
 typedef struct { int E, k, pad[2]; } Q4RouteArgs;                     // experts, top k (<= 32)
 typedef struct { int hc, d, pad[2]; } Q4PleGateArgs;
@@ -20,7 +20,7 @@ typedef struct { int nh, D, rs, maxdone, k, pad[3]; } Q4QsaArgs;      // scores 
 // hd a multiple of 32, <= 256. nsplit: k_q4_attend_g's key splits (its grid's depth). smin > 0: decode rows by their own
 // keys n, so that a row's sums do not depend on the other rows of its forward: rows with n >= smin in k_q4_attend_g, in
 // min(smax, ceil(n / skeys)) splits (smax 0: ATG_MAX_SPLIT; merged by k_q4_attend_comb), the others in k_q4_attend
-typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit, smin, skeys, smax, pad; } Q4AttArgs;
+typedef struct { int nh, nkv, hd, R, topk, pos0; float scale; int nsplit, smin, skeys, smax, qld; } Q4AttArgs;   // qld: q's row stride (0: nh 2 hd)
 #define ATG_MAX_SPLIT 32
 typedef struct { int w, ss, pos0, pad; } Q4StoreArgs;                 // cache rows: width, source row stride, first position
 typedef struct { int d, k, pad[2]; } Q4CombineArgs;                   // MoE combine: hidden size, top k
@@ -61,7 +61,7 @@ kernel void k_q4_gdn_conv(constant Q4ConvArgs& a [[buffer(0)]], device const flo
     for (int k = 0; k < K - 1; ++k) st[k] = conv[(ulong) k * cd + ch];
     for (int k = 0; k < K; ++k) wk[k] = w[(ulong) ch * K + k];
     for (int t = 0; t < a.T; ++t) {
-        const float x = qkv[(ulong) t * cd + ch];
+        const float x = qkv[(ulong) t * (a.ld ? a.ld : cd) + ch];
         float acc = wk[K - 1] * x;
         for (int k = 0; k < K - 1; ++k) acc += wk[k] * st[k];
         cv[(ulong) t * cd + ch] = acc * sigm(acc);
@@ -101,8 +101,9 @@ kernel void k_q4_gdn_step(GDN_STEP_ARGS) {
         float qq = 0, kk = 0;
         for (int j = 0; j < DK; ++j) { qq += q[j] * q[j]; kk += k[j] * k[j]; }
         const float sq = rsqrt(qq + 1e-6f) * rsqrt((float) DK), sk = rsqrt(kk + 1e-6f);   // L2 norms; q also dk^-0.5
-        const float ap = aa[(ulong) t * a.hv + hv] + dtb, sp = ap > 20.0f ? ap : log(1.0f + exp(ap));
-        const float g = exp(-A * sp), beta = sigm(bb[(ulong) t * a.hv + hv]);
+        const ulong ab = (ulong) t * (a.abld ? a.abld : a.hv) + hv;   // a and b: their columns of the merged in_proj rows
+        const float ap = aa[ab] + dtb, sp = ap > 20.0f ? ap : log(1.0f + exp(ap));
+        const float g = exp(-A * sp), beta = sigm(bb[ab]);
         threadgroup const float* kp = k + p * DJ;
         threadgroup const float* qp = q + p * DJ;
         float kv = 0;
@@ -131,7 +132,7 @@ kernel void k_q4_gdn_norm(constant Q4GNormArgs& a [[buffer(0)]], device const fl
     threadgroup float red[32];
     const ulong o = ((ulong) tg.y * a.hv + tg.x) * a.dv + tid;
     const float v = y[o], r = rsqrt(tg_sum(v * v, red, lane, sg, (uint) a.dv / 32) / a.dv + a.eps);
-    y[o] = v * r * norm_w[tid] * sigm(z[o]);
+    y[o] = v * r * norm_w[tid] * sigm(z[a.zld ? (ulong) tg.y * a.zld + (ulong) tg.x * a.dv + tid : o]);
 }
 
 // ---- RMSNorm (1 + w) and the hyper-connection pointwise steps --------------------------------------------------------
@@ -154,10 +155,18 @@ kernel void k_q4_norm1p(constant Q4NormArgs& a [[buffer(0)]], device const float
 }
 
 kernel void k_q4_hc_act(constant Q4HcArgs& a [[buffer(0)]], device float* lo [[buffer(1)]], uint i [[thread_position_in_grid]]) {
-    if ((int) i < a.n) { const float x = lo[i] * a.inv_hc; lo[i] = x * sigm(x); }
+    if ((int) i >= a.n) return;
+    const ulong j = a.ld ? (ulong) (i / (uint) a.w) * a.ld + i % (uint) a.w : i;   // the down rows of the merged down + inject rows
+    const float x = lo[j] * a.inv_hc;
+    lo[j] = x * sigm(x);
 }
 kernel void k_q4_hc_gate(constant Q4HcArgs& a [[buffer(0)]], device float* inj [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if ((int) i < a.n) inj[i] = 2.0f * sigm(inj[i] * a.inv_hc);
+}
+// The same from the inject columns of the merged down + inject rows (w = hc values a row, ld apart) into inj[t][hc]
+kernel void k_q4_hc_gate_rows(constant Q4HcArgs& a [[buffer(0)]], device const float* lo [[buffer(1)]], device float* inj [[buffer(2)]],
+                              uint i [[thread_position_in_grid]]) {
+    if ((int) i < a.n) inj[i] = 2.0f * sigm(lo[(ulong) (i / (uint) a.w) * a.ld + i % (uint) a.w] * a.inv_hc);
 }
 // grid (d, T): mixed[t][i] = mean_s sigmoid(up[t][s][i]) normed[t][s][i]
 kernel void k_q4_hc_mix(constant Q4HcArgs& a [[buffer(0)]], device const float* normed [[buffer(1)]], device const float* up [[buffer(2)]],
@@ -440,7 +449,7 @@ kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float*
     const int h = (int) tg.x, t = (int) tg.y, w = (int) sg, dl = a.hd / 32, g = h / (a.nh / a.nkv);
     const int pos = a.pos0 + t, ns = nsel[t], tail = ns ? (pos + 1) / a.R * a.R : 0, n = ns * a.R + pos + 1 - tail;
     if (a.smin && n >= a.smin) return;   // k_q4_attend_g's row
-    device const float* qh = q + ((ulong) t * a.nh + h) * 2 * a.hd;
+    device const float* qh = q + (ulong) t * (a.qld ? a.qld : a.nh * 2 * a.hd) + (ulong) h * 2 * a.hd;   // q rows qld apart (merged projections)
     float qv[8], acc[8], m = -INFINITY, l = 0;
     for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
     for (int k = w; k < n; k += 8) {
@@ -494,7 +503,7 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
     const int per = ((n + nsp - 1) / nsp + ATG_K - 1) / ATG_K * ATG_K;
     const int kb = (int) tg.z * per, ke = min(n, kb + per);
     const bool active = ht * 8 < G;
-    device const float* qb = q + ((ulong) t * a.nh + (ulong) g * G + ht * 8) * 2 * hd;   // 8 heads, stride 2 hd
+    device const float* qb = q + (ulong) t * (a.qld ? a.qld : a.nh * 2 * hd) + ((ulong) g * G + ht * 8) * 2 * hd;   // 8 heads, stride 2 hd; rows qld apart
     simdgroup_float8x8 O[32 / ATG_NQ];   // the loops run to a constant so that O[] stays in registers
     for (int j = 0; j < 32 / ATG_NQ; ++j) O[j] = simdgroup_float8x8(0);
     float m = -INFINITY, l = 0;   // half 0, lanes 0..7: head row `lane` of the tile
@@ -598,7 +607,7 @@ kernel void k_q4_attend_comb(constant Q4AttArgs& a [[buffer(0)]], device const f
     for (int s = 0; s < nsp; ++s) M = max(M, pb[s * st + hd]);
     float L = 0.0f;
     for (int s = 0; s < nsp; ++s) { const float ms = pb[s * st + hd]; if (ms != -INFINITY) L += pb[s * st + hd + 1] * exp(ms - M); }
-    device const float* qh = q + head * 2 * hd;
+    device const float* qh = q + (ulong) t * (a.qld ? a.qld : a.nh * 2 * hd) + (ulong) h * 2 * hd;
     for (int i = (int) tid; i < hd; i += 256) {
         float v = 0.0f;
         for (int s = 0; s < nsp; ++s) { const float ms = pb[s * st + hd]; if (ms != -INFINITY) v += pb[s * st + i] * exp(ms - M); }

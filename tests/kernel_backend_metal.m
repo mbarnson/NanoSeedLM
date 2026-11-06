@@ -797,8 +797,8 @@ int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const flo
                   nb = buf(w->norm_w, 4 * (size_t) dv), qb = buf(qkv, 4 * cd * T), zb = buf(z, 4 * vd * T),
                   ab = buf(a, 4 * (size_t) hv * T), bb = buf(b, 4 * (size_t) hv * T), cb = buf(conv, 4 * nc), Sb = buf(S, 4 * ns),
                   cvb = buf(NULL, 4 * cd * T), yb = buf(NULL, 4 * vd * T);
-    const Q4ConvArgs ca = {(int) cd, K, T, 0};
-    const Q4GdnArgs ga = {(int) cd, c->lin_hk * dk, (int) vd, hv, hv / c->lin_hk, dv, T, 0};
+    const Q4ConvArgs ca = {(int) cd, K, T, 0, 0, {0, 0, 0}};
+    const Q4GdnArgs ga = {(int) cd, c->lin_hk * dk, (int) vd, hv, hv / c->lin_hk, dv, T, 0, 0, {0, 0, 0}};
     const Q4GNormArgs na = {hv, dv, c->eps, 0};
     const int split = Q4_GDN_SPLIT(dk);
     if (run(^(id<MTLComputeCommandEncoder> e) {
@@ -836,7 +836,7 @@ int kt_q4_hc(const Qwen4Cfg* c, float* lo, const float* normed, const float* up,
     id<MTLBuffer> lb = buf(lo, 4 * nl), nb = buf(normed, 4 * HD * T), ub = buf(up, 4 * HD * T), mb = buf(NULL, 4 * nm),
                   ib = buf(inj, 4 * ni), Hb = buf(H, 4 * HD * T), bb = buf(branch, 4 * nm);
     const float ih = 1.0f / (float) c->hc;
-    const Q4HcArgs act = {c->hc, c->d, (int) nl, ih}, gate = {c->hc, c->d, (int) ni, ih}, mix = {c->hc, c->d, 0, ih};
+    const Q4HcArgs act = {c->hc, c->d, (int) nl, ih, 0, 0, {0, 0}}, gate = {c->hc, c->d, (int) ni, ih, 0, 0, {0, 0}}, mix = {c->hc, c->d, 0, ih, 0, 0, {0, 0}};
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, pa, &act, sizeof act, @[lb]);
             [e dispatchThreads:TGS(nl, 1) threadsPerThreadgroup:TGS(256, 1)];

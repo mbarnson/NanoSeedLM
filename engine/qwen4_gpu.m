@@ -38,11 +38,11 @@ typedef struct {   // a tensor of the folder: its streams (nslm/model_st.h), for
 } MW;
 
 typedef struct {
-    MW hc_down[2], hc_up[2], hc_inj[2];
+    MW hc_di[2], hc_up[2];   // each mix: the down rows, then the hc inject rows (one weight of the same input); up
     id<MTLBuffer> hc_norm[2];
-    MW qkv, z, b, a, out;                           // Gated DeltaNet
+    MW in, out;   // Gated DeltaNet: in = the rows of in_proj qkv, z, b and a (one weight of x)
     id<MTLBuffer> conv_w, A_log, dt_bias, norm_w, conv, S;
-    MW q, k, v, o, ix;                              // QSA attention
+    MW qkvi, o;   // QSA attention: qkvi = the rows of q (with its gate), k, v and the indexer's qk (one weight of x)
     id<MTLBuffer> qn, kn, iqn, ikn, K, V, raw, blk;
     MW gate, sg, sh_g, sh_u, sh_d, eg, eu, ed;      // MoE
     MW key, val;                                    // PLE
@@ -71,8 +71,8 @@ struct Q4Eng {
     int max_pos, pos, nb, nple, kq;    // context; QSA block slots; PLE layers; QSA blocks a row attends
     int maxt;                          // rows of one prompt forward (Q4EOpts.rows, or MAXT_DEFAULT)
     int32_t* ids;                      // the context (host), for the PLE n-grams
-    id<MTLBuffer> x, H, normed, lo, up, inj, br, qp, kk, vv, o, ixo, sc, emb, keys, qs, vals, gated;
-    id<MTLBuffer> lg, wt, A, Gb, Ub, Dx, sh, sgv, logits, y, cv, qkvb, zb, bb, ab;
+    id<MTLBuffer> x, H, normed, lo, up, inj, br, qp, o, sc, emb, keys, qs, vals, gated;
+    id<MTLBuffer> lg, wt, A, Gb, Ub, Dx, sh, sgv, logits, y, cv, qkvb;
     id<MTLBuffer> tok, ind, sel, done, nsel, zero, perm, tiles, apart;   // apart: k_q4_attend_g's split partials
     id<MTLCommandBuffer> cb;   // the forward being encoded
     id<MTLComputeCommandEncoder> enc;
@@ -248,6 +248,48 @@ static id<MTLBuffer> load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
     return b;
 }
 
+// A row of the merged input projections (as engine/qwen4_cuda.c): attention's q (and gate), k, v, the indexer's q heads and
+// key; DeltaNet's qkv, z, b, a
+static int att_ld(const Qwen4Cfg* c) { return c->n_head * 2 * c->head_dim + 2 * c->n_kv * c->head_dim + (c->ix_heads + 1) * c->ix_dim; }
+static int gdn_ld(const Qwen4Cfg* c) { return 2 * c->lin_hk * c->lin_dk + 2 * c->lin_hv * c->lin_dv + 2 * c->lin_hv; }
+// Dense weights of the same input (BF16, Q8 or Q4, one encoding, group and width) as one: their rows in order, copied into
+// new buffers (the merged rows are not contiguous in the folder's files)
+static void load_cat(Q4Eng* e, MW* w, const char* const* names, int n) {
+    const NsTensor* t[4];
+    int rows = 0;
+    *w = (MW) {0};
+    for (int i = 0; i < n; ++i) {
+        if (!(t[i] = ns_find(&e->nm, names[i]))) { fail(e, "%s: missing", names[i]); return; }
+        if (t[i]->enc != t[0]->enc || (t[0]->enc != NS_BF16 && t[0]->enc != NS_Q4 && t[0]->enc != NS_Q8) || t[i]->cols != t[0]->cols ||
+            t[i]->group != t[0]->group || t[i]->slices != 1 || (t[0]->enc == NS_Q4 && t[0]->group != 32 && t[0]->group != 64) ||
+            (t[0]->enc == NS_Q8 && t[0]->group != 64)) {
+            fail(e, "%s and %s: not one dense encoding, group and width", names[0], names[i]);
+            return;
+        }
+        rows += t[i]->rows;
+    }
+    for (int s = 0; s < 4; ++s) {
+        uint64_t len = 0;
+        for (int i = 0; i < n; ++i) len += t[i]->s[s].len;
+        if (!len) continue;
+        id<MTLBuffer> b = dbuf(e, NULL, len);
+        if (!b) return;
+        uint8_t* p = (uint8_t*) b.contents;
+        for (int i = 0; i < n; p += t[i]->s[s].len, ++i) memcpy(p, t[i]->s[s].p, t[i]->s[s].len);
+        w->b[s] = b;
+    }
+    w->fmt = t[0]->enc; w->slices = 1; w->rows = rows; w->cols = t[0]->cols; w->gs = t[0]->enc == NS_BF16 ? 0 : t[0]->group;
+}
+// Rows r0 .. r0 + n - 1 of a dense weight (BF16, Q8 or Q4): its streams from those rows' bytes
+static MW rows_of(const MW* w, int r0, int n) {
+    MW v = *w;
+    const uint64_t wb = w->fmt == MF_BF16 ? 2 * (uint64_t) w->cols : (uint64_t) w->cols * (w->fmt == MF_Q8 ? 8 : 4) / 8;   // packed bytes a row
+    const uint64_t sb = w->fmt == MF_BF16 ? 0 : 2 * (uint64_t) w->cols / (uint64_t) w->gs;                                  // BF16 scales / biases a row
+    v.o[0] += wb * (uint64_t) r0;
+    if (sb) { v.o[1] += sb * (uint64_t) r0; v.o[2] += sb * (uint64_t) r0; }
+    v.rows = n;
+    return v;
+}
 // Layer L named lp (attention if attn): main layer l, or the MTP head's layer (l < 0: no PLE)
 static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
     const Qwen4Cfg* c = &e->c;
@@ -255,16 +297,19 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
     for (int b = 0; b < 2; ++b) {
         const char* hc = b ? "mlp_hyper_connection" : "attn_hyper_connection";
         L->hc_norm[b] = load_v(e, HD, "%s.%s.hc_norm.weight", lp, hc);
-        load_w(e, &L->hc_down[b], "%s.%s.input_mix_weight_down.weight", lp, hc);
+        char n[2][192];
+        snprintf(n[0], sizeof n[0], "%s.%s.input_mix_weight_down.weight", lp, hc);
+        snprintf(n[1], sizeof n[1], "%s.%s.block_inject_weight.weight", lp, hc);
+        load_cat(e, &L->hc_di[b], (const char* const[]) {n[0], n[1]}, 2);
         load_w(e, &L->hc_up[b], "%s.%s.input_mix_weight_up.weight", lp, hc);
-        load_w(e, &L->hc_inj[b], "%s.%s.block_inject_weight.weight", lp, hc);
     }
     if (attn) {
-        load_w(e, &L->q, "%s.self_attn.q_proj.weight", lp);
-        load_w(e, &L->k, "%s.self_attn.k_proj.weight", lp);
-        load_w(e, &L->v, "%s.self_attn.v_proj.weight", lp);
+        const char* in[4] = {"q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"};
+        char n[4][192];
+        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.self_attn.%s.weight", lp, in[i]);
+        load_cat(e, &L->qkvi, (const char* const[]) {n[0], n[1], n[2], n[3]}, 4);
+        if (!e->err[0] && L->qkvi.rows != att_ld(c)) fail(e, "%s: attention projections of %d rows, not %d", lp, L->qkvi.rows, att_ld(c));
         load_w(e, &L->o, "%s.self_attn.o_proj.weight", lp);
-        load_w(e, &L->ix, "%s.self_attn.indexer.index_qk_proj.weight", lp);
         L->qn = load_v(e, c->head_dim, "%s.self_attn.q_norm.weight", lp);
         L->kn = load_v(e, c->head_dim, "%s.self_attn.k_norm.weight", lp);
         L->iqn = load_v(e, c->ix_dim, "%s.self_attn.indexer.q_layernorm.weight", lp);
@@ -274,10 +319,11 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
         L->raw = F((size_t) e->max_pos * c->ix_dim);
         L->blk = F((size_t) e->nb * c->ix_dim);
     } else {
-        load_w(e, &L->qkv, "%s.linear_attn.in_proj_qkv.weight", lp);
-        load_w(e, &L->z, "%s.linear_attn.in_proj_z.weight", lp);
-        load_w(e, &L->b, "%s.linear_attn.in_proj_b.weight", lp);
-        load_w(e, &L->a, "%s.linear_attn.in_proj_a.weight", lp);
+        const char* in[4] = {"qkv", "z", "b", "a"};
+        char n[4][192];
+        for (int i = 0; i < 4; ++i) snprintf(n[i], sizeof n[i], "%s.linear_attn.in_proj_%s.weight", lp, in[i]);
+        load_cat(e, &L->in, (const char* const[]) {n[0], n[1], n[2], n[3]}, 4);
+        if (!e->err[0] && L->in.rows != gdn_ld(c)) fail(e, "%s: DeltaNet in_proj of %d rows, not %d", lp, L->in.rows, gdn_ld(c));
         load_w(e, &L->out, "%s.linear_attn.out_proj.weight", lp);
         L->conv_w = load_v(e, (int64_t) cd * c->lin_conv, "%s.linear_attn.conv1d.weight", lp);
         L->A_log = load_v(e, c->lin_hv, "%s.linear_attn.A_log", lp);
@@ -477,34 +523,36 @@ static void store(Q4Eng* e, id<MTLBuffer> dst, int w, id<MTLBuffer> src, uint64_
 }
 
 // The streams of H mixed into x; with inj, the weights that add the branch back (nslm/qwen4_ops.h)
-static void hc_mix(Q4Eng* e, id<MTLBuffer> norm, const MW* down, const MW* upw, const MW* injw, int T) {
+// down: hc_rank rows, then (inj) the hc rows of the weights that add the branch back (one weight, as engine/qwen4_cuda.c)
+static void hc_mix(Q4Eng* e, id<MTLBuffer> norm, const MW* down, const MW* upw, int inj, int T) {
     const Qwen4Cfg* c = &e->c;
-    const int HD = c->hc * c->d;
+    const int HD = c->hc * c->d, ld = down->rows;
     const float ih = 1.0f / (float) c->hc;
     norm1p(e, e->H, HD, c->d, norm, e->normed, T);
     mv(e, down, e->normed, e->lo, T);
-    const Q4HcArgs act = {c->hc, c->d, T * c->hc_rank, ih}, mix = {c->hc, c->d, 0, ih}, gate = {c->hc, c->d, T * c->hc, ih};
+    const Q4HcArgs act = {c->hc, c->d, T * c->hc_rank, ih, c->hc_rank, ld, {0, 0}}, mix = {c->hc, c->d, 0, ih, 0, 0, {0, 0}};
+    const Q4HcArgs gate = {c->hc, c->d, T * c->hc, ih, c->hc, ld, {0, 0}};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_hc_act")];
     A_(e, &act, sizeof act);
     B(e, 1, e->lo, 0);
     thr(e, (uint64_t) T * c->hc_rank, 1, 256);
-    mv(e, upw, e->lo, e->up, T);
+    mv_o(e, upw, e->lo, 0, ld, e->up, 0, upw->rows, T);
     [e->enc setComputePipelineState:pipe4(e, "k_q4_hc_mix")];
     A_(e, &mix, sizeof mix);
     B(e, 1, e->normed, 0);
     B(e, 2, e->up, 0);
     B(e, 3, e->x, 0);
     thr(e, (uint64_t) c->d, (uint64_t) T, 256);
-    if (injw) {
-        mv(e, injw, e->normed, e->inj, T);
-        [e->enc setComputePipelineState:pipe4(e, "k_q4_hc_gate")];
+    if (inj) {   // the inject columns of lo into inj[t][hc]
+        [e->enc setComputePipelineState:pipe4(e, "k_q4_hc_gate_rows")];
         A_(e, &gate, sizeof gate);
-        B(e, 1, e->inj, 0);
+        B(e, 1, e->lo, sizeof(float) * (uint64_t) c->hc_rank);
+        B(e, 2, e->inj, 0);
         thr(e, (uint64_t) T * c->hc, 1, 256);
     }
 }
 static void hc_add(Q4Eng* e, id<MTLBuffer> H, id<MTLBuffer> inj, int T) {   // H[t][s] += inj[t][s] br[t]
-    const Q4HcArgs a = {e->c.hc, e->c.d, 0, 1.0f / (float) e->c.hc};
+    const Q4HcArgs a = {e->c.hc, e->c.d, 0, 1.0f / (float) e->c.hc, 0, 0, {0, 0}};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_hc_add")];
     A_(e, &a, sizeof a);
     B(e, 1, H, 0);
@@ -564,17 +612,20 @@ static void ple(Q4Eng* e, int l, int T) {
 // one behind a forward). drow: the rows' first entry in done / nsel (q4e_draft's head row j)
 static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int drow) {
     const Qwen4Cfg* c = &e->c;
-    const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio, iw = (c->ix_heads + 1) * D;
-    if (!keys_only) mv(e, &L->q, e->x, e->qp, T);
-    mv(e, &L->k, e->x, e->kk, T);
-    mv(e, &L->v, e->x, e->vv, T);
-    if (!keys_only) head_norm_rope(e, e->qp, 0, c->n_head * 2 * hd, c->n_head, 2 * hd, hd, L->qn, pos0, 1, T);
-    head_norm_rope(e, e->kk, 0, kvw, c->n_kv, hd, hd, L->kn, pos0, 1, T);
-    store_as(e, 1, L->K, kvw, e->kk, 0, kvw, pos0, T);
-    store_as(e, 1, L->V, kvw, e->vv, 0, kvw, pos0, T);
-    mv(e, &L->ix, e->x, e->ixo, T);
-    store(e, L->raw, D, e->ixo, sizeof(float) * (uint64_t) c->ix_heads * D, iw, pos0, T);
-    if (!keys_only) head_norm_rope(e, e->ixo, 0, iw, c->ix_heads, D, D, L->iqn, pos0, 1, T);
+    const int hd = c->head_dim, kvw = c->n_kv * hd, D = c->ix_dim, R = c->ix_ratio;
+    const int ld = att_ld(c), qw = c->n_head * 2 * hd;   // a row of qp: q (with its gate), k, v, the indexer's q heads and key
+    const uint64_t ko = sizeof(float) * (uint64_t) qw, vo = ko + sizeof(float) * (uint64_t) kvw, io = vo + sizeof(float) * (uint64_t) kvw;
+    if (!keys_only) mv_o(e, &L->qkvi, e->x, 0, c->d, e->qp, 0, ld, T);
+    else {   // the MTP head's rows one behind: k, v and the indexer only (the rows after q)
+        const MW kvi = rows_of(&L->qkvi, qw, ld - qw);
+        mv_o(e, &kvi, e->x, 0, c->d, e->qp, ko, ld, T);
+    }
+    if (!keys_only) head_norm_rope(e, e->qp, 0, ld, c->n_head, 2 * hd, hd, L->qn, pos0, 1, T);
+    head_norm_rope(e, e->qp, ko, ld, c->n_kv, hd, hd, L->kn, pos0, 1, T);
+    store_as(e, 1, L->K, kvw, e->qp, ko, ld, pos0, T);
+    store_as(e, 1, L->V, kvw, e->qp, vo, ld, pos0, T);
+    store(e, L->raw, D, e->qp, io + sizeof(float) * (uint64_t) c->ix_heads * D, ld, pos0, T);
+    if (!keys_only) head_norm_rope(e, e->qp, io, ld, c->ix_heads, D, D, L->iqn, pos0, 1, T);
     mark(e, ST_ATTN);
     // the key blocks these rows complete: the mean of their raw keys, then norm + RoPE at the block's first position
     const int j0 = pos0 / R, j1 = (pos0 + T) / R;
@@ -590,10 +641,10 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
     if (keys_only) return;
     const uint64_t dro = sizeof(int32_t) * (uint64_t) drow;
     if (j1 > 0) {   // done / nsel are the host's (the forward's rows)
-        const Q4QsaArgs qa = {c->ix_heads, D, iw, j1, e->kq, {0, 0, 0}};
+        const Q4QsaArgs qa = {c->ix_heads, D, ld, j1, e->kq, {0, 0, 0}};   // the indexer's q heads: columns io of qp's rows
         [e->enc setComputePipelineState:pipe4(e, "k_q4_qsa_scores")];
         A_(e, &qa, sizeof qa);
-        B(e, 1, e->ixo, 0);
+        B(e, 1, e->qp, io);
         B(e, 2, L->blk, 0);
         B(e, 3, e->done, dro);
         B(e, 4, e->sc, 0);
@@ -618,7 +669,7 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
         if (n >= e->smin) { ++nlong; if (z > zmax) zmax = z < e->smax ? z : e->smax; }
     }
     const int split = T <= MV_MAXT && canG && nlong && !e->no_splitk, grouped = (T > MV_MAXT && canG && !e->no_attg) || split;
-    const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, pos0, 1.0f / sqrtf((float) hd), split ? zmax : 1, split ? e->smin : 0, e->skeys, e->smax, 0};
+    const Q4AttArgs aa = {c->n_head, c->n_kv, hd, R, e->kq, pos0, 1.0f / sqrtf((float) hd), split ? zmax : 1, split ? e->smin : 0, e->skeys, e->smax, ld};
     for (int pass = 0; pass < 1 + (split && nlong < T); ++pass) {   // split rows: then k_q4_attend for the short rows
         const int g = grouped && !pass;
         [e->enc setComputePipelineState:pipe4(e, g ? "k_q4_attend_g" : "k_q4_attend")];
@@ -652,11 +703,10 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
 static void gdn(Q4Eng* e, Layer* L, int T) {
     const Qwen4Cfg* c = &e->c;
     const int dk = c->lin_dk, dv = c->lin_dv, hv = c->lin_hv, cd = 2 * c->lin_hk * dk + hv * dv, vd = hv * dv;
-    mv(e, &L->qkv, e->x, e->qkvb, T);
-    mv(e, &L->z, e->x, e->zb, T);
-    mv(e, &L->b, e->x, e->bb, T);
-    mv(e, &L->a, e->x, e->ab, T);
-    const Q4ConvArgs ca = {cd, c->lin_conv, T, e->keep && L->kconv[0] != nil};
+    const int ld = gdn_ld(c);   // a row of qkvb: qkv (cd), z (vd), b (hv), a (hv)
+    const uint64_t zo = sizeof(float) * (uint64_t) cd, bo = zo + sizeof(float) * (uint64_t) vd, ao = bo + sizeof(float) * (uint64_t) hv;
+    mv_o(e, &L->in, e->x, 0, c->d, e->qkvb, 0, ld, T);
+    const Q4ConvArgs ca = {cd, c->lin_conv, T, e->keep && L->kconv[0] != nil, ld, {0, 0, 0}};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_gdn_conv")];
     A_(e, &ca, sizeof ca);
     B(e, 1, L->conv_w, 0);
@@ -665,23 +715,23 @@ static void gdn(Q4Eng* e, Layer* L, int T) {
     B(e, 4, e->cv, 0);
     bind_keep(e, 5, L->kconv, L->conv);
     thr(e, (uint64_t) cd, 1, 256);
-    const Q4GdnArgs ga = {cd, c->lin_hk * dk, vd, hv, hv / c->lin_hk, dv, T, e->keep && L->kS[0] != nil};
+    const Q4GdnArgs ga = {cd, c->lin_hk * dk, vd, hv, hv / c->lin_hk, dv, T, e->keep && L->kS[0] != nil, ld, {0, 0, 0}};
     [e->enc setComputePipelineState:pipe4(e, dk == 32 ? "k_q4_gdn_step_32" : dk == 64 ? "k_q4_gdn_step_64" : "k_q4_gdn_step_128")];
     A_(e, &ga, sizeof ga);
     B(e, 1, e->cv, 0);
-    B(e, 2, e->ab, 0);
-    B(e, 3, e->bb, 0);
+    B(e, 2, e->qkvb, ao);
+    B(e, 3, e->qkvb, bo);
     B(e, 4, L->A_log, 0);
     B(e, 5, L->dt_bias, 0);
     B(e, 6, L->S, 0);
     B(e, 7, e->y, 0);
     bind_keep(e, 8, L->kS, L->S);
     tgs(e, (uint64_t) hv, (uint64_t) dv / 32, 32 * Q4_GDN_SPLIT(dk));
-    const Q4GNormArgs na = {hv, dv, c->eps, 0};
+    const Q4GNormArgs na = {hv, dv, c->eps, ld};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_gdn_norm")];
     A_(e, &na, sizeof na);
     B(e, 1, L->norm_w, 0);
-    B(e, 2, e->zb, 0);
+    B(e, 2, e->qkvb, zo);
     B(e, 3, e->y, 0);
     tgs(e, (uint64_t) hv, (uint64_t) T, (uint64_t) dv);
     mv(e, &L->out, e->y, e->br, T);
@@ -749,7 +799,7 @@ static void embed_x(Q4Eng* e, id<MTLBuffer> tok, uint64_t to, int T) {
 static void embed(Q4Eng* e, int T) {   // the forward's tokens into each stream of H
     const int32_t d = e->c.d;
     embed_x(e, e->tok, 0, T);
-    const Q4HcArgs a = {e->c.hc, e->c.d, 0, 0};
+    const Q4HcArgs a = {e->c.hc, e->c.d, 0, 0, 0, 0, {0, 0}};
     [e->enc setComputePipelineState:pipe4(e, "k_q4_tile")];
     A_(e, &a, sizeof a);
     B(e, 1, e->x, 0);
@@ -764,13 +814,13 @@ static int run_layer(Q4Eng* e, Layer* L, int l, int attn, int T, int pos0, int d
     const Qwen4Cfg* c = &e->c;
     if (l >= 0 && c->ple[l] >= 0) ple(e, l, T);
     mark(e, ST_PLE);
-    hc_mix(e, L->hc_norm[0], &L->hc_down[0], &L->hc_up[0], &L->hc_inj[0], T);
+    hc_mix(e, L->hc_norm[0], &L->hc_di[0], &L->hc_up[0], 1, T);
     mark(e, ST_HC);
     if (attn) attention(e, L, T, pos0, 0, drow);
     else gdn(e, L, T);
     mark(e, attn ? ST_ATTN : ST_GDN);
     hc_add(e, e->H, e->inj, T);
-    hc_mix(e, L->hc_norm[1], &L->hc_down[1], &L->hc_up[1], &L->hc_inj[1], T);
+    hc_mix(e, L->hc_norm[1], &L->hc_di[1], &L->hc_up[1], 1, T);
     mark(e, ST_HC);
     if (moe(e, L, T)) return -1;
     hc_add(e, e->H, e->inj, T);
@@ -802,7 +852,7 @@ static void head_rows(Q4Eng* e, int T) {
         head_in(e, e->tok, sizeof(int32_t) * (uint64_t) s, e->Hin, sizeof(float) * (uint64_t) s * HD, n);
         id<MTLBuffer> H = e->H;
         e->H = e->Hm;
-        hc_mix(e, e->M.hc_norm[0], &e->M.hc_down[0], &e->M.hc_up[0], NULL, n);
+        hc_mix(e, e->M.hc_norm[0], &e->M.hc_di[0], &e->M.hc_up[0], 0, n);
         attention(e, &e->M, n, e->pos - 1 + s, 1, 0);
         e->H = H;
     }
@@ -842,7 +892,7 @@ static int draft_rows(Q4Eng* e, int k, int sampled) {
         head_in(e, e->dtok, sizeof(int32_t) * (uint64_t) j, j ? e->Hm : e->Hin, 0, 1);
         e->H = e->Hm;
         rc = run_layer(e, &e->M, -1, 1, 1, e->pos - 1 + j, j);
-        hc_mix(e, e->m_norm, &e->m_down, &e->m_up, NULL, 1);
+        hc_mix(e, e->m_norm, &e->m_down, &e->m_up, 0, 1);
         e->H = H;
         mv(e, &e->head, e->x, e->mlog, 1);
         if (sampled) draft_q(e, j);
@@ -942,16 +992,16 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         e->ndraft = o->mtp < Q4E_MAX_DRAFTS ? o->mtp : Q4E_MAX_DRAFTS;
     }
     const size_t T = (size_t) e->maxt, HD = (size_t) c->hc * c->d, cd = (size_t) 2 * c->lin_hk * c->lin_dk + (size_t) c->lin_hv * c->lin_dv;
-    const size_t vd = (size_t) c->lin_hv * c->lin_dv, iw = (size_t) (c->ix_heads + 1) * c->ix_dim, kf = (size_t) c->top_k * c->ff_exp;
+    const size_t vd = (size_t) c->lin_hv * c->lin_dv, kf = (size_t) c->top_k * c->ff_exp;
     const size_t ka = kf > (size_t) c->ff_shared ? kf : (size_t) c->ff_shared;
     if (!e->err[0]) {
-        e->x = F(T * c->d); e->H = F(T * HD); e->normed = F(T * HD); e->lo = F(T * c->hc_rank); e->up = F(T * HD); e->inj = F(T * c->hc);
-        e->br = F(T * c->d); e->qp = F((T * c->n_head + 16) * 2 * c->head_dim); e->kk = F(T * c->n_kv * c->head_dim);   // qp: + 16 heads, k_q4_attend_g's padding
-        e->vv = F(T * c->n_kv * c->head_dim); e->o = F(T * c->n_head * c->head_dim); e->ixo = F(T * iw); e->sc = F(T * (size_t) e->nb);
+        e->x = F(T * c->d); e->H = F(T * HD); e->normed = F(T * HD); e->lo = F(T * (c->hc_rank + c->hc)); e->up = F(T * HD); e->inj = F(T * c->hc);
+        e->br = F(T * c->d); e->qp = F(T * (size_t) att_ld(c) + 16 * 2 * (size_t) c->head_dim);   // qp: + 16 heads, k_q4_attend_g's padding
+        e->o = F(T * c->n_head * c->head_dim); e->sc = F(T * (size_t) e->nb);
         e->emb = F(T * c->ple_dim * (size_t) (e->nple ? e->nple : 1)); e->keys = F(T * HD); e->qs = F(T * HD); e->vals = F(T * c->d);
         e->gated = F(T * HD); e->lg = F(T * c->n_exp); e->wt = F(T * c->top_k); e->A = F(T * ka); e->Gb = F(T * ka); e->Ub = F(T * ka);
         e->Dx = F(T * c->top_k * c->d); e->sh = F(T * c->d); e->sgv = F(T); e->logits = F((size_t) LOGT * c->vocab); e->y = F(T * vd);
-        e->cv = F(T * cd); e->qkvb = F(T * cd); e->zb = F(T * vd); e->bb = F(T * c->lin_hv); e->ab = F(T * c->lin_hv);
+        e->cv = F(T * cd); e->qkvb = F(T * (size_t) gdn_ld(c));
         e->tok = dbuf(e, NULL, 4 * T); e->ind = dbuf(e, NULL, 4 * T * c->top_k); e->sel = dbuf(e, NULL, 4 * T * (size_t) (e->kq ? e->kq : 1));
         e->done = dbuf(e, NULL, 4 * T); e->nsel = dbuf(e, NULL, 4 * T); e->zero = dbuf(e, NULL, 4 * T);
         e->perm = dbuf(e, NULL, 4 * T * c->top_k);
@@ -1027,9 +1077,9 @@ void q4e_close(Q4Eng* e) {
     e->m_fe = e->m_fh = e->m_down = e->m_up = (MW) {0};
     e->m_ne = e->m_nh = e->m_norm = e->Hin = e->Hm = e->ones = e->mlog = e->dtok = e->dprob = e->dtu = e->dqid = e->dqp = nil;
     e->mix_norm = e->stab = e->stab32 = e->inv = nil;
-    e->x = e->H = e->normed = e->lo = e->up = e->inj = e->br = e->qp = e->kk = e->vv = e->o = e->ixo = e->sc = e->emb = nil;
+    e->x = e->H = e->normed = e->lo = e->up = e->inj = e->br = e->qp = e->o = e->sc = e->emb = nil;
     e->keys = e->qs = e->vals = e->gated = e->lg = e->wt = e->A = e->Gb = e->Ub = e->Dx = e->sh = e->sgv = e->logits = nil;
-    e->y = e->cv = e->qkvb = e->zb = e->bb = e->ab = e->tok = e->ind = e->sel = e->done = e->nsel = e->zero = e->perm = e->tiles = e->apart = nil;
+    e->y = e->cv = e->qkvb = e->tok = e->ind = e->sel = e->done = e->nsel = e->zero = e->perm = e->tiles = e->apart = nil;
     free(e->ids);
     if (e->table) ple_close(&e->pt);
     ns_close(&e->nm);
@@ -1071,7 +1121,7 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
     for (int l = 0; l < c->n_layer; ++l)
         if (run_layer(e, &e->L[l], l, c->attn[l], T, e->pos, 0)) return -1;
     if (logits) {   // prompt rows without logits skip the mixer and the head
-        hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, NULL, T);
+        hc_mix(e, e->mix_norm, &e->mix_down, &e->mix_up, 0, T);
         mv(e, &e->head, e->x, e->logits, T);
         mark(e, ST_HEAD);
     }
