@@ -64,6 +64,10 @@ Work that is not done yet, with its gates and hypotheses.
   stopped: 2.7 times fewer key loads, but 1.7 times slower.
 - [2026-11-06: The KV cache of Qwen3.8-Flash-Next in BF16](plans/2026-11-06-qwen4-kv-bf16.md): draft. About 0.8 GB at
   32K for the expert cache, on CUDA and Metal.
+- [2026-11-06: Skew-aware importance weights](plans/2026-11-06-skew-aware-importance.md): draft. `nslm-moe --h-temper`
+  raises h to the power 1/2 where a few input channels dominate. On Qwen it changes 48 of 73,728 expert matrices.
+- [2026-11-06: The seed search on qubits](plans/2026-11-06-quantum-seed-search.md): draft. A toy LFSR seed search as a
+  Hamiltonian of Pauli Z products, with QAOA and Fourier sampling on a simulator and on IBM's free tier.
 
 ## Results
 
@@ -196,6 +200,10 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   path decodes about 39 tokens per second to 30K of context. The Q8_0 PLE table costs 0% to 4%.
 - [2026-11-06: Long decode and long prompts on the RTX 4080](results/2026-11-06-long-bench-4080.md): 4,096 tokens
   at 44 (TCQ3), 38 (TCQ3-D4) and 31 (TCQ4) tokens per second, and 42, 36 and 30 after 30K tokens.
+- [2026-11-06: Wider LFSR seeds and the state stride](results/2026-11-06-lfsr-width.md): each seed bit multiplies the
+  weight error by about 0.83. Every 4th state gives 8% to 10% less error. No exact seed exists at P = 3 sizes.
+- [2026-11-06: Search objectives and KL on SmolLM2-135M](results/2026-11-06-search-objective-kl.md): the imatrix
+  weights suit a mild skew. At an extreme skew they give the trellis 7 to 12 times the KL of no weights.
 
 ## For contributors and agents
 

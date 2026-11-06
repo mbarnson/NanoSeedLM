@@ -923,3 +923,33 @@ write them (`d56a17c`) after the release folders were built, and R5 uploaded the
 are on the Hub now (TCQ4 `e53ffdd2`, TCQ3-D4 `30012655`, TCQ3 `d1353e4a`). They are the `17eeb5d` loaders that oMLX ran
 on TQ4's download. `tools/hf_release_publish.sh` now refuses a folder without them. The v0.1.0 start scripts pin the
 earlier revisions.
+
+## [2026-11-06] result | Wider LFSR seeds and the state stride
+
+Matt asked whether a wider LFSR would improve P3 and P4. On 2,048 blocks of Qwen expert rows, each extra seed bit
+multiplies the weight error by about 0.83 and doubles the search time. P3 with a 20-bit seed has the error of P4 at
+4.5 bits. A decode that reads every 4th LFSR state gives 8% to 10% less error at no cost. A BF16 weight carries about
+10.5 bits, so no exact seed exists at P3 sizes. The probes are in `tools/seed_kl_probe/` (`e6b5944`). Read
+[Wider LFSR seeds](results/2026-11-06-lfsr-width.md).
+
+## [2026-11-06] result | Search objectives and KL on SmolLM2-135M
+
+A NumPy KL harness measured one MLP layer of SmolLM2-135M on the cloud CPU (`e6b5944`). For the trellis, the
+packer's imatrix weights give the lowest KL at a mild input skew, as in Qwen's experts. Where 1% of the channels hold
+98% of the input energy, the same weights give 7 to 12 times the KL of no weights. There, h^1/2 is best. For seeds,
+the lowest output error (GPTQ) does not give the lowest KL, and KL falls by about 0.80 for each seed bit. Read
+[Search objectives and KL](results/2026-11-06-search-objective-kl.md).
+
+## [2026-11-06] plan | Skew-aware importance weights
+
+`e6b5944` adds `nslm-moe --h-temper`, off by default, with a unit test. `auto` raises h to the power 1/2 for an expert
+matrix whose top 1% of inputs hold more than half of sum h. On Qwen that is 48 of 73,728 matrices, so the KL of the
+packs may not change. A TCQ4 encode and a KL job decide the default. Read
+[Skew-aware importance weights](plans/2026-11-06-skew-aware-importance.md).
+
+## [2026-11-06] plan | The seed search on qubits
+
+`tools/quantum_seed.py` (`e6b5944`) puts a toy LFSR seed search on K qubits as a Hamiltonian of Pauli Z products. On
+an exact simulator, QAOA finds the best seed 2 to 11 times as often as a random draw at K = 4 to 8. A noisy copy of
+`ibm_fez` keeps 60% to 97% of the gain for circuits of 13 to 160 two-qubit gates. The next step runs it on IBM's free
+tier with Matt. Read [The seed search on qubits](plans/2026-11-06-quantum-seed-search.md).

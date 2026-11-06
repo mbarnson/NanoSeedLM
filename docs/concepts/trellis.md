@@ -91,6 +91,11 @@ imatrix-weighted error, sum_t h_t (w_t - a q(s_t))^2, by a Viterbi search over t
 3. Refit a by weighted least squares on the chosen path.
 4. Repeat steps 2 and 3 twice more. Round the last scale to BF16.
 
+The imatrix weights suit Qwen's experts, whose input energy spreads over many channels. On SmolLM2-135M, 1% of the MLP's input
+channels hold 98% of the input energy. There the same weights gave 7 to 12 times the KL of no weights, because the
+block's scale fits the dominant channel. Weights h^1/2 gave the lowest KL there. Read
+[Search objectives and KL](../results/2026-11-06-search-objective-kl.md).
+
 The search costs about 6 times 2^L operations for each weight. The C encoder (`nslm/lib_trellis.c`) and the CUDA
 encoder (`nslm/trellis.cu`) write the same words, bit for bit. They use the same float operations without fused
 multiply-adds and the same ties: the lowest dropped bits j, then the lowest last state.
@@ -118,6 +123,8 @@ shared memory, then uses the same tensor-core GEMM as the seeds. The Metal kerne
   and the speed with 8-bit dense weights.
 - [VRAM that grows with the context on the RTX 4080](../results/2026-11-06-context-vram-4080.md): the pass, forward
   and KV buffers at 32K.
+- [Search objectives and KL on SmolLM2-135M](../results/2026-11-06-search-objective-kl.md): the importance weights
+  of the encoder, at mild and extreme input skew.
 
 ## See also
 

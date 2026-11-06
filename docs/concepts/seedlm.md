@@ -45,6 +45,15 @@ code, and it keeps the seed with the smallest error. There are two error measure
 The search runs on Metal and on CUDA. On one M4 Max, the search over all routed experts of K2-Horizon-MoVA takes about
 3.4 hours. Read [Make a model folder](../guides/make-a-model.md).
 
+### Seed width
+
+The 16-bit seed limits the search time. Each extra seed bit adds 1/8 bit for each weight and doubles the search time.
+On Qwen expert rows, each extra bit multiplies the weight error by about 0.83. On one layer of SmolLM2-135M, it
+multiplies the KL by about 0.80. So P = 3 with a 20-bit seed matches P = 4 at 4.5 bits. Adjacent LFSR states are
+correlated. A decode that reads every 4th state gives 8% to 10% less weight error at no cost in bits. No kernel reads
+states that way yet. An exact seed for real weights does not exist at these sizes: a BF16 weight carries about 10.5
+bits. Read [Wider LFSR seeds](../results/2026-11-06-lfsr-width.md).
+
 ### The kernels
 
 The SeedLM paper made the weights on an FPGA. NanoSeedLM makes them in GPU kernels:
@@ -89,6 +98,8 @@ place of quantization.
 - [Seeds against affine quantization (R-02)](../results/2026-10-10-seeds-vs-affine.md)
 - [GQA seed model against BF16 and Q4](../results/2026-10-06-gqa-seed-model.md)
 - [MLA projections as seeds](../results/2026-10-08-mla-projections.md)
+- [Wider LFSR seeds and the state stride](../results/2026-11-06-lfsr-width.md)
+- [Search objectives and KL on SmolLM2-135M](../results/2026-11-06-search-objective-kl.md)
 
 ## See also
 

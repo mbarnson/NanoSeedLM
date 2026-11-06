@@ -29,7 +29,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 
 | Tool | Use |
 |---|---|
-| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8-Flash-Next experts take `--imatrix`. `--codec tq --tq-k K --tq-l L` writes trellis-coded experts (`.blkt`) on the CPU. Build it with Clang |
+| `nslm-moe` | Seed search for experts (`--scope gud`) and MLA projections (`--scope mla`). Qwen3.8-Flash-Next experts take `--imatrix`. `--codec tq --tq-k K --tq-l L` writes trellis-coded experts (`.blkt`) on the CPU. `--h-temper auto` raises the importance h to the power 1/2 for expert matrices whose top 1% of inputs hold more than half of sum h (default `off`). Build it with Clang |
 | `nslm-mova-mlacapture` | Activation statistics and `X^T X` of the MLA projection inputs |
 | `nslm-mova-pack` | Write a model folder |
 | `nslm-qwen4-pack` | Write a Qwen3.8-Flash-Next MLX folder with seed experts, or (`--tq`) without the routed experts and with trellis banks, from an MLX base folder |
@@ -66,3 +66,5 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `mova_export.py` | Inputs for `nslm-mova-score`, `nslm-mova-gen`, `nslm-mova-bench` and route studies |
 | `tokenizer_golden.py`, `template_golden.py`, `mova_affine_golden.py` | Golden files for the tests |
 | `serve_bench.py` | Server speed. It waits for an idle GPU and records machine state |
+| `seed_kl_probe/` | Probes for wider LFSR seeds (`lfsr_width.c`, `walsh.c`, `bm.c`), a vectorized seed search (`seedlib.c`) and a KL harness on SmolLM2-135M (`harness.py`) for seeds and the trellis. Read [Search objectives and KL](../results/2026-11-06-search-objective-kl.md) |
+| `quantum_seed.py` | A toy seed search on qubits with Qiskit: an exact simulator, a noisy copy of an IBM device, or IBM Quantum. Read [the quantum plan](../plans/2026-11-06-quantum-seed-search.md) |
