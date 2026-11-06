@@ -267,8 +267,8 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
         L->kn = load_v(e, c->head_dim, "%s.self_attn.k_norm.weight", lp);
         L->iqn = load_v(e, c->ix_dim, "%s.self_attn.indexer.q_layernorm.weight", lp);
         L->ikn = load_v(e, c->ix_dim, "%s.self_attn.indexer.k_layernorm.weight", lp);
-        L->K = F((size_t) e->max_pos * c->n_kv * c->head_dim);
-        L->V = F((size_t) e->max_pos * c->n_kv * c->head_dim);
+        L->K = dbuf(e, NULL, sizeof(uint16_t) * (size_t) e->max_pos * c->n_kv * c->head_dim);   // BF16 keys and values (plan K)
+        L->V = dbuf(e, NULL, sizeof(uint16_t) * (size_t) e->max_pos * c->n_kv * c->head_dim);
         L->raw = F((size_t) e->max_pos * c->ix_dim);
         L->blk = F((size_t) e->nb * c->ix_dim);
     } else {
@@ -460,14 +460,18 @@ static void head_norm_rope(Q4Eng* e, id<MTLBuffer> X, uint64_t xo, int rs, int n
     B(e, 3, e->inv, 0);
     tgs(e, (uint64_t) nh, (uint64_t) T, 128);
 }
-// dst rows pos0 .. pos0 + T - 1 (width w) = the rows of src (stride ss, byte offset so)
-static void store(Q4Eng* e, id<MTLBuffer> dst, int w, id<MTLBuffer> src, uint64_t so, int ss, int pos0, int T) {
+// dst rows pos0 .. pos0 + T - 1 (width w) = the rows of src (stride ss, byte offset so); bf16: dst is the BF16 K or V cache
+// (plan K: rounded to nearest even, as qwen4_ref_kv_bf16)
+static void store_as(Q4Eng* e, int bf16, id<MTLBuffer> dst, int w, id<MTLBuffer> src, uint64_t so, int ss, int pos0, int T) {
     const Q4StoreArgs a = {w, ss, pos0, 0};
-    [e->enc setComputePipelineState:pipe4(e, "k_q4_store")];
+    [e->enc setComputePipelineState:pipe4(e, bf16 ? "k_q4_store_bf16" : "k_q4_store")];
     A_(e, &a, sizeof a);
     B(e, 1, dst, 0);
     B(e, 2, src, so);
     thr(e, (uint64_t) w, (uint64_t) T, 256);
+}
+static void store(Q4Eng* e, id<MTLBuffer> dst, int w, id<MTLBuffer> src, uint64_t so, int ss, int pos0, int T) {
+    store_as(e, 0, dst, w, src, so, ss, pos0, T);
 }
 
 // The streams of H mixed into x; with inj, the weights that add the branch back (nslm/qwen4_ops.h)
@@ -564,8 +568,8 @@ static void attention(Q4Eng* e, Layer* L, int T, int pos0, int keys_only, int dr
     mv(e, &L->v, e->x, e->vv, T);
     if (!keys_only) head_norm_rope(e, e->qp, 0, c->n_head * 2 * hd, c->n_head, 2 * hd, hd, L->qn, pos0, 1, T);
     head_norm_rope(e, e->kk, 0, kvw, c->n_kv, hd, hd, L->kn, pos0, 1, T);
-    store(e, L->K, kvw, e->kk, 0, kvw, pos0, T);
-    store(e, L->V, kvw, e->vv, 0, kvw, pos0, T);
+    store_as(e, 1, L->K, kvw, e->kk, 0, kvw, pos0, T);
+    store_as(e, 1, L->V, kvw, e->vv, 0, kvw, pos0, T);
     mv(e, &L->ix, e->x, e->ixo, T);
     store(e, L->raw, D, e->ixo, sizeof(float) * (uint64_t) c->ix_heads * D, iw, pos0, T);
     if (!keys_only) head_norm_rope(e, e->ixo, 0, iw, c->ix_heads, D, D, L->iqn, pos0, 1, T);

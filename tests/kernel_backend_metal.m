@@ -949,8 +949,12 @@ int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float*
     if (!p || (nsplit > 1 && !pc)) return -1;
     const size_t kv = (size_t) npos * c->n_kv * c->head_dim, no = (size_t) T * c->n_head * c->head_dim;
     const int topk = c->ix_budget / c->ix_ratio;
-    id<MTLBuffer> qb = buf(NULL, 4 * (no * 2 + (size_t) 32 * c->head_dim)), Kb = buf(K, 4 * kv), Vb = buf(V, 4 * kv),
+    uint16_t* kh = (uint16_t*) malloc(2 * kv), *vh = (uint16_t*) malloc(2 * kv);   // the BF16 cache (plan K)
+    for (size_t i = 0; i < kv; ++i) { kh[i] = nslm_f2bf(K[i]); vh[i] = nslm_f2bf(V[i]); }
+    id<MTLBuffer> qb = buf(NULL, 4 * (no * 2 + (size_t) 32 * c->head_dim)), Kb = buf(kh, 2 * kv), Vb = buf(vh, 2 * kv),
                   sb = buf(sel, 4 * (size_t) T * topk), nb = buf(nsel, 4 * (size_t) T), ob = buf(NULL, 4 * no);
+    free(kh);
+    free(vh);
     memcpy(qb.contents, q, 4 * no * 2);   // + 16 heads of slack: k_q4_attend_g reads its padding heads
     const int ns = nsplit > 1 ? nsplit : 1;
     id<MTLBuffer> pb = buf(NULL, 4 * (size_t) T * c->n_head * ns * (c->head_dim + 2));

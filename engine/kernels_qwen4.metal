@@ -186,11 +186,20 @@ kernel void k_q4_tile(constant Q4HcArgs& a [[buffer(0)]], device const float* x 
     const float v = x[(ulong) t * a.d + i];
     for (int s = 0; s < a.hc; ++s) H[((ulong) t * a.hc + s) * a.d + i] = v;
 }
-// grid (w, T): dst[(pos0 + t) * w + i] = src[t * ss + i] (the K, V and raw indexer key caches)
+// grid (w, T): dst[(pos0 + t) * w + i] = src[t * ss + i] (the raw indexer key cache)
 kernel void k_q4_store(constant Q4StoreArgs& a [[buffer(0)]], device float* dst [[buffer(1)]], device const float* src [[buffer(2)]],
                        uint2 g [[thread_position_in_grid]]) {
     const int i = (int) g.x, t = (int) g.y;
     if (i < a.w) dst[(ulong) (a.pos0 + t) * a.w + i] = src[(ulong) t * a.ss + i];
+}
+// The K and V caches in BF16 (plan K): round to nearest even, as nslm_f2bf and qwen4_ref_kv_bf16 (finite inputs)
+static inline ushort q4_f2bf(float f) { uint u = as_type<uint>(f); u += 0x7FFFu + ((u >> 16) & 1u); return ushort(u >> 16); }
+static inline float q4_bf2f(ushort h) { return as_type<float>(uint(h) << 16); }
+// grid (w, T): dst[(pos0 + t) * w + i] = bf16(src[t * ss + i]) (the K and V caches)
+kernel void k_q4_store_bf16(constant Q4StoreArgs& a [[buffer(0)]], device ushort* dst [[buffer(1)]], device const float* src [[buffer(2)]],
+                            uint2 g [[thread_position_in_grid]]) {
+    const int i = (int) g.x, t = (int) g.y;
+    if (i < a.w) dst[(ulong) (a.pos0 + t) * a.w + i] = q4_f2bf(src[(ulong) t * a.ss + i]);
 }
 // grid (d, T): out[t] = sigmoid(sg[t]) sh[t] + sum_j wt[t][j] D[t][j] (the routed experts' rows, token-major pairs)
 kernel void k_q4_moe_combine(constant Q4CombineArgs& a [[buffer(0)]], device const float* D [[buffer(1)]], device const float* wt [[buffer(2)]],
@@ -423,8 +432,8 @@ kernel void k_q4_qsa_topk(constant Q4QsaArgs& a [[buffer(0)]], device const floa
 
 // Threadgroup (head, row), 8 simdgroups: each takes every 8th visible key with an online softmax (lanes hold hd / 32
 // dims of q and of the output), then the simdgroups merge; the output is gated by sigmoid of the query's gate half
-kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* K [[buffer(2)]],
-                        device const float* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
+kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const ushort* K [[buffer(2)]],
+                        device const ushort* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
                         device float* o [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float sm[8], sl[8], sacc[8][256];
@@ -436,13 +445,13 @@ kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float*
     for (int i = 0; i < dl; ++i) { qv[i] = qh[lane + 32 * i]; acc[i] = 0; }
     for (int k = w; k < n; k += 8) {
         const int key = k < ns * a.R ? sel[(ulong) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
-        device const float* kk = K + ((ulong) key * a.nkv + g) * a.hd;
+        device const ushort* kk = K + ((ulong) key * a.nkv + g) * a.hd;   // BF16 (plan K)
         float d = 0;
-        for (int i = 0; i < dl; ++i) d += qv[i] * kk[lane + 32 * i];
+        for (int i = 0; i < dl; ++i) d += qv[i] * q4_bf2f(kk[lane + 32 * i]);
         d = simd_sum(d) * a.scale;
         const float mn = max(m, d), cf = exp(m - mn), p = exp(d - mn);
-        device const float* vv = V + ((ulong) key * a.nkv + g) * a.hd;
-        for (int i = 0; i < dl; ++i) acc[i] = acc[i] * cf + p * vv[lane + 32 * i];
+        device const ushort* vv = V + ((ulong) key * a.nkv + g) * a.hd;
+        for (int i = 0; i < dl; ++i) acc[i] = acc[i] * cf + p * q4_bf2f(vv[lane + 32 * i]);
         l = l * cf + p;
         m = mn;
     }
@@ -467,8 +476,8 @@ kernel void k_q4_attend(constant Q4AttArgs& a [[buffer(0)]], device const float*
 // the online softmax per head row (lanes 0..7 of half 0) sees the sum of both parts.  O = diag(rescale) O + P V.  The
 // same result as k_q4_attend up to the order of the sums.  hd a multiple of 8 ATG_NQ, <= 256.
 #define ATG_K 8
-kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const float* K [[buffer(2)]],
-                          device const float* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
+kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const float* q [[buffer(1)]], device const ushort* K [[buffer(2)]],
+                          device const ushort* V [[buffer(3)]], device const int* sel [[buffer(4)]], device const int* nsel [[buffer(5)]],
                           device float* o [[buffer(6)]], device float* part [[buffer(7)]], uint3 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]]) {
@@ -496,8 +505,8 @@ kernel void k_q4_attend_g(constant Q4AttArgs& a [[buffer(0)]], device const floa
             float kv = 0.0f, vv = 0.0f;
             if (k < ke) {
                 const int key = k < ns * a.R ? sel[(ulong) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
-                kv = K[(ulong) key * kvw + (ulong) g * hd + i];
-                vv = V[(ulong) key * kvw + (ulong) g * hd + i];
+                kv = q4_bf2f(K[(ulong) key * kvw + (ulong) g * hd + i]);   // BF16 (plan K), widened into the f32 tiles
+                vv = q4_bf2f(V[(ulong) key * kvw + (ulong) g * hd + i]);
             }
             sK[x] = kv;
             sV[x] = vv;
