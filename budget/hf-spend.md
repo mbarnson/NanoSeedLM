@@ -45,6 +45,10 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI f4d997d (6aeda8020e0338d1bb80fdc8): the release workflow, NSLM_STATIC_ICU, 44 PASS | rtx-pro-6000 ($2.75/h) | about 1.8 | about $0.08 | about $20.85 |
 
+| Linux CI 418224b (6aedac030e0338d1bb81010f): the packer writes the MLX loader, 44 PASS | rtx-pro-6000 ($2.75/h) | about 1.8 | about $0.08 | about $20.93 |
+
+| Linux CI a499194 (6aedacb2c78863f9c6340172): the loader packer and mac-metal's resource_dir, running | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $21.01 |
+
 | nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda, src-29a76aa: a local copy first), running | cpu-xl ($1.00/h) | at most 180 | at most $3.00 | |
 
-Left this week: about $4.15 before the third upload job.
+Left this week: about $3.99 before the third upload job.
