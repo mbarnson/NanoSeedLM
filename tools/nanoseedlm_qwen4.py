@@ -2,9 +2,12 @@
 """NanoSeedLM for MLX: Qwen3.8-Flash-Next (qwen4_exp, mlx-vlm) whose routed experts are SeedLM P = 3 or 4 weights.
 
 mlx-vlm and oMLX (Trust Remote Code) load this file through config.json "model_file". Each layer's
-NAME.seeds / .coefs (or .nibbles) / .codes / .exp_bias tensors replace its switch_mlp projection. All other tensors are stock.
+NAME.seeds / .coefs (or .nibbles) / .codes / .exp_bias tensors replace its switch_mlp projection. Trellis banks
+L{l}_{gate,up,down}_proj.blkt beside this file (nanoseedlm_trellis.py, plan R7) replace layer l's projection in turn, and
+L{num_hidden_layers} the MTP head's when the model has one. All other tensors are stock.
 """
 
+import glob
 import os
 import sys
 
@@ -31,4 +34,7 @@ class Model(_Qwen4Model):
             self.update_modules(tree_unflatten([(p, SeedSwitchLinear(kb * 8, n, e, seed_p(weights, p)))]))
         for glu in {p.rsplit(".", 1)[0] for p in seeded}:
             _module(self, glu).__class__ = SeedSwitchGLU
+        if glob.glob(os.path.join(_HERE, "L*_*_proj.blkt")):   # trellis banks: nanoseedlm_trellis.py ships with them
+            from nanoseedlm_trellis import add_banks
+            weights = add_banks(self, weights, _HERE, self.config.text_config.num_hidden_layers)
         return weights
