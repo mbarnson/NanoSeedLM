@@ -20,4 +20,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 1d0bb37 (6aed588b0e0338d1bb80e1a6): ns_add_banks, the MTP head's banks | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.61 |
 
-Left this week: about $19.39.
+| Linux CI 7e8f43b (6aed5eb3c78863f9c633da18): nslm-qwen4-emulate --dense | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.69 |
+
+Left this week: about $19.31.
