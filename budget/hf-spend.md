@@ -14,4 +14,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 |---|---|---|---|---|
 | nslm-kld-tq-mix (6aed21aec78863f9c633bdd0): TQ2, mixes, UD-Q2_K_XL against BF16 | rtx-pro-6000x4 ($11/h) | 29.3 | $5.37 | $5.37 |
 
-Left this week: $19.63.
+| Linux CI fb31f8c (6aed3b7a0e0338d1bb80d9cb): nslm-qwen4-gen --prompt-file | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.45 |
+
+Left this week: about $19.55.
