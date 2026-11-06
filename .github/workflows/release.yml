@@ -1,11 +1,11 @@
 # The engine binaries (nslm-chat, nslm-serve) for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal), as a GitHub
-# release. A change of VERSION (or of this file) on main starts it as a draft (tag v + VERSION), as does the Actions
-# page. A draft stays private until it is published on the releases page, which makes its tag. A published one stays.
+# release draft (tag v + VERSION). A change of VERSION, this file, start/ or the README on main starts it, as does the
+# Actions page. Publishing the draft on the releases page makes its tag. A published release stays as it is.
 name: release
 on:
   push:
     branches: [main]
-    paths: [VERSION, .github/workflows/release.yml]
+    paths: [VERSION, .github/workflows/release.yml, start/**, tools/release-readme.txt]
   workflow_dispatch:
     inputs:
       tag:
