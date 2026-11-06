@@ -1,8 +1,8 @@
-# mac-metal claims (updated 2026-11-06T00:47:33Z)
+# mac-metal claims (updated 2026-11-06T01:31:39Z)
 
 
-- **Now (cloud's T3 split):** trellis experts on Metal. First the k_tq_mv_gu / k_tq_mv_sel gathers in engine/kernels_moe.metal (MF_TCQ = 8, the exact rint form from my bench, the same output rounding as k_mv_gu / k_mv). Then MF_TCQ in tests/kernel_backend_metal.m, so tcq_case runs on Metal. Then trellis experts in engine/qwen4_gpu.m, in the shape of cloud's 41f75cc (W.group, tq_experts in moe(), ns_add_banks at open). Then gate TC decode on the M4 Max against P3.
-- **Waiting for main:** the Metal trellis encoder (850f337, as 54a7130 in cloud's head; macos on 54a7130 running).
-- **Stopped:** the Mac's CPU encode of K = 3, L = 12 (a duplicate of HF's TQ3L12). Its 24 sha256 are posted for cloud's cross-check, and the folder stays until then.
-- **Done (on main):** MTP drafts on Metal and in nslm-chat (Q4E_DRAFTS); the day's Metal decode and prompt kernels; the T3 preview (trellis matvec as fast as P3's seeds, exact).
+- **Running (cloud's go):** the trellis encodes for gate TC on the Mac, on the Metal GPU (nslm-moe b301be5, 2 workers). K = 3, L = 12 is at 68 of 144 at 01:31Z, ETA about 02:25Z (~/models/Qwen3.8-Flash-Next-tq-k3-l12). Then K = 4 starts by itself, ETA about 04:10Z (~/models/Qwen3.8-Flash-Next-tq-k4-l12). No Mac benchmarks while they run.
+- **Next:** gate TC on the M4 Max, decode and prompt against P3 for TQ3L12, TQ4L12 and the "down" mix (TQ3 gate/up + TQ4 down, as cloud's 01:16Z message to pc-cuda). Code and chat, 256 tokens, two rounds, K = 0 and drafts, Q4E_PROFILE=3 on the experts, plus prompt runs.
+- **Done (main 6f90957):** trellis experts on Metal (gathers, prompt GEMM, qwen4_gpu.m); the Metal trellis encoder; MTP drafts on Metal and in nslm-chat; the day's Metal decode and prompt kernels.
 - **Mine:** engine/*.metal, engine/qwen4_gpu.m, engine/mova_gpu.m, tests/kernel_backend_metal.m, tests/test_qwen4_metal.c, tests/test_qwen4_api_mtp.c, nslm/trellis.metal, nslm/trellis_metal.m.
+- **Rule (Matt):** I push only mac/* branches and post them here; main merges are cloud's. Nothing on HF without a message to cloud first.
