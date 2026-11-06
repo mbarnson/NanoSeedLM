@@ -302,6 +302,7 @@ typedef struct {
     size_t content_sent;            // bytes of content already streamed
     const char* finish;
     int prompt_tokens, completion_tokens, cached_tokens, restored_tokens;
+    int64_t drafted, kept;          // MTP drafts proposed and accepted
     double prefill_s, decode_s, ttft_s;
 } Gen;
 
@@ -450,6 +451,7 @@ typedef struct Job {
     int rs_next, rs_end, restored;    // cold-cache blocks still to restore [rs_next, rs_end); tokens restored
     uint8_t (*h)[32];                 // the prompt's block hashes (cold cache)
     bool prefilled, done, eos, failed, cancel, released, hit_stop;   // hit_stop: the scheduler's own
+    EngStats st;                      // drafts proposed and accepted (Q4E_DRAFTS)
     double t_admit, t_prefill;
     pthread_cond_t cv;                // signalled with new tokens, at the end and on release
     struct Job* next;                 // the queue
@@ -660,7 +662,7 @@ static void* scheduler(void* arg) {
             Job* j = dec[0];
             int32_t got[ENG_MAX_DRAFTS + 1];
             const int want = j->max_tokens - j->nout < g_drafts + 1 ? j->max_tokens - j->nout : g_drafts + 1;
-            const int cnt = eng_generate_pick(g_eng, seqs[0], want, serve_pick, j, got, NULL);
+            const int cnt = eng_generate_pick(g_eng, seqs[0], want, serve_pick, j, got, &j->st);
             for (int k = 0; k < cnt; ++k) slot_push(&g_slots[seqs[0]], got[k]);
             pthread_mutex_lock(&g_lock);
             if (cnt < 0) { g_slots[seqs[0]].len = 0; j->failed = j->done = true; }
@@ -774,6 +776,8 @@ static bool run_generation(Conn* c, Gen* g, const int32_t* ids, int n) {
     g->decode_s = j.prefilled ? t1 - j.t_prefill : 0;
     g->completion_tokens = seen;
     g->restored_tokens = j.restored;
+    g->drafted = j.st.proposals;
+    g->kept = j.st.accepted;
     pthread_cond_destroy(&j.cv);
     free(j.h);
     free(j.out);
@@ -967,11 +971,12 @@ static void handle_generate(Conn* c, const char* body, size_t body_len, bool cha
     }
 
     if (g_verbose) {
-        char ncalls[32] = "";
+        char ncalls[32] = "", nd[48] = "";
         if (calls) snprintf(ncalls, sizeof ncalls, " (%d calls)", calls->n);
-        fprintf(stderr, "nslm-serve: prompt %5d tok (%5d cached, %5d from disk) %7.1f ms | gen %5d tok %7.2f s = %5.1f tok/s | ttft %6.1f ms | %s%s\n",
+        if (g.drafted) snprintf(nd, sizeof nd, " | drafts %lld of %lld kept", (long long) g.kept, (long long) g.drafted);
+        fprintf(stderr, "nslm-serve: prompt %5d tok (%5d cached, %5d from disk) %7.1f ms | gen %5d tok %7.2f s = %5.1f tok/s | ttft %6.1f ms%s | %s%s\n",
                 g.prompt_tokens, g.cached_tokens, g.restored_tokens, g.prefill_s * 1e3, g.completion_tokens, g.decode_s,
-                g.decode_s > 0 ? g.completion_tokens / g.decode_s : 0.0, g.ttft_s * 1e3, ok ? g.finish : "ENGINE ERROR", ncalls);
+                g.decode_s > 0 ? g.completion_tokens / g.decode_s : 0.0, g.ttft_s * 1e3, nd, ok ? g.finish : "ENGINE ERROR", ncalls);
     }
     if (!ok) {
         if (g.stream) {
