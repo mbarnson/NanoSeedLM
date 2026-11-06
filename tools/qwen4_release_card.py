@@ -18,9 +18,9 @@ ORDER = ["TCQ4", "TCQ3-D4", "TCQ3", "P4", "P3"]
 # name: expert code, bits for each expert weight, expert GB, dense weights, download GB, resident GB (PLE on disk),
 # KL against BF16 as shipped (TCQ: from the logs; None: not measured), the experts' KL with Q8_0 dense, runtimes
 PACKS = {
-    "TCQ4": ("trellis, K = 4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "NanoSeedLM engines"),
-    "TCQ3-D4": ("trellis, K = 3, `down_proj` K = 4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "NanoSeedLM engines"),
-    "TCQ3": ("trellis, K = 3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "NanoSeedLM engines"),
+    "TCQ4": ("trellis, K = 4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
+    "TCQ3-D4": ("trellis, K = 3, `down_proj` K = 4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
+    "TCQ3": ("trellis, K = 3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
     "P4": ("SeedLM seeds, P = 4", 4.5, 68.0, "4-bit", 105.7, 74, None, 0.0408, "NanoSeedLM CUDA engine, mlx-vlm, oMLX with the fix"),
     "P3": ("SeedLM seeds, P = 3", 4.0, 60.4, "4-bit", 98.2, 66, 0.182, 0.0600, "NanoSeedLM engines, mlx-vlm, oMLX with the fix"),
 }
@@ -77,8 +77,8 @@ expert weights, their dense weights, and the runtimes that load them.
 | A PC with a GPU of 24 GB or more and 96 to 128 GB of RAM | {L("TCQ4")} | The lowest KL. The experts (62.3 GB) stay in RAM, and the GPU caches the experts in use |
 | A PC with a 16 GB GPU and 96 to 128 GB of RAM | {L("TCQ3-D4")} | The middle KL, 10 GB smaller than TCQ4. The GPU caches more of its experts |
 | A PC with a 12 or 16 GB GPU and 64 GB of RAM | {L("TCQ3")} | The only pack whose experts (47.2 GB) leave room for the system in 64 GB of RAM. We did not test a 12 GB GPU or a 64 GB PC yet. A 12 GB GPU caches fewer experts than a 16 GB GPU, so it decodes slower |
-| A 128 GB Mac, NanoSeedLM engine | {L("TCQ4")} | The lowest KL |
-| A 128 GB Mac, oMLX or mlx-vlm | {L("P3")} | The pack for the MLX runtimes. It decodes faster than TCQ4, at about 4 times the KL |
+| A 128 GB Mac | {L("TCQ4")} | The lowest KL, in the NanoSeedLM engine, oMLX or mlx-vlm |
+| A 128 GB Mac, for speed | {L("P3")} | In the NanoSeedLM engine it decodes about 20% faster than TCQ4, at about 4 times the KL |
 | A 96 GB Mac | {L("TCQ3-D4")} | It leaves room for a long context and other programs |
 | Research on seed experts | {L("P4")} or {L("P3")} | SeedLM seeds at 4.5 or 4.0 bits for each expert weight |
 | Less than 64 GB of RAM | None | The experts of each pack must fit in RAM |
@@ -102,9 +102,9 @@ closer to the original model.
   KL: 0.0600 with 8-bit dense weights, 0.182 with the 4-bit ones that it ships. So the TCQ packs ship 8-bit dense
   weights. The cost is speed: they read 1.84 GB more for each token. On the M4 Max, TCQ4 decodes about 15% slower than
   P3.
-- **Runtimes.** P3 and P4 carry their MLX model files, so mlx-vlm runs them with Trust Remote Code. oMLX runs them
-  with the fix in [jundot/omlx#5112]({OMLX_PR}). The TCQ packs run in the NanoSeedLM engines: CUDA on Linux and Windows,
-  Metal on macOS. Their MLX loader is not in these repositories yet.
+- **Runtimes.** Each pack carries its MLX model files, so mlx-vlm runs it with Trust Remote Code. oMLX runs it with
+  the fix in [jundot/omlx#5112]({OMLX_PR}). The NanoSeedLM engines run each pack too: CUDA on Linux and Windows, Metal
+  on macOS. The start scripts of the engine release prepare the TCQ packs.
 - **The PLE table.** Each pack carries the 4-bit MLX PLE table (32 GB). In the NanoSeedLM engines, Unsloth's Q8_0 table
   (54.4 GB) lowers the KL by about 0.006, and the start scripts download it.
 
@@ -141,9 +141,9 @@ the CPU of a PC can compute the experts that are not in VRAM. Read the story:
 def yaml(name):
     tcq = name.startswith("TCQ")
     tags = ["qwen4_exp", "qwen3.8-flash-next", "moe", "nanoseedlm", "nslm", "research-preview"] + \
-        (["trellis", "tcq", "cuda", "metal"] if tcq else
-         ["seedlm", "lfsr", "seeds", "mlx", "mlx-vlm", "omlx", "apple-silicon", "custom_code", "cuda"])
-    lib = "" if tcq else "library_name: mlx\n"
+        (["trellis", "tcq"] if tcq else ["seedlm", "lfsr", "seeds"]) + \
+        ["mlx", "mlx-vlm", "omlx", "apple-silicon", "custom_code", "cuda", "metal"]
+    lib = "library_name: mlx\n"
     return ("---\nbase_model:\n- Qwen/Qwen3.8-Flash-Next\nbase_model_relation: quantized\nlicense: other\n"
             "license_name: qwen-community-1.0\nlicense_link: https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE\n"
             f"pipeline_tag: image-text-to-text\n{lib}tags:\n" + "".join(f"- {t}\n" for t in tags) + "---\n")
@@ -161,6 +161,32 @@ def speed(name):
 """
 
 
+def mlx(name, note):
+    """The mlx-vlm and oMLX sections of a card (each pack carries its model files)."""
+    dl = PACKS[name][4]
+    return f"""### mlx-vlm
+
+```bash
+python -m mlx_vlm.generate --model txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} --trust-remote-code \\
+    --prompt "Why do tide pools matter?" --max-tokens 256
+```
+
+The pack is {dl} GB, and macOS gives the GPU about three quarters of its memory. So keep the PLE table on the SSD: make
+a folder view with mlx-vlm, and run that folder.
+
+```python
+from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
+prepare_external_ple_model("Qwen3.8-Flash-Next-NanoSeedLM-{name}", "Qwen3.8-Flash-Next-NanoSeedLM-{name}-ssd-ple")
+```
+
+### oMLX
+
+Stock oMLX removes `model_file` from each `qwen4_exp` configuration, so it does not load this pack's model files. The
+fix in [jundot/omlx#5112]({OMLX_PR}) keeps `model_file` when it is not the stock `qwen4_exp.py`. Until it merges, use
+the branch [fix/qwen4-exp-custom-model-file]({OMLX_FORK}). Then enable Trust Remote Code for this model. {note}
+"""
+
+
 def tcq(name, k):
     code, bits, egb, _, _, mem, _, _, _ = PACKS[name]
     below = 100 * (1 - k["mean"] / curve(bits))
@@ -172,6 +198,9 @@ def tcq(name, k):
              "TCQ3": "K = 3 for `gate_proj`, `up_proj` and `down_proj`"}[name]
     m, (d, d30, _) = next(iter(SPEED[name].items()))
     uns = "\n".join(f"| Unsloth {n} | {b:.3f} | {v:.4f} |" for n, b, v in UNSLOTH)
+    omlx_note = ("We tested TCQ4's download in oMLX with these model files "
+                 "([the runs]({DOCS}2026-11-06-release-downloads-m4max.md)). The PLE table stayed on the SSD, and the "
+                 "head's trellis banks gave the MTP drafts. We did not test mlx-vlm with it yet.").format(DOCS=DOCS) if name == "TCQ4" else "We tested this fix with TCQ4, not with this pack yet."
     tested = ("- We tested this pack on an RTX 4080 with 128 GB of RAM, not on a 12 GB GPU or a 64 GB PC yet. With 64 GB,\n"
               "  close other large programs: the experts and the page cache need most of the RAM.\n") if name == "TCQ3" else ""
     return f"""{yaml(name)}
@@ -181,8 +210,8 @@ def tcq(name, k):
 divergence against BF16 is {k['mean']:.4f}, {below:.0f}% below Unsloth's packs of the same size. On an {m.split(' (')[0]} it
 decodes at {d} tokens per second, and at {d30} after a prompt of 30,000 tokens.
 
-> **Research preview.** It runs in the [NanoSeedLM]({GITHUB}) engines: CUDA on Linux and Windows, Metal on macOS.
-> mlx-vlm and oMLX do not load it yet.
+> **Research preview.** It runs in the [NanoSeedLM]({GITHUB}) engines: CUDA on Linux and Windows, Metal on macOS. It
+> also runs in mlx-vlm with Trust Remote Code, and in oMLX with the fix in [jundot/omlx#5112]({OMLX_PR}).
 
 **Start.** Unpack the [engine release]({GITHUB}/releases) for your machine. Then run `START-HERE.bat {name}` (Windows) or
 `./start-here.sh {name}` (Linux, macOS). The script checks the machine, downloads and checks this pack and Unsloth's
@@ -222,6 +251,8 @@ Unsloth's packs, measured in the same way (with their own dense weights):
 {speed(name)}
 ## How to run, by hand
 
+### NanoSeedLM engines
+
 Download the engine ([releases]({GITHUB}/releases), or [build it]({GITHUB}/blob/main/docs/guides/build.md)), this
 folder, and Unsloth's Q8_0 PLE table:
 
@@ -241,11 +272,12 @@ build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-{name} --ctx 32768 --
 
 Read [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 
+{mlx(name, omlx_note)}
 ## Limits
 
 - This is a research preview. Its output is not identical to the output of the original model.
-- The MLX loader for trellis experts is on NanoSeedLM's main branch, not in this repository yet. So mlx-vlm and oMLX
-  cannot load this pack.
+- mlx-vlm and oMLX need Trust Remote Code. The NanoSeedLM engines do not.
+- In the MLX runtimes, this pack reads the 4-bit PLE table of the folder, not Unsloth's Q8_0 table.
 {tested}- We did not test image or video input.
 
 ## Files
@@ -253,7 +285,10 @@ Read [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 - `model-*.safetensors`: the dense weights (8-bit MLX), the PLE table (4-bit MLX), the vision tower and the MTP head.
 - `L{{layer}}_{{gate_proj,up_proj,down_proj}}.blkt`: the trellis-coded routed experts of layers 0 to 47 and of the MTP
   head (layer 48). Read [the format]({GITHUB}/blob/main/docs/reference/model-folder.md).
-- `config.json`, the tokenizer and the chat template of the 4-bit MLX model.
+- `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`, `nanoseedlm_trellis.py`: the MLX model files. `nanoseedlm_qwen4.py`
+  puts the trellis banks in place of the routed experts.
+- `config.json`: the configuration of the 8-bit MLX model, with `model_file`. The tokenizer and the chat template.
+- `LICENSE`: the Qwen Community License 1.0.
 
 ## Credits
 
@@ -332,27 +367,7 @@ The engines memory-map the PLE table, so it stays on the disk. For a lower KL, d
 `Q4E_PLE_GGUF` to it, as on the TCQ cards. `Q4E_DRAFTS=2` turns on the MTP drafts. Read
 [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 
-### mlx-vlm
-
-```bash
-python -m mlx_vlm.generate --model txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} --trust-remote-code \\
-    --prompt "Why do tide pools matter?" --max-tokens 256
-```
-
-The pack is {dl} GB, and macOS gives the GPU about 96 GB of a 128 GB Mac. So keep the PLE table on the SSD: make a folder
-view with mlx-vlm, and run that folder.
-
-```python
-from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
-prepare_external_ple_model("Qwen3.8-Flash-Next-NanoSeedLM-{name}", "Qwen3.8-Flash-Next-NanoSeedLM-{name}-ssd-ple")
-```
-
-### oMLX
-
-Stock oMLX removes `model_file` from each `qwen4_exp` configuration, so it does not load this pack's model files. The
-fix in [jundot/omlx#5112]({OMLX_PR}) keeps `model_file` when it is not the stock `qwen4_exp.py`. Until it merges, use
-the branch [fix/qwen4-exp-custom-model-file]({OMLX_FORK}). Then enable Trust Remote Code for this model. {omlx_note}
-
+{mlx(name, omlx_note)}
 ## Limits
 
 - This is a research preview. Its output is not identical to the output of the original model.
@@ -365,6 +380,7 @@ the branch [fix/qwen4-exp-custom-model-file]({OMLX_FORK}). Then enable Trust Rem
 - `model-*.safetensors`: the weights. `NAME.seeds`, `NAME.nibbles` and `NAME.exp_bias` hold the routed experts.
 - `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`: the MLX model files.
 - `config.json`: the configuration of the 4-bit MLX model, with `model_file`.
+- `LICENSE`: the Qwen Community License 1.0.
 
 ## Credits
 

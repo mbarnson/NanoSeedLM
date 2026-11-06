@@ -44,11 +44,12 @@ model.
 | [MLA](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA) (BF16) | `k2_mla.py` | Yes | Not checked | Not checked |
 | [MLA-oQ4e](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-oQ4e), [oQ6e](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-oQ6e), [oQ8e](https://huggingface.co/txgsync/K2-Horizon-MoVA-36B-A4B-MLA-oQ8e) | `k2_mla.py` | Yes | No | No |
 | [0.9B-NSLM-seeds-4bpw](https://huggingface.co/txgsync/K2-Horizon-0.9B-NSLM-seeds-4bpw) | `nanoseedlm_k2.py` | Yes | No | No |
-| [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4), [P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3) | `nanoseedlm_qwen4.py` (mlx-vlm) | Not yet | Yes | Yes |
-| [Qwen3.8-Flash-Next-NanoSeedLM-TCQ4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4), [TCQ3-D4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4), [TCQ3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3) | Not in the repositories yet | Not yet | Yes | Yes |
+| [Qwen3.8-Flash-Next-NanoSeedLM-P4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P4), [P3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3) | `nanoseedlm_qwen4.py` (mlx-vlm) | With the fix (P3 tested) | Yes | Yes |
+| [Qwen3.8-Flash-Next-NanoSeedLM-TCQ4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4), [TCQ3-D4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4), [TCQ3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3) | `nanoseedlm_qwen4.py` with `nanoseedlm_trellis.py` (mlx-vlm) | With the fix (TCQ4 tested) | Yes | Yes |
 
-oMLX removes `model_file` from `qwen4_exp` configurations, so it does not load the Qwen3.8-Flash-Next loader yet. A
-one-line fix (Matt's fork, `29ee79c`) lets it load P3 and, with `nanoseedlm_trellis.py`, TCQ4. The fix is in review
+Each Qwen3.8-Flash-Next repository carries its MLX model files, and its `config.json` names `nanoseedlm_qwen4.py` in
+`model_file`. The TCQ repositories got theirs on 2026-11-06, after the release. Stock oMLX removes `model_file` from
+`qwen4_exp` configurations, so it does not load them. A one-line fix (Matt's fork, `29ee79c`) lets it load P3 and TCQ4. The fix is in review
 upstream as [jundot/omlx#5112](https://github.com/jundot/omlx/pull/5112).
 Use mlx-vlm 0.7.12 or later with `--trust-remote-code`. To use a model in oMLX, read [The MLX loader](../guides/mlx.md).
 To use a model in the engine, read [Run and serve](../guides/run-and-serve.md).
