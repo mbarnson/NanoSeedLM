@@ -11,10 +11,13 @@
 #import <Metal/Metal.h>
 
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "qwen4_eng.h"
 
@@ -50,6 +53,9 @@ typedef struct {
     id<MTLBuffer> kconv[Q4E_KEEP_SLOTS], kS[Q4E_KEEP_SLOTS], khist[Q4E_KEEP_SLOTS];   // the state after verify rows 0 .. ndraft - 1 (MTP)
 } Layer;
 _Static_assert(Q4E_KEEP_SLOTS == Q4E_MAX_DRAFTS, "the kernels' snapshot buffers: one for each verify row but the last");
+
+// A share [i0, i1) of n items of fn on the pool; rc: fn's result (0, or the first item's error)
+typedef struct { Q4Eng* e; int (*fn)(Q4Eng* e, const void* ctx, int i0, int i1); const void* ctx; int i0, i1, rc; } PoolJob;
 
 struct Q4Eng {
     Qwen4Cfg c;
@@ -96,6 +102,13 @@ struct Q4Eng {
     id<MTLBuffer> m_ne, m_nh, m_norm, Hin, Hm, ones, mlog, dtok;
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and snapshot buffers a layer)
     double stage_ms[10];
+    int ple_threads;               // Q4E_PLE_THREADS: threads for the PLE rows, a pool of ple_threads - 1 workers and the caller
+    pthread_t pth[16];             // the pool (engine/qwen4_cuda.c's): a pool_run bumps pgen, workers w < pnw run pj[w], the
+    pthread_mutex_t pmu;           // caller pj[0], pndone counts
+    pthread_cond_t pgo, pdone;
+    PoolJob pj[16];
+    int pgen, pnw, pndone, pquit, nth;
+    double host_ms[2];             // Q4E_PROFILE: host time of the PLE prefetch and the PLE rows
     char err[256];
 };
 
@@ -512,17 +525,78 @@ static void bind_keep(Q4Eng* e, int first, id<MTLBuffer> __strong const* k, id<M
     for (int i = 0; i < Q4E_KEEP_SLOTS; ++i) B(e, first + i, e->keep && k[i] ? k[i] : state, 0);
 }
 
-// The PLE rows of rows [pos, pos + T) of each PLE layer into emb [ple index][maxt][ple_dim]: host work, before encoding
-static int ple_rows(Q4Eng* e, int T) {
-    const Qwen4Cfg* c = &e->c;
-    float* emb = (float*) e->emb.contents;
-    for (int l = 0; l < c->n_layer; ++l)
-        for (int t = 0; c->ple[l] >= 0 && t < T; ++t)
-            if (qwen4_ple_embed(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t,
-                                emb + ((size_t) c->ple[l] * e->maxt + t) * c->ple_dim))
-                return fail(e, "layer %d: a PLE table shard is missing or does not hold a row", l);
+static double host_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return 1e3 * (double) ts.tv_sec + 1e-6 * (double) ts.tv_nsec;
+}
+
+static void* pool_worker(void* arg) {   // worker w of the pool
+    Q4Eng* e = ((PoolJob*) arg)->e;
+    const int w = (int) ((PoolJob*) arg - e->pj);
+    int gen = 0;
+    pthread_mutex_lock(&e->pmu);
+    for (;;) {
+        while (e->pgen == gen && !e->pquit) pthread_cond_wait(&e->pgo, &e->pmu);
+        if (e->pquit) break;
+        gen = e->pgen;
+        if (w >= e->pnw) continue;
+        pthread_mutex_unlock(&e->pmu);
+        PoolJob* j = &e->pj[w];
+        j->rc = j->fn(e, j->ctx, j->i0, j->i1);
+        pthread_mutex_lock(&e->pmu);
+        if (++e->pndone == e->pnw - 1) pthread_cond_signal(&e->pdone);
+    }
+    pthread_mutex_unlock(&e->pmu);
+    return NULL;
+}
+
+// fn over n items, split on the pool (the caller runs the first share); the first non-zero result
+static int pool_run(Q4Eng* e, int n, int (*fn)(Q4Eng*, const void*, int, int), const void* ctx) {
+    const int nw = n < e->nth + 1 ? n : e->nth + 1;
+    for (int w = 0; w < nw; ++w) e->pj[w] = (PoolJob) {e, fn, ctx, (int) ((int64_t) n * w / nw), (int) ((int64_t) n * (w + 1) / nw), 0};
+    if (nw > 1) {
+        pthread_mutex_lock(&e->pmu);
+        e->pnw = nw;
+        e->pndone = 0;
+        ++e->pgen;
+        pthread_cond_broadcast(&e->pgo);
+        pthread_mutex_unlock(&e->pmu);
+    }
+    if (nw > 0) e->pj[0].rc = fn(e, ctx, e->pj[0].i0, e->pj[0].i1);
+    if (nw > 1) {
+        pthread_mutex_lock(&e->pmu);
+        while (e->pndone < nw - 1) pthread_cond_wait(&e->pdone, &e->pmu);
+        pthread_mutex_unlock(&e->pmu);
+    }
+    for (int w = 0; w < nw; ++w) if (e->pj[w].rc) return e->pj[w].rc;
     return 0;
 }
+
+// PLE items: rows (prefetch), else (row, head); 1 + the layer of a missing row
+static int ple_items(Q4Eng* e, const void* ctx, int i0, int i1) {
+    const Qwen4Cfg* c = &e->c;
+    const int prefetch = *(const int*) ctx, H = prefetch ? 1 : e->ng[0].heads;
+    float* emb = (float*) e->emb.contents;
+    for (int l = 0; l < c->n_layer; ++l)
+        for (int i = i0; c->ple[l] >= 0 && i < i1; ++i) {
+            const int t = i / H;
+            if (prefetch) qwen4_ple_prefetch(&e->nm, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t);
+            else if (qwen4_ple_head(&e->nm, &e->rows, e->table, c, &e->ng[c->ple[l]], l, e->ids, e->pos + t, i % H,
+                                    emb + ((size_t) c->ple[l] * e->maxt + t) * c->ple_dim)) return l + 1;
+        }
+    return 0;
+}
+
+// The PLE rows [pos, pos + T) of each PLE layer: their pages asked of the OS (prefetch), or into emb [ple index][maxt]
+// [ple_dim]. Host work, before encoding, on the pool; decode rows split by head, so their page reads overlap
+static int ple_run(Q4Eng* e, int T, int prefetch) {
+    const double t0 = e->prof ? host_ms() : 0;
+    const int bad = pool_run(e, prefetch ? T : T * e->ng[0].heads, ple_items, &prefetch);
+    if (e->prof && !e->prof_skip) e->host_ms[prefetch ? 0 : 1] += host_ms() - t0;
+    return bad ? fail(e, "layer %d: a PLE table shard is missing or does not hold a row", bad - 1) : 0;
+}
+static int ple_rows(Q4Eng* e, int T) { return ple_run(e, T, 0); }
 
 static void ple(Q4Eng* e, int l, int T) {
     const Qwen4Cfg* c = &e->c;
@@ -947,6 +1021,17 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     e->ids = (int32_t*) malloc(sizeof(int32_t) * (size_t) e->max_pos);
     e->prof = getenv("Q4E_PROFILE") ? atoi(getenv("Q4E_PROFILE")) : 0;
+    const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    e->ple_threads = getenv("Q4E_PLE_THREADS") ? atoi(getenv("Q4E_PLE_THREADS")) : ncpu > 16 ? 16 : ncpu > 1 ? (int) ncpu : 1;
+    if (e->ple_threads < 1) e->ple_threads = 1;
+    if (e->ple_threads > 16) e->ple_threads = 16;
+    pthread_mutex_init(&e->pmu, NULL);
+    pthread_cond_init(&e->pgo, NULL);
+    pthread_cond_init(&e->pdone, NULL);
+    for (e->pj[0].e = e; e->nth < e->ple_threads - 1; ++e->nth) {
+        e->pj[e->nth + 1].e = e;
+        if (pthread_create(&e->pth[e->nth], NULL, pool_worker, &e->pj[e->nth + 1])) break;
+    }
     e->kms = [NSMutableDictionary new];
     e->kcalls = [NSMutableDictionary new];
     e->no_split = getenv("Q4E_NO_SPLIT") != NULL;
@@ -993,6 +1078,18 @@ void q4e_close(Q4Eng* e) {
         for (int i = 0; i < ST_N; ++i)
             if (e->stage_ms[i] > 0) fprintf(stderr, "  %-18s %9.1f ms  %5.1f%%\n", kStage[i], e->stage_ms[i], 100 * e->stage_ms[i] / (total > 0 ? total : 1));
     }
+    if (e->prof) fprintf(stderr, "Q4E_PROFILE: host PLE prefetch %.0f ms, PLE rows %.0f ms (%d threads)\n", e->host_ms[0], e->host_ms[1], e->nth + 1);
+    if (e->ple_threads) {   // the PLE pool (started once ple_threads is set)
+        pthread_mutex_lock(&e->pmu);
+        e->pquit = 1;
+        pthread_cond_broadcast(&e->pgo);
+        pthread_mutex_unlock(&e->pmu);
+        for (int w = 0; w < e->nth; ++w) pthread_join(e->pth[w], NULL);
+        pthread_mutex_destroy(&e->pmu);
+        pthread_cond_destroy(&e->pgo);
+        pthread_cond_destroy(&e->pdone);
+        e->ple_threads = 0;
+    }
     if (e->residency) { [e->residency endResidency]; [e->queue removeResidencySet:e->residency]; }
     e->residency = nil;
     e->pipes = nil; e->buffers = nil; e->lib = nil; e->lib4 = nil; e->queue = nil; e->dev = nil;
@@ -1038,8 +1135,8 @@ static int forward_rows(Q4Eng* e, const int32_t* ids, int T, float* logits) {
         done[t] = (e->pos + t + 1) / c->ix_ratio;
         nsel[t] = done[t] > e->kq ? e->kq : 0;
     }
-    if (ple_rows(e, T)) return -1;
     e->prof_skip = e->prof == 4 ? T <= MV_MAXT : e->prof >= 2 && T > MV_MAXT;
+    if (ple_rows(e, T)) return -1;
     cmd_begin(e);
     embed(e, T);
     mark(e, ST_EMBED);
@@ -1065,8 +1162,8 @@ int q4e_forward(Q4Eng* e, const int32_t* ids, int n, float* logits) {
     if (e->pos + n > e->max_pos) return fail(e, "the context is full (%d positions)", e->max_pos);
     for (int i = 0; i < n; ++i) if (ids[i] < 0 || ids[i] >= e->embed.rows) return fail(e, "token %d out of range", ids[i]);
     memcpy(e->ids + e->pos, ids, sizeof(int32_t) * (size_t) n);
-    for (int l = 0; l < e->c.n_layer; ++l)   // all PLE rows of the call at once: the OS reads them in parallel, not row by row
-        for (int t = 0; e->c.ple[l] >= 0 && t < n; ++t) qwen4_ple_prefetch(&e->nm, e->table, &e->c, &e->ng[e->c.ple[l]], l, e->ids, e->pos + t);
+    e->prof_skip = e->prof >= 2 && e->prof != 4 && n > MV_MAXT;
+    if (n > MV_MAXT && ple_run(e, n, 1)) return -1;   // a prompt's PLE rows at once: the OS reads them in parallel (decode: by head)
     const int step = logits ? LOGT : e->maxt;
     for (int i = 0; i < n; i += step) {
         const int T = n - i < step ? n - i : step;

@@ -51,7 +51,8 @@ same results as the engine.
 | MLA KV cache q8, rq4 | No | No | Yes |
 | Hybrid MLA (`mla_ranks` 0: GQA layers) | Yes | Yes | Yes |
 | Qwen3.8-Flash-Next with P = 3 / 4 seed experts | Yes (`nslm-qwen4-gen`, `qwen4_gpu.m`) | Yes (`nslm-qwen4-gen`) | Yes (mlx-vlm) |
-| Qwen3.8-Flash-Next PLE table from an Unsloth engram GGUF | No | Yes (`--ple-gguf`) | No (mlx-vlm's SSD PLE view) |
+| Qwen3.8-Flash-Next PLE table from an Unsloth engram GGUF (`Q4E_PLE_GGUF`, `--ple-gguf`) | Yes | Yes | No (mlx-vlm's SSD PLE view) |
+| Qwen3.8-Flash-Next PLE rows on a host thread pool (`Q4E_PLE_THREADS`) | Yes | Yes | No |
 | Qwen3.8-Flash-Next VRAM cache of host experts | No | Yes (`--expert-cache-gb`) | No |
 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve` (`engine/engine.c`) | Yes | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next MTP drafts (`q4e_draft`, `nslm-qwen4-gen --drafts`) | Yes (`qwen4_gpu.m`) | Yes | Yes (mlx-vlm) |

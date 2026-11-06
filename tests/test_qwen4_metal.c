@@ -363,6 +363,18 @@ int main(void) {
             CHECK(diff == 0, "the prompt's row split changes the next token's logits");
             q4e_close(e);
         }
+        setenv("Q4E_PLE_THREADS", "1", 1);   // the PLE rows on one thread: the same logits, bit for bit
+        e = q4e_open("tests/data/qwen4_tiny", &o, err, sizeof err);
+        unsetenv("Q4E_PLE_THREADS");
+        CHECK(e != NULL, "open: %s", err);
+        if (e) {
+            CHECK(q4e_forward(e, lid, L, NULL) == 0 && q4e_forward(e, lid + L, 1, three) == 0, "a serial pass: %s", q4e_error(e));
+            int diff = 0;
+            for (int v = 0; v < V; ++v) diff += one[v] != three[v];
+            printf("PLE rows on one thread or the pool: %d logits differ\n", diff);
+            CHECK(diff == 0, "threaded PLE rows change the logits");
+            q4e_close(e);
+        }
         free(lid); free(one); free(three);
     }
     free(got); free(twice); free(again); free(big);
