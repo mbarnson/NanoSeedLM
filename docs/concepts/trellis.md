@@ -38,8 +38,8 @@ free on a display GPU, not 2,560. So the cache holds about 20% more experts. Rea
 
 The units are tokens per second. The percentages compare with P3 at the same reserve.
 
-The release packs have 8-bit dense weights. On the RTX 4080 these take about 23% of the cache's slots. So TQ3-D4
-decodes at 39.6 tokens per second and TQ3 at 43, with the token embedding in host memory. Read
+The release packs have 8-bit dense weights. On the RTX 4080 these take about 23% of the cache's slots. So TCQ3-D4
+decodes at 39.6 tokens per second and TCQ3 at 43, with the token embedding in host memory. Read
 [The release packs from the Hub on the RTX 4080](../results/2026-11-06-release-downloads-4080.md). A long context takes
 VRAM from the cache too: at 32K, `nslm-serve` has 3,004 slots with passes of 8,192 rows (the default under 32 GB). Read
 [VRAM that grows with the context](../results/2026-11-06-context-vram-4080.md).

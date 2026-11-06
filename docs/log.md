@@ -876,3 +876,68 @@ passes gate RE. `373499f` fixes the pack choice of the start scripts on 64 GB PC
 expert cache has 379 more slots and decode is 5.7% faster. On the M4 Max a 15K prompt is 5% to 6% faster. The KL of
 the BF16 cache against the f32 cache is at or below a half-step noise floor. Read
 [The KV cache in BF16](results/2026-11-06-qwen4-kv-bf16.md).
+
+## [2026-11-06] result | The KL of the 4-bit PLE table
+
+`4373d30` adds `nslm-qwen4-emulate --ple`. In HF job `6aee1d9d`, the 4-bit MLX PLE table that the packs ship gives a KL
+of 0.0259 on Q8_0. Unsloth's Q8_0 table gives 0.0199. `ff92415` makes the start scripts download the Q8_0 table
+by default. Read [The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md).
+
+## [2026-11-06] release | The trellis packs are TCQ4, TCQ3-D4 and TCQ3
+
+The three repositories moved from `-TQ4`, `-TQ3-D4` and `-TQ3` to `-TCQ4`, `-TCQ3-D4` and `-TCQ3`, at the same
+revisions. TCQ is trellis-coded quantization. In oMLX and in the community, TQ means TurboQuant. The Hub redirects the
+old names. The start scripts, the cards and the current pages use the new names. The dated results pages keep the
+names of their measurements.
+
+## [2026-11-06] plan | MTP drafts in nslm-serve, with sampling
+
+`nslm-serve` does not draft: `eng_generate` keeps only greedy drafts, and the server samples. The plan makes the draft
+rule speculative sampling, with one sampler for `nslm-chat` and `nslm-serve`, and the MTP head's first input from the
+caller. Read [MTP drafts in nslm-serve](plans/2026-11-06-serve-drafts.md).
+
+## [2026-11-06] result | Long decode and long prompts on the RTX 4080
+
+The model cards get long runs in place of 256-token decodes. On the stock path of v0.1.0 (the Q8_0 PLE table, 32K
+context), the RTX 4080 decodes 4,096 tokens at 44 (TCQ3), 38 (TCQ3-D4) and 31 (TCQ4) tokens per second. After 30K
+tokens of prompt it decodes at 42, 36 and 30. Read [Long decode on the RTX 4080](results/2026-11-06-long-bench-4080.md).
+
+## [2026-11-06] plan | MTP drafts that the sampler keeps more often
+
+At temperature 1.0 on the RTX 4080, 2 drafts in `nslm-serve` keep 38% to 46% and make decode 16% slower (gate SC). The
+plan takes Strata's rule: drafts sampled from the head's distribution, kept with min(1, p / q), and a confidence gate.
+Cheaper verify rows need a plan of their own. Read [Drafts the sampler keeps](plans/2026-11-06-draft-acceptance.md).
+
+## [2026-11-06] release | NanoSeedLM engine v0.1.0
+
+Matt published [v0.1.0](https://github.com/mbarnson/NanoSeedLM/releases/tag/v0.1.0) as a pre-release. The tag is
+`47714b8`. It has `nslm-chat` and `nslm-serve` for Windows x64 and Linux x64 (CUDA 12.8) and macOS (Metal, signed and
+notarized), with the start scripts. The scripts download a TCQ pack and Unsloth's Q8_0 PLE table. The stock path passes
+on the M4 Max (tarball `003648f3`) and on the RTX 4080 (zip `6becc62c`). Read [the release
+plan](plans/2026-11-05-release-family.md).
+
+## [2026-11-06] result | Long decode and long prompts on the M4 Max
+
+On the stock path of v0.1.0, the M4 Max decodes 4,096 tokens of TCQ4 at about 39 tokens per second, and also after
+30,000 tokens of prompt. Warm prompts run at about 480. The Q8_0 PLE table costs 0% to 4%: the host reads its rows on one
+thread. Read [Long decode on the M4 Max](results/2026-11-06-long-bench-m4max.md).
+
+## [2026-11-06] release | The TCQ repositories get their MLX model files
+
+The three TCQ repositories shipped without `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`, `nanoseedlm_trellis.py`, the
+`model_file` key and the LICENSE. So mlx-vlm and oMLX had nothing to load with Trust Remote Code. The packer learned to
+write them (`d56a17c`) after the release folders were built, and R5 uploaded the folders without a rebuild. The files
+are on the Hub now (TCQ4 `e53ffdd2`, TCQ3-D4 `30012655`, TCQ3 `d1353e4a`). They are the `17eeb5d` loaders that oMLX ran
+on TQ4's download. `tools/hf_release_publish.sh` now refuses a folder without them. The v0.1.0 start scripts pin the
+earlier revisions.
+
+## [2026-11-06] result | MTP drafts in nslm-serve on the RTX 4080
+
+Drafts sampled from the head's distribution keep 63% of 2 drafts at temperature 1.0, against 38% to 46% before. The
+confidence gate raises that to 77% to 84%. Decode is break-even, within 2%. Strata decodes the same request at 71 tokens
+per second, against 38, mostly by decode without drafts. Read [the gates](results/2026-11-06-draft-gates-4080.md).
+
+## [2026-11-06] result | TCQ3 on a 12 GB GPU
+
+On the RTX 4080 with 4 GB more of VRAM kept free, TCQ3 decodes at 27 tokens per second, against 44 with all 16 GB. Read
+[TCQ3 on a 12 GB GPU](results/2026-11-06-tcq3-12gb.md).

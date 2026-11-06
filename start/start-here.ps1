@@ -11,9 +11,9 @@ function Fail($m) { Write-Host "`n$m" -ForegroundColor Red; exit 1 }
 
 # name = repository, revision, least RAM GB, least VRAM GB, download GB (the model cards' "For" column)
 $packs = [ordered]@{
-    'TQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ4', '25339937b55f9efbe384a3f8cb2bc92d86ecfa32', 96, 24, 102)
-    'TQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4', '7e5edb2be58071fbe5a5133421ab6c1f2f0de58f', 96, 16, 92)
-    'TQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3', '5f2a859927d2215081a7ac5684dbae5da6517104', 64, 16, 87)
+    'TCQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4', '25339937b55f9efbe384a3f8cb2bc92d86ecfa32', 96, 24, 102)
+    'TCQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4', '7e5edb2be58071fbe5a5133421ab6c1f2f0de58f', 96, 16, 92)
+    'TCQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3', '5f2a859927d2215081a7ac5684dbae5da6517104', 64, 12, 87)
 }
 
 Write-Host "NanoSeedLM: Qwen3.8-Flash-Next on this PC`n"
@@ -31,16 +31,16 @@ $eRepo, $eRev, $eFile = 'unsloth/Qwen3.8-Flash-Next-GGUF', 'd96201194f103c906994
 function Fits($have, $size) { $have -ge 0.9 * $size }   # a 64 GB PC may report 62 GB: 90% of a size counts as that size
 $rec = $null
 foreach ($n in $packs.Keys) { $p = $packs[$n]; if (-not $rec -and (Fits $ram $p[2]) -and (Fits $vram $p[3])) { $rec = $n } }
-if (-not $rec) { if (-not (Fits $ram 64)) { Fail "The smallest pack (TQ3) needs 64 GB of RAM. This PC has $ram GB." }; $rec = 'TQ3' }
+if (-not $rec) { if (-not (Fits $ram 64)) { Fail "The smallest pack (TCQ3) needs 64 GB of RAM. This PC has $ram GB." }; $rec = 'TCQ3' }
 Write-Host "`nPacks (KL against BF16: lower is closer to the original model):"
-Write-Host "  TQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TQ4'][4]) GB download)"
-Write-Host "  TQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TQ3-D4'][4]) GB download)"
-Write-Host "  TQ3     0.0778  for a 16 GB GPU with 64 GB of RAM ($($packs['TQ3'][4]) GB download)"
+Write-Host "  TCQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TCQ4'][4]) GB download)"
+Write-Host "  TCQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TCQ3-D4'][4]) GB download)"
+Write-Host "  TCQ3     0.0778  for a 12 or 16 GB GPU with 64 GB of RAM ($($packs['TCQ3'][4]) GB download)"
 Write-Host "Each pack runs with Unsloth's Q8_0 PLE table (54.4 GB more), as on the model cards. NSLM_PLE=pack skips it."
 $pick = $Pack
 if (-not $pick) { $pick = Read-Host "Pack [$rec]" }
 if (-not $pick) { $pick = $rec }
-if (-not $packs.Contains($pick)) { Fail "Unknown pack $pick. Use TQ4, TQ3-D4 or TQ3." }
+if (-not $packs.Contains($pick)) { Fail "Unknown pack $pick. Use TCQ4, TCQ3-D4 or TCQ3." }
 $root = $ModelDir
 if (-not $root -and -not $Pack) { $root = Read-Host "Model folder [$here\models]" }
 if (-not $root) { $root = "$here\models" }
@@ -80,8 +80,8 @@ foreach ($f in $files) {
     $need += $f.size - $have
 }
 $free = (Get-Item $dir).PSDrive.Free
-if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N0} GB free." -f ($need / 1GB), ($free / 1GB)) }
-Write-Host ("`n{0} files to check, {1:N1} GB to download into {2}" -f $check, ($need / 1GB), $root)
+if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N0} GB free." -f ($need / 1e9), ($free / 1e9)) }
+Write-Host ("`n{0} files to check, {1:N1} GB to download into {2}" -f $check, ($need / 1e9), $root)
 if ($need -gt 1GB -and -not $Pack -and (Read-Host "Start? [Y/n]") -match '^[nN]') { Write-Host "Stopped. Run START-HERE.bat again."; exit 0 }
 if ($need -gt 1GB -and $Pack) { Write-Host "The download starts in 5 s (Ctrl+C stops it)."; Start-Sleep 5 }   # a folder typo
 $i = 0
@@ -92,9 +92,9 @@ foreach ($f in $files) {
     New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
     $have = 0
     if (Test-Path $dst) { $have = (Get-Item $dst).Length }
-    Write-Host ("[{0}/{1}] {2} ({3:N1} GB)" -f $i, $files.Count, $f.path, ($f.size / 1GB))
+    Write-Host ("[{0}/{1}] {2} ({3})" -f $i, $files.Count, $f.path, $(if ($f.size -lt 1e9) { "{0:N0} MB" -f ($f.size / 1e6) } else { "{0:N1} GB" -f ($f.size / 1e9) }))
     if ($have -ne $f.size) {
-        & curl.exe -fL --retry 5 -C - --progress-bar @auth -o $dst "https://huggingface.co/$($f.r)/resolve/$($f.v)/$($f.path)"
+        & curl.exe -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - --progress-bar @auth -o $dst "https://huggingface.co/$($f.r)/resolve/$($f.v)/$($f.path)"   # a stalled connection: a new one resumes
         if ($LASTEXITCODE) { Fail "The download of $($f.path) stopped (curl $LASTEXITCODE). Run START-HERE.bat again to resume." }
     }
     if ((Get-Item $dst).Length -ne $f.size) { Fail "$($f.path) has the wrong size. Run START-HERE.bat again." }

@@ -54,8 +54,8 @@ Work that is not done yet, with its gates and hypotheses.
   with more bits where the KL needs them, and a KL of each pack as shipped.
 - [2026-11-05: An LFSR code for the trellis](plans/2026-11-05-lfsr-trellis.md): draft. The trellis with NanoSeedLM's
   LFSR as its code generator in place of 1MAD, tested on KL and decode speed.
-- [2026-11-05: The trellis family on Hugging Face](plans/2026-11-05-release-family.md): draft. Three public packs (TQ4,
-  TQ3-D4, TQ3) that one `hf download` gets and the engines run, each with its KL as shipped.
+- [2026-11-05: The trellis family on Hugging Face](plans/2026-11-05-release-family.md): current. Three public packs (TCQ4,
+  TCQ3-D4, TCQ3) that one `hf download` gets and the engines run, each with its KL as shipped.
 - [2026-11-04: A high seed tier that follows the routing](plans/2026-11-04-qwen38-adaptive-tiers.md): draft. The
   engine keeps the session's hot experts in P4 and the rest in S3 or P3.
 - [2026-11-04: Three seed packs of Qwen3.8-Flash-Next by RAM size](plans/2026-11-04-qwen38-ram-tiers.md): packs for
@@ -68,6 +68,10 @@ Work that is not done yet, with its gates and hypotheses.
 
 Dated measurements. Each page gives the result, its status, the setup and the data.
 
+- [2026-11-06: MTP drafts in nslm-serve, with sampling](plans/2026-11-06-serve-drafts.md): draft. Speculative sampling with
+  the MTP head's drafts, so the server drafts at any temperature with its sampler's distribution.
+- [2026-11-06: MTP drafts that the sampler keeps more often](plans/2026-11-06-draft-acceptance.md): draft. Drafts sampled
+  from the head's distribution, as Strata does, and a confidence gate. For the RTX 4080's bar of 60 tokens per second.
 - [2026-10-06: GQA seed model against BF16 and Q4](results/2026-10-06-gqa-seed-model.md): seeded experts against
   affine Q4 experts on the original model.
 - [2026-10-07: CUDA and Metal measured side by side](results/2026-10-07-cuda-vs-metal.md): RTX 4080 against M4 Max.
@@ -187,6 +191,15 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   to 42 tokens per second, 67 to 69 with 2 drafts. oMLX 49, and 81 to 84 with MTP. The macOS archive passes gate RE.
 - [2026-11-06: The KV cache of Qwen3.8-Flash-Next in BF16](results/2026-11-06-qwen4-kv-bf16.md): +379 slots and decode
   +5.7% on the RTX 4080 at 32K, a 15K prompt +5% to +6% on the M4 Max. The KL change is at the noise floor.
+- [2026-11-06: The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md): 0.0060 more than Unsloth's Q8_0
+  table (0.0199 to 0.0259 on Q8_0). The start scripts take the Q8_0 table by default.
+- [2026-11-06: MTP drafts in nslm-serve on the RTX 4080](results/2026-11-06-draft-gates-4080.md): sampled drafts keep 63%
+  to 84%, but decode only breaks even. Gates SC and GB fail, GA passes.
+- [2026-11-06: TCQ3 on a 12 GB GPU](results/2026-11-06-tcq3-12gb.md): emulated on the RTX 4080, 27 tokens per second.
+- [2026-11-06: Long decode and long prompts on the M4 Max](results/2026-11-06-long-bench-m4max.md): TCQ4 on the stock
+  path decodes about 39 tokens per second to 30K of context. The Q8_0 PLE table costs 0% to 4%.
+- [2026-11-06: Long decode and long prompts on the RTX 4080](results/2026-11-06-long-bench-4080.md): 4,096 tokens
+  at 44 (TCQ3), 38 (TCQ3-D4) and 31 (TCQ4) tokens per second, and 42, 36 and 30 after 30K tokens.
 
 ## For contributors and agents
 

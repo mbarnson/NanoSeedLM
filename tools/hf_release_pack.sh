@@ -4,9 +4,9 @@
 # OUT/NAME, then for each a local copy, two runs of nslm-qwen4-gen and the KL as shipped (tools/hf_llama_kld.sh /PATH
 # packs).  PACK=0 tests the folders that an earlier run packed; TESTS (default PACKS) names the folders to test.
 #   hf jobs run --flavor rtx-pro-6000x2 -v hf://buckets/txgsync/nslm-qwen38:/b -e SRC=/b/src-REV [-e OUT=/b/release] \
-#       [-e PACKS="TQ3 TQ3-D4 TQ4"] nvidia/cuda:12.8.1-devel-ubuntu24.04 bash /b/src-REV/tools/hf_release_pack.sh
+#       [-e PACKS="TCQ3 TCQ3-D4 TCQ4"] nvidia/cuda:12.8.1-devel-ubuntu24.04 bash /b/src-REV/tools/hf_release_pack.sh
 set -euo pipefail
-OUT=${OUT:-/b/release} TQBANK=${TQBANK:-/b/tq} PACKS=${PACKS:-"TQ3 TQ3-D4 TQ4"} TESTS=${TESTS:-${PACKS:-"TQ3 TQ3-D4 TQ4"}}
+OUT=${OUT:-/b/release} TQBANK=${TQBANK:-/b/tq} PACKS=${PACKS:-"TCQ3 TCQ3-D4 TCQ4"} TESTS=${TESTS:-${PACKS:-"TCQ3 TCQ3-D4 TCQ4"}}
 P3=txgsync/Qwen3.8-Flash-Next-NanoSeedLM-P3 P3REV=5753a67
 OQ8=mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp OQ8REV=2a9de025436ea977720e4e3d6f369b185838e791
 PROMPT="Write a Python function that returns the n-th Fibonacci number, with a docstring."
@@ -33,9 +33,9 @@ echo "== downloads: $(( $(date +%s) - t0 )) s, P3 $(du -sh /m/seed-P3 | cut -f1)
 mkdir -p "$OUT"   # nslm-qwen4-pack makes the last level only
 for p in $PACKS; do
     case $p in
-        TQ3) tq=TQ3L12 down= ;;
-        TQ3-D4) tq=TQ3L12 down=TQ4L12 ;;
-        TQ4) tq=TQ4L12 down= ;;
+        TCQ3) tq=TQ3L12 down= ;;
+        TCQ3-D4) tq=TQ3L12 down=TQ4L12 ;;
+        TCQ4) tq=TQ4L12 down= ;;
         *) echo "== $p: unknown pack"; continue ;;
     esac
     t0=$(date +%s)
