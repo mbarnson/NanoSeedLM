@@ -2,6 +2,22 @@
 
 `nslm-chat` runs one prompt. `nslm-serve` is an OpenAI-compatible HTTP server.
 
+## Start from a release
+
+The [releases](https://github.com/mbarnson/NanoSeedLM/releases) have built engines for Windows x64 and Linux x64
+(CUDA 12.8), and for macOS on Apple Silicon (Metal). You do not need a build.
+
+1. Download the archive for your machine, and unpack it.
+2. On Windows, double-click `START-HERE.bat`. On Linux or macOS, run `./start-here.sh`.
+3. Answer two questions: the pack (Enter takes the recommended pack) and the model folder.
+
+The script checks the GPU, the driver, the RAM and the disk. It downloads the pack from Hugging Face and checks the
+SHA-256 of each file. Then it runs one short chat, writes `run-PACK.bat` (or `run-PACK.sh`) and starts `nslm-serve` on
+port 8080. If the download stops, run the script again. It continues from the last file.
+
+On a PC, the engines need an NVIDIA GPU of sm_80 or newer and driver 570 or newer. On a Mac, they need Apple Silicon and
+macOS 15 or newer. The smallest pack needs 64 GB of RAM.
+
 ## Get a model folder
 
 Download a model from [the model list](../reference/models.md), or make one. Read

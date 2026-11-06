@@ -34,7 +34,7 @@ jobs:
       - name: package
         run: |
           d=nslm-$TAG-linux-x64-cuda12.8
-          mkdir -p "$d/build/bin" && cp build/bin/nslm-chat build/bin/nslm-serve "$d/build/bin/" && cp LICENSE "$d/"
+          mkdir -p "$d/build/bin" && cp build/bin/nslm-chat build/bin/nslm-serve "$d/build/bin/" && cp LICENSE start/start-here.sh "$d/"
           sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > "$d/README.txt"
           tar -czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@v4
@@ -69,7 +69,7 @@ jobs:
           $d = "nslm-$env:TAG-windows-x64-cuda12.8"
           New-Item -ItemType Directory "$d\build\bin" | Out-Null
           Copy-Item build\bin\nslm-chat.exe, build\bin\nslm-serve.exe "$d\build\bin\"
-          Copy-Item LICENSE $d
+          Copy-Item LICENSE, start\START-HERE.bat, start\start-here.ps1 $d
           (Get-Content tools\release-readme.txt) -replace '@TAG@', $env:TAG -replace '@SHA@', $env:GITHUB_SHA | Set-Content "$d\README.txt"
           Compress-Archive -Path $d -DestinationPath "$d.zip"
       - uses: actions/upload-artifact@v4
@@ -93,7 +93,7 @@ jobs:
           d=nslm-$TAG-macos-arm64-metal
           mkdir -p "$d/out/bin" "$d/out/res"
           cp out/bin/nslm-chat out/bin/nslm-serve "$d/out/bin/" && cp out/res/kernels_moe.metallib out/res/kernels_qwen4.metallib "$d/out/res/"
-          cp LICENSE "$d/" && sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > "$d/README.txt"
+          cp LICENSE start/start-here.sh "$d/" && sed "s/@TAG@/$TAG/; s/@SHA@/$GITHUB_SHA/" tools/release-readme.txt > "$d/README.txt"
           tar -czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@v4
         with: {name: macos, path: "nslm-*.tar.gz"}

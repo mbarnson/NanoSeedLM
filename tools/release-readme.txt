@@ -5,8 +5,12 @@ Requirements:
   Windows 10 1903 or newer. Linux: glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or newer).
 - macOS: Apple Silicon and macOS 15 or newer.
 
-Run the commands from this folder. The binaries are in build/bin (Windows, Linux) or out/bin (macOS, with the Metal
-kernels in out/res). Download a model first, for example:
+To start: double-click START-HERE.bat (Windows), or run ./start-here.sh (Linux, macOS). It checks this machine,
+recommends a pack, downloads and checks it, chats once, writes run-PACK.bat (or run-PACK.sh) and starts the server on
+http://127.0.0.1:8080/v1. Run it again to resume a download.
+
+To run by hand, run the commands from this folder. The binaries are in build/bin (Windows, Linux) or out/bin
+(macOS, with the Metal kernels in out/res). Download a model first, for example:
 
   hf download txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4 --local-dir Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4
 
