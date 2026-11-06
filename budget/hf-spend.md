@@ -55,6 +55,8 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | nslm-rel-linux (6aedb3f3c78863f9c634082f): the v0.1.0 Linux archive on Ubuntu 22.04 with TQ3: chat and serve pass | rtx-pro-6000 ($2.75/h) | 8.7 | about $0.40 | about $22.00 |
 
+| Linux CI 1a55b64 (6aedc9fc0e0338d1bb814084): Q4EOpts.pass_rows, 44 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $22.08 |
+
 | nslm release upload, third (6aeda68a0e0338d1bb80fcb4, by pc-cuda): TQ3 5f2a8599, TQ3-D4 7e5edb2b, TQ4 25339937 (each copy about 8 min, each upload about 1 min: Xet found the chunks) | cpu-xl ($1.00/h) | 29.1 | about $0.49 | about $21.50 |
 
-Left this week: about $3.00.
+Left this week: about $2.92.
