@@ -37,21 +37,24 @@ static int copy_file(const char* from, const char* to) {
     return b && !fclose(b) ? 0 : -1;
 }
 // The tiny model with every layer's experts as trellis banks (L 12, K 3, T = a row; random weights encoded by the C
-// encoder), as test_qwen4_engine.c's tcq_fixture: the banks replace the folder's affine experts
-static int tcq_fixture(const char* dir, char* err, int errlen) {
+// encoder), as test_qwen4_engine.c's tcq_fixture: the banks replace the folder's affine experts. head: also the MTP head's
+// experts, as the bank L{n_layer} (ns_add_banks' head rule)
+static int tcq_fixture(const char* dir, int head, char* err, int errlen) {
     char a[1024], b[1024];
     mkdir(dir, 0755);
     snprintf(b, sizeof b, "%s/config.json", dir);
     snprintf(a, sizeof a, "%s/model.safetensors", dir);
     Qwen4Cfg c;
+    char m[1024];
+    snprintf(m, sizeof m, "%s/model-mtp.safetensors", dir);   // the MTP head (mtp.*)
     if (copy_file("tests/data/qwen4_tiny/config.json", b) || copy_file("tests/data/qwen4_tiny/model.safetensors", a) ||
-        qwen4_cfg_load(&c, dir, err, errlen)) {
+        copy_file("tests/data/qwen4_tiny/model-mtp.safetensors", m) || qwen4_cfg_load(&c, dir, err, errlen)) {
         if (!err[0]) snprintf(err, (size_t) errlen, "cannot copy the tiny model to %s", dir);
         return -1;
     }
     const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
     uint32_t r = 777;
-    for (int l = 0; l < c.n_layer; ++l)
+    for (int l = 0; l < c.n_layer + (head != 0); ++l)
         for (int p = 0; p < 3; ++p) {
             const int R = p == 2 ? c.d : c.ff_exp, C = p == 2 ? c.ff_exp : c.d, E = c.n_exp, T = C;
             const size_t nw = nslm_tq_row_words(C, T, 12, 3);
@@ -83,7 +86,7 @@ static int tcq_fixture(const char* dir, char* err, int errlen) {
 static void tcq_check(void) {
     char dir[512], err[512] = "";
     snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq_metal", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-    if (tcq_fixture(dir, err, sizeof err)) { CHECK(0, "trellis fixture: %s", err); return; }
+    if (tcq_fixture(dir, 0, err, sizeof err)) { CHECK(0, "trellis fixture: %s", err); return; }
     Qwen4Ref* r = qwen4_ref_open(dir, err, sizeof err);
     CHECK(r != NULL, "trellis fixture, reference: %s", err);
     if (!r) return;
@@ -116,6 +119,70 @@ static void tcq_check(void) {
     }
     free(ref); free(lg);
     qwen4_ref_close(r);
+}
+
+// The MTP head with trellis experts (the bank L{n_layer}, ns_add_banks' head rule): the head opens; greedy decode with 1 to
+// 3 drafts a step gives the tokens of decode without drafts (plan gate MB, as test_qwen4_mtp's decode); and the head runs
+// its bank (draft 1 differs from the same fixture's without the head bank, as the C reference's does)
+static void tcq_head_check(void) {
+    char dir[512], err[512] = "";
+    snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq_head_metal", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (tcq_fixture(dir, 1, err, sizeof err)) { CHECK(0, "trellis head fixture: %s", err); return; }
+    Q4EOpts o;
+    memset(&o, 0, sizeof o);
+    o.max_pos = 64;
+    o.mtp = 3;
+    Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
+    CHECK(e != NULL, "open the trellis head fixture: %s", err);
+    if (!e) return;
+    const int V = q4e_cfg(e)->vocab;
+    enum { N = 12, NT = 24 };
+    int32_t ids[N], plain[NT], spec[NT];
+    for (int i = 0; i < N; ++i) ids[i] = (i * 41 + 7) % V;
+    float* lg = (float*) malloc(sizeof(float) * (size_t) V * 4);
+    for (int k = 0; k <= 3; ++k) {
+        int32_t* out = k ? spec : plain;
+        q4e_reset(e);
+        int rc = q4e_forward(e, ids, N - 1, NULL) || q4e_forward(e, ids + N - 1, 1, lg), got = 0, acc = 0;
+        while (!rc && got < NT) {
+            int32_t row[4];
+            row[0] = argmax(lg, V);
+            if (!k) { out[got++] = row[0]; rc = q4e_forward(e, row, 1, lg); continue; }
+            int m = 1;
+            rc = q4e_draft(e, k, row + 1) || q4e_forward_keep(e, row, k + 1, lg);
+            while (!rc && m <= k && argmax(lg + (size_t) (m - 1) * V, V) == row[m]) ++m;
+            if (!rc) rc = q4e_accept(e, m);
+            for (int i = 0; i < m && got < NT; ++i) out[got++] = row[i];
+            acc += m - 1;
+            memmove(lg, lg + (size_t) (m - 1) * V, sizeof(float) * (size_t) V);
+        }
+        CHECK(rc == 0, "trellis head, %d drafts: %s", k, q4e_error(e));
+        if (k) {
+            int same = 0;
+            while (same < NT && spec[same] == plain[same]) ++same;
+            printf("trellis head, %d drafts a step: %d accepted, the first %d of %d tokens as without drafts\n", k, acc, same, NT);
+            CHECK(same == NT, "trellis head: %d drafts change token %d", k, same);
+        }
+    }
+    {   // the head runs its bank: against the same fixture without the head bank (the same main model, so the same bonus),
+        // draft 1 differs. The prompt (i 85 + 7) mod 512 is one where the C reference's draft 1 differs (171 against 511).
+        char d0[512];
+        snprintf(d0, sizeof d0, "%s/nslm_qwen4_tiny_tcq_metal", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");   // tcq_check's
+        Q4Eng* a = q4e_open(d0, &o, err, sizeof err);
+        int32_t p[N], da[3] = {0}, dt[3] = {0};
+        for (int i = 0; i < N; ++i) p[i] = (i * 85 + 7) % V;
+        float* la = (float*) malloc(sizeof(float) * (size_t) V * N), *lt = (float*) malloc(sizeof(float) * (size_t) V * N);
+        q4e_reset(e);
+        const int ok = a && !q4e_forward(a, p, N, la) && !q4e_draft(a, 3, da) && !q4e_forward(e, p, N, lt) && !q4e_draft(e, 3, dt);
+        const int ba = argmax(la + (size_t) (N - 1) * V, V), bt = argmax(lt + (size_t) (N - 1) * V, V);
+        printf("trellis head: bonus %d, drafts %d %d %d; without the head bank: bonus %d, drafts %d %d %d\n", bt, dt[0], dt[1], dt[2], ba, da[0],
+               da[1], da[2]);
+        CHECK(ok && ba == bt && da[0] != dt[0], "the head bank: bonus %d / %d, draft 1 %d / %d (%s)", bt, ba, dt[0], da[0], a ? q4e_error(a) : err);
+        q4e_close(a);
+        free(la); free(lt);
+    }
+    free(lg);
+    q4e_close(e);
 }
 
 int main(void) {
@@ -270,6 +337,7 @@ int main(void) {
     free(got); free(twice); free(again); free(big);
     st_close_file(&st);
     tcq_check();
+    tcq_head_check();
     printf("test_qwen4_metal: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }
