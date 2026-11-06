@@ -3,7 +3,10 @@
 # table (RAM-tier plan T1), on an HF Jobs node with 1 TB of RAM and 384 GB of VRAM (rtx-pro-6000x4).
 #
 #   SRC=/b/src OUT=/b/kld [PACKS="Q8_0 P3 P4 UD-IQ3_XXS UD-Q3_K_XL UD-IQ4_XS UD-Q4_K_XL"] [CHUNKS=64] [MAPS=/b/maps] \
-#     [S3BANK=/b/s3/experts-s3] [TQBANK=/b/tq] bash tools/hf_llama_kld.sh
+#     [S3BANK=/b/s3/experts-s3] [TQBANK=/b/tq] [REF=/b/kld-ref] bash tools/hf_llama_kld.sh
+#
+# REF: a folder for the BF16 reference logits. The first job with REF writes REF/ref-cCHUNKS.kld. Later jobs copy it and
+# skip BF16 (330 GB): then every pack keeps its own PLE table (Q8_0's adds 0.00005 of KL), and rtx-pro-6000x2 is enough.
 #
 # A pack is an Unsloth folder, a seed or trellis tier (P3, P4, S3, TQ{K}L{L}: the Q8_0 shards with those experts,
 # nslm-qwen4-emulate; TQ3L12 is the folder TQBANK/TQ3L12 of nslm-moe --codec tq banks, as tools/hf_seedbank.sh writes), or
@@ -66,13 +69,20 @@ echo "== builds: $(( $(date +%s) - t0 )) s"
 hf download Salesforce/wikitext --repo-type dataset --include "wikitext-2-raw-v1/test-*" --local-dir /w/wt >/dev/null
 python3 -c 'import glob, pyarrow.parquet as pq; open("/w/text.txt", "w").write("".join(pq.read_table(glob.glob("/w/wt/wikitext-2-raw-v1/test-*")[0]).column("text").to_pylist()))'
 
-get BF16   # the reference, with its own BF16 table (shard 3 of 8), which every pack then uses
-ppl /m/BF16 "$OUT/BF16.log" -f /w/text.txt --kl-divergence-base /w/ref.kld
-PLE=/m/BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf
+SAVED=${REF:+$REF/ref-c$CHUNKS.kld}
+if [ -n "$SAVED" ] && [ -f "$SAVED" ]; then   # the saved reference: no BF16, each pack's own PLE table
+    cp "$SAVED" /w/ref.kld && echo "== BF16: the saved reference $SAVED"; PLE=
+else
+    get BF16   # the reference, with its own BF16 table (shard 3 of 8), which every pack then uses
+    ppl /m/BF16 "$OUT/BF16.log" -f /w/text.txt --kl-divergence-base /w/ref.kld
+    [ -n "$SAVED" ] && mkdir -p "$REF" && cp /w/ref.kld "$SAVED" && echo "== BF16: reference saved to $SAVED"
+    PLE=/m/BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf
+fi
 for pk in $PACKS; do
     case $pk in
-        Q8_0) [ -d /m/Q8_0 ] || get Q8_0 -00003-of-00006; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf
-            stamp "$PLE" 3 6; dir=/m/Q8_0 ;;
+        Q8_0) if [ -z "$PLE" ]; then [ -d /m/Q8_0 ] || get Q8_0
+              else [ -d /m/Q8_0 ] || get Q8_0 -00003-of-00006; ln -sf "$PLE" /m/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf; stamp "$PLE" 3 6; fi
+            dir=/m/Q8_0 ;;
         Q8_0-PLE)   # Q8_0's shards with its own table: shard 3 from Unsloth, the others linked from /m/Q8_0
             mkdir -p /m/Q8_0-PLE && hf download "$UREPO" --revision "$UREV" --include "Q8_0/*-00003-of-00006.gguf" --local-dir /m/q8ple >/dev/null
             for f in /m/Q8_0/*.gguf; do ln -sf "$f" /m/Q8_0-PLE/; done
@@ -86,9 +96,11 @@ for pk in $PACKS; do
             if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack"; then
                 echo "== $pk: emulate failed"; continue
             fi
-            stamp "$PLE" 3 6
+            [ -n "$PLE" ] && stamp "$PLE" 3 6
             echo "== $pk: emulate $(( $(date +%s) - t1 )) s"; dir=/m/Q8_0 ;;
-        UD-*) get "$pk" -00004-of-00004; stamp "$PLE" 4 4; ln -sf "$PLE" "/m/$pk/Qwen3.8-Flash-Next-$pk-00004-of-00004.gguf"; dir=/m/$pk ;;
+        UD-*) if [ -z "$PLE" ]; then get "$pk"
+              else get "$pk" -00004-of-00004; stamp "$PLE" 4 4; ln -sf "$PLE" "/m/$pk/Qwen3.8-Flash-Next-$pk-00004-of-00004.gguf"; fi
+            dir=/m/$pk ;;
         *) echo "unknown pack $pk"; continue ;;
     esac
     echo "== $pk"
