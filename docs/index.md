@@ -184,6 +184,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   text in two runs. TQ3-D4 decodes at 39.6 tokens per second with 8-bit dense weights (54.4 with 4-bit), TQ3 at 43.
 - [2026-11-06: VRAM that grows with the context on the RTX 4080](results/2026-11-06-context-vram-4080.md): passes of
   8,192 rows at 32K give 474 more cache slots, decode +8% and prompts +43% to +47%. The default under 32 GB of VRAM.
+- [2026-11-06: The release packs from the Hub on the M4 Max](results/2026-11-06-release-downloads-m4max.md): TQ4 at 38
+  to 42 tokens per second, 67 to 69 with 2 drafts. oMLX 49, and 81 to 84 with MTP. The macOS archive passes gate RE.
 
 ## For contributors and agents
 
