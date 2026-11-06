@@ -73,6 +73,9 @@ Release 1 is R1 to R5. R6 and R7 follow as release 1.1 and release 2.
 
 ## Risks
 
+- A stale MLX loader can ship. The P3 and P4 repositories ship the `nanoseedlm_seeds.py` from before `cccbd52`, which
+  gives wrong experts in verify windows of 4 or more tokens. Each repository's `tools/nanoseedlm_*.py` must equal
+  `main`'s at the release commit.
 - The card numbers of speed come from one PC and one Mac.
 - The 4-bit MLX PLE table is not measured against BF16's (trellis plan step T5). The KL of R3 uses Q8_0's table.
 
