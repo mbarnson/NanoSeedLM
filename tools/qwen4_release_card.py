@@ -15,7 +15,7 @@ PACKS = {
     "TQ3-D4": ("trellis K = 3, `down_proj` at K = 4", 3.458, 52.2, 60, 0.0619,
                "A 16 GB GPU with 96 to 128 GB of RAM. A 96 GB Mac", "54.4", "48.8",
                "K = 3 for `gate_proj` and `up_proj`, K = 4 for `down_proj`"),
-    "TQ3": ("trellis K = 3", 3.125, 47.2, 55, 0.0765, "A 16 GB GPU with 64 GB of RAM. A 64 GB Mac", "61.3", "48.8",
+    "TQ3": ("trellis K = 3", 3.125, 47.2, 55, 0.0765, "A 16 GB GPU with 64 GB of RAM. A 96 GB Mac (a 64 GB Mac is not tested)", "61.3", "48.8",
             "K = 3 for `gate_proj`, `up_proj` and `down_proj`"),
 }
 UNSLOTH = [("UD-Q4_K_XL", 5.101, 0.0304), ("UD-IQ4_XS", 3.999, 0.0509), ("UD-Q3_K_XL", 3.720, 0.0593),

@@ -6,7 +6,8 @@ the pack's KL against BF16 as shipped, its speed and the machine that it is for.
 
 **Status.** Draft. Matt approved the release on 2026-11-05. D0 of the dense plan changed release 1: P3's 4-bit MLX
 dense weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)). So the packs take 8-bit
-dense weights (step R2b).
+dense weights (step R2b). R1 to R4 are done, and the folders are in the bucket. Their KL as shipped is 0.0415
+(TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3) ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
 
 ## The family
 

@@ -17,6 +17,7 @@ t0=$(date +%s)
 rm -rf /w/src && mkdir -p /w /m && cp -r "$SRC" /w/src
 cmake -S /w/src -B /w/src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null
 cmake --build /w/src/build --target nslm-qwen4-pack nslm-qwen4-gen 2>&1 | grep -E "error" || true
+mkdir -p /w/bin && cp /w/src/build/bin/nslm-qwen4-pack /w/src/build/bin/nslm-qwen4-gen /w/bin/   # hf_llama_kld.sh rebuilds /w/src
 echo "== builds: $(( $(date +%s) - t0 )) s"
 
 if [ "${PACK:-1}" = 1 ]; then   # PACK=0: test folders that an earlier run packed into OUT
@@ -38,7 +39,7 @@ for p in $PACKS; do
         *) echo "== $p: unknown pack"; continue ;;
     esac
     t0=$(date +%s)
-    /w/src/build/bin/nslm-qwen4-pack --base /m/seed-P3 --tq "$TQBANK/$tq" ${down:+--tq-down "$TQBANK/$down"} --dense8 /m/oq8 --out "$OUT/$p"
+    /w/bin/nslm-qwen4-pack --base /m/seed-P3 --tq "$TQBANK/$tq" ${down:+--tq-down "$TQBANK/$down"} --dense8 /m/oq8 --out "$OUT/$p"
     echo "== $p: packed in $(( $(date +%s) - t0 )) s, $(du -sh "$OUT/$p" | cut -f1), $(ls "$OUT/$p" | wc -l) files"
 done
 rm -rf /m/oq8 /m/seed-P3
@@ -50,7 +51,7 @@ for p in $TESTS; do   # each folder copied to the local disk: a memory map of th
     rm -rf /m/rel && mkdir -p /m/rel && cp -r "$OUT/$p" /m/rel/
     echo "== $p: copied in $(( $(date +%s) - t0 )) s, $(du -sh "/m/rel/$p" | cut -f1)"
     for r in 1 2; do   # gate RC: the same text in two runs
-        /w/src/build/bin/nslm-qwen4-gen --model "/m/rel/$p" --expert-cache-gb -1 --no-think --max-tokens 128 --prompt "$PROMPT" >"/w/$p-$r.txt" 2>"/w/$p-$r.err" || true
+        /w/bin/nslm-qwen4-gen --model "/m/rel/$p" --expert-cache-gb -1 --no-think --max-tokens 128 --prompt "$PROMPT" >"/w/$p-$r.txt" 2>"/w/$p-$r.err" || true
         echo "== $p run $r: md5 $(md5sum <"/w/$p-$r.txt" | cut -c1-8), $(grep -iE 'tok/s|tokens per second' "/w/$p-$r.err" | tail -1)"
     done
     cmp -s "/w/$p-1.txt" "/w/$p-2.txt" && [ -s "/w/$p-1.txt" ] && echo "== $p: the same text in both runs" || { echo "== $p: THE RUNS DIFFER OR FAILED"; tail -5 "/w/$p-1.err"; }

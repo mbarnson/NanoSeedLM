@@ -828,3 +828,9 @@ Read [The trellis family on Hugging Face](plans/2026-11-05-release-family.md).
 against BF16 is 0.182 for P3 and 0.185 for the trellis mix, not 0.060 and 0.062. Top-1 agreement falls from 91.5% to 84%. Unsloth's
 3-bit packs keep their dense weights at Q6_K or Q8_0. So release 1 takes 8-bit dense weights. Read
 [Packs as shipped](results/2026-11-05-dense-as-shipped.md).
+
+## [2026-11-05] result | The release packs as shipped
+
+HF jobs `6aed6ff3` and `6aed75a2`: the three release folders are in the bucket. They hold P3's tensors without its seed
+experts, oQ8e's 8-bit dense modules and the trellis banks. Their KL against BF16 is 0.0415 (TQ4), 0.0638 (TQ3-D4) and
+0.0778 (TQ3). TQ3 gives the same text in two runs on CUDA. Read [The release packs as shipped](results/2026-11-05-release-as-shipped.md).

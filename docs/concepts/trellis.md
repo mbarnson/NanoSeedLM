@@ -11,6 +11,8 @@ trellis mix with P3's quality decodes 27% faster than P3, because its experts ar
 
 KL against BF16 in llama.cpp, with the experts emulated in Unsloth's Q8_0 shards. The last column interpolates
 Unsloth's two nearest packs in log KL. Read [Trellis packs and Unsloth's curve](../results/2026-11-05-trellis-mixes.md).
+The release packs, with their 8-bit dense weights, are 2% to 4% higher
+([as shipped](../results/2026-11-05-release-as-shipped.md)).
 
 | Experts | Bits for each expert weight | Expert GB | Mean KLD | Unsloth's curve at those bits |
 |---|---|---|---|---|

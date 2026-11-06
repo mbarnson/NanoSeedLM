@@ -176,6 +176,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   computed 1MAD. An LFSR code through two tables makes the gathers about 60% slower.
 - [2026-11-05: Packs as shipped](results/2026-11-05-dense-as-shipped.md): the 4-bit MLX dense weights triple the KL
   (P3 0.182, the trellis mix 0.185, against 0.060 and 0.062 with Q8_0 dense weights).
+- [2026-11-05: The release packs as shipped](results/2026-11-05-release-as-shipped.md): with 8-bit dense weights, KL
+  0.0415 (TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3), 2% to 4% above Q8_0 dense weights.
 
 ## For contributors and agents
 
