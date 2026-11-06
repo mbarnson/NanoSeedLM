@@ -5,7 +5,7 @@ MTP head's drafts, as Strata does. Then drafts make decode faster on the RTX 408
 sampler's distribution. Matt's bar for the RTX 4080 is more than 60 tokens per second for one request. This plan is one
 half of that bar. Cheaper verify rows are the other half (see "Verify rows on the RTX 4080").
 
-**Status.** Draft. For v0.1.1, after [MTP drafts in nslm-serve](2026-11-06-serve-drafts.md).
+**Status.** In progress, for v0.1.1. A1 and A2 are on CUDA (branch `claude/sleepy-brown-k67z9u`, `304d415` and `da4e1ce`). Gates GA and GB are next on the RTX 4080.
 
 ## Why
 
@@ -15,9 +15,9 @@ half of that bar. Cheaper verify rows are the other half (see "Verify rows on th
   - At temperature 1.0, 1 draft keeps 55% to 58%, and decode is 2% slower.
 - The rule keeps a fixed draft d, the head's arg max, with probability p(d). This is speculative sampling with a draft
   distribution q of one point.
-- Strata kept 82% of its drafts on the same RTX 4080 ([the probe](../results/2026-11-05-strata-4080-probe.md)). The probe
-  page gives temperature 0 for those requests, and pc-cuda checks it. At temperature 0 the M4 Max kept 165 of 176 of
-  our drafts. So the gap is at temperature 1.0. Strata's code does two things that ours does not do:
+- Strata kept 82% of its drafts on the same RTX 4080 ([the probe](../results/2026-11-05-strata-4080-probe.md)). Those
+  requests were greedy (temperature 0). Strata's defaults are the card's, as ours are. At temperature 0 the M4 Max kept
+  165 of 176 of our drafts. So the gap is at temperature 1.0. Strata's code does two things that ours does not do:
   - It samples the draft from the head's distribution q, and keeps it with probability min(1, p(d) / q(d)).
   - It offers a draft only while the head's probability of it is 0.5 or more (`--spec-min-p 0.5`).
 
