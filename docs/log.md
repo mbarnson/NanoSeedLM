@@ -741,7 +741,7 @@ than the PCIe 4 copy it saves. Plan step D4 closes. Read
 
 ## [2026-11-05] result | Trellis-coded experts against BF16: KL in llama.cpp
 
-`7e442c7`: the CUDA encoder in `nslm-moe --codec tq` encodes all 121 G expert weights at L = 12 in about 5 minutes a K
-on 8 RTX PRO 6000s. At K = 4 (4.125 bits, 62.3 GB) the KL is 0.0398, against P4's 0.0408 at 4.5 bits, and 16% below
+`7e442c7`: `nslm-moe --codec tq` runs the CUDA encoder. On 8 RTX PRO 6000s it encodes all 121 G expert weights at
+L = 12 in about 5 minutes a K. At K = 4 (4.125 bits, 62.3 GB) the KL is 0.0398, against P4's 0.0408 at 4.5 bits, and 16% below
 Unsloth's curve. At K = 3 (3.125 bits, 47.2 GB) it is 0.0765, about 4% below an extrapolation of the curve. A Q8_0 PLE
 table changes the KL by 0.00005. Read [Trellis-coded experts against BF16](results/2026-11-05-trellis-kld.md).
