@@ -136,6 +136,8 @@ while read -r k p s h; do
     echo "$p" >>"$d/.nslm-verified"
 done <<<"$list"
 pline="# the pack's own PLE table"   # run-PACK.sh's line for the table
+dline="# MTP drafts: Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3 (they break even on an RTX 4080)"   # and for the drafts
+[ -n "$mac" ] && dline="export Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3   # 2 MTP drafts: 32% faster on an M4 Max, the same text"
 [ "$ple" = q8 ] && export Q4E_PLE_GGUF="$edir/$E_FILE" && pline="export Q4E_PLE_GGUF=\"$Q4E_PLE_GGUF\""
 
 echo
@@ -147,6 +149,7 @@ cat >"$run" <<EOF
 cd "\$(dirname "\$0")" || exit 1
 echo "NanoSeedLM $pick: an OpenAI-compatible API on http://127.0.0.1:8080/v1 (Ctrl+C stops it)"
 $pline
+$dline
 exec $bin/nslm-serve --model "$dir" --ctx 32768 --port 8080
 EOF
 chmod +x "$run"
