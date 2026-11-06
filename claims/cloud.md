@@ -1,21 +1,24 @@
-# cloud claims (updated 2026-11-06T20:59:34Z)
+# cloud claims (updated 2026-11-06T21:19:11Z)
 
-# cloud claims (updated 2026-11-06T21:00Z)
+# cloud claims (updated 2026-11-06T21:20Z)
 
 **Hand-off.** This cloud session ends here. A new cloud session takes over with a new goal. Keep posting results and messages to `cloud`: the new session reads this branch.
 
-- **Released:** v0.1.0 (tag `47714b8`, a pre-release, published 2026-11-06 20:47Z). Main is `0c20dd9`: only docs since the tag.
-- **Hugging Face cards:** TCQ4 `163d3d5f`, TCQ3-D4 `9be4e986`, TCQ3 `5da7791d`, from `tools/qwen4_release_card.py` on main and the logs in `kld/`. The P3 and P4 cards still need the lead about the LFSR seeds' benefits, with long-run numbers. P3's long runs are in `results/2026-11-06-long-bench-m4max.md` on main. P4 waits for mac-metal.
+- **Released:** v0.1.0 (tag `47714b8`, a pre-release, published 2026-11-06 20:47Z). Main is `fb1504f`: only docs and tools since the tag.
+- **Hugging Face cards:** all five come from `tools/qwen4_release_card.py` on main (`fb1504f`) and the logs in `kld/`: TCQ4 `d537b68f`, TCQ3-D4 `e8ce9331`, TCQ3 `8bcc960c`, P4 `aaae240c`, P3 `70654748`.
+  - Each card has the same sections: which pack for which machine, the family table, the trade-offs, long-run decode and "Why NanoSeedLM".
+  - To change a number, edit the generator's PACKS or SPEED table and upload all five again.
+  - Open: P4's long runs and its KL as shipped (mac-metal's P4 runs). TCQ3 on a 12 GB GPU (pc-cuda, emulated: msgs/...tcq3-12gb-emulated).
 - **Branch `claude/sleepy-brown-k67z9u` `da4e1ce`, for v0.1.1:** linux PASS, windows PASS, macos PASS at `73abfdf` (not yet at `da4e1ce`).
   - It has: plan K (the BF16 KV cache), the PLE emulator (`ple:TIER`), one sampler (`harness/sample.c`), and drafts in nslm-serve and nslm-chat at any temperature (`eng_generate_pick`).
   - It also has: the draft gate (`Q4E_DRAFT_MIN_P`, A1), drafts sampled from the head's q (A2), and `nslm/rng.h`.
   - Merge to main when macos passes `da4e1ce`, with `mac/qwen4-merged-proj` `b80abc4`. Then set VERSION 0.1.1 to start the next draft.
 - **Open gates:**
-  - pc-cuda: GA and GB on the RTX 4080 (`docs/plans/2026-11-06-draft-acceptance.md`), then Strata at temperature 1.0.
+  - pc-cuda: GA and GB on the RTX 4080 (`docs/plans/2026-11-06-draft-acceptance.md`), then Strata at temperature 1.0, then TCQ3 on an emulated 12 GB GPU.
   - mac-metal: macos at `da4e1ce`, gate SC on the M4 Max, the P4 numbers, the Metal PLE row fix, A1m and A2m.
 - **Pending:**
   - R8: the signing secrets go into a `release` environment (`docs/plans/2026-11-05-release-family.md`).
-  - Pin the new HF revisions in the start scripts, and show GB in decimal (pc-cuda's nit), with v0.1.1. The scripts must also drop the empty line in pack mode.
+  - With v0.1.1, in the start scripts: pin the new HF revisions, show GB in decimal (pc-cuda's nit), drop the empty line in pack mode, and say "a 12 or 16 GB GPU" for TCQ3.
   - A results page for gates SC, GA and GB.
 - **Proposed next goal (Matt to confirm):**
   - On an RTX 4080 with a TCQ pack, more than 60 tok/s for one request at the card's defaults, and more than 60 in aggregate in nslm-serve.
