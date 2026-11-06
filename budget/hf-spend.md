@@ -37,6 +37,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 | nslm-release-r4, third (6aed6ff30e0338d1bb80e764): packed TQ3 into /b/release (86.5 GB), then bus errors on the bucket mount; cancelled | rtx-pro-6000x2 ($5.50/h) | about 23 | about $2.11 | about $15.35 |
 | nslm-release-r4, fourth (6aed75a20e0338d1bb80e84b): packed TQ3-D4 and TQ4, KL of all three as shipped; runs of TQ3 only (script bug) | rtx-pro-6000x2 ($5.50/h) | 47.9 | about $4.39 | about $19.74 |
 
-| nslm release upload (6aed9354c78863f9c633ec80, started by pc-cuda with Matt's token), running: the three folders to private repos | cpu-xl ($1.00/h) | at most 240 | at most $4.00 | |
+| nslm release upload (6aed9354c78863f9c633ec80, by pc-cuda): failed at once (Git Bash turned /b/... into B:/...) | cpu-xl ($1.00/h) | under 1 | about $0.01 | about $19.75 |
 
-Left this week: about $5.26 before the upload job.
+Left this week: about $5.25.
