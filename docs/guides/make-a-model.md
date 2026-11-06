@@ -105,6 +105,14 @@ A mix takes `down_proj`'s banks from another K with `--tq-down`. For example, `g
 out/bin/nslm-qwen4-pack --base P3_DIR --tq out/tq3 --tq-down out/tq4 --out TQ3_D4_DIR
 ```
 
+`--dense8 DIR` takes the quantized modules of an 8-bit MLX folder in place of the base's 4-bit ones, but not the PLE
+table. The packer writes groups of 128 as two groups of 64 with the same scale and bias, so the weights do not change.
+The 4-bit MLX dense weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-shipped.md)).
+
+```bash
+out/bin/nslm-qwen4-pack --base P3_DIR --tq out/tq3 --tq-down out/tq4 --dense8 OQ8E_DIR --out TQ3_D4_DIR
+```
+
 A seed pack's folder, whole, with the bank files beside its shards also works. Hard links save the disk space.
 
 ## MLA projections

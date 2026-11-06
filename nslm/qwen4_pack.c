@@ -1,7 +1,8 @@
 // nslm/qwen4_pack.c - nslm-qwen4-pack: an MLX qwen4_exp base folder with each layer's switch_mlp replaced by seeds, or
-// (--tq) by trellis banks beside the shards (nslm_qwen4_pack_tq: no loader; --tq-down: down_proj's banks).
+// (--tq) by trellis banks beside the shards (nslm_qwen4_pack_tq: no loader; --tq-down: down_proj's banks; --dense8: the
+// quantized modules of an 8-bit MLX folder).
 //   nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR) --out DIR [--loader tools/nanoseedlm_qwen4.py] [--shard-gb 4.5]
-//   nslm-qwen4-pack --base DIR --tq DIR [--tq-down DIR] --out DIR [--shard-gb 4.5]
+//   nslm-qwen4-pack --base DIR --tq DIR [--tq-down DIR] [--dense8 DIR] --out DIR [--shard-gb 4.5]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,12 +120,15 @@ int main(int argc, char** argv) {
     const char* tq = opt(argc, argv, "--tq", NULL);
     if (tq && base && out && !blk) {
         char e[512];
-        if (nslm_qwen4_pack_tq(base, tq, opt(argc, argv, "--tq-down", NULL), out, shard, e, sizeof e)) { fprintf(stderr, "%s\n", e); return 1; }
+        if (nslm_qwen4_pack_tq(base, tq, opt(argc, argv, "--tq-down", NULL), opt(argc, argv, "--dense8", NULL), out, shard, e, sizeof e)) {
+            fprintf(stderr, "%s\n", e);
+            return 1;
+        }
         printf("wrote %s: %s's tensors without the routed experts, and the trellis banks of %s\n", out, base, tq);
         return 0;
     }
     if (!base || !out || !blk3 == !blk4) {
-        fprintf(stderr, "usage: nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR | --tq DIR [--tq-down DIR]) --out DIR [--loader FILE] [--shard-gb 4.5]\n");
+        fprintf(stderr, "usage: nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR | --tq DIR [--tq-down DIR] [--dense8 DIR]) --out DIR [--loader FILE] [--shard-gb 4.5]\n");
         return 2;
     }
     FILE* lf = fopen(loader, "rb");   // before the pack's hours, not after

@@ -240,14 +240,18 @@ int main(void) {
         CHECK(t && t->enc == NS_TCQ && m.n == 5, "bank L1 (no layer 0) not added as layer 1 (%d tensors)", m.n);
         ns_close(&m);
         // nslm-qwen4-pack --tq: the base without its routed experts (a layer's, the head's), plus the banks of layers 0 and 1
-        const NsSpec bs[5] = {{"language_model.model.layers.0.linear_attn.out_proj.weight", NS_RAW, 1, 1, 1},
+        const NsSpec bs[8] = {{"language_model.model.layers.0.linear_attn.out_proj.weight", NS_RAW, 1, 1, 1},
                               {"language_model.model.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1},
                               {"language_model.model.layers.0.mlp.gate.weight", NS_RAW, 1, 1, 1},
-                              {"mtp.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1}, {"mtp.layers.0.mlp.gate.weight", NS_RAW, 1, 1, 1}};
-        const NsRaw br[5] = {{"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}};
+                              {"mtp.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1}, {"mtp.layers.0.mlp.gate.weight", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.0.linear_attn.in_proj_z.weight", NS_RAW, 1, 1, 1},   // 4-bit, groups of 32
+                              {"language_model.model.layers.0.linear_attn.in_proj_z.scales", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.0.linear_attn.in_proj_z.biases", NS_RAW, 1, 1, 1}};
+        const NsRaw br[8] = {{"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4},
+                             {"U32", 2, {1, 16}, 64}, {"BF16", 2, {1, 4}, 8}, {"BF16", 2, {1, 4}, 8}};
         mkdir("out/test_moe_qbase", 0755);
         mkdir("out/test_moe_qbanks", 0755);
-        CHECK(ns_write_raw("out/test_moe_qbase", bs, br, 5, 1u << 20, NULL, seq_fill, NULL, berr, sizeof berr) == 0, "base: %s", berr);
+        CHECK(ns_write_raw("out/test_moe_qbase", bs, br, 8, 1u << 20, NULL, seq_fill, NULL, berr, sizeof berr) == 0, "base: %s", berr);
         f = fopen("out/test_moe_qbase/config.json", "wb");
         fputs("{\"model_type\": \"qwen4_exp\", \"hidden_size\": 8, \"moe_intermediate_size\": 8, \"num_experts\": 2, \"num_hidden_layers\": 1, "
               "\"model_file\": \"nanoseedlm_qwen4.py\", \"quantization\": {\"group_size\": 32, "
@@ -265,13 +269,13 @@ int main(void) {
                 fwrite(&h, sizeof h, 1, f); fwrite(rel, 4, 2 * E, f); fwrite(words, 4, nw * E * R, f); fwrite(sc, 2, E * R * NB, f);
                 fclose(f);
             }
-        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_qpack", 1u << 20, berr, sizeof berr) == 0,
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, "out/test_moe_qpack", 1u << 20, berr, sizeof berr) == 0,
               "pack: %s", berr);
-        CHECK(ns_open(&m, "out/test_moe_qpack", berr, sizeof berr) == 0 && m.n == 3 && ns_add_banks(&m, "out/test_moe_qpack", berr, sizeof berr) == 0,
+        CHECK(ns_open(&m, "out/test_moe_qpack", berr, sizeof berr) == 0 && m.n == 4 && ns_add_banks(&m, "out/test_moe_qpack", berr, sizeof berr) == 0,
               "packed folder: %s", berr);
         t = ns_find(&m, "language_model.model.layers.0.linear_attn.out_proj.weight");
         const NsTensor* hu = ns_find(&m, "mtp.layers.0.mlp.switch_mlp.up_proj.weight");
-        CHECK(t && t->s[0].len == 4 && t->s[0].p[0] == 0 && t->s[0].p[3] == 3 && hu && hu->enc == NS_TCQ && m.n == 9,
+        CHECK(t && t->s[0].len == 4 && t->s[0].p[0] == 0 && t->s[0].p[3] == 3 && hu && hu->enc == NS_TCQ && m.n == 10,
               "packed tensors: %d, the head's up_proj %s", m.n, hu ? "trellis" : "missing");
         ns_close(&m);
         FILE* cf = fopen("out/test_moe_qpack/config.json", "rb");
@@ -281,8 +285,41 @@ int main(void) {
         cf = fopen("out/test_moe_qpack/LICENSE", "rb");
         CHECK(cf != NULL, "LICENSE not copied");
         if (cf) fclose(cf);
+        // --dense8: in_proj_z from an 8-bit folder in one group of 128, packed as two groups of 64 with the same weights
+        const NsSpec ds[3] = {{"language_model.model.layers.0.linear_attn.in_proj_z.weight", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.0.linear_attn.in_proj_z.scales", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.0.linear_attn.in_proj_z.biases", NS_RAW, 1, 1, 1}};
+        const NsRaw dr[3] = {{"U32", 2, {1, 32}, 128}, {"BF16", 2, {1, 1}, 2}, {"BF16", 2, {1, 1}, 2}};
+        mkdir("out/test_moe_q8", 0755);
+        CHECK(ns_write_raw("out/test_moe_q8", ds, dr, 3, 1u << 20, NULL, seq_fill, NULL, berr, sizeof berr) == 0, "8-bit folder: %s", berr);
+        f = fopen("out/test_moe_q8/config.json", "wb");
+        fputs("{\"quantization\": {\"group_size\": 64, \"bits\": 8, \"language_model.model.layers.0.linear_attn.in_proj_z\": "
+              "{\"group_size\": 128, \"bits\": 8}}}", f);
+        fclose(f);
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_q8", "out/test_moe_qpack8", 1u << 20, berr,
+                                 sizeof berr) == 0, "pack with --dense8: %s", berr);
+        CHECK(ns_open(&m, "out/test_moe_qpack8", berr, sizeof berr) == 0, "packed --dense8 folder: %s", berr);
+        t = ns_find(&m, "language_model.model.layers.0.linear_attn.in_proj_z.weight");
+        CHECK(t && t->enc == NS_Q8 && t->group == 64 && t->rows == 1 && t->cols == 128, "in_proj_z: enc %d group %d cols %d", t ? t->enc : -1,
+              t ? t->group : 0, t ? t->cols : 0);
+        if (t && t->enc == NS_Q8) {   // seq_fill: weight bytes 0..127, the scale's bytes 0, 1 and the bias's 0, 1 (BF16 0x0100)
+            NsRows* r8 = (NsRows*) malloc(sizeof *r8);
+            ns_rows_init(r8);
+            float w8[128];
+            ns_row_f32(r8, t, 0, 0, 0, w8);
+            const float sb = nslm_bf2f(0x0100);
+            int ok = 1;
+            for (int c = 0; c < 128; ++c) ok &= w8[c] == sb * (float) c + sb;
+            CHECK(ok, "in_proj_z's weights differ from the 8-bit folder's");
+            free(r8);
+        }
+        ns_close(&m);
+        cf = fopen("out/test_moe_qpack8/config.json", "rb");
+        cb[0] = 0;
+        if (cf) { cb[fread(cb, 1, sizeof cb - 1, cf)] = 0; fclose(cf); }
+        CHECK(strstr(cb, "\"language_model.model.layers.0.linear_attn.in_proj_z\": {") && strstr(cb, "\"bits\": 8"), "config: %s", cb);
         remove("out/test_moe_qbanks/L1_down_proj.blkt");   // a missing bank: refused
-        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_qpack2", 1u << 20, berr, sizeof berr) != 0 &&
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, "out/test_moe_qpack2", 1u << 20, berr, sizeof berr) != 0 &&
               strstr(berr, "L1_down_proj"), "a missing head bank: %s", berr);
         free(nr); free(words); free(y);
     }
