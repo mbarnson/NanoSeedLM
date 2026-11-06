@@ -46,7 +46,7 @@ oMLX cannot load these packs in this release.
 | R2 | `nslm-qwen4-pack --tq`: P3's folder without its experts, plus a pack's banks and `LICENSE` (done, `99cf18a`) | cloud | RA |
 | R2b | `nslm-qwen4-pack --dense8 DIR`: the dense tensors of an 8-bit MLX folder, its groups of 128 split into 64 | cloud | RA |
 | R3 | The KL against BF16 of each pack as shipped (`NAME/mlx` in `tools/hf_llama_kld.sh`) | cloud, HF | RB |
-| R4 | The three folders, built in the bucket by an HF job, and a run of each on an RTX PRO 6000 | cloud, HF | RC |
+| R4 | The three folders, built in the bucket by an HF job (`tools/hf_release_pack.sh`), and two runs of each on an RTX PRO 6000 | cloud, HF | RC |
 | R5 | The upload job to three private repositories, a download and run on the PC and on the Mac, then public | pc-cuda, mac-metal | RD |
 | R6 | `start-here.bat` and `start-here.sh`, as Strata's: check the PC, pick a pack, download the engine and the pack, start `nslm-serve` | cloud, pc-cuda | RE |
 | R7 | Trellis kernels in the MLX loader, and a test in oMLX | mac-metal | RF |
@@ -55,7 +55,7 @@ oMLX cannot load these packs in this release.
   full folder.
 - **RB.** Each pack's KL as shipped is on its card. The KL of TQ3-D4 as shipped is at most 5% above its KL with
   Q8_0 dense weights (0.0619).
-- **RC.** Each folder gives the same text in two runs, and the text of its banks beside P3's folder.
+- **RC.** Each folder gives the same text in two runs.
 - **RD.** On the RTX 4080 and the M4 Max, `hf download` and one command give the same text as RC.
 - **RE.** On a Windows PC with no NanoSeedLM, the script reaches a chat in one run.
 - **RF.** mlx-vlm with `--trust-remote-code` gives the text of the Metal engine within BF16 rounding.
