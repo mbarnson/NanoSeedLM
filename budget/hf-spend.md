@@ -39,6 +39,8 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | nslm release upload (6aed9354c78863f9c633ec80, by pc-cuda): failed at once (Git Bash turned /b/... into B:/...) | cpu-xl ($1.00/h) | under 1 | about $0.01 | about $19.75 |
 
-| nslm release upload again (6aed93be0e0338d1bb80efb1, by pc-cuda, MSYS_NO_PATHCONV=1), running | cpu-xl ($1.00/h) | at most 240 | at most $4.00 | |
+| nslm release upload again (6aed93be0e0338d1bb80efb1, by pc-cuda, MSYS_NO_PATHCONV=1): no bytes moved, then EIO (hf upload read the bucket mount; my script bug) | cpu-xl ($1.00/h) | 56.4 | about $0.94 | about $20.69 |
 
-Left this week: about $5.25 before the upload job.
+| nslm release upload, third (src-29a76aa: a local copy first), not started | cpu-xl ($1.00/h) | at most 180 | at most $3.00 | |
+
+Left this week: about $4.31 before the third upload job.
