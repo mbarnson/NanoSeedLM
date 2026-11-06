@@ -26,6 +26,8 @@ Write-Host "GPU: $($g[0]), $vram GB, driver $($g[2]). RAM: $ram GB."
 if ([int]$g[2].Split('.')[0] -lt 570) { Fail "The driver is older than 570 (CUDA 12.8). Update it: https://www.nvidia.com/drivers" }
 if ($vram -lt 12) { Write-Host "Warning: less than 12 GB of VRAM. The engine may not fit." -ForegroundColor Yellow }
 
+# Unsloth's Q8_0 PLE table: the KL on the model cards is with it. NSLM_PLE=pack keeps the pack's 4-bit table
+$eRepo, $eRev, $eFile = 'unsloth/Qwen3.8-Flash-Next-GGUF', 'd96201194f103c906994f283f504209dc8d2a10c', 'engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file'
 function Fits($have, $size) { $have -ge 0.9 * $size }   # a 64 GB PC may report 62 GB: 90% of a size counts as that size
 $rec = $null
 foreach ($n in $packs.Keys) { $p = $packs[$n]; if (-not $rec -and (Fits $ram $p[2]) -and (Fits $vram $p[3])) { $rec = $n } }
@@ -34,6 +36,7 @@ Write-Host "`nPacks (KL against BF16: lower is closer to the original model):"
 Write-Host "  TQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TQ4'][4]) GB download)"
 Write-Host "  TQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TQ3-D4'][4]) GB download)"
 Write-Host "  TQ3     0.0778  for a 16 GB GPU with 64 GB of RAM ($($packs['TQ3'][4]) GB download)"
+Write-Host "Each pack runs with Unsloth's Q8_0 PLE table (54.4 GB more), as on the model cards. NSLM_PLE=pack skips it."
 $pick = $Pack
 if (-not $pick) { $pick = Read-Host "Pack [$rec]" }
 if (-not $pick) { $pick = $rec }
@@ -42,23 +45,35 @@ $root = $ModelDir
 if (-not $root -and -not $Pack) { $root = Read-Host "Model folder [$here\models]" }
 if (-not $root) { $root = "$here\models" }
 $repo, $rev = $packs[$pick][0], $packs[$pick][1]
-$dir = Join-Path $root ($repo.Split('/')[1])
-New-Item -ItemType Directory -Force $dir | Out-Null
+$dir, $edir = (Join-Path $root ($repo.Split('/')[1])), (Join-Path $root ($eRepo.Split('/')[1]))
+$ple = if ($env:NSLM_PLE) { $env:NSLM_PLE } else { 'q8' }
+if ($ple -eq 'q8' -and -not $Pack -and (Read-Host "Also download Unsloth's Q8_0 PLE table (54.4 GB), as on the model card? [Y/n]") -match '^[nN]') { $ple = 'pack' }
+if ($ple -ne 'q8') { $edir = $dir }
+New-Item -ItemType Directory -Force $dir, $edir | Out-Null
 
-# the pack's files at the pinned revision, each checked by size and SHA-256 (verified ones are listed in .nslm-verified)
+# the files at their pinned revisions, each checked by size and SHA-256 (verified ones are listed in .nslm-verified)
 $hdr = @{}
 $auth = @()
 if ($env:HF_TOKEN) { $hdr['Authorization'] = "Bearer $env:HF_TOKEN"; $auth = @('-H', "Authorization: Bearer $env:HF_TOKEN") }
-$tree = Invoke-RestMethod -Headers $hdr "https://huggingface.co/api/models/$repo/tree/$($rev)?recursive=true"   # PowerShell 5.1: one array object
-$files = @($tree | Where-Object { $_.type -eq 'file' -and -not $_.path.StartsWith('.') })
-$okf = Join-Path $dir '.nslm-verified'
+function Files($r, $v, $d, $sub) {   # the files of repository r at revision v (under sub), to download into folder d
+    $u = "https://huggingface.co/api/models/$r/tree/$v" + $(if ($sub) { "/$sub" }) + '?recursive=true'
+    $t = Invoke-RestMethod -Headers $hdr $u   # PowerShell 5.1: one array object
+    @($t | Where-Object { $_.type -eq 'file' -and -not $_.path.StartsWith('.') } | ForEach-Object {
+        [pscustomobject]@{ r = $r; v = $v; d = $d; path = $_.path; size = $_.size; oid = $(if ($_.lfs) { $_.lfs.oid }) } })
+}
+$files = @(Files $repo $rev $dir)
+if ($ple -eq 'q8') {
+    $e = @(Files $eRepo $eRev $edir ($eFile.Split('/')[0]) | Where-Object { $_.path -eq $eFile })
+    if (-not $e) { Fail "Cannot find $eFile in $eRepo." }
+    $files += $e
+}
 $ok = @{}
-if (Test-Path $okf) { Get-Content $okf | ForEach-Object { $ok[$_] = 1 } }
+foreach ($d in @($dir, $edir)) { $okf = Join-Path $d '.nslm-verified'; if (Test-Path $okf) { Get-Content $okf | ForEach-Object { $ok["$d|$_"] = 1 } } }
 $check, $need = 0, 0   # files to check; bytes to download (a partial file resumes)
 foreach ($f in $files) {
-    if ($ok.ContainsKey($f.path)) { continue }
+    if ($ok.ContainsKey("$($f.d)|$($f.path)")) { continue }
     $check += 1
-    $dst = Join-Path $dir $f.path
+    $dst = Join-Path $f.d $f.path
     $have = 0
     if (Test-Path $dst) { $have = (Get-Item $dst).Length }
     if ($have -gt $f.size) { Remove-Item $dst; $have = 0 }
@@ -66,29 +81,31 @@ foreach ($f in $files) {
 }
 $free = (Get-Item $dir).PSDrive.Free
 if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N0} GB free." -f ($need / 1GB), ($free / 1GB)) }
-Write-Host ("`n{0}: {1} files to check, {2:N1} GB to download into {3}" -f $repo, $check, ($need / 1GB), $dir)
+Write-Host ("`n{0} files to check, {1:N1} GB to download into {2}" -f $check, ($need / 1GB), $root)
 if ($need -gt 1GB -and -not $Pack -and (Read-Host "Start? [Y/n]") -match '^[nN]') { Write-Host "Stopped. Run START-HERE.bat again."; exit 0 }
 if ($need -gt 1GB -and $Pack) { Write-Host "The download starts in 5 s (Ctrl+C stops it)."; Start-Sleep 5 }   # a folder typo
 $i = 0
 foreach ($f in $files) {
     $i += 1
-    if ($ok.ContainsKey($f.path)) { continue }
-    $dst = Join-Path $dir $f.path
+    if ($ok.ContainsKey("$($f.d)|$($f.path)")) { continue }
+    $dst = Join-Path $f.d $f.path
     New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
     $have = 0
     if (Test-Path $dst) { $have = (Get-Item $dst).Length }
     Write-Host ("[{0}/{1}] {2} ({3:N1} GB)" -f $i, $files.Count, $f.path, ($f.size / 1GB))
     if ($have -ne $f.size) {
-        & curl.exe -fL --retry 5 -C - --progress-bar @auth -o $dst "https://huggingface.co/$repo/resolve/$rev/$($f.path)"
+        & curl.exe -fL --retry 5 -C - --progress-bar @auth -o $dst "https://huggingface.co/$($f.r)/resolve/$($f.v)/$($f.path)"
         if ($LASTEXITCODE) { Fail "The download of $($f.path) stopped (curl $LASTEXITCODE). Run START-HERE.bat again to resume." }
     }
     if ((Get-Item $dst).Length -ne $f.size) { Fail "$($f.path) has the wrong size. Run START-HERE.bat again." }
-    if ($f.lfs -and (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -ne $f.lfs.oid) {
+    if ($f.oid -and (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -ne $f.oid) {
         Remove-Item $dst
         Fail "$($f.path) failed its SHA-256 check and was removed. Run START-HERE.bat again."
     }
-    Add-Content $okf $f.path
+    Add-Content (Join-Path $f.d '.nslm-verified') $f.path
 }
+$pline = 'rem the pack''s own PLE table'
+if ($ple -eq 'q8') { $env:Q4E_PLE_GGUF = Join-Path $edir $eFile; $pline = "set `"Q4E_PLE_GGUF=$env:Q4E_PLE_GGUF`"" }
 
 Write-Host "`nThe pack is ready. One short chat:"
 & build\bin\nslm-chat.exe --model $dir --no-think --max-tokens 64 "Say hello in one short sentence."
@@ -96,7 +113,7 @@ if ($LASTEXITCODE) { Fail "nslm-chat failed. See the message above." }
 $run = Join-Path $here "run-$pick.bat"
 Set-Content -Encoding ascii $run @(
     '@echo off', 'cd /d "%~dp0"',
-    "echo NanoSeedLM $pick`: an OpenAI-compatible API on http://127.0.0.1:8080/v1 (Ctrl+C stops it)",
+    "echo NanoSeedLM $pick`: an OpenAI-compatible API on http://127.0.0.1:8080/v1 (Ctrl+C stops it)", $pline,
     "build\bin\nslm-serve.exe --model `"$dir`" --ctx 32768 --port 8080", 'pause')
 Write-Host "`nWrote $run. Next time, run it to start the server at once."
 & cmd /c $run

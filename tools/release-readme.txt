@@ -8,7 +8,8 @@ Requirements:
 To start: double-click START-HERE.bat (Windows), or run ./start-here.sh (Linux, macOS). It checks this machine,
 recommends a pack, downloads and checks it, chats once, writes run-PACK.bat (or run-PACK.sh) and starts the server on
 http://127.0.0.1:8080/v1. Run it again to resume a download. Arguments skip the questions, for example
-START-HERE.bat TQ3-D4 D:\models or ./start-here.sh TQ4 ~/models.
+START-HERE.bat TQ3-D4 D:\models or ./start-here.sh TQ4 ~/models. It also downloads Unsloth's Q8_0 PLE table
+(54.4 GB, read from the disk), because the KL on the model cards is with that table. NSLM_PLE=pack skips it.
 
 To run by hand, run the commands from this folder. The binaries are in build/bin (Windows, Linux) or out/bin
 (macOS, with the Metal kernels in out/res). The macOS binaries are signed with a Developer ID and notarized by Apple.
