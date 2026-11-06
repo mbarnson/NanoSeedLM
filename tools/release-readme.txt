@@ -11,7 +11,9 @@ http://127.0.0.1:8080/v1. Run it again to resume a download. Arguments skip the 
 START-HERE.bat TQ3-D4 D:\models or ./start-here.sh TQ4 ~/models.
 
 To run by hand, run the commands from this folder. The binaries are in build/bin (Windows, Linux) or out/bin
-(macOS, with the Metal kernels in out/res). Download a model first, for example:
+(macOS, with the Metal kernels in out/res). Apple does not sign them. If a browser downloaded the macOS archive,
+start-here.sh clears its quarantine. By hand, run xattr -dr com.apple.quarantine out first. Download a model, for
+example:
 
   hf download txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4 --local-dir Qwen3.8-Flash-Next-NanoSeedLM-TQ3-D4
 
