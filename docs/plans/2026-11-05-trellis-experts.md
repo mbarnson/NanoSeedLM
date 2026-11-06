@@ -4,12 +4,11 @@
 NanoSeedLM gets better quality and speed at a given VRAM or RAM footprint. On the RTX 4080, 2-bit experts would also
 double the expert cache's slots.
 
-**Status.** T1 done ([weight error](../results/2026-11-05-trellis-probe.md)). Gate TA passes at 3.1 bits (0.0158 against
-IQ3_S's 0.0182) and misses by 1% at 2.1 bits (0.0609 against IQ2_S's 0.0602). So the 2-bit target stops, and T2 goes on
-with K = 3 and 4. T2 runs on the Mac, not on the RTX 4080. The CPU encoder (`nslm-moe --codec tq`) writes the same
-words as the C reference. Built with Clang, it encodes about 230,000 weights a second on one thread at L = 12 (the
-cloud container). GCC builds do not vectorize its search, and they are about 7 times slower. A Metal encoder may be
-faster. T3 preview on the M4 Max: a trellis matvec at L = 16 is as fast as P3's at each K.
+**Status.** T1 done ([weight error](../results/2026-11-05-trellis-probe.md)). T2 done at L = 12
+([KL against BF16](../results/2026-11-05-trellis-kld.md)). Gate TB passes. K = 4 (4.125 bits) has a KL of 0.0398,
+16% below Unsloth's curve and below P4's 0.0408. K = 3 (3.125 bits) has 0.0765, 4% below an extrapolated curve. The
+CUDA encoder on 8 GPUs encodes one K in about 5 minutes, so encodes run on HF. Next: T3 (decode in the engine) and T4
+(packs mixed by layer or by use). A Q8_0 PLE table passes gate TP in llama.cpp (T5).
 
 ## The method
 

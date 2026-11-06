@@ -148,6 +148,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   CPU experts a layer. A CPU expert costs more than the PCIe 4 copy it saves.
 - [2026-11-05: Trellis-coded experts: weight error](results/2026-11-05-trellis-probe.md): at 3.1 and 4.1 bits a trellis
   has less weighted error than ggml's IQ3_S (3.44 bits) and IQ4_XS (4.25 bits). It saves about 0.4 to 0.5 bits a weight.
+- [2026-11-05: Trellis-coded experts against BF16: KL](results/2026-11-05-trellis-kld.md): at 4.125 bits the KL is
+  0.0398, 16% below Unsloth's curve and below P4's. At 3.125 bits it is 0.0765, near the curve. A Q8_0 PLE table adds no KL.
 
 ## For contributors and agents
 
