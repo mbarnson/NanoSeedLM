@@ -7,8 +7,9 @@ double the expert cache's slots.
 **Status.** T1 and T2 done, T4 in part ([KL against BF16](../results/2026-11-05-trellis-kld.md),
 [mixes and the corrected curve](../results/2026-11-05-trellis-mixes.md)). Gate TB passes at every bit rate that
 Unsloth's curve covers. K = 4 (4.125 bits) is 17% below the curve, and K = 3 (3.125 bits) is 16% below. K = 4 for
-`down_proj` with K = 3 for the rest (3.46 bits) is 10% below. K = 2 (2.13 bits) has a KL of 0.204. Next: T3, decode
-speed in the engine on the RTX 4080 and the M4 Max. Then T6 with a 2-bit mix that has more K = 3.
+`down_proj` with K = 3 for the rest (3.46 bits) is 10% below. K = 2 (2.13 bits) has a KL of 0.204. T3: gate TC
+passes on the RTX 4080 ([speed](../results/2026-11-05-trellis-speed-4080.md)). The mix decodes 27% faster than P3 at
+P3's KL, and K = 3 43% faster. K = 4 is 8% slower. Next: the M4 Max runs, then T6 with a 2-bit mix.
 
 ## The method
 

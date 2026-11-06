@@ -752,3 +752,10 @@ table changes the KL by 0.00005. Read [Trellis-coded experts against BF16](resul
 the corrected curve, the trellis is 16% below it at 3.125 bits and 17% below at 4.125 bits. K = 4 for `down_proj` and
 K = 3 for the rest gives 0.0619 at 3.46 bits, 10% below. K = 2 gives 0.204 at 2.13 bits. Read
 [Trellis packs and Unsloth's curve](results/2026-11-05-trellis-mixes.md).
+
+## [2026-11-05] result | Trellis experts on the RTX 4080: faster than P3 at P3's quality
+
+`54a7130`, pc-cuda's RTX 4080, the automatic expert cache: trellis experts with `down_proj` at K = 4 and the rest at
+K = 3 decode at 49.7 tokens per second, against P3's 39.1 (+27%). Prompts are 22% faster, and the KL is about P3's
+(0.0619 against 0.0600). K = 3 is 43% faster at a KL of 0.0765, and K = 4 is 8% slower. Read
+[Trellis experts on the RTX 4080](results/2026-11-05-trellis-speed-4080.md).

@@ -3,8 +3,9 @@
 A trellis code stores the experts of Qwen3.8-Flash-Next as a bit stream instead of one code for each weight. Each
 weight reads a short window of the stream, and a fixed function turns the window into a value. Neighbouring weights
 share most of their window bits, so the encoder must choose all the bits of a block together. A Viterbi search does
-that. At about 4 bits for each weight, trellis-coded experts come closer to the original model than our seeds. They
-also beat Unsloth's packs of the same size. The GPU computes each weight from its window, as it does for seeds.
+that. At each size from 3 to 4 bits for each weight, trellis-coded experts come closer to the original model than
+Unsloth's packs and our seeds. The GPU computes each weight from its window, as it does for seeds. On an RTX 4080, a
+trellis mix with P3's quality decodes 27% faster than P3, because its experts are smaller.
 
 ## Key numbers
 
@@ -20,6 +21,16 @@ Unsloth's two nearest packs in log KL. Read [Trellis packs and Unsloth's curve](
 | Trellis K = 3, L = 12 | 3.125 | 47.2 | 0.0765 | 0.0916 |
 | Trellis K = 2 + 3 (used experts at K = 3) | 2.465 | 37.2 | 0.164 | (no Unsloth pack this small) |
 | Trellis K = 2, L = 12 | 2.133 | 32.2 | 0.204 | (no Unsloth pack this small) |
+
+Decode and prompt in the engine on the RTX 4080, with the automatic expert cache. Read
+[Trellis experts on the RTX 4080](../results/2026-11-05-trellis-speed-4080.md).
+
+| Experts | Decode, tokens per second | Prompt of 2,994 tokens, tokens per second |
+|---|---|---|
+| P3 seeds | 39.1 | 642 |
+| Trellis K = 4 | 35.7 (-8%) | 608 |
+| Trellis K = 3 + 4 (`down_proj` at K = 4) | 49.7 (+27%) | 781 (+22%) |
+| Trellis K = 3 | 56.0 (+43%) | 1,036 (+61%) |
 
 Speed of one expert matvec call (gate and up, one token, 10 experts). These are kernel benches, not decode in the
 engine.
@@ -83,6 +94,7 @@ shared memory, then uses the same tensor-core GEMM as the seeds. The Metal kerne
 - [Trellis-coded experts: weight error](../results/2026-11-05-trellis-probe.md): one layer, against ggml's types.
 - [Trellis-coded experts against BF16](../results/2026-11-05-trellis-kld.md): the whole model in llama.cpp.
 - [Trellis packs and Unsloth's curve](../results/2026-11-05-trellis-mixes.md): 2 to 4 bits, mixes, the corrected curve.
+- [Trellis experts on the RTX 4080](../results/2026-11-05-trellis-speed-4080.md): decode and prompt against P3.
 
 ## See also
 

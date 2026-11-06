@@ -154,6 +154,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   0.0398, 16% below Unsloth's curve and below P4's. At 3.125 bits it is 0.0765, near the curve. A Q8_0 PLE table adds no KL.
 - [2026-11-05: Trellis packs at 2 to 4 bits and Unsloth's curve, corrected](results/2026-11-05-trellis-mixes.md): 16%
   and 17% below the curve at 3.125 and 4.125 bits. `down_proj` at K = 4 gives 0.0619 at 3.46 bits.
+- [2026-11-05: Trellis experts on the RTX 4080: decode and prompt against P3](results/2026-11-05-trellis-speed-4080.md):
+  the mix with P3's KL decodes 27% faster and reads prompts 22% faster. K = 3 is 43% and 61% faster.
 
 ## For contributors and agents
 
