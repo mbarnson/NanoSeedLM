@@ -22,6 +22,10 @@ if [ "$(uname -s)" = Darwin ]; then
     ram=$(( $(sysctl -n hw.memsize) / 1073741824 )) vram=0 mac=1   # unified memory: the Mac column
     sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
     echo "Mac: $(sysctl -n machdep.cpu.brand_string), $ram GB."
+    if xattr -p com.apple.quarantine "$bin/nslm-serve" >/dev/null 2>&1; then   # a browser download: macOS blocks them
+        echo "The binaries are not signed by Apple. Clearing their download quarantine: xattr -dr com.apple.quarantine out"
+        xattr -dr com.apple.quarantine out
+    fi
 else
     bin=build/bin mac=
     command -v nvidia-smi >/dev/null || fail "No NVIDIA driver found. Install driver 570 or newer: https://www.nvidia.com/drivers"
@@ -57,22 +61,18 @@ dir=${root:-$here/models}/${repo#*/}
 mkdir -p "$dir"
 
 # the pack's files at the pinned revision, each checked by size and SHA-256 (verified ones are listed in .nslm-verified)
-auth=()
+auth=()   # used as ${auth[@]+"${auth[@]}"}: bash 3.2 (macOS) calls an empty array unbound under set -u
 [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
-tree=$(curl -fsSL "${auth[@]}" "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true") || fail "Cannot list $repo."
-if command -v python3 >/dev/null; then
+tree=$(curl -fsSL ${auth[@]+"${auth[@]}"} "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true") ||
+    fail "Cannot list $repo."
+if [ -n "$mac" ]; then   # JavaScript for Automation reads JSON on each Mac. python3 can be a stub that asks for Xcode
+    list=$(osascript -l JavaScript -e 'function run(a) { return JSON.parse(a[0]).filter(f => f.type == "file" &&
+        f.path[0] != ".").map(f => f.path + " " + f.size + " " + ((f.lfs || {}).oid || "-")).join("\n") }' "$tree")
+else
+    command -v python3 >/dev/null || fail "start-here.sh needs python3 to read the file list. Install python3."
     list=$(python3 -I -c 'import json, sys
 for f in json.load(sys.stdin):
     if f["type"] == "file" and not f["path"].startswith("."): print(f["path"], f["size"], (f.get("lfs") or {}).get("oid", "-"))' <<<"$tree")
-else   # macOS without python3: plutil reads JSON
-    printf '%s' "$tree" >"$dir/.tree.json" list= k=0
-    while t=$(plutil -extract "$k.type" raw -o - "$dir/.tree.json" 2>/dev/null); do
-        p=$(plutil -extract "$k.path" raw -o - "$dir/.tree.json")
-        if [ "$t" = file ] && [ "${p#.}" = "$p" ]; then
-            list+="$p $(plutil -extract "$k.size" raw -o - "$dir/.tree.json") $(plutil -extract "$k.lfs.oid" raw -o - "$dir/.tree.json" 2>/dev/null || echo -)"$'\n'
-        fi
-        k=$((k + 1))
-    done
 fi
 okf=$dir/.nslm-verified
 touch "$okf"
@@ -94,7 +94,7 @@ if [ "$need" -gt 1073741824 ] && [ -z "${1:-}" ]; then
 elif [ "$need" -gt 1073741824 ]; then
     echo "The download starts in 5 s (Ctrl+C stops it)."; sleep 5   # a folder typo
 fi
-total=$(wc -l <<<"$list") i=0
+total=$(( $(wc -l <<<"$list") )) i=0
 while read -r p s h; do
     i=$((i + 1))
     grep -qxF "$p" "$okf" && continue
@@ -104,7 +104,7 @@ while read -r p s h; do
     have=0
     [ -f "$dst" ] && have=$(( $(wc -c <"$dst") ))
     if [ "$have" -ne "$s" ]; then
-        curl -fL --retry 5 -C - -# "${auth[@]}" -o "$dst" "https://huggingface.co/$repo/resolve/$rev/$p" </dev/null ||
+        curl -fL --retry 5 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst" "https://huggingface.co/$repo/resolve/$rev/$p" </dev/null ||
             fail "The download of $p stopped. Run start-here.sh again to resume."
     fi
     [ $(( $(wc -c <"$dst") )) -eq "$s" ] || fail "$p has the wrong size. Run start-here.sh again."
