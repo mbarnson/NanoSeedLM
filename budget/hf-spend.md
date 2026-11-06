@@ -32,4 +32,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI d2a249b (6aed69a9c78863f9c633de07): emulator packed folders | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $12.75 |
 
-Left this week: about $12.25.
+| nslm-release-r4 (6aed6e410e0338d1bb80e70b), running: the three release folders into /b/release, two runs each, KL of each as shipped | rtx-pro-6000x2 ($5.50/h) | expected about 70, at most 110 | expected about $6.40, at most $10.08 | |
+
+Left this week: about $12.25 before nslm-release-r4.
