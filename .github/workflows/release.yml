@@ -124,6 +124,7 @@ jobs:
           otool -L out/bin/nslm-serve
           rc=0; out/bin/nslm-serve >/dev/null 2>&1 || rc=$?; test "$rc" = 2
       - name: sign and notarize   # Developer ID and Apple's notary: Gatekeeper accepts a browser download
+        # The Developer ID Application certificate expires on 2027-02-01: then renew MACOS_CERT_P12 and MACOS_CERT_PASSWORD
         env:
           P12: ${{ secrets.MACOS_CERT_P12 }}                 # base64 of the Developer ID Application .p12
           P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
