@@ -53,6 +53,7 @@ same results as the engine.
 | Qwen3.8-Flash-Next with P = 3 / 4 seed experts | Yes (`nslm-qwen4-gen`, `qwen4_gpu.m`) | Yes (`nslm-qwen4-gen`) | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next PLE table from an Unsloth engram GGUF | No | Yes (`--ple-gguf`) | No (mlx-vlm's SSD PLE view) |
 | Qwen3.8-Flash-Next VRAM cache of host experts | No | Yes (`--expert-cache-gb`) | No |
+| Qwen3.8-Flash-Next KV cache in BF16 ([plan K](../plans/2026-11-06-qwen4-kv-bf16.md)) | Not yet (f32) | Yes | Yes (MLX's BF16) |
 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve` (`engine/engine.c`) | Yes | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next MTP drafts (`q4e_draft`, `nslm-qwen4-gen --drafts`) | Yes (`qwen4_gpu.m`) | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next MTP drafts in `nslm-chat` (`Q4E_DRAFTS`, `engine/qwen4_api.c`) | Yes | Yes | Yes (mlx-vlm) |

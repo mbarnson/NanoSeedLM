@@ -660,7 +660,11 @@ int kt_q4_attend(const Qwen4Cfg* c, const float* q, const float* K, const float*
                  const int32_t* nsel, float* o, int T) {
     const size_t kv = (size_t) npos * c->n_kv * c->head_dim, no = (size_t) T * c->n_head * c->head_dim;
     float* dout = (float*) dev(NULL, 4 * no);
-    if (kq4_attend(0, c, (const float*) dev(q, 4 * no * 2), (const float*) dev(K, 4 * kv), (const float*) dev(V, 4 * kv), pos0, NULL,
+    uint16_t* kb = (uint16_t*) malloc(2 * kv), *vb = (uint16_t*) malloc(2 * kv);   // the BF16 cache (plan K)
+    for (size_t i = 0; i < kv; ++i) { kb[i] = nslm_f2bf(K[i]); vb[i] = nslm_f2bf(V[i]); }
+    const uint16_t* dk = (const uint16_t*) dev(kb, 2 * kv), *dv = (const uint16_t*) dev(vb, 2 * kv);
+    free(kb); free(vb);
+    if (kq4_attend(0, c, (const float*) dev(q, 4 * no * 2), dk, dv, pos0, NULL,
                    (const int32_t*) dev(sel, 4 * (size_t) T * (c->ix_budget / c->ix_ratio)), (const int32_t*) dev(nsel, 4 * (size_t) T), dout, T)) {
         done("kq4_attend", NULL, NULL, 0);
         printf("FAIL: kq4_attend: head_dim not supported\n");

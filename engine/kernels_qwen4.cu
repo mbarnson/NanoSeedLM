@@ -365,6 +365,22 @@ __global__ void k_q4_store(float* dst, int w, const float* src, int ss, int pos0
 void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T) {
     k_q4_store<<<dim3((unsigned) (w + 255) / 256, (unsigned) T), 256, 0, s>>>(dst, w, src, ss, pos0, dpos);
 }
+// The cache of keys and values in BF16 (plan K): rounded to nearest even, as nslm_f2bf
+static __device__ __forceinline__ uint16_t kv_f2bf(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+static __device__ __forceinline__ float4 kv_bf4(uint2 u) {   // 4 BF16 values, the first in the low half of u.x
+    return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000u), __uint_as_float(u.y << 16),
+                       __uint_as_float(u.y & 0xFFFF0000u));
+}
+__global__ void k_q4_store_bf16(uint16_t* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos) {
+    const int t = (int) blockIdx.y, i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < w) dst[(size_t) (pos0 + (dpos ? *dpos : 0) + t) * w + i] = kv_f2bf(src[(size_t) t * ss + i]);
+}
+void kq4_store_bf16(cudaStream_t s, uint16_t* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T) {
+    k_q4_store_bf16<<<dim3((unsigned) (w + 255) / 256, (unsigned) T), 256, 0, s>>>(dst, w, src, ss, pos0, dpos);
+}
 
 // Row t: one warp, a lane's logits in registers (E at most 32 RT_PER). k rounds of a warp arg-max (ties: the higher
 // index); the weights are the softmax over all E, renormalised over the k picked.
@@ -681,7 +697,7 @@ typedef struct {
 // Prompt rows: block (KV group, row), a warp per query head of the group. The row's keys come in tiles of AT_KT; each
 // key's K and V is read once into shared memory for all heads of the group. Each head takes one online-softmax step a tile
 #define AT_KT 16
-__global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel, const int32_t* nsel,
+__global__ void k_q4_attend_g(AttArgs a, const float* q, const uint16_t* K, const uint16_t* V, const int32_t* sel, const int32_t* nsel,
                               const int32_t* dpos, float* o) {
     extern __shared__ float kvs[];   // K [AT_KT][hd], then V [AT_KT][hd]
     __shared__ int keys[AT_KT];
@@ -699,12 +715,12 @@ __global__ void k_q4_attend_g(AttArgs a, const float* q, const float* K, const f
             keys[threadIdx.x] = k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
         }
         __syncthreads();
-        const int h4 = a.hd / 4;   // 16-byte loads: fewer load rounds a tile
+        const int h4 = a.hd / 4;   // 8-byte loads of 4 BF16 values
 #pragma unroll 4
         for (int x = threadIdx.x; x < nk * h4; x += blockDim.x) {
             const size_t at = (((size_t) keys[x / h4] * a.nkv + g) * a.hd) / 4 + x % h4;
-            ((float4*) kvs)[x] = ((const float4*) K)[at];
-            ((float4*) Vs)[x] = ((const float4*) V)[at];
+            ((float4*) kvs)[x] = kv_bf4(((const uint2*) K)[at]);
+            ((float4*) Vs)[x] = kv_bf4(((const uint2*) V)[at]);
         }
         __syncthreads();
         float d[AT_KT], mt = m, ps = 0;   // the tile's scores first (independent), then one softmax step for the tile
@@ -748,14 +764,30 @@ template <typename A, typename B, typename C> static __device__ __forceinline__ 
     nvcuda::wmma::mma_sync(c, ah, bl, c);
     nvcuda::wmma::mma_sync(c, al, bh, c);
 }
-// The tile of TC_KT keys (key < 0: zeros) of K or V into the shared tile, by cp.async; the caller commits and waits
-static __device__ __forceinline__ void tc_fetch(const AttArgs& a, const int* keys, const float* KV, int g, int ld, float* tile) {
-    for (int x = threadIdx.x; x < TC_KT * a.hd / 4; x += blockDim.x) {
-        const int kk = x / (a.hd / 4), c4 = x % (a.hd / 4), key = keys[kk];
-        const float* src = KV + (key >= 0 ? ((size_t) key * a.nkv + g) * a.hd + 4 * c4 : 0);
-        __pipeline_memcpy_async(tile + kk * ld + 4 * c4, src, 16, key >= 0 ? 0 : 16);
+// The tile of TC_KT keys (key < 0: zeros) of K or V, BF16 [TC_KT][hd] at the start of the shared tile, by cp.async. The
+// caller waits, then tc_widen makes it floats [TC_KT][ld]
+static __device__ __forceinline__ void tc_fetch(const AttArgs& a, const int* keys, const uint16_t* KV, int g, float* tile) {
+    uint16_t* st = (uint16_t*) tile;
+    for (int x = threadIdx.x; x < TC_KT * a.hd / 8; x += blockDim.x) {
+        const int kk = x / (a.hd / 8), c8 = x % (a.hd / 8), key = keys[kk];
+        const uint16_t* src = KV + (key >= 0 ? ((size_t) key * a.nkv + g) * a.hd + 8 * c8 : 0);
+        __pipeline_memcpy_async(st + kk * a.hd + 8 * c8, src, 16, key >= 0 ? 0 : 16);
     }
     __pipeline_commit();
+}
+#define TC_W4 (TC_KT * 256 / 4 / 128)   // groups of 4 BF16 values a thread widens (head_dim 256, 128 threads)
+static __device__ __forceinline__ void tc_widen(int hd, int ld, float* tile) {   // in place: all read, then all write
+    uint2 v[TC_W4];
+    const int n4 = TC_KT * hd / 4, h4 = hd / 4;
+#pragma unroll
+    for (int i = 0; i < TC_W4; ++i) if (threadIdx.x + 128 * i < n4) v[i] = ((const uint2*) tile)[threadIdx.x + 128 * i];
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < TC_W4; ++i) {
+        const int x = threadIdx.x + 128 * i;
+        if (x < n4) *(float4*) (tile + x / h4 * ld + 4 * (x % h4)) = kv_bf4(v[i]);
+    }
+    __syncthreads();
 }
 // mma.sync m16n8k8 TF32. Lane (g = lane / 4, t = lane % 4) holds a = {A[g][t], A[g+8][t], A[g][t+4], A[g+8][t+4]},
 // b = {B[t][g], B[t+4][g]}, c = {C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]}
@@ -774,7 +806,7 @@ template <int N> static __device__ __forceinline__ void tf32_parts(const float* 
     for (int i = 0; i < N; ++i) { hi[i] = to_tf32(x[i]); lo[i] = to_tf32(x[i] - __uint_as_float(hi[i])); }
 }
 static size_t tc_smem(int hd) { return sizeof(float) * ((size_t) TC_KT * (hd + 8) + 4 * 256 + 16 * TC_PS); }
-__global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel,
+__global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float* q, const uint16_t* K, const uint16_t* V, const int32_t* sel,
                                                          const int32_t* nsel, const int32_t* dpos, float* o) {
     using namespace nvcuda;
     typedef wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> FragA;
@@ -808,9 +840,10 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
             keys[tid] = tid >= nk ? -1 : k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
         }
         __syncthreads();
-        tc_fetch(a, keys, K, g, ld, Ks);
+        tc_fetch(a, keys, K, g, Ks);
         __pipeline_wait_prior(0);
         __syncthreads();
+        tc_widen(hd, ld, Ks);
         wmma::fragment<wmma::accumulator, 16, 16, 8, float> sacc;   // warp w: the dims [w ds, (w + 1) ds) of S
         wmma::fill_fragment(sacc, 0.0f);
 #pragma unroll
@@ -822,7 +855,7 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
             }
         wmma::store_matrix_sync(Sp + w * 256, sacc, 16, wmma::mem_row_major);
         __syncthreads();   // S is done with the K tile: V takes it, while the softmax runs
-        tc_fetch(a, keys, V, g, ld, Ks);
+        tc_fetch(a, keys, V, g, Ks);
         {   // row r: 8 threads of 2 keys each. The new maximum, the scale of the row's old O and sum, its probabilities
             const int r = tid >> 3, h = tid & 7;
             float sc[2], mt = -INFINITY;
@@ -849,6 +882,7 @@ __global__ void __launch_bounds__(128, 4) k_q4_attend_tc(AttArgs a, const float*
         }
         __pipeline_wait_prior(0);
         __syncthreads();
+        tc_widen(hd, ld, Ks);
         const float a0 = alpha[gq], a1 = alpha[gq + 8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) { oc[j][0] *= a0; oc[j][1] *= a0; oc[j][2] *= a1; oc[j][3] *= a1; }
@@ -896,7 +930,7 @@ void kq4_attend_info(const Qwen4Cfg* c, int* regs, int* blocks) {   // the promp
 // Decode rows: block (KV group, split, row), a warp per head of the group. Split sp takes keys [n sp / AD_S, n (sp + 1) / AD_S)
 // of the row's n. Their K and V come in tiles of AT_KT through shared memory, once for all heads. part: m, l, acc[hd].
 #define AD_S 32
-__global__ void k_q4_attend_d(AttArgs a, const float* q, const float* K, const float* V, const int32_t* sel, const int32_t* nsel,
+__global__ void k_q4_attend_d(AttArgs a, const float* q, const uint16_t* K, const uint16_t* V, const int32_t* sel, const int32_t* nsel,
                               const int32_t* dpos, float* part) {
     __shared__ float Ks[AT_KT][256], Vs[AT_KT][256];
     __shared__ int keys[AT_KT];
@@ -916,10 +950,11 @@ __global__ void k_q4_attend_d(AttArgs a, const float* q, const float* K, const f
             keys[threadIdx.x] = k < ns * a.R ? sel[(size_t) t * a.topk + k / a.R] * a.R + k % a.R : tail + (k - ns * a.R);
         }
         __syncthreads();
-        for (int i = threadIdx.x; i < nk * a.hd; i += blockDim.x) {
-            const size_t off = ((size_t) keys[i / a.hd] * a.nkv + g) * a.hd + i % a.hd;
-            Ks[i / a.hd][i % a.hd] = K[off];
-            Vs[i / a.hd][i % a.hd] = V[off];
+        for (int i = threadIdx.x; i < nk * a.hd / 4; i += blockDim.x) {   // 8-byte loads of 4 BF16 values
+            const int kk = i / (a.hd / 4), c = 4 * (i % (a.hd / 4));
+            const size_t off = (((size_t) keys[kk] * a.nkv + g) * a.hd + c) / 4;
+            *(float4*) &Ks[kk][c] = kv_bf4(((const uint2*) K)[off]);
+            *(float4*) &Vs[kk][c] = kv_bf4(((const uint2*) V)[off]);
         }
         __syncthreads();
         float d[AT_KT], mx = m;
@@ -975,7 +1010,7 @@ __global__ void k_q4_attend_dc(AttArgs a, const float* q, const float* part, flo
     }
 }
 size_t kq4_attend_part_len(const Qwen4Cfg* c) { return (size_t) 8 * c->n_head * AD_S * (c->head_dim + 2); }
-int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
+int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const uint16_t* K, const uint16_t* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T) {
     float* part = NULL;
     if (T <= 8 && cudaMalloc(&part, sizeof(float) * kq4_attend_part_len(c)) != cudaSuccess) return -1;
@@ -983,7 +1018,7 @@ int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K
     cudaFree(part);
     return rc;
 }
-int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
+int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const uint16_t* K, const uint16_t* V, int pos0,
                     const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, float* part, int T) {
     if (c->head_dim % 32 || c->head_dim > 256 || c->n_head % c->n_kv || c->n_head / c->n_kv > 32) return -1;
     const AttArgs a = {c->n_head, c->n_kv, c->head_dim, c->ix_ratio, c->ix_budget / c->ix_ratio, pos0, qld, 1.0f / sqrtf((float) c->head_dim)};

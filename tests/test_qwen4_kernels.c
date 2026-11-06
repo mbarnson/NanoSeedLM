@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "kernel_backend.h"
+#include "lfsr.h"   // nslm_f2bf, nslm_bf2f
 #include "trellis.h"
 
 static int fails = 0;
@@ -294,6 +295,7 @@ static void qsa_attend_case(void) {
         const int npos = 112, pos0 = 97, no = c.n_head * c.head_dim;
         const size_t kv = (size_t) npos * c.n_kv * c.head_dim;
         float *q = rnd((size_t) 2 * no * AT, -1, 1), *K = rnd(kv, -1, 1), *V = rnd(kv, -1, 1), *o = rnd((size_t) no * AT, 0, 0);
+        for (size_t i = 0; i < kv; ++i) { K[i] = nslm_bf2f(nslm_f2bf(K[i])); V[i] = nslm_bf2f(nslm_f2bf(V[i])); }   // BF16 keys (plan K)
         float *o_k = rnd((size_t) no * AT, 0, 0);
         int32_t asel[12 * 8], ansel[12];
         for (int t = 0; t < AT; ++t) ansel[t] = t % 2 ? 0 : k;   // sparse and dense rows in turn

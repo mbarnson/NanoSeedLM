@@ -242,6 +242,7 @@ static void tcq_check(void) {
     snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq", tmp);
     if (tcq_fixture(dir, err, sizeof err)) { CHECK(0, "trellis fixture: %s", err); return; }
     Qwen4Ref* r = qwen4_ref_open(dir, err, sizeof err);
+    if (r) qwen4_ref_kv_bf16(r, 1);   // the CUDA engine's BF16 KV cache (plan K)
     CHECK(r != NULL, "trellis fixture, reference: %s", err);
     if (!r) return;
     enum { N = 28, NP = 20 };
@@ -446,6 +447,7 @@ int main(void) {
     {   // qwen4_tiny_attn (tools/qwen4_tiny_attn.py): attention strong enough that zero keys move the C reference's
         // logits by about 1.7 of 1.7. The engine against the reference, in decode rows and in one prompt forward.
         Qwen4Ref* r = qwen4_ref_open("tests/data/qwen4_tiny_attn", err, sizeof err);
+        if (r) qwen4_ref_kv_bf16(r, 1);   // the CUDA engine's BF16 KV cache (plan K)
         CHECK(r != NULL, "reference: %s", err);
         Q4Eng* ea = r ? q4e_open("tests/data/qwen4_tiny_attn", &o, err, sizeof err) : NULL;
         CHECK(!r || ea != NULL, "open qwen4_tiny_attn: %s", err);

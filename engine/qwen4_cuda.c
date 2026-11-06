@@ -41,7 +41,8 @@ typedef struct {
     Q4GdnDev gw;
     float *conv, *S;
     W qkvi, o;   // QSA attention: qkvi = the rows of q, k, v and the indexer's qk (one GEMM of x)
-    float *qn, *kn, *iqn, *ikn, *K, *V, *raw, *blk;
+    float *qn, *kn, *iqn, *ikn, *raw, *blk;
+    uint16_t *K, *V;   // BF16 (plan K)
     W gate, sh_g, sh_u, sh_d, eg, eu, ed;   // MoE: gate = the router rows, then the shared expert gate row
     W key, val;                                 // PLE
     float *nk, *nq, *nc, *pw, *hist;
@@ -287,8 +288,8 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
         L->kn = load_v(e, c->head_dim, "%s.self_attn.k_norm.weight", lp);
         L->iqn = load_v(e, c->ix_dim, "%s.self_attn.indexer.q_layernorm.weight", lp);
         L->ikn = load_v(e, c->ix_dim, "%s.self_attn.indexer.k_layernorm.weight", lp);
-        L->K = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->n_kv * c->head_dim);
-        L->V = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->n_kv * c->head_dim);
+        L->K = (uint16_t*) dmem(e, NULL, sizeof(uint16_t) * (size_t) e->max_pos * c->n_kv * c->head_dim);
+        L->V = (uint16_t*) dmem(e, NULL, sizeof(uint16_t) * (size_t) e->max_pos * c->n_kv * c->head_dim);
         L->raw = (float*) dmem(e, NULL, sizeof(float) * (size_t) e->max_pos * c->ix_dim);
         L->blk = (float*) dmem(e, NULL, sizeof(float) * (size_t) nb * c->ix_dim);
     } else {
@@ -960,8 +961,8 @@ static int attention(Q4Eng* e, Layer* L, int p0, int T, int keys_only) {
     mark(e, ST_PROJ);
     kq4_head_norm_rope_inv(e->s, c, e->qp, ld, c->n_head, 2 * hd, hd, L->qn, e->inv, p0, e->din, T);
     kq4_head_norm_rope_inv(e->s, c, kk, ld, c->n_kv, hd, hd, L->kn, e->inv, p0, e->din, T);
-    kq4_store(e->s, L->K, kvw, kk, ld, p0, e->din, T);
-    kq4_store(e->s, L->V, kvw, vv, ld, p0, e->din, T);
+    kq4_store_bf16(e->s, L->K, kvw, kk, ld, p0, e->din, T);
+    kq4_store_bf16(e->s, L->V, kvw, vv, ld, p0, e->din, T);
     kq4_store(e->s, L->raw, D, ixo + (size_t) c->ix_heads * D, ld, p0, e->din, T);
     kq4_head_norm_rope_inv(e->s, c, ixo, ld, c->ix_heads, D, D, L->iqn, e->inv, p0, e->din, T);
     mark(e, ST_ROPE);

@@ -47,6 +47,8 @@ void kq4_head_norm_rope_inv(cudaStream_t s, const Qwen4Cfg* c, float* x, int rs,
                             const float* inv, int pos0, const int32_t* dpos, int T);
 // dst[(pos + t) * w + i] = src[t * ss + i]: rows into a cache at their positions
 void kq4_store(cudaStream_t s, float* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T);
+// The same into the BF16 cache of keys and values (plan K): rounded to nearest even, as qwen4_ref_kv_bf16
+void kq4_store_bf16(cudaStream_t s, uint16_t* dst, int w, const float* src, int ss, int pos0, const int32_t* dpos, int T);
 // qwen4_route of logits[T][n_exp] into ind, wt [T][top_k] (top_k <= 32, n_exp <= 1024); _ld: logits rows ld apart
 void kq4_route(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt, int T);
 void kq4_route_ld(cudaStream_t s, const Qwen4Cfg* c, const float* logits, int ld, int32_t* ind, float* wt, int T);
@@ -83,13 +85,13 @@ void kq4_qsa_rows(cudaStream_t s, const Qwen4Cfg* c, int pos0, const int32_t* dp
 // sc is scratch of T x maxdone floats.  Rows with done[t] <= budget / ratio are left as they are.
 void kq4_qsa_select(cudaStream_t s, const Qwen4Cfg* c, const float* iq, int rs, const float* blk, const int32_t* done, int maxdone,
                     float* sc, int32_t* sel, int T);
-// qwen4_attend for row t: q[t][n_head][2 head_dim], K, V [pos][n_kv][head_dim], nsel[t] blocks of sel[t]; o[t][n_head][head_dim].
+// qwen4_attend for row t: q[t][n_head][2 head_dim], K, V [pos][n_kv][head_dim] (BF16), nsel[t] blocks of sel[t]; o[t][n_head][head_dim].
 // -1 unless head_dim is a multiple of 32 up to 256 and a KV head serves at most 32 heads.
-int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const float* K, const float* V, int pos0, const int32_t* dpos,
+int kq4_attend(cudaStream_t s, const Qwen4Cfg* c, const float* q, const uint16_t* K, const uint16_t* V, int pos0, const int32_t* dpos,
                const int32_t* sel, const int32_t* nsel, float* o, int T);
 // The same with the rows of q qld floats apart, and part, the scratch of decode rows (T <= 8): kq4_attend_part_len
 // floats. kq4_attend makes its own.
-int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const float* K, const float* V, int pos0,
+int kq4_attend_part(cudaStream_t s, const Qwen4Cfg* c, const float* q, int qld, const uint16_t* K, const uint16_t* V, int pos0,
                     const int32_t* dpos, const int32_t* sel, const int32_t* nsel, float* o, float* part, int T);
 size_t kq4_attend_part_len(const Qwen4Cfg* c);
 // Q4E_PROFILE: the prompt-row attention kernel's registers a thread and blocks an SM
