@@ -54,6 +54,7 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `gguf_expert_bytes.py` | The routed experts' bytes and bits for each weight of a GGUF pack on the Hub, from its headers only |
 | `page_resident.py` | How much of a pack's files is in the page cache, by kind (`mincore`). `--drop` evicts the shards first |
 | `hf_release_pack.sh` | Build the trellis release folders (P3, oQ8e's 8-bit dense modules, the banks) into the bucket, run each twice and score each against BF16, on an HF Jobs GPU node |
+| `qwen4_release_card.py` | Write the release cards, with each pack's KL as shipped from the release job's llama.cpp logs |
 | `hf_release_publish.sh` | Upload the release folders and their cards from the bucket to private Hub repositories (a CPU job with the owner's token) |
 | `hf_qwen4_routes.sh` | Record routing traces of a pack on chat and code text, on an HF Jobs GPU node |
 | `qwen4_tier_map.py` | Write a per-expert tier map from routing traces (most used experts), at random, or by projection |
