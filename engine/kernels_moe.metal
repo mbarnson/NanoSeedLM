@@ -2135,12 +2135,11 @@ kernel void k_attn_prefill_q8(constant AttnArgs& a [[buffer(0)]], device const f
     attn_prefill(a, q, Kc, Vc, Ks, Vs, ri, g, o, T, tg, tid, lane, sgi, Kt, Vt, Qt[sgi], Ox[sgi]);
 }
 
-// Greedy argmax over the vocabulary (ties: the lowest id); one threadgroup of 1024 per row.
-kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [[buffer(1)]], constant int& V [[buffer(2)]],
-                     uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                     uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float bv[32];
-    threadgroup int bi[32];
+// Greedy argmax over the vocabulary (ties: the lowest id); one threadgroup of 1024 per row. P: also its softmax
+// probability, 1 / sum_i exp(l_i - max) (CUDA's k_argmax with prob, plan A1: the MTP head's draft confidence)
+template <bool P>
+static inline void argmax_row(device const float* logits, device int* out, device float* prob, int V, uint t, uint tid, uint lane,
+                              uint sgi, threadgroup float* bv, threadgroup int* bi) {
     device const float* l = logits + (ulong) t * V;
     float best = -INFINITY;
     int idx = 0;
@@ -2157,7 +2156,36 @@ kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [
         int ix = bi[0];
         for (int s = 1; s < 32; ++s) if (bv[s] > b || (bv[s] == b && bi[s] < ix)) { b = bv[s]; ix = bi[s]; }
         out[t] = ix;
+        bv[0] = b;
     }
+    if (!P) return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mx = bv[0];
+    float s = 0.0f;
+    for (int i = (int) tid; i < V; i += 1024) s += exp(l[i] - mx);
+    s = simd_sum(s);
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // every thread has read bv[0]
+    if (lane == 0) bv[sgi] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < 32; ++w) tot += bv[w];
+        prob[t] = 1.0f / tot;
+    }
+}
+kernel void k_argmax(device const float* logits [[buffer(0)]], device int* out [[buffer(1)]], constant int& V [[buffer(2)]],
+                     uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float bv[32];
+    threadgroup int bi[32];
+    argmax_row<false>(logits, out, nullptr, V, t, tid, lane, sgi, bv, bi);
+}
+kernel void k_argmax_p(device const float* logits [[buffer(0)]], device int* out [[buffer(1)]], constant int& V [[buffer(2)]],
+                       device float* prob [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]], uint sgi [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float bv[32];
+    threadgroup int bi[32];
+    argmax_row<true>(logits, out, prob, V, t, tid, lane, sgi, bv, bi);
 }
 
 #endif

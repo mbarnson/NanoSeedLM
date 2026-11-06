@@ -93,7 +93,7 @@ struct Q4Eng {
     // in logits (-1: none); keep: a q4e_forward_keep of nkeep rows
     Layer M;
     MW m_fe, m_fh, m_down, m_up;
-    id<MTLBuffer> m_ne, m_nh, m_norm, Hin, Hm, ones, mlog, dtok;
+    id<MTLBuffer> m_ne, m_nh, m_norm, Hin, Hm, ones, mlog, dtok, dprob;   // dprob: the head's probability of each draft
     int mtp, ndraft, lrow, keep, nkeep;   // ndraft: Q4EOpts.mtp, the most drafts (and snapshot buffers a layer)
     double stage_ms[10];
     char err[256];
@@ -807,12 +807,14 @@ static void head_rows(Q4Eng* e, int T) {
     store(e, e->Hin, HD, e->H, sizeof(float) * (uint64_t) (T - 1) * HD, HD, 0, 1);
     mark(e, ST_HEAD);
 }
-static void argmax(Q4Eng* e, id<MTLBuffer> X, id<MTLBuffer> out, uint64_t oo) {   // out = the arg max of X[vocab] (k_argmax)
+// out = the arg max of X[vocab] (k_argmax); prob: also its softmax probability at po (k_argmax_p)
+static void argmax(Q4Eng* e, id<MTLBuffer> X, id<MTLBuffer> out, uint64_t oo, id<MTLBuffer> prob, uint64_t po) {
     const int32_t V = e->c.vocab;
-    [e->enc setComputePipelineState:pipe_g(e, "k_argmax", 0, 0, 0)];
+    [e->enc setComputePipelineState:pipe_g(e, prob ? "k_argmax_p" : "k_argmax", 0, 0, 0)];
     B(e, 0, X, 0);
     B(e, 1, out, oo);
     [e->enc setBytes:&V length:4 atIndex:2];
+    if (prob) B(e, 3, prob, po);
     tgs(e, 1, 1, 1024);
 }
 // k head rows on dtok = {bonus, ...}: row j at pos - 1 + j on token dtok[j] and Hin row 0 (j = 0), then its own
@@ -827,7 +829,7 @@ static int draft_rows(Q4Eng* e, int k) {
         hc_mix(e, e->m_norm, &e->m_down, &e->m_up, NULL, 1);
         e->H = H;
         mv(e, &e->head, e->x, e->mlog, 1);
-        argmax(e, e->mlog, e->dtok, sizeof(int32_t) * (uint64_t) (j + 1));
+        argmax(e, e->mlog, e->dtok, sizeof(int32_t) * (uint64_t) (j + 1), e->dprob, sizeof(float) * (uint64_t) j);
         mark(e, ST_HEAD);
     }
     return rc;
@@ -940,7 +942,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
     }
     if (e->mtp && !e->err[0]) {
         e->Hin = F(T * HD); e->Hm = F(T * HD); e->ones = F(T * c->hc); e->mlog = F(c->vocab);
-        e->dtok = dbuf(e, NULL, sizeof(int32_t) * (Q4E_MAX_DRAFTS + 1));
+        e->dtok = dbuf(e, NULL, sizeof(int32_t) * (Q4E_MAX_DRAFTS + 1)); e->dprob = F(Q4E_MAX_DRAFTS);
         for (size_t i = 0; e->ones && i < T * c->hc; ++i) ((float*) e->ones.contents)[i] = 1.0f;
         for (int l = 0; l < c->n_layer; ++l)
             for (int i = 0; i < e->ndraft; ++i) {   // a verify of ndraft + 1 rows keeps the state after its first ndraft
@@ -1004,7 +1006,7 @@ void q4e_close(Q4Eng* e) {
     e->embed = e->head = e->mix_down = e->mix_up = (MW) {0};
     e->M = (Layer) {0};
     e->m_fe = e->m_fh = e->m_down = e->m_up = (MW) {0};
-    e->m_ne = e->m_nh = e->m_norm = e->Hin = e->Hm = e->ones = e->mlog = e->dtok = nil;
+    e->m_ne = e->m_nh = e->m_norm = e->Hin = e->Hm = e->ones = e->mlog = e->dtok = e->dprob = nil;
     e->mix_norm = e->stab = e->stab32 = e->inv = nil;
     e->x = e->H = e->normed = e->lo = e->up = e->inj = e->br = e->qp = e->kk = e->vv = e->o = e->ixo = e->sc = e->emb = nil;
     e->keys = e->qs = e->vals = e->gated = e->lg = e->wt = e->A = e->Gb = e->Ub = e->Dx = e->sh = e->sgv = e->logits = nil;
@@ -1109,9 +1111,10 @@ int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, i
 }
 
 int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p) { (void) e; (void) j; (void) id; (void) p; return 0; }   // plan A2m
-int q4e_draft_probs(const Q4Eng* e, int k, float* p) {   // plan A1m: the head's probabilities on Metal
-    (void) e; (void) k; (void) p;
-    return -1;
+int q4e_draft_probs(const Q4Eng* e, int k, float* p) {   // k_argmax_p of draft_rows (plan A1m)
+    if (!e->mtp || !e->dprob || k < 1 || k > e->ndraft) return -1;
+    memcpy(p, e->dprob.contents, sizeof(float) * (size_t) k);
+    return 0;
 }
 
 int q4e_forward_keep(Q4Eng* e, const int32_t* ids, int n, float* logits) {

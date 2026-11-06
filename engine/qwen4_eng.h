@@ -51,7 +51,7 @@ int q4e_draft(Q4Eng* e, int k, int32_t* drafts);
 int q4e_draft_from(Q4Eng* e, int32_t bonus, int k, float temp, const float* u, int32_t* drafts);
 // Draft j's q of the last q4e_draft: its n ids and probabilities, n returned (0: an arg max, one point)
 int q4e_draft_q(const Q4Eng* e, int j, int32_t* id, float* p);
-// The head's softmax probability of drafts 1 .. k of the last q4e_draft; -1 where the engine has none (Metal: plan A1m)
+// The head's softmax probability of drafts 1 .. k of the last q4e_draft; -1 without an MTP head
 int q4e_draft_probs(const Q4Eng* e, int k, float* p);
 // q4e_forward of n <= Q4E_MAX_DRAFTS + 1 rows that keeps the recurrent state (DeltaNet, conv, PLE) after each row;
 // q4e_accept(e, m) then keeps rows [0, m) of it: the position and the state of row m - 1. 0, or -1.
