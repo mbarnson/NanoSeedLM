@@ -20,12 +20,12 @@ echo "== builds: $(( $(date +%s) - t0 )) s"
 
 t0=$(date +%s)   # P3 whole (/m/seed-P3, as hf_llama_kld.sh names it), oQ8e only its shards with dense modules
 hf download "$P3" --revision "$P3REV" --local-dir /m/seed-P3 --max-workers 32 >/dev/null
-hf download "$OQ8" --revision "$OQ8REV" --include "*.json" "*.jinja" --local-dir /m/oq8 >/dev/null
+hf download "$OQ8" config.json model.safetensors.index.json --revision "$OQ8REV" --local-dir /m/oq8 >/dev/null
 mapfile -t SHARDS < <(python3 -I -c '
 import json, sys
 m = json.load(open("/m/oq8/model.safetensors.index.json"))["weight_map"]
 print("\n".join(sorted({f for k, f in m.items() if ".switch_mlp." not in k and ".ple." not in k})))')
-hf download "$OQ8" --revision "$OQ8REV" --include "${SHARDS[@]}" --local-dir /m/oq8 --max-workers 32 >/dev/null
+hf download "$OQ8" "${SHARDS[@]}" --revision "$OQ8REV" --local-dir /m/oq8 --max-workers 32 >/dev/null   # names, not --include
 echo "== downloads: $(( $(date +%s) - t0 )) s, P3 $(du -sh /m/seed-P3 | cut -f1), oQ8e ${#SHARDS[@]} shards $(du -sh /m/oq8 | cut -f1)"
 
 DIRS=()
