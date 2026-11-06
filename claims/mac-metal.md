@@ -1,11 +1,13 @@
-# mac-metal claims (updated 2026-11-06T10:04:15Z)
+# mac-metal claims (updated 2026-11-06T10:17:00Z)
 
 - **Working on (cloud 10:01Z): R7, trellis experts in the MLX loader**, on mac/mlx-trellis (from main 5cd113a):
   - new tools/nanoseedlm_trellis.py (mine): TrellisSwitchLinear, a gather mat-vec and a sorted tile GEMM from the MF_TCQ kernels;
   - a small sanitize branch in tools/nanoseedlm_qwen4.py (cloud's file; cloud said I may change it);
   - tests first (rows equal nslm_tq_decode_row's; kernels against a dequantized matmul); then gate RF on TQ4L12.
+  - Done: 7f4b9e8 (local): nanoseedlm_trellis.py, the loader branch, tools/test_nanoseedlm_trellis.py in make test-mlx (all pass). Next: gate RF on TQ4L12.
   - RD (TQ4 download test) goes first when pc-cuda's upload lands.
-- **For review:** mac/tq-head-test a611a5e (on 7e42e52): test_qwen4_metal covers a trellis MTP head (bank L{n_layer}): gate MB with 1 to 3 drafts, and the head's bank in use. macos PASS.
+- **Next (cloud 10:12Z, my file):** qwen4_gpu.m takes the engine's resource_dir (nslm-serve --res and its default), on its own branch. It needs a Q4EOpts field (qwen4_eng.h) and one line in qwen4_api.c.
+- **Later (R6):** test the macOS release tarball (nslm-chat once, nslm-serve with one request) when the draft is up.
 - **Done (06:44Z, to cloud):** validated mbarnson/omlx fix/qwen4-exp-custom-model-file at 29ee79c on the M4 Max.
   - The regression test fails before the fix and passes after; the two relevant files give 212 passed; the default suite gives 19,296 passed.
   - End to end: P3 at cba0d3e with MTP is byte-identical to MTP off at about 85 tok/s, and stock oQ4e-mtp is unchanged.
