@@ -15,6 +15,7 @@
 
 static int fails = 0;
 static int zero_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) { (void) ctx; (void) t; (void) s; memset(dst, 0, len); return 0; }
+static int seq_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) { (void) ctx; (void) t; (void) s; for (uint64_t i = 0; i < len; ++i) dst[i] = (uint8_t) i; return 0; }
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 int main(void) {
@@ -217,12 +218,13 @@ int main(void) {
             }
         CHECK(same, "trellis rows differ from the encoder's output");
         ns_close(&m);
-        // A bank of layer n in a folder of layers 0 to n - 1 with an MTP head is the head's (the packer's rule)
-        const NsSpec sp[2] = {{"language_model.model.layers.2.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1},
-                              {"mtp.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1}};
-        const NsRaw rw[2] = {{"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}};
+        // A bank of layer n is the MTP head's when the folder has routers for layer n - 1 and the head, none for layer n
+        const NsSpec sp[4] = {{"language_model.model.layers.2.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.2.mlp.gate.weight", NS_RAW, 1, 1, 1},
+                              {"mtp.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1}, {"mtp.layers.0.mlp.gate.weight", NS_RAW, 1, 1, 1}};
+        const NsRaw rw[4] = {{"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}};
         mkdir("out/test_moe_thead", 0755);
-        CHECK(ns_write_raw("out/test_moe_thead", sp, rw, 2, 1u << 20, NULL, zero_fill, NULL, berr, sizeof berr) == 0, "head folder: %s", berr);
+        CHECK(ns_write_raw("out/test_moe_thead", sp, rw, 4, 1u << 20, NULL, zero_fill, NULL, berr, sizeof berr) == 0, "head folder: %s", berr);
         const char* bk[2] = {"out/test_moe_thead/L3_up_proj.blkt", "out/test_moe_thead/L1_up_proj.blkt"};   // L1: no layer 0
         for (int i = 0; i < 2; ++i) {
             f = fopen(bk[i], "wb");
@@ -235,8 +237,53 @@ int main(void) {
         CHECK(t && t->enc == NS_TCQ && !ns_find(&m, "language_model.model.layers.3.mlp.switch_mlp.up_proj.weight"),
               "bank L3 is not the MTP head's");
         t = ns_find(&m, "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight");
-        CHECK(t && t->enc == NS_TCQ && m.n == 3, "bank L1 (no layer 0) not added as layer 1 (%d tensors)", m.n);
+        CHECK(t && t->enc == NS_TCQ && m.n == 5, "bank L1 (no layer 0) not added as layer 1 (%d tensors)", m.n);
         ns_close(&m);
+        // nslm-qwen4-pack --tq: the base without its routed experts (a layer's, the head's), plus the banks of layers 0 and 1
+        const NsSpec bs[5] = {{"language_model.model.layers.0.linear_attn.out_proj.weight", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1},
+                              {"language_model.model.layers.0.mlp.gate.weight", NS_RAW, 1, 1, 1},
+                              {"mtp.layers.0.mlp.switch_mlp.up_proj.weight", NS_RAW, 1, 1, 1}, {"mtp.layers.0.mlp.gate.weight", NS_RAW, 1, 1, 1}};
+        const NsRaw br[5] = {{"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}, {"BF16", 2, {1, 2}, 4}};
+        mkdir("out/test_moe_qbase", 0755);
+        mkdir("out/test_moe_qbanks", 0755);
+        CHECK(ns_write_raw("out/test_moe_qbase", bs, br, 5, 1u << 20, NULL, seq_fill, NULL, berr, sizeof berr) == 0, "base: %s", berr);
+        f = fopen("out/test_moe_qbase/config.json", "wb");
+        fputs("{\"model_type\": \"qwen4_exp\", \"hidden_size\": 8, \"moe_intermediate_size\": 8, \"num_experts\": 2, \"num_hidden_layers\": 1, "
+              "\"model_file\": \"nanoseedlm_qwen4.py\", \"quantization\": {\"group_size\": 32, "
+              "\"language_model.model.layers.0.mlp.switch_mlp.up_proj\": {\"bits\": 4}}}", f);
+        fclose(f);
+        f = fopen("out/test_moe_qbase/LICENSE", "wb");
+        fputs("license", f);
+        fclose(f);
+        static const char* kq[3] = {"gate_proj", "up_proj", "down_proj"};
+        char bp[256];
+        for (int l = 0; l < 2; ++l)
+            for (int q = 0; q < 3; ++q) {
+                snprintf(bp, sizeof bp, "out/test_moe_qbanks/L%d_%s.blkt", l, kq[q]);
+                f = fopen(bp, "wb");
+                fwrite(&h, sizeof h, 1, f); fwrite(rel, 4, 2 * E, f); fwrite(words, 4, nw * E * R, f); fwrite(sc, 2, E * R * NB, f);
+                fclose(f);
+            }
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_qpack", 1u << 20, berr, sizeof berr) == 0,
+              "pack: %s", berr);
+        CHECK(ns_open(&m, "out/test_moe_qpack", berr, sizeof berr) == 0 && m.n == 3 && ns_add_banks(&m, "out/test_moe_qpack", berr, sizeof berr) == 0,
+              "packed folder: %s", berr);
+        t = ns_find(&m, "language_model.model.layers.0.linear_attn.out_proj.weight");
+        const NsTensor* hu = ns_find(&m, "mtp.layers.0.mlp.switch_mlp.up_proj.weight");
+        CHECK(t && t->s[0].len == 4 && t->s[0].p[0] == 0 && t->s[0].p[3] == 3 && hu && hu->enc == NS_TCQ && m.n == 9,
+              "packed tensors: %d, the head's up_proj %s", m.n, hu ? "trellis" : "missing");
+        ns_close(&m);
+        FILE* cf = fopen("out/test_moe_qpack/config.json", "rb");
+        char cb[1024] = "";
+        if (cf) { cb[fread(cb, 1, sizeof cb - 1, cf)] = 0; fclose(cf); }
+        CHECK(!strstr(cb, "model_file") && !strstr(cb, "switch_mlp") && strstr(cb, "group_size") && strstr(cb, "qwen4_exp"), "config: %s", cb);
+        cf = fopen("out/test_moe_qpack/LICENSE", "rb");
+        CHECK(cf != NULL, "LICENSE not copied");
+        if (cf) fclose(cf);
+        remove("out/test_moe_qbanks/L1_down_proj.blkt");   // a missing bank: refused
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_qpack2", 1u << 20, berr, sizeof berr) != 0 &&
+              strstr(berr, "L1_down_proj"), "a missing head bank: %s", berr);
         free(nr); free(words); free(y);
     }
 

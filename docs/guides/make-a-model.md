@@ -89,15 +89,23 @@ out/bin/nslm-moe --model SNAPSHOT --imatrix imatrix_unsloth.gguf_file --out out/
 
 The search is resumable: it skips a bank file that is complete.
 
-A pack is a seed pack's folder, whole, with the bank files beside its shards. The engine opens the folder, then puts
-each bank in place of the expert tensor of the same name. Hard links save the disk space.
+The MTP head's experts are layer 48 (`--layers 48-48`). Layer 48 has no imatrix statistics, so its weights are uniform.
+
+`nslm-qwen4-pack --tq` writes a pack: every tensor of a base folder but the routed experts, plus the bank files. The
+engine opens the folder, then adds each bank as the expert tensor of its layer and projection.
 
 ```bash
-mkdir TQ3_DIR && ln P3_DIR/* TQ3_DIR/ && cp out/tq3/*.blkt TQ3_DIR/
+out/bin/nslm-qwen4-pack --base P3_DIR --tq out/tq3 --out TQ3_DIR
 ```
 
-A mix takes each projection's banks from another K. For example, `gate_proj` and `up_proj` from K = 3 and `down_proj`
-from K = 4 give 3.46 bits for each expert weight.
+A mix takes `down_proj`'s banks from another K with `--tq-down`. For example, `gate_proj` and `up_proj` from K = 3 and
+`down_proj` from K = 4 give 3.46 bits for each expert weight.
+
+```bash
+out/bin/nslm-qwen4-pack --base P3_DIR --tq out/tq3 --tq-down out/tq4 --out TQ3_D4_DIR
+```
+
+A seed pack's folder, whole, with the bank files beside its shards also works. Hard links save the disk space.
 
 ## MLA projections
 

@@ -168,18 +168,19 @@ int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen) {
     return 0;
 }
 
-// The folder's tensor that bank tensor b replaces. A bank of layer n, in a folder with layer n - 1 and an MTP head but
-// no layer n, is the head's (the packer's rule): b is renamed mtp.layers.0.mlp.switch_mlp.*
+// The folder's tensor that bank tensor b replaces (NULL: b is added). A bank of layer n is the MTP head's (the packer's
+// rule) when the folder has routers for layer n - 1 and the head but none for layer n: b becomes mtp.layers.0.mlp.switch_mlp.*
 static const NsTensor* bank_target(const NsModel* v, NsTensor* b) {
     const NsTensor* t = ns_find(v, b->name);
     int l = -1, at = 0;
     if (t || sscanf(b->name, "language_model.model.layers.%d.mlp.switch_mlp.%n", &l, &at) != 1 || !at || l < 1) return t;
-    char prev[sizeof b->name], head[sizeof b->name];
-    snprintf(prev, sizeof prev, "language_model.model.layers.%d.mlp.switch_mlp.%s", l - 1, b->name + at);
+    char r0[96], r1[96], head[sizeof b->name];
+    snprintf(r0, sizeof r0, "language_model.model.layers.%d.mlp.gate.weight", l - 1);
+    snprintf(r1, sizeof r1, "language_model.model.layers.%d.mlp.gate.weight", l);
+    if (!ns_find(v, r0) || ns_find(v, r1) || !ns_find(v, "mtp.layers.0.mlp.gate.weight")) return NULL;
     snprintf(head, sizeof head, "mtp.layers.0.mlp.switch_mlp.%s", b->name + at);
-    if (!ns_find(v, prev) || !(t = ns_find(v, head))) return NULL;
     memcpy(b->name, head, sizeof head);
-    return t;
+    return ns_find(v, head);
 }
 
 int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen) {
@@ -197,7 +198,7 @@ int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen) {
     return 0;
 }
 
-static int copy_file(const char* from, const char* to) {
+int nslm_copy_file(const char* from, const char* to) {
     FILE* a = fopen(from, "rb");
     if (!a) return -1;
     FILE* b = fopen(to, "wb");
@@ -213,19 +214,19 @@ int nslm_copy_loader(const char* loader, const char* dir) {
     char from[2048], to[2048];
     snprintf(from, sizeof from, "%.*snanoseedlm_seeds.py", sl ? (int) (sl - loader + 1) : 0, loader);
     snprintf(to, sizeof to, "%s/%s", dir, sl ? sl + 1 : loader);
-    if (copy_file(loader, to)) return -1;
+    if (nslm_copy_file(loader, to)) return -1;
     snprintf(to, sizeof to, "%s/nanoseedlm_seeds.py", dir);
-    return copy_file(from, to);
+    return nslm_copy_file(from, to);
 }
 
 void nslm_copy_model_files(const char* from, const char* to) {
     static const char* files[] = {"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
                                   "generation_config.json", "preprocessor_config.json", "processor_config.json",
-                                  "video_preprocessor_config.json", "vocab.json", "merges.txt"};
+                                  "video_preprocessor_config.json", "vocab.json", "merges.txt", "LICENSE"};
     char a[2048], b[2048];
     for (size_t i = 0; i < sizeof files / sizeof files[0]; ++i) {
         snprintf(a, sizeof a, "%s/%s", from, files[i]);
         snprintf(b, sizeof b, "%s/%s", to, files[i]);
-        copy_file(a, b);
+        nslm_copy_file(a, b);
     }
 }

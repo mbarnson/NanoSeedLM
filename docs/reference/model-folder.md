@@ -19,9 +19,14 @@ Read [SeedLM](../concepts/seedlm.md) for how the engine makes weights from seeds
 ## Trellis expert banks
 
 A folder can also hold trellis-coded experts as bank files, `L{layer}_{gate_proj,up_proj,down_proj}.blkt`
-(`nslm-moe --codec tq`). The engine and the C reference add them with `ns_add_banks`. Each bank takes the place of
-the folder's tensor `language_model.model.layers.L.mlp.switch_mlp.PROJ.weight`. The safetensors shards must stay
-whole, because the reader opens every shard that the index names.
+(`nslm-moe --codec tq`). The engine and the C reference add them with `ns_add_banks`. Each bank becomes the tensor
+`language_model.model.layers.L.mlp.switch_mlp.PROJ.weight`, in place of the folder's tensor of that name if it has
+one. The safetensors shards must stay whole, because the reader opens every shard that the index names.
+
+A bank of layer n can be the MTP head's (`mtp.layers.0.mlp.switch_mlp.PROJ.weight`). That is so when the folder has
+the routers (`mlp.gate.weight`) of layer n - 1 and of the head, and no router for layer n. For Qwen3.8-Flash-Next, it
+is layer 48.
+`nslm-qwen4-pack --tq` writes a folder without the routed experts, so its banks are the only experts.
 
 | Part | Contents |
 |---|---|
