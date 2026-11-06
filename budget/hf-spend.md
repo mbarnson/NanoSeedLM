@@ -41,6 +41,8 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | nslm release upload again (6aed93be0e0338d1bb80efb1, by pc-cuda, MSYS_NO_PATHCONV=1): no bytes moved, then EIO (hf upload read the bucket mount; my script bug) | cpu-xl ($1.00/h) | 56.4 | about $0.94 | about $20.69 |
 
+| Linux CI 8856cc4 (6aeda44f0e0338d1bb80fac7): --dense-only, 44 PASS | rtx-pro-6000 ($2.75/h) | 1.8 | about $0.08 | about $20.77 |
+
 | nslm release upload, third (src-29a76aa: a local copy first), not started | cpu-xl ($1.00/h) | at most 180 | at most $3.00 | |
 
-Left this week: about $4.31 before the third upload job.
+Left this week: about $4.23 before the third upload job.
