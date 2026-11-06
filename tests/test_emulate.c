@@ -8,6 +8,7 @@
 
 #include "emulate.h"
 #include "gguf.h"
+#include "qwen4_cfg.h"
 #include "rows.h"
 
 static int fails = 0;
@@ -256,6 +257,48 @@ int main(void) {
             gguf_close(&g);
         }
         ns_close(&gm);
+    }
+
+    // The PLE table: the folder's shards of its PLE layer over the shard's per_layer_token_embd, row for row, in Q8_0
+    {
+        Qwen4Cfg c;
+        memset(&c, 0, sizeof c);
+        c.n_layer = 2; c.vocab = 100; c.ple_dim = 32; c.ngram = 2; c.heads_per_ngram = 1; c.ngram_parts = 4;
+        c.ngram_base = 50; c.ngram_div = 16; c.ple[0] = -1; c.ple[1] = 0;   // one head of 53 rows (the prime), padded to 64
+        Qwen4Ngram g;
+        qwen4_ngram_init(&c, 0, &g);
+        enum { W = 32 };
+        const int rows = (int) g.rows, per = rows / 4;
+        char sn[4][96];
+        NsSpec sp[4];
+        for (int k = 0; k < 4; ++k) {
+            snprintf(sn[k], sizeof sn[k], "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.%d.weight", k);
+            sp[k] = (NsSpec) {sn[k], NS_BF16, 1, per, W};
+        }
+        NsModel pm;
+        mkdir("out/test_emulate_ple", 0755);
+        CHECK(rows == 64 && ns_write("out/test_emulate_ple", sp, 4, 1u << 20, NULL, bf16_fill, NULL, err, sizeof err) == 0 &&
+              ns_open(&pm, "out/test_emulate_ple", err, sizeof err) == 0, "ple pack: %d rows, %s", rows, err);
+        uint8_t* want = (uint8_t*) malloc((size_t) rows * 34);
+        float w[W];
+        for (int r = 0; r < rows; ++r) { ns_row_f32(nr, ns_find(&pm, sn[r / per]), 0, r % per, 0, w); ns_q8_0_row(w, W, want + r * 34); }
+        const char* pp = "out/test_emulate_ple.gguf";
+        for (int c2 = 0; c2 < 2; ++c2) {   // the table's shape: written; 16 rows short: refused, the file unchanged
+            uint8_t* fill0 = (uint8_t*) malloc((size_t) (rows + 1) * 34);
+            memset(fill0, 0xAB, (size_t) (rows + 1) * 34);
+            write_gguf2(pp, "per_layer_token_embd.weight", rows - 16 * c2, "blk.0.attn_qkv.weight", 1, fill0, (size_t) (rows - 16 * c2 + 1) * 34);
+            int64_t nw = -1;
+            const int rc = ns_emulate_ple(&pm, &c, pp, 3, &nw, err, sizeof err);
+            Gguf gg;
+            CHECK(gguf_open(&gg, pp, err + 256, 256) == 0, "reopen the ple shard");
+            const uint8_t* at = gg.map + gg.data;
+            if (!c2) CHECK(rc == 0 && nw == rows && !memcmp(at, want, (size_t) rows * 34) && at[rows * 34] == 0xAB, "ple: rc %d, %lld rows, %s", rc, (long long) nw, err);
+            else CHECK(rc != 0 && strstr(err, "per_layer_token_embd") && at[0] == 0xAB, "ple, a short table: rc %d, %s", rc, err);
+            gguf_close(&gg);
+            free(fill0);
+        }
+        free(want);
+        ns_close(&pm);
     }
 
     for (int i = 0; i < 2; ++i) ns_close(&m[i]);

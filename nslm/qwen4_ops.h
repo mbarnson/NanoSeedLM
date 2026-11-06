@@ -38,6 +38,8 @@ void qwen4_head_norm_rope(const Qwen4Cfg* c, float* x, int nh, int hs, int hd, c
 // MoE router: softmax of logits[n_exp], the top k (ties to the higher expert), weights renormalised over the k
 void qwen4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt);
 
+// The folder's table shard of `layer` that holds row `row`, and the row's index in it (*local); NULL when missing
+const NsTensor* qwen4_ple_shard(const NsModel* m, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer, int64_t row, int* local);
 // PLE of token t: emb[ple_dim], the rows of its n-grams from table (a GGUF table, e.g. Unsloth's), or when NULL from the
 // folder's table shards of `layer`; -1 when a row is missing
 int qwen4_ple_embed(const NsModel* m, const NsRows* rw, const PleTable* table, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer,

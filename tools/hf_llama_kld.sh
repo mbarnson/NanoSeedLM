@@ -15,7 +15,9 @@
 # NAME/mlx: a tier with P3's 4-bit MLX dense tensors too (the pack as shipped, nslm-qwen4-emulate --dense), or /PATH: a
 # packed folder (nslm-qwen4-pack --tq) with its own experts and dense tensors, or dense:KIND: P3's 4-bit MLX dense tensors
 # whose names contain KIND over the folder's (dense plan D2a; each adds to the last, so "dense:shared_expert dense:self_attn"
-# has both kinds at 4 bits).  These come last: they change the Q8_0 dense tensors in place.  The reference logits: BF16 on
+# has both kinds at 4 bits), or ple:TIER: the 4-bit MLX PLE table of tier TIER's folder (ple:P3, the table of the release
+# packs) over the Q8_0 shard's own table (with REF only: BF16's linked table is refused).  These come last: they change
+# the Q8_0 tensors in place.  The reference logits: BF16 on
 # the first CHUNKS windows of 2,048 tokens of wikitext-2 (test).
 set -uo pipefail
 UREPO=unsloth/Qwen3.8-Flash-Next-GGUF
@@ -91,17 +93,18 @@ for pk in $PACKS; do
             mkdir -p /m/Q8_0-PLE && hf download "$UREPO" --revision "$UREV" --include "Q8_0/*-00003-of-00006.gguf" --local-dir /m/q8ple >/dev/null
             for f in /m/Q8_0/*.gguf; do ln -sf "$f" /m/Q8_0-PLE/; done
             ln -sf /m/q8ple/Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf /m/Q8_0-PLE/; dir=/m/Q8_0-PLE ;;
-        P3|P4|S3|TQ*|*+*@*|*/mlx|/*|dense:*)   # the experts or dense tensors of the Q8_0 folder replaced: Q8_0 must come first
+        P3|P4|S3|TQ*|*+*@*|*/mlx|/*|dense:*|ple:*)   # the experts or dense tensors of the Q8_0 folder replaced: Q8_0 must come first
             t1=$(date +%s) base=${pk%/mlx}
-            if [[ -n ${MLX:-} && $pk != */mlx && $pk != /* && $pk != dense:* ]]; then echo "== $pk: after a /mlx, folder or dense pack the dense tensors changed: put those last"; continue; fi
+            if [[ -n ${MLX:-} && $pk != */mlx && $pk != /* && $pk != dense:* && $pk != ple:* ]]; then echo "== $pk: after a /mlx, folder or dense pack the dense tensors changed: put those last"; continue; fi
             if [[ $pk == dense:* ]]; then seed P3; args=(--dense /m/seed-P3 --dense-only "${pk#dense:}"); MLX=1
+            elif [[ $pk == ple:* ]]; then seed "${pk#ple:}"; args=(--ple "/m/seed-${pk#ple:}"); MLX=1
             elif [[ $pk == /* ]]; then args=(--pack "$pk" --dense "$pk"); MLX=1
             elif [[ $base == *@* ]]; then
                 lo=${base%%+*} hi=${base#*+}; hi=${hi%@*}
                 seed "$lo"; seed "$hi"; args=(--pack "/m/seed-$lo" --pack "/m/seed-$hi" --map "$MAPS/${base#*@}.bin")
             else seed "$base"; args=(--pack "/m/seed-$base"); fi
             if [[ $pk == */mlx ]]; then seed P3; args+=(--dense /m/seed-P3); MLX=1; fi
-            if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack|dense"; then
+            if ! /w/src/build/bin/nslm-qwen4-emulate "${args[@]}" --workers "$(nproc)" /m/Q8_0/*.gguf | grep -E "experts:|of the pack|dense|PLE"; then
                 echo "== $pk: emulate failed"; continue
             fi
             [ -n "$PLE" ] && stamp "$PLE" 3 6

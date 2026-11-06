@@ -121,8 +121,7 @@ void qwen4_route(const Qwen4Cfg* c, const float* logits, int32_t* ind, float* wt
     free(pr);
 }
 
-// The folder's table shard of `layer` that holds row `row`, and the row's index in it (*local); NULL when missing
-static const NsTensor* ple_shard(const NsModel* m, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer, int64_t row, int* local) {
+const NsTensor* qwen4_ple_shard(const NsModel* m, const Qwen4Cfg* c, const Qwen4Ngram* g, int layer, int64_t row, int* local) {
     const int64_t base = g->rows / c->ngram_parts, rem = g->rows % c->ngram_parts, big = rem * (base + 1);   // shard k: base + (k < rem) rows
     const int64_t k = row < big ? row / (base + 1) : rem + (row - big) / base;
     const int64_t first = k < rem ? k * (base + 1) : big + (k - rem) * base;
@@ -142,7 +141,7 @@ int qwen4_ple_head(const NsModel* m, const NsRows* rw, const PleTable* table, co
     qwen4_ngram_rows(c, g, ids, t, rows);
     emb += (size_t) h * wd;
     if (table) return table->width != wd || ple_row(table, rows[h], emb) ? -1 : 0;
-    const NsTensor* s = ple_shard(m, c, g, layer, rows[h], &local);
+    const NsTensor* s = qwen4_ple_shard(m, c, g, layer, rows[h], &local);
     if (!s || s->cols != wd) return -1;
     ns_row_f32(rw, s, 0, local, 0, emb);
     return 0;
@@ -159,7 +158,7 @@ int qwen4_ple_prefetch(const NsModel* m, const PleTable* table, const Qwen4Cfg* 
     int found = 0, local;
     qwen4_ngram_rows(c, g, ids, t, rows);
     for (int h = 0; h < g->heads; ++h) {
-        const NsTensor* s = table ? NULL : ple_shard(m, c, g, layer, rows[h], &local);
+        const NsTensor* s = table ? NULL : qwen4_ple_shard(m, c, g, layer, rows[h], &local);
         if (table ? ple_prefetch(table, rows[h]) == 0 : s != NULL) ++found;
         if (s) ns_row_prefetch(s, 0, local);
     }

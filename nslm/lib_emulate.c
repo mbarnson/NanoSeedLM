@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "gguf.h"
+#include "qwen4_ops.h"
 #include "rows.h"
 
 uint16_t ns_f32_to_f16(float f) {
@@ -260,5 +261,79 @@ int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* onl
     if (fd >= 0 && close(fd) && !rc) rc = snprintf(err, (size_t) errlen, "%s: a write failed", gguf);
     free(w); free(tmp); free(buf); free(nr); free(et);
     *n = rc ? 0 : nt;
+    return rc ? -1 : 0;
+}
+
+typedef struct {
+    const NsModel* m;
+    const Qwen4Cfg* c;
+    const Qwen4Ngram* g;
+    int layer, width, fd, bad;
+    int64_t rows, next;   // the table's rows; the first row of the next chunk
+    uint64_t off;
+    pthread_mutex_t mu;
+} PleEmu;
+
+enum { PLE_CHUNK = 1 << 16 };   // rows of one write
+static void* ple_worker(void* arg) {
+    PleEmu* x = (PleEmu*) arg;
+    const size_t rb = (size_t) x->width / 32 * 34;
+    NsRows* nr = (NsRows*) malloc(sizeof *nr);
+    uint8_t* buf = (uint8_t*) malloc(rb * PLE_CHUNK);
+    float* w = (float*) malloc(sizeof(float) * (size_t) x->width);
+    ns_rows_init(nr);
+    for (;;) {
+        pthread_mutex_lock(&x->mu);
+        const int64_t r0 = x->bad ? x->rows : x->next;
+        x->next = r0 + PLE_CHUNK;
+        pthread_mutex_unlock(&x->mu);
+        if (r0 >= x->rows) break;
+        const int64_t n = x->rows - r0 < PLE_CHUNK ? x->rows - r0 : PLE_CHUNK;
+        int ok = 1, local;
+        for (int64_t i = 0; ok && i < n; ++i) {
+            const NsTensor* s = qwen4_ple_shard(x->m, x->c, x->g, x->layer, r0 + i, &local);
+            if ((ok = s && s->cols == x->width)) { ns_row_f32(nr, s, 0, local, 0, w); ns_q8_0_row(w, x->width, buf + rb * (size_t) i); }
+        }
+        size_t done = 0;
+        const size_t len = rb * (size_t) n;
+        while (ok && done < len) {
+            const ssize_t k = pwrite(x->fd, buf + done, len - done, (off_t) (x->off + rb * (uint64_t) r0 + done));
+            if (k <= 0) break;
+            done += (size_t) k;
+        }
+        if (!ok || done < len) { pthread_mutex_lock(&x->mu); x->bad = 1; pthread_mutex_unlock(&x->mu); }
+    }
+    free(nr); free(buf); free(w);
+    return NULL;
+}
+
+int ns_emulate_ple(const NsModel* pack, const Qwen4Cfg* c, const char* gguf, int workers, int64_t* rows, char* err, int errlen) {
+    *rows = 0;
+    Gguf g;
+    if (gguf_open(&g, gguf, err, errlen)) return -1;
+    const GgufTensor* gt = NULL;
+    for (int i = 0; i < g.n; ++i) if (!strcmp(g.t[i].name, "per_layer_token_embd.weight")) gt = &g.t[i];
+    if (!gt) { gguf_close(&g); return 0; }
+    int layer = -1, rc = 0, local;
+    for (int l = 0; l < c->n_layer && layer < 0; ++l) if (c->ple[l] >= 0) layer = l;
+    Qwen4Ngram ng;
+    if (layer >= 0) qwen4_ngram_init(c, c->ple[layer], &ng);
+    const int width = layer >= 0 ? c->ple_dim / ng.heads : 0;
+    const NsTensor* s0 = layer >= 0 ? qwen4_ple_shard(pack, c, &ng, layer, 0, &local) : NULL;
+    if (!s0 || gt->type != 8 || gt->ndim != 2 || width % 32 || gt->dims[0] != width || gt->dims[1] != ng.rows ||
+        s0->cols != width || g.data + gt->offset + (uint64_t) width / 32 * 34 * (uint64_t) ng.rows > g.size)
+        rc = snprintf(err, (size_t) errlen, "%s: per_layer_token_embd.weight is not a Q8_0 table of %lld rows of %d like the pack's", gguf,
+                      layer >= 0 ? (long long) ng.rows : 0LL, width);
+    PleEmu x = {pack, c, &ng, layer, width, -1, 0, layer >= 0 ? ng.rows : 0, 0, g.data + (rc ? 0 : gt->offset), PTHREAD_MUTEX_INITIALIZER};
+    gguf_close(&g);   // before the writes: the mapping is read-only
+    if (!rc && (x.fd = open(gguf, O_RDWR)) < 0) rc = snprintf(err, (size_t) errlen, "%s: cannot open for writing", gguf);
+    if (!rc) {
+        pthread_t th[64];
+        const int nw = workers < 1 ? 1 : workers > 64 ? 64 : workers;
+        for (int i = 0; i < nw; ++i) pthread_create(&th[i], NULL, ple_worker, &x);
+        for (int i = 0; i < nw; ++i) pthread_join(th[i], NULL);
+        if (close(x.fd) || x.bad) rc = snprintf(err, (size_t) errlen, "%s: a PLE row is missing in the pack, or a write failed", gguf);
+    }
+    *rows = rc ? 0 : x.rows;
     return rc ? -1 : 0;
 }

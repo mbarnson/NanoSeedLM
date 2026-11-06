@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "model_st.h"
+#include "qwen4_cfg.h"
 
 uint16_t ns_f32_to_f16(float f);                         // IEEE half: nearest, ties to even
 void ns_q8_0_row(const float* x, int n, uint8_t* out);   // llama.cpp quantize_row_q8_0_ref: n / 32 blocks of 34 bytes
@@ -20,3 +21,7 @@ typedef struct { int hk, hv, dk, dv; } NsGdnHeads;   // Gated DeltaNet key and v
 // tensor whose sampled rows differ from the shard's own by more than 0.3 (relative) has another order, and nothing is
 // written.  only: the tensors whose engine name contains it (NULL: all).  *n: tensors written.  0, or -1 with err.
 int ns_emulate_dense(const NsModel* pack, const NsGdnHeads* gdn, const char* only, const char* gguf, int* n, char* err, int errlen);
+// The shard's per_layer_token_embd.weight (Q8_0: the PLE n-gram table of Unsloth's engram files, rows of ple_dim / heads)
+// from the pack's own table: its PLE layer's shards, as the engine reads them, as Q8_0 rows.  *rows: rows written (0:
+// the shard has no such table).  A table of another shape is refused before any write.  0, or -1 with err.
+int ns_emulate_ple(const NsModel* pack, const Qwen4Cfg* c, const char* gguf, int workers, int64_t* rows, char* err, int errlen);
