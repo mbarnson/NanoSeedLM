@@ -22,4 +22,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 7e8f43b (6aed5eb3c78863f9c633da18): nslm-qwen4-emulate --dense | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.69 |
 
-Left this week: about $19.31.
+| Linux CI 7eb5d9b (6aed60c8c78863f9c633dadc): the DeltaNet head order | rtx-pro-6000 ($2.75/h) | about 1.7 | about $0.08 | about $5.77 |
+
+Left this week: about $19.23.
