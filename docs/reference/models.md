@@ -48,7 +48,8 @@ model.
 | [Qwen3.8-Flash-Next-NanoSeedLM-TCQ4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4), [TCQ3-D4](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4), [TCQ3](https://huggingface.co/txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3) | Not in the repositories yet | Not yet | Yes | Yes |
 
 oMLX removes `model_file` from `qwen4_exp` configurations, so it does not load the Qwen3.8-Flash-Next loader yet. A
-one-line fix (Matt's fork, `29ee79c`) lets it load P3 and, with `nanoseedlm_trellis.py`, TCQ4.
+one-line fix (Matt's fork, `29ee79c`) lets it load P3 and, with `nanoseedlm_trellis.py`, TCQ4. The fix is in review
+upstream as [jundot/omlx#5112](https://github.com/jundot/omlx/pull/5112).
 Use mlx-vlm 0.7.12 or later with `--trust-remote-code`. To use a model in oMLX, read [The MLX loader](../guides/mlx.md).
 To use a model in the engine, read [Run and serve](../guides/run-and-serve.md).
 
