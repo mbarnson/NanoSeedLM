@@ -5,8 +5,8 @@ a prompt of 30,000 tokens it still decodes at about 39. Warm prompts run at abou
 PLE table costs 0% to 4% of decode against the pack's own table: the host reads its rows on one thread.
 
 **Status.** Current. The Mac's part of the long runs for the cards. The PC's part is
-[the RTX 4080 page](2026-11-06-long-bench-4080.md). The note on the cost of the Q8_0 table is replaced by
-[the PLE rows on a host pool](2026-11-06-ple-pool-m4max.md): the host reads take 5 to 17 ms for 256 tokens.
+[the RTX 4080 page](2026-11-06-long-bench-4080.md). [The PLE rows on a host pool](2026-11-06-ple-pool-m4max.md)
+replaces the note on the cost of the Q8_0 table. The host reads take 5 to 17 ms for 256 tokens.
 
 ## Setup
 
