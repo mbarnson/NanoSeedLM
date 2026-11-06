@@ -5,7 +5,7 @@
 // test_qwen4_engine.c's bounds, also with the decode rows in key splits. Bit for bit across row splits is what MTP's
 // verify forwards need: drafts then change no logits (plan gate MB, tests/test_qwen4_mtp.c). Last, the tiny model with
 // trellis experts (L 12, K 3 banks, as test_qwen4_engine.c's tcq_check) against the C reference: a prompt of 20 rows
-// (the trellis GEMM) and 8 decode rows (the gathers).
+// (the trellis GEMM) and 8 decode rows (the gathers); then with the MTP head's experts as a bank too (its drafts, gate MB).
 #define _DARWIN_C_SOURCE   // setenv
 #include <math.h>
 #include <stdio.h>
