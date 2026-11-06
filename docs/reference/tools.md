@@ -50,7 +50,8 @@ Read [Make a model folder](../guides/make-a-model.md).
 | `hf_cuda_test.sh` | Build and run CUDA tests on an HF Jobs GPU node |
 | `hf_qwen4_gen.sh` | Run a Qwen3.8-Flash-Next pack through `nslm-qwen4-gen` on an HF Jobs GPU node |
 | `hf_qwen4_kld.sh` | Score packs with `nslm-qwen4-kld` against a reference model on wikitext-2, on an HF Jobs GPU node |
-| `hf_llama_kld.sh` | Score Unsloth packs and emulated seed packs against BF16 in llama.cpp, with the BF16 PLE table |
+| `hf_llama_kld.sh` | Score Unsloth packs and emulated seed or trellis packs against BF16 in llama.cpp. `REF` keeps the BF16 reference for later jobs |
+| `gguf_expert_bytes.py` | The routed experts' bytes and bits for each weight of a GGUF pack on the Hub, from its headers only |
 | `hf_qwen4_routes.sh` | Record routing traces of a pack on chat and code text, on an HF Jobs GPU node |
 | `qwen4_tier_map.py` | Write a per-expert tier map from routing traces (most used experts), at random, or by projection |
 | `qwen4_tier_sim.py` | Simulate a high tier that follows the routing: its share of router choices and its loads |
