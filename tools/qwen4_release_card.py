@@ -21,7 +21,7 @@ PACKS = {
     "TCQ4": ("Trellis K4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "Engines, mlx-vlm, oMLX"),
     "TCQ3-D4": ("Trellis K3, down K4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "Engines, mlx-vlm, oMLX"),
     "TCQ3": ("Trellis K3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "Engines, mlx-vlm, oMLX"),
-    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 105.7, 74, None, 0.0408, "Engines, mlx-vlm, oMLX"),
+    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 105.7, 74, 0.169, 0.0408, "Engines, mlx-vlm, oMLX"),
     "P3": ("Seeds P3", 4.0, 60.4, "4-bit", 98.2, 66, 0.182, 0.0600, "Engines, mlx-vlm, oMLX"),
 }
 # Decode of 4,096 tokens and after 30K, prompt tok/s at 30K, in nslm-serve's long runs (absent: not measured)
@@ -104,7 +104,7 @@ expert weights, their dense weights, and the runtimes that load them.
 - **Bits** are the bits for each expert weight. **Memory** counts the weights that stay resident, about. The PLE
   n-gram table stays on the disk, and the page cache holds the rows that a session reads.
 - **KL as shipped** is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2. Lower is closer to the
-  original model. P4 as shipped is not measured yet.
+  original model.
 - **Engines** are the NanoSeedLM engines: CUDA on Linux and Windows, Metal on macOS. oMLX needs the fix in
   [jundot/omlx#5112]({OMLX_PR}). We tested each pack in oMLX, and P3 and TCQ4 in mlx-vlm.
 
@@ -113,9 +113,9 @@ expert weights, their dense weights, and the runtimes that load them.
 - **Trellis or seeds.** Both compute each expert weight from a few stored bits with integer arithmetic, and neither
   stores a codebook. On this model the trellis code (TCQ) is closer to BF16 for its bits. Compare the experts with the
   same 8-bit dense weights: TCQ4 gives 0.0398 at 4.125 bits, P4 0.0408 at 4.5 bits and P3 0.0600 at 4.0 bits.
-- **8-bit or 4-bit dense weights.** The dense weights are a small part of the bytes, but in P3 they cause most of the
-  KL: 0.0600 with 8-bit dense weights, 0.182 with the 4-bit ones that it ships. So the TCQ packs ship 8-bit dense
-  weights. The cost is speed: they read 1.84 GB more for each token. On the M4 Max, TCQ4 decodes about 15% slower than
+- **8-bit or 4-bit dense weights.** The dense weights are a small part of the bytes, but in P3 and P4 they cause most
+  of the KL. With 8-bit dense weights, P3 gives 0.0600 and P4 0.0408. With the 4-bit ones that they ship, P3 gives 0.182
+  and P4 0.169. So the TCQ packs ship 8-bit dense weights. The cost is speed: they read 1.84 GB more for each token. On the M4 Max, TCQ4 decodes about 15% slower than
   P3.
 - **Runtimes.** Each pack carries its MLX model files, so mlx-vlm runs it with Trust Remote Code. oMLX runs it with
   the fix in [jundot/omlx#5112]({OMLX_PR}). The NanoSeedLM engines run each pack too. The start scripts of the engine
@@ -349,7 +349,8 @@ def seeds(name):
     rel = f"{abs(off):.0f}% {'above' if off > 0 else 'below'}"
     shipped_row = kl(shipped) if shipped else "Not measured yet"
     shipped_note = "" if shipped else " In P3, the 4-bit dense weights add 0.12 to the KL."
-    lead = {"P4": f"Its experts are on Unsloth's quality curve: {kq8:.4f} at 4.5 bits, {rel} it.",
+    lead = {"P4": f"As shipped, its KL against BF16 is {kl(shipped)}, and its 4-bit dense weights cause most of it. Its "
+                  f"experts are on Unsloth's quality curve: {kq8:.4f} at 4.5 bits, {rel} it.",
             "P3": f"As shipped, its KL against BF16 is {kl(shipped)}, and its 4-bit dense weights cause most of it."}[name]
     run = ""
     omlx_note = "SSD PLE and MTP work, and MTP on gives the same text as MTP off."
