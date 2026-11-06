@@ -947,3 +947,9 @@ On the RTX 4080 with 4 GB more of VRAM kept free, TCQ3 decodes at 27 tokens per 
 With A1m, A2m and the merged projections (`b911cb5`), 2 drafts at `Q4E_DRAFT_MIN_P=0.3` make TCQ4 decode 32% faster at
 temperature 0, with the same text, and 16% faster at 1.0. The start script of v0.1.1 turns them on for a Mac. Read
 [the gates on the M4 Max](results/2026-11-06-draft-gates-m4max.md).
+
+## [2026-11-06] result | The PLE rows on a host pool on the M4 Max
+
+mac-metal's pool for the PLE rows (`c9fcca7`) gives the same text and no speed beyond the noise, so it does not join
+v0.1.1. The Q8_0 table's difference with drafts comes from its draft counts, not from row reads. Read
+[the PLE rows on a host pool](results/2026-11-06-ple-pool-m4max.md).
