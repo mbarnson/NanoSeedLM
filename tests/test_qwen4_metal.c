@@ -3,16 +3,21 @@
 // bit), one GEMM row of 48, the same logits twice (the QSA selection in block order), and a prompt of 199 rows in one
 // forward or three, bit for bit. Then tests/data/qwen4_tiny_attn (strong attention) against nslm/qwen4_ref.h, with
 // test_qwen4_engine.c's bounds, also with the decode rows in key splits. Bit for bit across row splits is what MTP's
-// verify forwards need: drafts then change no logits (plan gate MB, tests/test_qwen4_mtp.c).
+// verify forwards need: drafts then change no logits (plan gate MB, tests/test_qwen4_mtp.c). Last, the tiny model with
+// trellis experts (L 12, K 3 banks, as test_qwen4_engine.c's tcq_check) against the C reference: a prompt of 20 rows
+// (the trellis GEMM) and 8 decode rows (the gathers).
 #define _DARWIN_C_SOURCE   // setenv
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "format.h"
+#include "moe.h"
 #include "qwen4_eng.h"
 #include "qwen4_ref.h"
+#include "trellis.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -21,6 +26,96 @@ static int argmax(const float* v, int n) {
     int a = 0;
     for (int i = 1; i < n; ++i) if (v[i] > v[a]) a = i;
     return a;
+}
+
+static int copy_file(const char* from, const char* to) {
+    FILE* a = fopen(from, "rb"), *b = a ? fopen(to, "wb") : NULL;
+    char buf[1 << 16];
+    size_t got;
+    while (a && b && (got = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, got, b);
+    if (a) fclose(a);
+    return b && !fclose(b) ? 0 : -1;
+}
+// The tiny model with every layer's experts as trellis banks (L 12, K 3, T = a row; random weights encoded by the C
+// encoder), as test_qwen4_engine.c's tcq_fixture: the banks replace the folder's affine experts
+static int tcq_fixture(const char* dir, char* err, int errlen) {
+    char a[1024], b[1024];
+    mkdir(dir, 0755);
+    snprintf(b, sizeof b, "%s/config.json", dir);
+    snprintf(a, sizeof a, "%s/model.safetensors", dir);
+    Qwen4Cfg c;
+    if (copy_file("tests/data/qwen4_tiny/config.json", b) || copy_file("tests/data/qwen4_tiny/model.safetensors", a) ||
+        qwen4_cfg_load(&c, dir, err, errlen)) {
+        if (!err[0]) snprintf(err, (size_t) errlen, "cannot copy the tiny model to %s", dir);
+        return -1;
+    }
+    const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+    uint32_t r = 777;
+    for (int l = 0; l < c.n_layer; ++l)
+        for (int p = 0; p < 3; ++p) {
+            const int R = p == 2 ? c.d : c.ff_exp, C = p == 2 ? c.ff_exp : c.d, E = c.n_exp, T = C;
+            const size_t nw = nslm_tq_row_words(C, T, 12, 3);
+            MoeBlkHeader h;
+            memset(&h, 0, sizeof h);
+            memcpy(h.magic, "NSLMBLKT", 8);
+            h.rows = (uint32_t) R; h.cols = (uint32_t) C; h.n_experts = (uint32_t) E; h.n_seeds = 12; h.n_exp = 3; h.refit = (uint32_t) T;
+            uint32_t* words = (uint32_t*) calloc(nw * (size_t) E * R, 4);
+            uint16_t* sc = (uint16_t*) calloc((size_t) E * R, 2);
+            float* w = (float*) malloc(sizeof(float) * (size_t) C), *rel = (float*) calloc(2 * (size_t) E, 4);
+            NsTqScratch z;
+            nslm_tq_scratch_init(&z, T, 12, 3);
+            for (int k = 0; k < E * R; ++k) {
+                for (int j = 0; j < C; ++j) { r = r * 1664525u + 1013904223u; w[j] = ((float) (r >> 8) / 16777216.0f - 0.5f) * 0.5f; }
+                nslm_tq_encode_row(w, NULL, C, T, &z, words + nw * (size_t) k, sc + k, NULL);
+            }
+            nslm_tq_scratch_free(&z);
+            snprintf(a, sizeof a, "%s/L%d_%s.blkt", dir, l, proj[p]);
+            FILE* f = fopen(a, "wb");
+            const int ok = f && fwrite(&h, sizeof h, 1, f) == 1 && fwrite(rel, 4, 2 * (size_t) E, f) == 2 * (size_t) E &&
+                           fwrite(words, 4, nw * E * R, f) == nw * E * R && fwrite(sc, 2, (size_t) E * R, f) == (size_t) E * R;
+            if (f) fclose(f);
+            free(words); free(sc); free(w); free(rel);
+            if (!ok) { snprintf(err, (size_t) errlen, "cannot write %s", a); return -1; }
+        }
+    return 0;
+}
+// Trellis experts (NS_TCQ banks) in the Metal engine against the C reference, with tcq_check's limits
+static void tcq_check(void) {
+    char dir[512], err[512] = "";
+    snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq_metal", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (tcq_fixture(dir, err, sizeof err)) { CHECK(0, "trellis fixture: %s", err); return; }
+    Qwen4Ref* r = qwen4_ref_open(dir, err, sizeof err);
+    CHECK(r != NULL, "trellis fixture, reference: %s", err);
+    if (!r) return;
+    enum { N = 28, NP = 20 };
+    const int V = qwen4_ref_cfg(r)->vocab;
+    int32_t ids[N];
+    for (int i = 0; i < N; ++i) ids[i] = (i * 37 + 11) % V;
+    float* ref = (float*) malloc(sizeof(float) * (size_t) N * V), *lg = (float*) malloc(sizeof(float) * (size_t) N * V);
+    CHECK(qwen4_ref_forward(r, ids, N, ref) == 0, "trellis fixture, reference forward");
+    double m = 1e-30;
+    for (size_t i = 0; i < (size_t) N * V; ++i) m = fmax(m, fabs((double) ref[i]));
+    Q4EOpts o;
+    memset(&o, 0, sizeof o);
+    o.max_pos = 64;
+    Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
+    CHECK(e != NULL, "open the trellis fixture: %s", err);
+    if (e) {
+        int rc = q4e_forward(e, ids, NP, lg);
+        for (int t = NP; !rc && t < N; ++t) rc = q4e_forward(e, ids + t, 1, lg + (size_t) t * V);
+        CHECK(rc == 0, "trellis fixture, forward: %s", q4e_error(e));
+        double d = 0;
+        int am = 0;
+        for (int t = 0; t < N && !rc; ++t) {
+            for (int v = 0; v < V; ++v) d = fmax(d, fabs((double) lg[(size_t) t * V + v] - ref[(size_t) t * V + v]) / m);
+            am += argmax(lg + (size_t) t * V, V) != argmax(ref + (size_t) t * V, V);
+        }
+        printf("trellis experts (L 12, K 3): logits %.1e of max |logit| from the C reference, argmax differs in %d of %d rows\n", d, am, N);
+        CHECK(!rc && d < 3e-2 && am <= N / 16, "trellis experts: %.1e from the reference, %d argmax rows", d, am);
+        q4e_close(e);
+    }
+    free(ref); free(lg);
+    qwen4_ref_close(r);
 }
 
 int main(void) {
@@ -174,6 +269,7 @@ int main(void) {
     }
     free(got); free(twice); free(again); free(big);
     st_close_file(&st);
+    tcq_check();
     printf("test_qwen4_metal: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

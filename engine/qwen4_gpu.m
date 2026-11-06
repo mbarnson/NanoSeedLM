@@ -21,6 +21,7 @@
 #include "kernels_moe.metal"     // argument structs and constants only
 #include "kernels_qwen4.metal"
 #include "model_st.h"
+#include "moe.h"   // ns_add_banks: trellis experts
 #include "ple.h"
 #include "qwen4_ops.h"
 #include "rows.h"
@@ -137,9 +138,11 @@ static id<MTLComputePipelineState> pipe_g(Q4Eng* e, const char* name, int fmt, i
     else {
         MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
         const short f = (short) fmt, t = (short) T, g = (short) gs;
+        const int tq = gs;   // MF_TCQ: the trellis group L | K << 8 | T << 16 (function constant 3)
         [cv setConstantValue:&f type:MTLDataTypeShort atIndex:0];
         [cv setConstantValue:&t type:MTLDataTypeShort atIndex:1];
-        if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
+        if (fmt == MF_TCQ) [cv setConstantValue:&tq type:MTLDataTypeInt atIndex:3];
+        else if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
         fn = [e->lib newFunctionWithName:[NSString stringWithUTF8String:name] constantValues:cv error:&err];
     }
     if (e->prof >= 3) e->kname = key;
@@ -209,8 +212,15 @@ static void load_w(Q4Eng* e, MW* w, const char* fmt, ...) {
         fail(e, "%s: affine group %d not supported", name, t->group);
         return;
     }
+    if (t->enc == NS_TCQ) {   // trellis rows: the kernels take T a multiple of 32 up to 320 (a lane's W = T / 32 <= 10), L <= 16
+        const int L = t->group & 255, K = t->group >> 8 & 255, T = t->group >> 16;
+        if (T % 32 || T > 32 * TQ_WMAX || t->cols % T || L > 16 || K < 1 || 2 * K > L) {
+            fail(e, "%s: trellis L %d K %d T %d not supported", name, L, K, T);
+            return;
+        }
+    }
     w->fmt = t->enc; w->slices = t->slices; w->rows = t->rows; w->cols = t->cols;
-    w->gs = t->enc == NS_Q4 || t->enc == NS_Q8 ? t->group : 0;
+    w->gs = t->enc == NS_Q4 || t->enc == NS_Q8 || t->enc == NS_TCQ ? t->group : 0;   // NS_TCQ: L | K << 8 | T << 16
     for (int s = 0; s < 4; ++s) {
         const NsStream* st = &t->s[s];
         if (!st->len) continue;
@@ -842,6 +852,7 @@ static int check_shapes(Q4Eng* e) {   // what the kernels take (as tests/kernel_
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) {
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
+    if (ns_add_banks(&e->nm, model_dir, err, errlen)) { ns_close(&e->nm); free(e); return NULL; }   // trellis experts (.blkt)
     const Qwen4Cfg* c = &e->c;
     e->max_pos = o && o->max_pos > 0 ? o->max_pos : 4096;
     e->nb = e->max_pos / c->ix_ratio + 1;

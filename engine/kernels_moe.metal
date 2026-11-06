@@ -12,6 +12,7 @@ using namespace metal;
 // SEED4 / SEED4P4: LFSR seeds, expanded from the per-seed stream table.
 enum { MF_BF16 = 0, MF_SEED4 = 1, MF_Q8 = 2, MF_Q4 = 3, MF_SEED4P4 = 4, MF_SEED6P8 = 5, MF_TCQ = 8 };   // = NS_* (nslm/model_st.h)
 // MF_TCQ: trellis-coded rows (nslm/trellis.h format v0); KtWeight / NsTensor group = L | K << 8 | T << 16
+#define TQ_WMAX 10   // MF_TCQ: a lane's weights of a block, T / 32 (T <= 320)
 #define MV_MAXT 8          // dense matvec: tokens per weight-row load
 #define MV_ROWS 8          // simdgroups per matvec threadgroup
 #define MVS_TG 256         // k_mv_split: threads per output row
@@ -136,6 +137,11 @@ constant short FC_T [[function_constant(1)]];
 // MLX packs).  The Metal engine leaves it unset.
 constant short FC_GS [[function_constant(2)]];
 constant uint AFF_GS = is_function_constant_defined(FC_GS) ? (uint) FC_GS : 64u;
+// MF_TCQ: the trellis group L | K << 8 | T << 16 (function constant 3, set only for MF_TCQ pipelines)
+constant int FC_TQ [[function_constant(3)]];
+constant int TQ_L = is_function_constant_defined(FC_TQ) ? (FC_TQ & 255) : 12;
+constant int TQ_KB = is_function_constant_defined(FC_TQ) ? ((FC_TQ >> 8) & 255) : 3;
+constant int TQ_T = is_function_constant_defined(FC_TQ) ? (FC_TQ >> 16) : 256;
 static_assert(MV_Q4_BPL <= 4, "a lane's MV_Q4_BPL blocks must stay in one group of 32");
 // MLA quantized caches: the RoPE key FP8; the latent FP8 (KV_FP8) or its first MLA_FP4_LEAD dims FP8, the rest FP4
 #define KLH ATT_HD
@@ -544,7 +550,38 @@ static inline float mv_lane(short fmt, device const uchar* W, device const ushor
 // Gather: grid y = pair p; row r of slice sel[p]; input row p / xdiv.
 // Each simdgroup takes MV_NR(fmt) consecutive rows; the lanes walk the 8-weight blocks, each x block loaded once for
 // all of them.  Buffers: 0 args, 1 W (codes / BF16 / seeds), 2 scales (Q8/Q4) or nibble / coefficient words (seeds),
+// One lane's part of a trellis-coded row (MF_TCQ, nslm/trellis.h format v0, plan T3), as CUDA's tq_block: the row's C / T
+// blocks, block b a stream of NB = K T + L - K bits from bit b NB of the row's words (row_words = ceil(C / T NB / 32) + 1,
+// the spare word included). Lane l takes the W = T / 32 weights from l W of each block: one 3-word read (the third only when
+// its window reaches it), shifted to its first bit, then each state s at a compile-time shift. q(s), the byte sum of
+// 34038481 s + 76625530 less 510, is exact in f32 as rint(255 (sum of unpack_unorm4x8)) - 510 (all 65,536 states checked).
+// Each block's sum times its BF16 scale.
+static inline float tq_row_lane(device const uint* row, device const ushort* sc, int C, uint lane, device const float* xb) {
+    const int W = TQ_T / 32, NB = TQ_KB * TQ_T + TQ_L - TQ_KB, nb = C / TQ_T;
+    float acc = 0;
+    for (int b = 0; b < nb; ++b) {
+        const uint o = uint(b) * uint(NB) + uint(TQ_KB * W) * lane, sh = o & 31u;
+        device const uint* p = row + (o >> 5);
+        const uint w0 = p[0], w1 = p[1], w2 = sh + uint(TQ_KB * (W - 1) + TQ_L) > 64u ? p[2] : 0u;
+        const uint u0 = uint(((ulong(w1) << 32) | ulong(w0)) >> sh), u1 = uint(((ulong(w2) << 32) | ulong(w1)) >> sh);
+        device const float* xp = xb + b * TQ_T + int(lane) * W;
+        float s = 0;
+        for (int i = 0; i < TQ_WMAX; ++i) {
+            if (i >= W) break;
+            const int off = TQ_KB * i;
+            const uint st = (off + TQ_L <= 32 ? u0 >> uint(off) : off >= 32 ? u1 >> uint(off - 32) : (u0 >> uint(off)) | (u1 << uint(32 - off))) &
+                            ((1u << TQ_L) - 1u);
+            const float4 u = unpack_unorm4x8_to_float(st * 34038481u + 76625530u);
+            s += (rint((u.x + u.y + u.z + u.w) * 255.0f) - 510.0f) * xp[i];
+        }
+        acc += bf(sc[b]) * s;
+    }
+    return acc;
+}
+static inline ulong tq_row_words(int C) { return (ulong) (((C / TQ_T) * (TQ_KB * TQ_T + TQ_L - TQ_KB) + 31) / 32 + 1); }
+
 // 3 biases (Q8/Q4) or int32 slice biases (seeds), 4 x, 5 y, 6 sel (gather), 7 G (seeds), 8 exponent nibbles (SEED4P4).
+// MF_TCQ: 1 the words, 2 the BF16 block scales; gathers only.
 kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffer(1)]], device const ushort* S [[buffer(2)]],
                  device const ushort* B [[buffer(3)]], device const float* x [[buffer(4)]], device float* y [[buffer(5)]],
                  device const int* sel [[buffer(6)]], device const uint* G [[buffer(7)]], device const uchar* EN [[buffer(8)]],
@@ -560,6 +597,19 @@ kernel void k_mv(constant MvArgs& a [[buffer(0)]], device const uchar* W [[buffe
     threadgroup float xsum[1];
     const bool xsq = FC_FMT == MF_Q4 && FC_T > 1 && FC_T * (a.K / 8) <= 1;
     if (xsq) { xsum[tid] = 0; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    if (FC_FMT == MF_TCQ) {   // trellis rows: gathers only (decode, and prompt rows until a trellis GEMM)
+        const int r = (int) (tg.x * MV_ROWS + sgi);
+        if (r >= a.R || FC_T != 0) return;
+        const int p0 = (int) tg.y, nb = a.K / TQ_T;
+        const ulong row = (ulong) sel[p0] * a.R + r;
+        const float s = simd_sum(tq_row_lane((device const uint*) W + row * tq_row_words(a.K), S + row * (ulong) nb, a.K, lane,
+                                             x + (ulong) (p0 / a.xdiv) * a.xs));
+        if (lane == 0) {
+            device float* yo = y + (ulong) p0 * a.ys + r;
+            *yo = a.add ? bfr(*yo + bfr(s)) : bfr(s);
+        }
+        return;
+    }
     if (FC_T > 0 && MV_QUARTER(FC_FMT, a.K)) {   // dense, Q4 rows of few blocks: four rows a simdgroup, 8 lanes each
         const int qr = (int) lane / 8, sl = (int) lane % 8, rr = (int) (tg.x * MV_ROWS + sgi) * 4 + qr, nbk = a.K / 8;
         const ulong row = (ulong) min(rr, a.R - 1);
@@ -766,6 +816,17 @@ kernel void k_mv_gu(constant MvArgs& a [[buffer(0)]], device const uchar* W [[bu
     static_assert(MV_NR_SEED == 1 && MV_NR_AFF == 1, "k_mv_gu: one row per simdgroup");
     threadgroup uint Gt[512];
     if (FC_SEED) split_g_load(Gt, G, tid, 32 * MV_ROWS);
+    if (FC_FMT == MF_TCQ) {   // trellis rows: W / S the gate's words and scales, Wu / Su the up's
+        const int r = (int) (tg.x * MV_ROWS + sgi);
+        if (r >= a.R) return;
+        const int p0 = (int) tg.y, nb = a.K / TQ_T;
+        const ulong row = (ulong) sel[p0] * a.R + r, nw = tq_row_words(a.K);
+        device const float* xb = x + (ulong) (p0 / a.xdiv) * a.xs;
+        const float g = simd_sum(tq_row_lane((device const uint*) W + row * nw, S + row * (ulong) nb, a.K, lane, xb));
+        const float u = simd_sum(tq_row_lane((device const uint*) Wu + row * nw, Su + row * (ulong) nb, a.K, lane, xb));
+        if (lane == 0) y[(ulong) p0 * a.ys + r] = bfr(silu_bf(bfr(g)) * bfr(u));
+        return;
+    }
     const SplitG Gs = {Gt};
     const int r = (int) (tg.x * MV_ROWS + sgi);
     if (r >= a.R) return;
@@ -874,6 +935,22 @@ static inline void seed6p8_block(device const uchar* W, device const ushort* S, 
 }
 static inline void tile_weights(short fmt, device const uchar* W, device const ushort* S, device const ushort* B, device const uint* G,
                                 int slice, ulong row, int K, int j, int ebias, threadgroup float* dst, device const uchar* EN) {
+    if (fmt == MF_TCQ) {   // 8 weights of a trellis row (T a multiple of 8, so one block): a guarded 3-word window, as tq_row_lane;
+        const int c0 = 8 * j, b = c0 / TQ_T, NB = TQ_KB * TQ_T + TQ_L - TQ_KB;   // scale x q is exact in f32
+        const uint o = uint(b) * uint(NB) + uint(TQ_KB * (c0 % TQ_T)), sh = o & 31u;
+        device const uint* p = (device const uint*) W + row * tq_row_words(K) + (o >> 5);
+        const uint w0 = p[0], w1 = p[1], w2 = sh + uint(TQ_KB * 7 + TQ_L) > 64u ? p[2] : 0u;
+        const uint u0 = uint(((ulong(w1) << 32) | ulong(w0)) >> sh), u1 = uint(((ulong(w2) << 32) | ulong(w1)) >> sh);
+        const float sc = bf(S[row * (ulong) (K / TQ_T) + b]);
+        for (short i = 0; i < 8; ++i) {
+            const int off = TQ_KB * i;
+            const uint st = (off + TQ_L <= 32 ? u0 >> uint(off) : off >= 32 ? u1 >> uint(off - 32) : (u0 >> uint(off)) | (u1 << uint(32 - off))) &
+                            ((1u << TQ_L) - 1u);
+            const float4 u = unpack_unorm4x8_to_float(st * 34038481u + 76625530u);
+            dst[i] = sc * (rint((u.x + u.y + u.z + u.w) * 255.0f) - 510.0f);
+        }
+        return;
+    }
     float w[8];
     if (fmt == MF_SEED6P8) seed6p8_block(W, S, G, row, K, j, ebias, EN, w);
     else if (fmt == MF_SEED4P4) seed4p4_block(W, S, G, row, K, j, ebias, EN, w);

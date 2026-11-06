@@ -10,6 +10,7 @@
 #include "kernel_backend.h"
 #include "kernels_qwen4.metal"   // Q4*Args
 #include "lfsr.h"
+#include "trellis.h"
 
 static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
@@ -22,13 +23,16 @@ static id<MTLBuffer> buf(const void* p, size_t n) {
     else memset(b.contents, 0, n > 0 ? n : 16);
     return b;
 }
-// gs: the affine group of Q8 / Q4 weights (function constant 2); 0 or 64 leave it unset (group 64, as the engine)
+// gs: the affine group of Q8 / Q4 weights (function constant 2); 0 or 64 leave it unset (group 64, as the engine).
+// MF_TCQ: gs is the trellis group L | K << 8 | T << 16 (function constant 3)
 static id<MTLComputePipelineState> pipe_g(const char* name, int fmt, int T, int gs) {
     MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
     short f = (short) fmt, t = (short) T, g = (short) gs;
+    int tq = gs;
     [cv setConstantValue:&f type:MTLDataTypeShort atIndex:0];
     [cv setConstantValue:&t type:MTLDataTypeShort atIndex:1];
-    if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
+    if (fmt == MF_TCQ) [cv setConstantValue:&tq type:MTLDataTypeInt atIndex:3];
+    else if (gs && gs != 64) [cv setConstantValue:&g type:MTLDataTypeShort atIndex:2];
     NSError* err = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name] constantValues:cv error:&err];
     id<MTLComputePipelineState> p = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
@@ -74,7 +78,7 @@ const char* kt_name(void) { return "Metal"; }
 int kt_mm_tile(void) { return MM_BN; }
 int kt_attn_key_tile(void) { return ATTF_BK; }
 int kt_seed_gemm_exact(int on) { (void) on; return 0; }   // the Metal GEMM always multiplies the f32 seed weights
-int kt_has_fmt(int fmt) { return fmt >= MF_BF16 && fmt <= MF_SEED6P8; }
+int kt_has_fmt(int fmt) { return (fmt >= MF_BF16 && fmt <= MF_SEED6P8) || fmt == MF_TCQ; }   // MF_TCQ: the gathers
 
 // The weight's buffers (the kernels address slices themselves) and its seed table.
 typedef struct { id<MTLBuffer> W, S, B, N, G; } MW;
@@ -102,6 +106,7 @@ static int mv_dispatch(const KtWeight* w, MvArgs a, int T, int groups, id<MTLBuf
     });
 }
 int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
+    if (w->fmt == MF_TCQ) return 1;   // trellis rows: gathers only
     if (w->group && w->group != 32 && w->group != 64) return 1;   // affine groups 32 and 64
     const size_t yn = 4 * (size_t) T * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) T * w->K), yb = buf(y, yn), sel = buf((int32_t[]) {0}, 4);
@@ -111,7 +116,7 @@ int kt_mv(const KtWeight* w, int T, int add, const float* x, float* y) {
     return 0;
 }
 int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float* x, float* y) {
-    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
+    if (w->fmt != MF_TCQ && w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) P * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * w->K), yb = buf(NULL, yn), sb = buf(sel, 4 * (size_t) P);
     MvArgs a = {w->K, w->R, P, xdiv, w->K, w->R, 0, 0};
@@ -120,7 +125,7 @@ int kt_mv_sel(const KtWeight* w, int P, int xdiv, const int32_t* sel, const floa
     return 0;
 }
 int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float* x, float* out) {
-    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
+    if (w->fmt != MF_TCQ && w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const int fmt = w->fmt, R = w->R, K = w->K;
     const size_t yn = 4 * (size_t) P * R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * K), yb = buf(NULL, yn), sb = buf(sel, 4 * (size_t) P);
@@ -130,8 +135,10 @@ int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float
     const size_t ssl = fmt == MF_SEED4 || fmt == MF_SEED4P4 ? 2 * (size_t) R * K / 8 : (fmt == MF_Q8 || fmt == MF_Q4) ? 2 * (size_t) R * K / 64 : 0;
     const size_t bsl = fmt == MF_SEED4 || fmt == MF_SEED4P4 ? 4 : (fmt == MF_Q8 || fmt == MF_Q4) ? 2 * (size_t) R * K / 64 : 0;
     const size_t nsl = fmt == MF_SEED4P4 ? (size_t) R * K / 16 : 0;   // one slice of exponent nibbles
+    const int tqL = w->group & 255, tqK = (w->group >> 8) & 255, tqT = w->group >> 16;
+    const size_t twsl = fmt == MF_TCQ ? 4 * (size_t) R * nslm_tq_row_words(K, tqT, tqL, tqK) : 0, tssl = fmt == MF_TCQ ? 2 * (size_t) R * (K / tqT) : 0;
     const MW m = mw(w);
-    id<MTLComputePipelineState> p = pipe_("k_mv_gu", fmt, 0);
+    id<MTLComputePipelineState> p = pipe_g("k_mv_gu", fmt, 0, fmt == MF_TCQ ? w->group : 0);
     if (!p) return -1;
     if (run(^(id<MTLComputeCommandEncoder> e) {
             [e setComputePipelineState:p];
@@ -139,7 +146,8 @@ int kt_mv_gu(const KtWeight* w, int P, int xdiv, const int32_t* sel, const float
             [e setBuffer:m.W offset:0 atIndex:1]; [e setBuffer:m.S offset:0 atIndex:2]; [e setBuffer:m.B offset:0 atIndex:3];
             [e setBuffer:xb offset:0 atIndex:4]; [e setBuffer:yb offset:0 atIndex:5]; [e setBuffer:sb offset:0 atIndex:6];
             [e setBuffer:m.G offset:0 atIndex:7];
-            [e setBuffer:m.W offset:wsl atIndex:8]; [e setBuffer:m.S offset:ssl atIndex:9]; [e setBuffer:m.B offset:bsl atIndex:10];
+            [e setBuffer:m.W offset:fmt == MF_TCQ ? twsl : wsl atIndex:8]; [e setBuffer:m.S offset:fmt == MF_TCQ ? tssl : ssl atIndex:9];
+            [e setBuffer:m.B offset:bsl atIndex:10];
             [e setBuffer:m.N offset:0 atIndex:11]; [e setBuffer:m.N offset:nsl atIndex:12];
             [e dispatchThreadgroups:MTLSizeMake((R + MV_RPT(fmt) - 1) / MV_RPT(fmt), P, 1) threadsPerThreadgroup:MTLSizeMake(32 * MV_ROWS, 1, 1)];
         }))
@@ -172,7 +180,7 @@ int kt_mm(const KtWeight* w, int T, const float* x, float* y) {
 }
 int kt_mm_grouped(const KtWeight* w, int P, int xdiv, const int32_t* perm, const MmTile* tiles, int nt, const float* x,
                   float* y) {
-    if (w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
+    if (w->fmt != MF_TCQ && w->group && w->group != 64) return 1;   // the Metal kernels take group 64 only
     const size_t yn = 4 * (size_t) P * w->R;
     id<MTLBuffer> xb = buf(x, 4 * (size_t) ((P + xdiv - 1) / xdiv) * w->K), yb = buf(NULL, yn);
     MmArgs a = {w->K, w->R, 0, w->K, w->R, xdiv, 0, 0};
