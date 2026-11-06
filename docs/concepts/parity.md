@@ -58,7 +58,7 @@ same results as the engine.
 | Qwen3.8-Flash-Next MTP drafts (`q4e_draft`, `nslm-qwen4-gen --drafts`) | Yes (`qwen4_gpu.m`) | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next MTP drafts in `nslm-chat` and `nslm-serve`, with sampling (`Q4E_DRAFTS`, `engine/qwen4_api.c`) | Yes | Yes | Yes (mlx-vlm) |
 | Qwen3.8-Flash-Next draft confidence gate (`Q4E_DRAFT_MIN_P`, `q4e_draft_probs`) | Yes (`k_argmax_p`) | Yes | No |
-| Qwen3.8-Flash-Next drafts sampled from the head's q (`eng_draft_sampling`, `q4e_draft_q`) | No (arg max drafts, exact) | Yes | No |
+| Qwen3.8-Flash-Next drafts sampled from the head's q (`eng_draft_sampling`, `q4e_draft_q`) | Yes (`k_draft_q`) | Yes | No |
 | Qwen3.8-Flash-Next tail skip of missed experts (`Q4EOpts.tail_skip`, `--tail-skip`) | Not needed: every expert is in memory | Yes | No |
 | Qwen3.8-Flash-Next missed experts on the CPU (`Q4EOpts.cpu_tail`, `--cpu-tail`) | Not needed: every expert is in memory | Yes (Clang builds) | No |
 | Affine Q4 with group 32 (the 4-bit MLX packs) | Matvec, GEMM | Yes (matvec, GEMM, embedding) | Yes |
