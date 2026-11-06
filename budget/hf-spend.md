@@ -85,4 +85,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI a193c5f (6aee63780e0338d1bb826ba5): server hardening H1-H3, 47 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $23.70 |
 
-Left this week: about $1.30.
+| nslm-kld-p4mlx (6aee650cc78863f9c635827c): Q8_0 0.01991 (the same reference); P4 as shipped (P4's experts, P3's 4-bit MLX dense tensors, the Q8_0 PLE table) 0.1693 | rtx-pro-6000x2 ($5.50/h) | 8.9 | about $0.81 | about $24.51 |
+
+Left this week: about $0.49.
