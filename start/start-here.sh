@@ -22,8 +22,9 @@ if [ "$(uname -s)" = Darwin ]; then
     ram=$(( $(sysctl -n hw.memsize) / 1073741824 )) vram=0 mac=1   # unified memory: the Mac column
     sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
     echo "Mac: $(sysctl -n machdep.cpu.brand_string), $ram GB."
-    if xattr -p com.apple.quarantine "$bin/nslm-serve" >/dev/null 2>&1; then   # a browser download: macOS blocks them
-        echo "The binaries are not signed by Apple. Clearing their download quarantine: xattr -dr com.apple.quarantine out"
+    if xattr -p com.apple.quarantine "$bin/nslm-serve" >/dev/null 2>&1 &&   # a browser download that is not notarized
+        ! spctl --assess --type open --context context:primary-signature "$bin/nslm-serve" 2>/dev/null; then
+        echo "macOS does not accept these binaries. Clearing their download quarantine: xattr -dr com.apple.quarantine out"
         xattr -dr com.apple.quarantine out
     fi
 else
