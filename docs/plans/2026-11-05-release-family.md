@@ -9,7 +9,9 @@ dense weights triple the KL ([packs as shipped](../results/2026-11-05-dense-as-s
 dense weights (step R2b). R1 to R4 are done, and the folders are in the bucket. Their KL as shipped is 0.0415
 (TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3) ([the release packs as shipped](../results/2026-11-05-release-as-shipped.md)).
 The first R5 job failed: `hf upload` of the bucket mount gives EIO. The script now copies each folder to the local disk
-first (`29a76aa`). P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the risk of a stale loader is closed for them.
+first (`29a76aa`). R5's upload is done (TQ3 `5f2a8599`, TQ3-D4 `7e5edb2b`, TQ4 `25339937`, private). RD passes on the
+RTX 4080 ([the release packs from the Hub](../results/2026-11-06-release-downloads-4080.md)). The Mac's RD waits for
+its download. R6 is a draft release of the engines (v0.1.0) with the start scripts. R7 is on `main`. P3 and P4 now ship `main`'s `nanoseedlm_seeds.py`, so the risk of a stale loader is closed for them.
 
 ## The family
 

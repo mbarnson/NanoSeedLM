@@ -841,3 +841,11 @@ experts, oQ8e's 8-bit dense modules and the trellis banks. Their KL against BF16
 So gate DB of the dense plan now compares with the 8-bit dense weights. These read about 4.5 GB a decode token. Step
 D2a puts one more dense kind at a time in P3's 4-bit MLX format over Q8_0 (`dense:KIND` in `tools/hf_llama_kld.sh`).
 The KL job waits for the next weekly budget. Read [Trellis-coded dense weights](plans/2026-11-05-trellis-dense.md).
+
+## [2026-11-06] result | The release packs from the Hub on the RTX 4080
+
+HF job `6aeda68a` uploaded the three packs (private). `hf download` of TQ3-D4 and TQ3 gives the same text in two
+runs on the RTX 4080. The 8-bit dense weights cost speed there: TQ3-D4 decodes at 38.0 tokens per second, against 54.4
+with 4-bit dense weights, because the expert cache has 23% fewer slots. `00918f0` keeps the token embedding in host
+memory: 39.6 tokens per second, the same text. Read
+[The release packs from the Hub on the RTX 4080](results/2026-11-06-release-downloads-4080.md).

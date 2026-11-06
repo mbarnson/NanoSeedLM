@@ -178,6 +178,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   (P3 0.182, the trellis mix 0.185, against 0.060 and 0.062 with Q8_0 dense weights).
 - [2026-11-05: The release packs as shipped](results/2026-11-05-release-as-shipped.md): with 8-bit dense weights, KL
   0.0415 (TQ4), 0.0638 (TQ3-D4) and 0.0778 (TQ3), 2% to 4% above Q8_0 dense weights.
+- [2026-11-06: The release packs from the Hub on the RTX 4080](results/2026-11-06-release-downloads-4080.md): the same
+  text in two runs. TQ3-D4 decodes at 39.6 tokens per second with 8-bit dense weights (54.4 with 4-bit), TQ3 at 43.
 
 ## For contributors and agents
 
