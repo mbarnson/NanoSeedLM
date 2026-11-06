@@ -3,6 +3,14 @@
 // output of invalid UTF-8, the clamping of request numbers, and Qwen3.8-Flash-Next's thinking tags.
 #define main nslm_server_main
 #include "../harness/nslm-serve.c"
+
+// nslm-serve's draw (harness/sample.h, the filtered path) with the old call's shape
+static int sample_row(const float* l, int V, double temp, double top_p, int top_k, double min_p, uint64_t* rng) {
+    Sampler s = {temp, top_p, min_p, top_k, 0, *rng};
+    const int t = sample_pick(&s, l, V, -1);
+    *rng = s.rng;
+    return t;
+}
 #undef main
 
 static int check_split(const char* raw, const char* want_r, const char* want_c, bool chat, size_t cut) {
