@@ -209,14 +209,19 @@ int nslm_copy_file(const char* from, const char* to) {
     return fclose(b);
 }
 
-int nslm_copy_loader(const char* loader, const char* dir) {
+int nslm_copy_beside(const char* loader, const char* name, const char* dir) {
     const char* sl = strrchr(loader, '/');
     char from[2048], to[2048];
-    snprintf(from, sizeof from, "%.*snanoseedlm_seeds.py", sl ? (int) (sl - loader + 1) : 0, loader);
-    snprintf(to, sizeof to, "%s/%s", dir, sl ? sl + 1 : loader);
-    if (nslm_copy_file(loader, to)) return -1;
-    snprintf(to, sizeof to, "%s/nanoseedlm_seeds.py", dir);
+    snprintf(from, sizeof from, "%.*s%s", sl ? (int) (sl - loader + 1) : 0, loader, name);
+    snprintf(to, sizeof to, "%s/%s", dir, name);
     return nslm_copy_file(from, to);
+}
+
+int nslm_copy_loader(const char* loader, const char* dir) {
+    const char* sl = strrchr(loader, '/');
+    char to[2048];
+    snprintf(to, sizeof to, "%s/%s", dir, sl ? sl + 1 : loader);
+    return nslm_copy_file(loader, to) || nslm_copy_beside(loader, "nanoseedlm_seeds.py", dir) ? -1 : 0;
 }
 
 void nslm_copy_model_files(const char* from, const char* to) {

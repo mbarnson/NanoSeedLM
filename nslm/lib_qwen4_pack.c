@@ -41,7 +41,8 @@ static int module_of(const char* key, char* m, size_t n) {
     return 0;
 }
 
-static Json* config_tq(const Json* cfg) {   // no loader, no quantization entries of the routed experts
+// The config without the routed experts' quantization entries; model_file: the loader's name, or none
+static Json* config_tq(const Json* cfg, const char* loader) {
     Json* c = json_new(J_OBJ);
     for (int i = 0; i < cfg->n; ++i) {
         if (!strcmp(cfg->k[i], "model_file")) continue;
@@ -54,11 +55,12 @@ static Json* config_tq(const Json* cfg) {   // no loader, no quantization entrie
         }
         json_set(c, cfg->k[i], v);
     }
+    if (loader) json_set(c, "model_file", json_str(strrchr(loader, '/') ? strrchr(loader, '/') + 1 : loader));
     return c;
 }
 
-int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, const char* dense8, const char* out, uint64_t shard,
-                       char* err, int errlen) {
+int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, const char* dense8, const char* loader, const char* out,
+                       uint64_t shard, char* err, int errlen) {
     static const char* kp[3] = {"gate_proj", "up_proj", "down_proj"};
     Json* cfg = load_json(base, "config.json", err, errlen), *idx = cfg ? load_json(base, "model.safetensors.index.json", err, errlen) : NULL;
     Json* cfg8 = dense8 && idx ? load_json(dense8, "config.json", err, errlen) : NULL;
@@ -124,7 +126,7 @@ int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, co
     if (!rc && ns_write_raw(out, spec, raw, n, shard, "\"nanoseedlm\": \"qwen4_exp, trellis-coded routed experts in L*_*.blkt\"",
                             raw_fill, src, err, errlen)) rc = -1;
     if (!rc) {
-        Json* c = config_tq(cfg);
+        Json* c = config_tq(cfg, loader);
         static const char* kq[2] = {"quantization", "quantization_config"};
         for (int k = 0; k < 2; ++k) {   // the swapped modules: 8 bits, groups of 64
             Json* q = json_get(c, kq[k]);
@@ -145,6 +147,8 @@ int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, co
         json_free(c);
     }
     if (!rc) nslm_copy_model_files(base, out);
+    if (!rc && loader && (nslm_copy_loader(loader, out) || nslm_copy_beside(loader, "nanoseedlm_trellis.py", out)))
+        rc = snprintf(err, (size_t) errlen, "%s: cannot copy the loader, nanoseedlm_seeds.py and nanoseedlm_trellis.py", loader);
     for (int l = 0; !rc && l < L + head; ++l)
         for (int p = 0; !rc && p < 3; ++p) {
             snprintf(path, sizeof path, "%s/L%d_%s.blkt", p == 2 && tq_down ? tq_down : tq, l, kp[p]);

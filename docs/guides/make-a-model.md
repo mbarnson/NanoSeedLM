@@ -92,7 +92,9 @@ The search is resumable: it skips a bank file that is complete.
 The MTP head's experts are layer 48 (`--layers 48-48`). Layer 48 has no imatrix statistics, so its weights are uniform.
 
 `nslm-qwen4-pack --tq` writes a pack: every tensor of a base folder but the routed experts, plus the bank files. The
-engine opens the folder, then adds each bank as the expert tensor of its layer and projection.
+engine opens the folder, then adds each bank as the expert tensor of its layer and projection. The packer also copies
+the MLX loader (`tools/nanoseedlm_qwen4.py`, or `--loader FILE`) with `nanoseedlm_seeds.py` and `nanoseedlm_trellis.py`,
+and names it in `config.json`. Then mlx-vlm and oMLX can load the pack with Trust Remote Code.
 
 ```bash
 out/bin/nslm-qwen4-pack --base P3_DIR --tq out/tq3 --out TQ3_DIR

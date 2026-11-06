@@ -39,7 +39,7 @@ for p in $PACKS; do
         *) echo "== $p: unknown pack"; continue ;;
     esac
     t0=$(date +%s)
-    /w/bin/nslm-qwen4-pack --base /m/seed-P3 --tq "$TQBANK/$tq" ${down:+--tq-down "$TQBANK/$down"} --dense8 /m/oq8 --out "$OUT/$p"
+    /w/bin/nslm-qwen4-pack --base /m/seed-P3 --tq "$TQBANK/$tq" ${down:+--tq-down "$TQBANK/$down"} --dense8 /m/oq8 --loader /w/src/tools/nanoseedlm_qwen4.py --out "$OUT/$p"
     echo "== $p: packed in $(( $(date +%s) - t0 )) s, $(du -sh "$OUT/$p" | cut -f1), $(ls "$OUT/$p" | wc -l) files"
 done
 rm -rf /m/oq8 /m/seed-P3

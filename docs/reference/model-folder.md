@@ -60,6 +60,6 @@ encoding that `nslm-mova-pack --mla` sets. The engine does not use `k_proj`. The
 
 | Key | Use |
 |---|---|
-| `model_file` | The loader file: `nanoseedlm_k2.py`, `nanoseedlm_qwen4.py` or `k2_mla.py`. The NanoSeedLM loaders need `nanoseedlm_seeds.py` beside them |
+| `model_file` | The loader file: `nanoseedlm_k2.py`, `nanoseedlm_qwen4.py` or `k2_mla.py`. The NanoSeedLM loaders need `nanoseedlm_seeds.py` beside them. A folder with trellis banks also needs `nanoseedlm_trellis.py` |
 | `mla_max_context` | The longest context that you plan to use |
 | `mla_kv` | The MLA cache format. Read [The KV cache](../concepts/kv-cache.md) |

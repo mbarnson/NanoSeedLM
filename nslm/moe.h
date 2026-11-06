@@ -30,6 +30,7 @@ int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen);
 
 // Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.
 int nslm_copy_loader(const char* loader, const char* dir);
+int nslm_copy_beside(const char* loader, const char* name, const char* dir);   // the loader's folder's NAME into dir
 // Copies the tokenizer, template, processor and LICENSE files that exist in from (all optional) into to.
 void nslm_copy_model_files(const char* from, const char* to);
 int nslm_copy_file(const char* from, const char* to);   // 0, or -1
@@ -37,9 +38,10 @@ int nslm_copy_file(const char* from, const char* to);   // 0, or -1
 // MTP head's), in shards of at most shard bytes, and the banks L{l}_{proj}.blkt of layers 0 to n (n: the head, when
 // base has one) from tq, with down_proj's from tq_down (NULL: tq).  dense8 (NULL: none): an 8-bit MLX folder whose
 // modules take the place of base's quantized ones but the PLE table's, its groups of 128 split into 64 (the same weights).
-// config.json loses the loader and the experts' quantization entries.  0, or -1 with err.
-int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, const char* dense8, const char* out, uint64_t shard,
-                       char* err, int errlen);
+// config.json loses the experts' quantization entries.  loader (NULL: none): config.json's model_file, copied with
+// nanoseedlm_seeds.py and nanoseedlm_trellis.py from beside it, for mlx-vlm and oMLX.  0, or -1 with err.
+int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, const char* dense8, const char* loader, const char* out,
+                       uint64_t shard, char* err, int errlen);
 
 // The shard file of tensor `name` in a model.safetensors.index.json text (the weight_map entry).  0 when found.
 int nslm_moe_index_lookup(const char* index_json, const char* name, char* file, int filelen);

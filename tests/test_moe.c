@@ -269,7 +269,7 @@ int main(void) {
                 fwrite(&h, sizeof h, 1, f); fwrite(rel, 4, 2 * E, f); fwrite(words, 4, nw * E * R, f); fwrite(sc, 2, E * R * NB, f);
                 fclose(f);
             }
-        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, "out/test_moe_qpack", 1u << 20, berr, sizeof berr) == 0,
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, NULL, "out/test_moe_qpack", 1u << 20, berr, sizeof berr) == 0,
               "pack: %s", berr);
         CHECK(ns_open(&m, "out/test_moe_qpack", berr, sizeof berr) == 0 && m.n == 4 && ns_add_banks(&m, "out/test_moe_qpack", berr, sizeof berr) == 0,
               "packed folder: %s", berr);
@@ -296,8 +296,8 @@ int main(void) {
         fputs("{\"quantization\": {\"group_size\": 64, \"bits\": 8, \"language_model.model.layers.0.linear_attn.in_proj_z\": "
               "{\"group_size\": 128, \"bits\": 8}}}", f);
         fclose(f);
-        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_q8", "out/test_moe_qpack8", 1u << 20, berr,
-                                 sizeof berr) == 0, "pack with --dense8: %s", berr);
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, "out/test_moe_q8", "tools/nanoseedlm_qwen4.py", "out/test_moe_qpack8",
+                                 1u << 20, berr, sizeof berr) == 0, "pack with --dense8 and the loader: %s", berr);
         CHECK(ns_open(&m, "out/test_moe_qpack8", berr, sizeof berr) == 0, "packed --dense8 folder: %s", berr);
         t = ns_find(&m, "language_model.model.layers.0.linear_attn.in_proj_z.weight");
         CHECK(t && t->enc == NS_Q8 && t->group == 64 && t->rows == 1 && t->cols == 128, "in_proj_z: enc %d group %d cols %d", t ? t->enc : -1,
@@ -317,9 +317,17 @@ int main(void) {
         cf = fopen("out/test_moe_qpack8/config.json", "rb");
         cb[0] = 0;
         if (cf) { cb[fread(cb, 1, sizeof cb - 1, cf)] = 0; fclose(cf); }
-        CHECK(strstr(cb, "\"language_model.model.layers.0.linear_attn.in_proj_z\": {") && strstr(cb, "\"bits\": 8"), "config: %s", cb);
+        CHECK(strstr(cb, "\"language_model.model.layers.0.linear_attn.in_proj_z\": {") && strstr(cb, "\"bits\": 8") &&
+              strstr(cb, "\"model_file\": \"nanoseedlm_qwen4.py\""), "config: %s", cb);
+        for (int k = 0; k < 3; ++k) {   // the loader and the two modules it imports
+            char lp[128];
+            snprintf(lp, sizeof lp, "out/test_moe_qpack8/nanoseedlm_%s.py", (const char*[]) {"qwen4", "seeds", "trellis"}[k]);
+            cf = fopen(lp, "rb");
+            CHECK(cf != NULL, "%s not copied", lp);
+            if (cf) fclose(cf);
+        }
         remove("out/test_moe_qbanks/L1_down_proj.blkt");   // a missing bank: refused
-        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, "out/test_moe_qpack2", 1u << 20, berr, sizeof berr) != 0 &&
+        CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, NULL, "out/test_moe_qpack2", 1u << 20, berr, sizeof berr) != 0 &&
               strstr(berr, "L1_down_proj"), "a missing head bank: %s", berr);
         free(nr); free(words); free(y);
     }
