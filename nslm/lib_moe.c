@@ -163,8 +163,23 @@ int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen) {
                     for (int s = 0; s < 4; ++s) { t->s[s].p = at[s]; t->s[s].len = ns_stream_len(NS_SEEDS3, t->slices, t->rows, t->cols, s); }
                 }
             }
-    if (!m->n) { snprintf(err, (size_t) errlen, "%s: no seed or trellis banks (L*_*.blks, L*_*.blkt)", dir); return -1; }
+    if (!m->n) { snprintf(err, (size_t) errlen, "%s: no seed or trellis banks (L*_*.blks, L*_*.blkt)", dir); return 1; }
     qsort(m->t, (size_t) m->n, sizeof(NsTensor), bank_cmp);
+    return 0;
+}
+
+int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen) {
+    NsModel b;
+    const int rc = ns_open_bank(&b, dir, err, errlen);
+    if (rc) return rc > 0 ? 0 : -1;
+    m->t = (NsTensor*) realloc(m->t, sizeof(NsTensor) * (size_t) (m->n + b.n));
+    NsModel v = *m;   // the folder's own tensors, still sorted: bank names never repeat
+    for (int i = 0; i < b.n; ++i) {
+        const NsTensor* t = ns_find(&v, b.t[i].name);
+        m->t[t ? (int) (t - m->t) : m->n++] = b.t[i];   // a bank replaces the folder's tensor of that name
+    }
+    qsort(m->t, (size_t) m->n, sizeof(NsTensor), bank_cmp);
+    free(b.t);
     return 0;
 }
 

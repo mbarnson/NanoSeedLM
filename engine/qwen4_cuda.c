@@ -19,6 +19,7 @@
 #include "kernels_qwen4.h"
 #include "lfsr.h"
 #include "model_st.h"
+#include "moe.h"
 #include "qwen4_ops.h"
 #include "rows.h"
 #include "vram.h"
@@ -26,10 +27,11 @@
 #define Q4E_NEV 32768   // Q4E_PROFILE events of one forward
 
 
-typedef struct {   // a weight: its format and shape, slice 0, and a device table of all its slices
+typedef struct {   // a weight: its format and shape, slice 0, a device table of all its slices, NsTensor's group
     int fmt, slices, rows, cols;
     WSlice w;
     const WSlice* tab;
+    int group;
 } W;
 
 typedef struct {
@@ -204,7 +206,7 @@ static void load_w(Q4Eng* e, W* w, int host, const char* fmt, ...) {
         if (seed) memcpy(&tab[i].eb, t->s[2].p + 4 * (size_t) i, 4);
         if (t->enc == NS_Q4 || t->enc == NS_Q8) tab[i].gs = t->group == 32 ? 5 : 6;
     }
-    *w = (W) {t->enc, t->slices, t->rows, t->cols, tab[0], (const WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) t->slices)};
+    *w = (W) {t->enc, t->slices, t->rows, t->cols, tab[0], (const WSlice*) dmem(e, tab, sizeof(WSlice) * (size_t) t->slices), t->group};
     free(tab);
 }
 // A row of the merged input projections: attention's q (and gate), k, v and indexer q heads and key; DeltaNet's qkv, z, b, a
@@ -235,7 +237,7 @@ static void load_cat(Q4Eng* e, W* w, const char* const* names, int n) {
         free(h);
     }
     if (t[0]->enc != NS_BF16) ws.gs = t[0]->group == 32 ? 5 : 6;
-    *w = (W) {t[0]->enc, 1, rows, t[0]->cols, ws, (const WSlice*) dmem(e, &ws, sizeof ws)};
+    *w = (W) {t[0]->enc, 1, rows, t[0]->cols, ws, (const WSlice*) dmem(e, &ws, sizeof ws), 0};
 }
 // A BF16 vector of n values (any shape) as f32 in VRAM
 static float* load_v(Q4Eng* e, int64_t n, const char* fmt, ...) {
@@ -326,7 +328,10 @@ static void load_layer(Q4Eng* e, Layer* L, const char* lp, int attn, int l) {
         if (incache) e->et[l >= 0 ? l : c->n_layer][i] = t;
         if (!incache) load_w(e, ex[i], e->host_experts && l >= 0, "%s", name[i]);
         else if (!t || t->enc == NS_SEED6P8 || t->slices != c->n_exp) fail(e, "%s: missing, P = 8, or not %d experts", name[i], c->n_exp);
-        else { memset(ex[i], 0, sizeof *ex[i]); ex[i]->fmt = t->enc; ex[i]->slices = t->slices; ex[i]->rows = t->rows; ex[i]->cols = t->cols; }
+        else {
+            memset(ex[i], 0, sizeof *ex[i]);
+            ex[i]->fmt = t->enc; ex[i]->slices = t->slices; ex[i]->rows = t->rows; ex[i]->cols = t->cols; ex[i]->group = t->group;
+        }
     }
     if (l >= 0 && c->ple[l] >= 0) {
         load_w(e, &L->key, 0, "%s.ple.key_proj.weight", lp);
@@ -456,6 +461,7 @@ static void bufs_set(const Buf* b, int n, float* w) {
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) {
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
+    if (ns_add_banks(&e->nm, model_dir, err, errlen)) { ns_close(&e->nm); free(e); return NULL; }   // trellis experts (.blkt)
     const Qwen4Cfg* c = &e->c;
     if (c->n_exp > BUCKET_MAX_EXPERTS || c->d > Q4_ROW_MAX || c->rot_dim > 1024) {
         snprintf(err, (size_t) errlen, "%d experts (at most %d), hidden size %d (at most %d), RoPE width %d (at most 1024)", c->n_exp,
@@ -565,6 +571,7 @@ Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) 
         if (o->cache_gb > most) fprintf(stderr, "qwen4: expert cache %.2f GB, not %.2f: %.0f MB of VRAM stay free (NSLM_VRAM_RESERVE_MB)\n", most, o->cache_gb, res);
         build_cache(e, o->cache_gb > 0 && o->cache_gb < most ? o->cache_gb : most);
     }
+    if (e->cpu_tail && e->et[0][0] && e->et[0][0]->enc == NS_TCQ) fail(e, "--cpu-tail: the CPU computes seed experts only, not trellis ones");
     if (e->cpu_tail && !e->err[0]) {   // plan D4: the mapped list, rows and outputs, the hand-off words, the CPU thread
         const size_t P = (size_t) MV_MAXT * c->top_k;
         if (e->et[0][0]->enc != NS_SEED4) fail(e, "--cpu-tail: P = 3 seed experts only");
@@ -982,6 +989,17 @@ static int gdn(Q4Eng* e, Layer* L, int T) {
     return 0;
 }
 
+// Trellis experts (NS_TCQ): the matvecs at every row count, a pair a grid row (no trellis GEMM yet); L | K << 8 | T << 16
+static void tq_experts(Q4Eng* e, const Layer* L, int P, int k) {
+    const Qwen4Cfg* c = &e->c;
+    const int g = L->eg.group, d = L->ed.group;
+    if (P > 65535) { fail(e, "trellis experts: %d pairs in one call, at most 65535", P); return; }
+    if (L->eu.group != g || kc_tq_mv_gu(e->s, g & 255, g >> 8 & 255, g >> 16, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k) ||
+        kc_tq_mv_sel(e->s, d & 255, d >> 8 & 255, d >> 16, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1))
+        fail(e, "trellis experts: gate and up differ, or no kernel for L %d K %d T %d / L %d K %d T %d", g & 255, g >> 8 & 255, g >> 16,
+             d & 255, d >> 8 & 255, d >> 16);
+}
+
 static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's layer (the cache's sparse layer n_layer)
     const Qwen4Cfg* c = &e->c;
     const int k = c->top_k, P = T * k, side = T <= MV_MAXT;
@@ -1020,18 +1038,24 @@ static void moe(Q4Eng* e, Layer* L, int l, int T) {   // l < 0: the MTP head's l
     mark(e, ST_ROUTE);
     if (T > MV_MAXT) {   // prompt rows: pairs by expert, so each tile reads its expert's weights once (tensor cores)
         const int mt = P / MMT_BN + c->n_exp;
-        kc_bucket(e->s, e->ind, P, c->n_exp, e->perm, e->tiles, e->ntiles);
-        kc_mm_grouped_dev(e->s, L->eg.fmt, L->eg.tab, c->d, c->ff_exp, e->x, c->d, e->Gb, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eg));
-        kc_mm_grouped_dev(e->s, L->eu.fmt, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->Ub, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eu));
-        kc_swiglu(e->s, e->Gb, e->Ub, e->A, P * c->ff_exp);
-        kc_mm_grouped_dev(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, 1, e->perm, e->tiles, e->ntiles, mt, G(e, &L->ed));
+        if (L->eg.fmt == NS_TCQ) tq_experts(e, L, P, k);
+        else {
+            kc_bucket(e->s, e->ind, P, c->n_exp, e->perm, e->tiles, e->ntiles);
+            kc_mm_grouped_dev(e->s, L->eg.fmt, L->eg.tab, c->d, c->ff_exp, e->x, c->d, e->Gb, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eg));
+            kc_mm_grouped_dev(e->s, L->eu.fmt, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->Ub, c->ff_exp, k, e->perm, e->tiles, e->ntiles, mt, G(e, &L->eu));
+            kc_swiglu(e->s, e->Gb, e->Ub, e->A, P * c->ff_exp);
+            kc_mm_grouped_dev(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, 1, e->perm, e->tiles, e->ntiles, mt, G(e, &L->ed));
+        }
         mv(e, &L->sh_g, e->x, e->Gb, T);
         mv(e, &L->sh_u, e->x, e->Ub, T);
         kc_swiglu(e->s, e->Gb, e->Ub, e->A, T * c->ff_shared);
         mv(e, &L->sh_d, e->A, e->sh, T);
     } else {
-        kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
-        kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
+        if (L->eg.fmt == NS_TCQ) tq_experts(e, L, P, k);
+        else {
+            kc_mv_gu(e->s, L->eg.fmt, L->eg.tab, L->eu.tab, c->d, c->ff_exp, e->x, c->d, e->A, c->ff_exp, e->ind, P, k, G(e, &L->eg));
+            kc_mv_sel(e->s, L->ed.fmt, L->ed.tab, c->ff_exp, c->d, e->A, c->ff_exp, e->Dx, c->d, e->ind, P, 1, G(e, &L->ed));
+        }
         cudaStreamWaitEvent(e->s, e->ev_sh, 0);
     }
     kq4_moe_combine(e->s, c->d, k, e->Dx, e->wt, e->sh, e->lg + c->n_exp, c->n_exp + 1, e->br, T);

@@ -2150,9 +2150,12 @@ static __device__ __forceinline__ void tq_load_x(const float* xp, float* xv) {
     if (W % 4 == 0) {
 #pragma unroll
         for (int i = 0; i < W / 4; ++i) { const float4 v = ((const float4*) xp)[i]; xv[4 * i] = v.x; xv[4 * i + 1] = v.y; xv[4 * i + 2] = v.z; xv[4 * i + 3] = v.w; }
-    } else {
+    } else if (W % 2 == 0) {
 #pragma unroll
         for (int i = 0; i < W / 2; ++i) { const float2 v = ((const float2*) xp)[i]; xv[2 * i] = v.x; xv[2 * i + 1] = v.y; }
+    } else {
+#pragma unroll
+        for (int i = 0; i < W; ++i) xv[i] = xp[i];
     }
 }
 template <int L, int KB, int T>
@@ -2245,8 +2248,9 @@ void kc_mv_gu(cudaStream_t s, int fmt, const WSlice* wg, const WSlice* wu, int K
     MVGU_K[fmt]<<<dim3((unsigned) (R + MV_ROWS - 1) / MV_ROWS, (unsigned) P), 32 * MV_ROWS, 0, s>>>(a, wg, wu, x, a_, sel, G);
 }
 // (L, KB, T) index: L 12 / 16, KB 2 / 3 / 4, T 256 / 320
+// (12, 3, 64) and (12, 3, 32): the rows of 64 and 32 of the engine test's tiny model
 #define TQ_CASES(X) X(12, 2, 256) X(12, 3, 256) X(12, 4, 256) X(12, 2, 320) X(12, 3, 320) X(12, 4, 320) \
-                    X(16, 2, 256) X(16, 3, 256) X(16, 4, 256) X(16, 2, 320) X(16, 3, 320) X(16, 4, 320)
+                    X(16, 2, 256) X(16, 3, 256) X(16, 4, 256) X(16, 2, 320) X(16, 3, 320) X(16, 4, 320) X(12, 3, 64) X(12, 3, 32)
 int kc_tq_mv_gu(cudaStream_t s, int L, int KB, int T, const WSlice* wg, const WSlice* wu, int K, int R, const float* x, int xs,
                 float* a_, int ys, const int32_t* sel, int P, int xdiv) {
     if (K % T || R < 1 || P < 1) return -1;

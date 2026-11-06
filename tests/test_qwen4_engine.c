@@ -1,5 +1,5 @@
 // tests/test_qwen4_engine.c - the qwen4 CUDA engine against mlx-vlm and the C reference on tiny models: row splits,
-// graphs, caches, passes and the prefetch; kc_bucket for 512 experts. Skipped without a GPU.
+// graphs, caches, passes and the prefetch, seed and trellis experts; kc_bucket for 512 experts. Skipped without a GPU.
 #define _DEFAULT_SOURCE   // glibc: setenv / unsetenv under -std=c99 (Windows: _putenv_s)
 #include <math.h>
 #include <stdio.h>
@@ -12,10 +12,12 @@
 
 #include "format.h"
 #include "model_st.h"
+#include "moe.h"
 #include "kernels_cuda.h"
 #include "kernels_qwen4.h"
 #include "qwen4_eng.h"
 #include "qwen4_ref.h"
+#include "trellis.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -154,7 +156,7 @@ static int seed_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) {
     }
     return 0;
 }
-static int seed_fixture(const char* dir, char* err, int errlen) {
+static int tiny_fixture(const char* dir, int seeds, char* err, int errlen) {   // seeds 0: no experts (banks follow)
     StFile st;
     if (st_open_file(&st, "tests/data/qwen4_tiny/model.safetensors", err, errlen)) return -1;
     const Qwen4Cfg* c = NULL;
@@ -175,7 +177,7 @@ static int seed_fixture(const char* dir, char* err, int errlen) {
     }
     SeedFix f = {&st, ent, n, 12345};
     const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
-    for (int l = 0; l < c->n_layer; ++l)
+    for (int l = 0; l < c->n_layer && seeds; ++l)
         for (int p = 0; p < 3; ++p) {
             snprintf(names[3 * l + p], sizeof names[0], "language_model.model.layers.%d.mlp.switch_mlp.%s.weight", l, proj[p]);
             spec[n++] = (NsSpec) {names[3 * l + p], NS_SEED4, c->n_exp, p == 2 ? c->d : c->ff_exp, p == 2 ? c->ff_exp : c->d};
@@ -193,6 +195,107 @@ static int seed_fixture(const char* dir, char* err, int errlen) {
     free(spec); free(raw); free(ent);
     st_close_file(&st);
     return rc;
+}
+static int seed_fixture(const char* dir, char* err, int errlen) { return tiny_fixture(dir, 1, err, errlen); }
+
+// The tiny model with trellis experts (L 12, K 3) as .blkt banks: random weights of rms 0.14, as the seed fixture's
+static int tcq_fixture(const char* dir, char* err, int errlen) {
+    Qwen4Cfg c;
+    if (tiny_fixture(dir, 0, err, errlen) || qwen4_cfg_load(&c, dir, err, errlen)) return -1;
+    const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+    uint32_t r = 777;
+    for (int l = 0; l < c.n_layer; ++l)
+        for (int p = 0; p < 3; ++p) {
+            const int R = p == 2 ? c.d : c.ff_exp, C = p == 2 ? c.ff_exp : c.d, E = c.n_exp, T = C;
+            const size_t nw = nslm_tq_row_words(C, T, 12, 3);
+            MoeBlkHeader h;
+            memset(&h, 0, sizeof h);
+            memcpy(h.magic, "NSLMBLKT", 8);
+            h.rows = (uint32_t) R; h.cols = (uint32_t) C; h.n_experts = (uint32_t) E; h.n_seeds = 12; h.n_exp = 3; h.refit = (uint32_t) T;
+            uint32_t* words = (uint32_t*) calloc(nw * (size_t) E * R, 4);
+            uint16_t* sc = (uint16_t*) calloc((size_t) E * R, 2);
+            float* w = (float*) malloc(sizeof(float) * (size_t) C), *rel = (float*) calloc(2 * (size_t) E, 4);
+            NsTqScratch z;
+            nslm_tq_scratch_init(&z, T, 12, 3);
+            for (int k = 0; k < E * R; ++k) {
+                for (int j = 0; j < C; ++j) { r = r * 1664525u + 1013904223u; w[j] = ((float) (r >> 8) / 16777216.0f - 0.5f) * 0.5f; }
+                nslm_tq_encode_row(w, NULL, C, T, &z, words + nw * (size_t) k, sc + k, NULL);
+            }
+            nslm_tq_scratch_free(&z);
+            char path[1024];
+            snprintf(path, sizeof path, "%s/L%d_%s.blkt", dir, l, proj[p]);
+            FILE* f = fopen(path, "wb");
+            const int ok = f && fwrite(&h, sizeof h, 1, f) == 1 && fwrite(rel, 4, 2 * (size_t) E, f) == 2 * (size_t) E &&
+                           fwrite(words, 4, nw * E * R, f) == nw * E * R && fwrite(sc, 2, (size_t) E * R, f) == (size_t) E * R;
+            if (f) fclose(f);
+            free(words); free(sc); free(w); free(rel);
+            if (!ok) { snprintf(err, (size_t) errlen, "cannot write %s", path); return -1; }
+        }
+    return 0;
+}
+
+// Trellis experts (NS_TCQ banks) in the engine against the C reference: a prompt of 20 rows (the matvecs, no trellis
+// GEMM yet) and 8 decode rows, with every expert in VRAM and through a cache of one layer's experts
+static void tcq_check(void) {
+    char dir[512], err[512] = "";
+    const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
+    snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq", tmp);
+    if (tcq_fixture(dir, err, sizeof err)) { CHECK(0, "trellis fixture: %s", err); return; }
+    Qwen4Ref* r = qwen4_ref_open(dir, err, sizeof err);
+    CHECK(r != NULL, "trellis fixture, reference: %s", err);
+    if (!r) return;
+    enum { N = 28, NP = 20 };
+    const int V = qwen4_ref_cfg(r)->vocab;
+    int32_t ids[N];
+    for (int i = 0; i < N; ++i) ids[i] = (i * 37 + 11) % V;
+    float* ref = (float*) malloc(sizeof(float) * (size_t) N * V), *lg[2] = {NULL, NULL};
+    CHECK(qwen4_ref_forward(r, ids, N, ref) == 0, "trellis fixture, reference forward");
+    double m = 1e-30;
+    for (size_t i = 0; i < (size_t) N * V; ++i) m = fmax(m, fabs((double) ref[i]));
+    for (int run = 0; run < 2; ++run) {   // every expert in VRAM, then a cache of one layer's experts
+        Q4EOpts o;
+        memset(&o, 0, sizeof o);
+        o.max_pos = 64;
+        o.cache_gb = run ? 1e-5 : 0;
+        Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
+        CHECK(e != NULL, "open the trellis fixture (run %d): %s", run, err);
+        if (!e) break;
+        lg[run] = (float*) malloc(sizeof(float) * (size_t) N * V);
+        int rc = q4e_forward(e, ids, NP, lg[run]);
+        for (int t = NP; !rc && t < N; ++t) rc = q4e_forward(e, ids + t, 1, lg[run] + (size_t) t * V);
+        CHECK(rc == 0, "trellis fixture, forward (run %d): %s", run, q4e_error(e));
+        q4e_close(e);
+    }
+    if (lg[0] && lg[1]) {
+        double d = 0;
+        int am = 0;
+        for (int t = 0; t < N; ++t) {
+            int a = 0, b = 0;
+            for (int v = 0; v < V; ++v) {
+                const size_t i = (size_t) t * V + v;
+                d = fmax(d, fabs((double) lg[0][i] - ref[i]) / m);
+                if (lg[0][i] > lg[0][(size_t) t * V + a]) a = v;
+                if (ref[i] > ref[(size_t) t * V + b]) b = v;
+            }
+            am += a != b;
+        }
+        const int same = !memcmp(lg[0], lg[1], sizeof(float) * (size_t) N * V);
+        printf("trellis experts (L 12, K 3): logits %.1e of max |logit| from the C reference, argmax differs in %d of %d rows; "
+               "the cache %s\n", d, am, N, same ? "changes nothing" : "changes the logits");
+        CHECK(d < 3e-2 && am <= N / 16 && same, "trellis experts: %.1e from the reference, %d argmax rows, cache same %d", d, am, same);
+    }
+    {   // the CPU tail computes seed experts only
+        Q4EOpts o;
+        memset(&o, 0, sizeof o);
+        o.max_pos = 64;
+        o.cache_gb = 1e-5;
+        o.cpu_tail = 1;
+        Q4Eng* e = q4e_open(dir, &o, err, sizeof err);
+        CHECK(e == NULL, "--cpu-tail accepted trellis experts");
+        if (e) q4e_close(e);
+    }
+    free(ref); free(lg[0]); free(lg[1]);
+    qwen4_ref_close(r);
 }
 
 // Plan D4 (Q4EOpts.cpu_tail) on the seed fixture: decode rows with the tail on the CPU against without it. The first
@@ -271,6 +374,7 @@ int main(void) {
     bucket_check(512, 128, 10);   // qwen4: 512 experts, top 10, a prompt chunk of 128 rows
     bucket_check(128, 64, 8);     // MoVA
     cpu_tail_check();
+    tcq_check();
     cpu_pick_check(1, 10, 512, 1);    // one decode row of Qwen3.8-Flash-Next
     cpu_pick_check(4, 10, 64, 2);     // a verify step of 4 rows: experts shared by rows
     cpu_pick_check(8, 10, 64, 16);

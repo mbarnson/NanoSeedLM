@@ -22,8 +22,11 @@ int nslm_blk_stream(const uint8_t* blk, size_t len, int p, int E, int rows, int 
 
 // The banks of a folder as tensors language_model.model.layers.L.mlp.switch_mlp.PROJ.weight, mapped for the process:
 // S3 seeds as NS_SEEDS3 (nslm-moe --codec s3: L{l}_{gate,up,down}_proj.blks, as .blk4 with blocks of 12, a row's last
-// block padded), trellis-coded rows as NS_TCQ (--codec tq: .blkt).  0, or -1 with err (no bank, or a wrong file).
+// block padded), trellis-coded rows as NS_TCQ (--codec tq: .blkt).  0, 1 with err (no bank), or -1 with err (a wrong file).
 int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen);
+// The folder's banks added to m (ns_open's), each in place of m's tensor of its name.  0 (also with no bank), or -1 with err.
+// The banks stay mapped for the process.
+int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen);
 
 // Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.
 int nslm_copy_loader(const char* loader, const char* dir);

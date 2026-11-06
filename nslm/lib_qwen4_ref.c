@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "model_st.h"
+#include "moe.h"
 #include "qwen4_ops.h"
 #include "rows.h"
 
@@ -241,6 +242,7 @@ static void ple(Qwen4Ref* r, int l, const int32_t* ids, float* H, int n) {
 Qwen4Ref* qwen4_ref_open(const char* model_dir, char* err, int errlen) {
     Qwen4Ref* r = (Qwen4Ref*) calloc(1, sizeof *r);
     if (qwen4_cfg_load(&r->c, model_dir, err, errlen) || ns_open(&r->nm, model_dir, err, errlen)) { free(r); return NULL; }
+    if (ns_add_banks(&r->nm, model_dir, err, errlen)) { ns_close(&r->nm); free(r); return NULL; }   // trellis experts (.blkt)
     ns_rows_init(&r->rows);
     for (int l = 0; l < r->c.n_layer; ++l) if (r->c.ple[l] >= 0) qwen4_ngram_init(&r->c, r->c.ple[l], &r->ng[r->c.ple[l]]);
     return r;
