@@ -147,9 +147,8 @@ int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, co
         json_free(c);
     }
     if (!rc) nslm_copy_model_files(base, out);
-    if (!rc && loader && (nslm_copy_loader(loader, out) || nslm_copy_beside(loader, "nanoseedlm_trellis.py", out) ||
-                          nslm_copy_beside(loader, "nanoseedlm_ple.py", out)))
-        rc = snprintf(err, (size_t) errlen, "%s: cannot copy the loader, nanoseedlm_seeds.py, _trellis.py and _ple.py", loader);
+    if (!rc && loader && (nslm_copy_loader(loader, out) || nslm_copy_beside(loader, "nanoseedlm_trellis.py", out)))
+        rc = snprintf(err, (size_t) errlen, "%s: cannot copy the loader, nanoseedlm_seeds.py and nanoseedlm_trellis.py", loader);
     for (int l = 0; !rc && l < L + head; ++l)
         for (int p = 0; !rc && p < 3; ++p) {
             snprintf(path, sizeof path, "%s/L%d_%s.blkt", p == 2 && tq_down ? tq_down : tq, l, kp[p]);
