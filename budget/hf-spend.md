@@ -93,4 +93,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | ple8 relaunch (6aee7e490e0338d1bb828c5c): src-86f55a9, the table files by hf cp; the rest of the table and a PR on each of the five packs; launched by pc-cuda 2026-11-07T01:2xZ on Matt's approval; RUNNING | cpu-upgrade ($0.03/h) | up to 360 | up to $0.18 (reserved) | up to about $24.79 |
 
-Left this week: about $0.21 if the relaunch runs its full 6 h (about $0.39 before it).
+| Linux CI f6d5402 (6aee84a7e6320c66fad4f3fb): nanoseedlm_ple.py and the pack tool, 47 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | |
+
+Left this week: about $-0.08 (before the ple8 relaunch's cost, which pc-cuda logs).21 if the relaunch runs its full 6 h (about $0.39 before it).
