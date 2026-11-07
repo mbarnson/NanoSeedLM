@@ -4,8 +4,8 @@
 can be a web page in the user's browser, a machine on the same network, or a crafted request or model file. Matt's
 words: "if someone sets this up as a server they aren't easily taken advantage of."
 
-**Status.** In progress, for v0.1.1. H1 to H3 are done, and HA, HB and HE pass. Still open: the compute-sanitizer
-racecheck and initcheck of HD, and HC's checksec of the Linux release build.
+**Status.** In progress, for v0.1.1. H1 to H3 are done, and HA, HB, HC and HE pass. Still open: the compute-sanitizer
+racecheck and initcheck of HD (scoped to the kernel tests).
 - HA: test_serve_guard passes on Linux, macOS and Windows, at 8bfed94 and f6d5402.
 - HB: the first run failed 7 tests. The fixes:
   - the safetensors header and shape bounds;
@@ -13,7 +13,9 @@ racecheck and initcheck of HD, and HC's checksec of the Linux release build.
   - aligned test fixtures;
   - leaks on the skip paths.
   The job passes from 6e13dd6.
-- HC: Windows passes (`dumpbin`: Control Flow Guard in the cl and clang-cl builds of nslm-serve.exe).
+- HC: Windows passes (`dumpbin`: Control Flow Guard in the cl and clang-cl builds of nslm-serve.exe). Linux passes
+  (HF job `6aee90d9`, GCC, Release, a8a3416): nslm-serve and nslm-chat are PIE, with full RELRO (GNU_RELRO and
+  BIND_NOW), `__stack_chk_fail`, FORTIFY's `_chk` functions (14 and 12) and a stack that is not executable.
 - HD: memcheck finds nothing in 17 GPU tests, and MSVC ASan nothing in 26 CPU tests. mac-metal's Metal validation
   finds nothing once a test binds its buffers (b273911).
 - HE: passes in all three modes, on macOS and Windows. `--host 0.0.0.0` without a key refuses to start. The refusal
