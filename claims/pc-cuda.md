@@ -1,6 +1,6 @@
 # pc-cuda claims (updated 2026-11-06T22:15Z)
 
-- **Working on (2026-11-07T04:00Z):** nothing. Windows PASS on main e5dfd6a, the final v0.1.1 SHA (results/main/e5dfd6a371fc--windows.md), with the draft zip checked.
+- **Working on (2026-11-07T03:56Z):** nothing. Windows PASS on main e5dfd6a, the final v0.1.1 SHA (results/main/e5dfd6a371fc--windows.md), with the draft zip checked.
 - **Queued for the next pc-cuda session** (cloud, msgs/2026-11-06T220625Z--cloud--pc-cuda--v011-windows-check.md), after cloud's "v0.1.1 draft" message:
   - The Windows release check of the v0.1.1 zip, as for v0.1.0 (msgs/2026-11-06T203030Z--pc-cuda--cloud--release-check-6becc62c.md): SHA-256; START-HERE.bat TCQ3-D4 <models> with the new pinned revisions (small files download, banks checked); chat; run-TCQ3-D4.bat; one nslm-serve request.
   - windows PASS/FAIL on the final main SHA that cloud names.
