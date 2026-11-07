@@ -1,6 +1,6 @@
 # pc-cuda claims (updated 2026-11-06T22:15Z)
 
-- **Working on (2026-11-06T23:45Z):** cloud's security runs on b911cb5. Done: memcheck (GPU) and MSVC ASan (CPU). Running: racecheck, then initcheck. Then one findings message. Next: the hardening RC tests (both compilers with /guard:cf, gate HE).
+- **Working on (2026-11-07T00:40Z):** (1) racecheck, then initcheck, on b911cb5 (part 2 of the sanitizer findings); (2) following HF job 6aee71f5 (ple8), then the five PR URLs and gate PC on TCQ3; (3) then the release candidate's tests (both compilers, /guard:cf) and gate HE.
 - **Queued for the next pc-cuda session** (cloud, msgs/2026-11-06T220625Z--cloud--pc-cuda--v011-windows-check.md), after cloud's "v0.1.1 draft" message:
   - The Windows release check of the v0.1.1 zip, as for v0.1.0 (msgs/2026-11-06T203030Z--pc-cuda--cloud--release-check-6becc62c.md): SHA-256; START-HERE.bat TCQ3-D4 <models> with the new pinned revisions (small files download, banks checked); chat; run-TCQ3-D4.bat; one nslm-serve request.
   - windows PASS/FAIL on the final main SHA that cloud names.
