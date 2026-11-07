@@ -4,8 +4,7 @@
 can be a web page in the user's browser, a machine on the same network, or a crafted request or model file. Matt's
 words: "if someone sets this up as a server they aren't easily taken advantage of."
 
-**Status.** In progress, for v0.1.1. H1 to H3 are done, and HA, HB, HC and HE pass. Still open: the compute-sanitizer
-racecheck and initcheck of HD (scoped to the kernel tests).
+**Status.** Done, for v0.1.1. H1 to H3 are done, and HA to HE pass. H6 and H7 are for v0.1.2.
 - HA: test_serve_guard passes on Linux, macOS and Windows, at 8bfed94 and f6d5402.
 - HB: the first run failed 7 tests. The fixes:
   - the safetensors header and shape bounds;
@@ -17,7 +16,18 @@ racecheck and initcheck of HD (scoped to the kernel tests).
   (HF job `6aee90d9`, GCC, Release, a8a3416): nslm-serve and nslm-chat are PIE, with full RELRO (GNU_RELRO and
   BIND_NOW), `__stack_chk_fail`, FORTIFY's `_chk` functions (14 and 12) and a stack that is not executable.
 - HD: memcheck finds nothing in 17 GPU tests, and MSVC ASan nothing in 26 CPU tests. mac-metal's Metal validation
-  finds nothing once a test binds its buffers (b273911).
+  finds nothing once a test binds its buffers (b273911). On Windows, pc-cuda ran racecheck and initcheck for up to 30
+  minutes each, on b911cb5's cl build (the same kernels as a8a3416). They find nothing in test_mova_kernels and
+  test_tq_mv_gpu, and initcheck finds nothing in test_qwen4_mtp. They find two items, and both are explained:
+  - racecheck, test_qwen4_kernels: 1 warning (0 errors) in `k_q4_attend_tc`. The 8 lanes of row r read `mx[r]`, and
+    then lane 0 writes it. Each lane uses its read before the `__shfl_xor_sync`. Lane 0 writes after it, so the write
+    cannot come first. The tool does not count a shuffle as a barrier. v0.1.2 can add a `__syncwarp()`.
+  - initcheck, test_trellis_gpu: 66 errors in one copy to the host (`nslm/trellis.cu`, the path buffer). The short last
+    block of a row writes entries 0 to n-1 of its path, and the copy takes all T entries. The host reads only entries
+    under n, and the test's words and scales equal lib_trellis.c's. This is the pack builder's encoder, not the
+    engine. v0.1.2 can clear the buffer.
+  - racecheck did not finish 3 tests. It stopped test_trellis_gpu at 1,766 s and test_engine after 3½ hours, both
+    with no reports. It had no time left for test_qwen4_mtp.
 - HE: passes in all three modes, on macOS and Windows. `--host 0.0.0.0` without a key refuses to start. The refusal
   comes after the model load, which v0.1.2 can move before it.
 
