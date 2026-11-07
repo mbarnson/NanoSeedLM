@@ -470,6 +470,8 @@ static void bufs_set(const Buf* b, int n, float* w) {
 }
 
 Q4Eng* q4e_open(const char* model_dir, const Q4EOpts* o, char* err, int errlen) {
+    int ndev = 0;   // else a machine without a GPU fails later as "out of VRAM"
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { snprintf(err, (size_t) errlen, "no CUDA device"); return NULL; }
     Q4Eng* e = (Q4Eng*) calloc(1, sizeof *e);
     if (qwen4_cfg_load(&e->c, model_dir, err, errlen) || ns_open(&e->nm, model_dir, err, errlen)) { free(e); return NULL; }
     if (ns_add_banks(&e->nm, model_dir, err, errlen)) { ns_close(&e->nm); free(e); return NULL; }   // trellis experts (.blkt)

@@ -67,22 +67,32 @@ static const Ref* lookup(const Ref* r, int n, const char* name) {
 }
 static int name_cmp(const void* a, const void* b) { return strcmp(*(char* const*) a, *(char* const*) b); }
 
+// The JSON file dir/name, or NULL when it is absent (*there 0) or does not parse (*there 1, err set)
+static Json* folder_json(const char* dir, const char* name, int* there, char* err, int errlen) {
+    char path[2048];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE* f = fopen(path, "rb");
+    *there = f != NULL;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    const long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* s = len >= 0 ? (char*) malloc((size_t) len + 1) : NULL;
+    const size_t got = s ? fread(s, 1, (size_t) len, f) : 0;
+    fclose(f);
+    Json* j = s ? json_parse(s, got, err, errlen) : NULL;
+    free(s);
+    return j;
+}
+
 // Shard file names: from the index, else model*.safetensors in the folder.
 static int shard_names(const char* dir, char*** out, char* err, int errlen) {
     char path[2048];
     snprintf(path, sizeof path, "%s/model.safetensors.index.json", dir);
-    int n = 0;
+    int n = 0, there;
     char** v = NULL;
-    FILE* f = fopen(path, "rb");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        const long len = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        char* s = (char*) malloc((size_t) len + 1);
-        const size_t got = fread(s, 1, (size_t) len, f);
-        fclose(f);
-        Json* j = json_parse(s, got, err, errlen);
-        free(s);
+    Json* j = folder_json(dir, "model.safetensors.index.json", &there, err, errlen);
+    if (there) {
         const Json* wm = json_get(j, "weight_map");
         if (!wm || wm->t != J_OBJ) { json_free(j); snprintf(err, (size_t) errlen, "%s: no weight_map", path); return -1; }
         for (int i = 0; i < wm->n; ++i) {
@@ -152,7 +162,11 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
     const int ns = shard_names(dir, &names, err, errlen);
     if (ns < 0) return -1;
     m->sh = (StFile*) calloc((size_t) ns, sizeof(StFile));
-    int total = 0, rc = -1;
+    int total = 0, rc = -1, there;
+    Json* cfg = folder_json(dir, "config.json", &there, err, errlen);   // MLX's quantization block, top level or text_config
+    const Json* quant = json_get(cfg, "quantization");
+    if (!quant) quant = json_get(cfg, "quantization_config");
+    if (!quant) quant = json_get(json_get(cfg, "text_config"), "quantization");
     for (int i = 0; i < ns; ++i) {
         char path[2048];
         snprintf(path, sizeof path, "%s/%s", dir, names[i]);
@@ -199,11 +213,19 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
                 snprintf(k, sizeof k, "%s.weight", base);
                 const Ref* w = lookup(refs, nr, k);
                 if (!w && (w = lookup(refs, nr, base))) snprintf(logical, sizeof logical, "%s", base);   // codes named X
-                // bits * group = 32 * (code words per row) / (groups per row): 128 is Q4 g32, 256 Q4 g64, 512 Q8 g64
+                // bits * group = 32 * (code words per row) / (groups per row): 128 is Q4 g32, 256 Q4 g64 or Q8 g32, 512 Q8 g64.
+                // config.json's quantization entry for the module, if any, tells Q4 g64 from Q8 g32
                 const int64_t bg = w && w->e->ndim >= 1 && C ? w->e->shape[w->e->ndim - 1] * 32 / C : 0;
-                if (bg != 128 && bg != 256 && bg != 512) { snprintf(err, (size_t) errlen, "%s: not affine Q4 or Q8", base); free(refs); goto done; }
-                enc = bg == 512 ? NS_Q8 : NS_Q4;
-                group = bg == 128 ? 32 : 64;
+                const Json* qm = json_get(quant, base);
+                const Json* qb = json_get(qm, "bits"), *qg = json_get(qm, "group_size");
+                const int64_t b = qb && qb->t == J_INT ? qb->i : 0, gs = qg && qg->t == J_INT ? qg->i : 0;
+                if (b ? (b != 4 && b != 8) || (gs != 32 && gs != 64) || b * gs != bg : bg != 128 && bg != 256 && bg != 512) {
+                    snprintf(err, (size_t) errlen, "%s: not affine Q4 or Q8 with group 32 or 64", base);
+                    free(refs);
+                    goto done;
+                }
+                enc = (b ? b == 8 : bg == 512) ? NS_Q8 : NS_Q4;
+                group = b ? (int) gs : bg == 128 ? 32 : 64;
                 C *= group;
             }
             if (add(m, m, refs, nr, base, logical, enc, group, S, R, C, err, errlen)) { free(refs); goto done; }
@@ -223,6 +245,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
     if (m->n) qsort(m->t, (size_t) m->n, sizeof(NsTensor), ten_cmp);
     rc = 0;
 done:
+    json_free(cfg);
     for (int i = 0; i < ns; ++i) free(names[i]);
     free(names);
     if (rc) ns_close(m);

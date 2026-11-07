@@ -112,14 +112,14 @@ int main(void) {
     memset(&o, 0, sizeof o);
     o.max_pos = 256;
     Q4Eng* probe = q4e_open(DIR_, &o, err, sizeof err);   // the engine's own open fails without a GPU
-    if (!probe && strstr(err, "device")) { printf("SKIP: %s\n", err); return 77; }
+    if (!probe && strstr(err, "device")) { printf("SKIP: %s\n", err); st_close_file(&st); return 77; }
     q4e_close(probe);
     o.mtp = Q4E_MAX_DRAFTS;
     CHECK(!q4e_open("tests/data/qwen4_tiny_attn", &o, err, sizeof err) && strstr(err, "no MTP head"), "a folder without mtp.*: %s", err);
     Qwen4Ref* r = qwen4_ref_open(DIR_, err, sizeof err);
     Q4Eng* e = r ? q4e_open(DIR_, &o, err, sizeof err) : NULL;
     CHECK(r && e, "open: %s", err);
-    if (!r || !e) { printf("test_qwen4_mtp: FAIL\n"); return 1; }
+    if (!r || !e) { printf("test_qwen4_mtp: FAIL\n"); qwen4_ref_close(r); q4e_close(e); st_close_file(&st); return 1; }
     const int V = q4e_cfg(e)->vocab;
     float* lg = (float*) malloc(sizeof(float) * (size_t) V * N);
     float* buf = (float*) malloc(sizeof(float) * (size_t) V * N);

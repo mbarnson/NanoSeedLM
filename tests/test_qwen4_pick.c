@@ -48,7 +48,7 @@ int main(void) {
     if (st_open_file(&st, "tests/data/qwen4_tiny_golden.safetensors", err, sizeof err)) { printf("FAIL: %s\n", err); return 1; }
     const int32_t* ids = (const int32_t*) st_data(&st, st_find(&st, "ids"));
     Eng* e0 = open_k(0, err, sizeof err);   // the engine's own open fails without a GPU
-    if (!e0 && strstr(err, "device")) { printf("SKIP: %s\n", err); return 77; }
+    if (!e0 && strstr(err, "device")) { printf("SKIP: %s\n", err); st_close_file(&st); return 77; }
     Eng* e3 = e0 ? open_k(3, err, sizeof err) : NULL;
     CHECK(e0 && e3, "open: %s", err);
     if (!e0 || !e3) { printf("test_qwen4_pick: FAIL\n"); return 1; }

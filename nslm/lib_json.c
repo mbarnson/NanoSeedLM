@@ -98,6 +98,7 @@ typedef struct {
     int errlen;
     int depth;
 } P;
+static int lit(const P* p, const char* w, size_t k) { return p->n - p->i >= k && !memcmp(p->s + p->i, w, k); }
 
 static Json* fail(P* p, const char* msg) {
     if (p->err && !p->err[0]) snprintf(p->err, (size_t) p->errlen, "JSON: %s at byte %zu", msg, p->i);
@@ -216,9 +217,9 @@ static Json* pvalue(P* p) {
         if (!s) return NULL;
         j = json_new(J_STR);
         j->s = s;
-    } else if (!strncmp(p->s + p->i, "true", 4)) { p->i += 4; j = json_new(J_TRUE); }
-    else if (!strncmp(p->s + p->i, "false", 5)) { p->i += 5; j = json_new(J_FALSE); }
-    else if (!strncmp(p->s + p->i, "null", 4)) { p->i += 4; j = json_new(J_NULL); }
+    } else if (lit(p, "true", 4)) { p->i += 4; j = json_new(J_TRUE); }   // lit: no read past p->n (mac-metal's ASan find)
+    else if (lit(p, "false", 5)) { p->i += 5; j = json_new(J_FALSE); }
+    else if (lit(p, "null", 4)) { p->i += 4; j = json_new(J_NULL); }
     else if (c == '-' || (c >= '0' && c <= '9')) {
         const size_t st = p->i;
         int flt = 0;

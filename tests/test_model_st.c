@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <dirent.h>
 
+#include "json.h"
 #include "model_st.h"
 
 static int fails = 0;
@@ -209,6 +210,18 @@ int main(void) {
         CHECK(c && c->enc == NS_Q4 && c->group == 64 && c->rows == 4 && c->cols == 128, "Q4 group 64");
         if (a) CHECK(a->s[1].len == 2 * 8 * 4 * 2 && a->s[1].p[3] == byte_of(1, 0, 3), "Q4 group 32 scales");
         ns_close(&m);
+        // c's shapes are Q4 group 64 or Q8 group 32 (an 8-bit PLE table of 160 columns): config.json's entry decides
+        char cfg[600];
+        snprintf(cfg, sizeof cfg, "%s/config.json", path);
+        static const char* q8 = "{\"quantization\": {\"group_size\": 64, \"bits\": 4, \"c\": {\"group_size\": 32, \"bits\": 8}}}";
+        static const char* wrong = "{\"quantization\": {\"c\": {\"group_size\": 64, \"bits\": 8}}}";
+        CHECK(spit_file(cfg, (const uint8_t*) q8, (long) strlen(q8)) == 0, "config write");
+        CHECK(ns_open(&m, path, err, sizeof err) == 0, "Q8 group 32 open: %s", err);
+        c = ns_find(&m, "c.weight");
+        CHECK(c && c->enc == NS_Q8 && c->group == 32 && c->rows == 4 && c->cols == 64, "Q8 group 32 by the config");
+        ns_close(&m);
+        CHECK(spit_file(cfg, (const uint8_t*) wrong, (long) strlen(wrong)) == 0, "config write");
+        CHECK(ns_open(&m, path, err, sizeof err) != 0 && strstr(err, "c:"), "a config that the shapes contradict: %s", err);
         remove_dir(path);
     }
     {   // crafted files: each is refused, and none reads past the file (ASan) or overflows (UBSan)
@@ -236,6 +249,19 @@ int main(void) {
             err[0] = 0;
             CHECK(ns_open(&cm, path, err, sizeof err) != 0 && err[0], "%s: opened", bad[i].name);
             remove_dir(path);
+        }
+    }
+
+    {   // the index and config parser on truncated literals, each in a heap buffer of its exact size (ASan sees a past read)
+        static const char* cut[] = {"[1,t", "[1,tr", "{\"a\":fals", "[nul", "tru"};
+        for (size_t i = 0; i < sizeof cut / sizeof cut[0]; ++i) {
+            const size_t n = strlen(cut[i]);
+            char* b = (char*) malloc(n);
+            memcpy(b, cut[i], n);
+            Json* j = json_parse(b, n, NULL, 0);
+            CHECK(!j, "truncated JSON %s parsed", cut[i]);
+            json_free(j);
+            free(b);
         }
     }
 
