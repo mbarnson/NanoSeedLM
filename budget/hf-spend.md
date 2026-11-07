@@ -97,4 +97,13 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux hardening check a8a3416 (6aee90d90e0338d1bb82a2c9): nslm-serve and nslm-chat built with GCC; PIE, full RELRO, stack protector, FORTIFY | cpu-upgrade ($0.03/h) | about 2 | under $0.01 | |
 
-Left this week: about $0.29.
+| plan tcq-safetensors TS5, first try (6aef74720e0338d1bb83ab31, mac-metal): failed at the build (Ubuntu 22.04's CMake 3.22) | cpu-xl ($1.00/h) | about 1 | about $0.02 | |
+
+| Linux CI cdabec6 (6aef74990e0338d1bb83ab5f, mac-metal): tcq-safetensors, 48 PASS; the tiny model's model-tcq shards bit for bit on CUDA | rtx-pro-6000 ($2.75/h) | about 3 | about $0.14 | |
+
+| plan tcq-safetensors TS5 (6aef74b50e0338d1bb83ab7d, mac-metal): TCQ3, TCQ3-D4, TCQ4 to model-tcq-* shards, a PR each (discussions/2), merged | cpu-xl ($1.00/h) | about 27 | about $0.45 | |
+
+| plan tcq-safetensors TD (6aef7b6ce6320c66fad634a8, mac-metal): start-here.sh at TCQ3's old pin (198 files) and new pin (53 files) | cpu-xl ($1.00/h) | about 27 | about $0.45 | about $25.78 |
+
+Over the cap this week: about $0.78. Matt allowed it for plan tcq-safetensors (2026-11-07, in session: "feel free to use
+HF resources and exceed the budget to get this fixed").
