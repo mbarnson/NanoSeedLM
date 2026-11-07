@@ -6,7 +6,7 @@ each pack that puts it in place of the pack's 4-bit table. One file at a time, s
   python3 tools/hf_ple8.py pack REPO OUT        a pull request on REPO (not merged): the 4-bit table out, OUT's files in
 
 As an HF job, by the account that owns the packs (its token a job secret):
-  hf jobs run --flavor cpu-upgrade --timeout 3h --secrets HF_TOKEN -v hf://buckets/txgsync/nslm-qwen38:/b python:3.12 \
+  hf jobs run --flavor cpu-upgrade --timeout 6h --secrets HF_TOKEN -e HF_XET_CHUNK_CACHE_SIZE_BYTES=0 -v hf://buckets/txgsync/nslm-qwen38:/b python:3.12 \
       bash -c 'pip install -q numpy "huggingface_hub[hf_xet]" && S=/b/src-REV/tools/hf_ple8.py &&
                python3 $S table /b/ple8 && for P in TCQ4 TCQ3-D4 TCQ3 P4 P3; do
                python3 $S pack txgsync/Qwen3.8-Flash-Next-NanoSeedLM-$P /b/ple8; done'
@@ -14,8 +14,8 @@ As an HF job, by the account that owns the packs (its token a job secret):
 import json
 import os
 import re
-import shutil
 import struct
+import subprocess
 import sys
 
 SRC, SRC_REV = "Qwen/Qwen3.8-Flash-Next", "7ecef55a2e549814c62143fcf8b5be457695e3b9"
@@ -23,6 +23,13 @@ BF16 = re.compile(r"model\.language_model\.layers\.(\d+)\.ple\.ple_embedding\.ng
 OLD = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shards\.\d+\.(weight|scales|biases)$")
 Q8 = {"group_size": 32, "bits": 8, "mode": "affine"}   # 64 does not divide the table's 160 columns
 WORK = os.environ.get("WORK", "/w")
+# The table's big files go to and from the bucket by its API. The bucket mount keeps a local copy of each file written
+# through it: 28 of the 33 filled cpu-upgrade's 50 GB of disk (job 6aee71f5). The mount serves only small reads.
+URI = os.environ.get("PLE8_URI", "hf://buckets/txgsync/nslm-qwen38/ple8")
+
+
+def hf_cp(src, dst):
+    subprocess.run(["hf", "cp", src, dst], check=True, stdout=subprocess.DEVNULL)
 SIZE = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "BF16": 2, "F16": 2, "I16": 2, "U16": 2}
 
 
@@ -140,15 +147,16 @@ def table(out_dir):
             os.remove(p)
             tmp = os.path.join(WORK, name)
             open(tmp, "wb").write(st_write({"format": "mlx"}, parts))
-            shutil.copyfile(tmp, dst + ".part")   # the bucket mount: a plain copy, then the name
-            os.replace(dst + ".part", dst)
+            hf_cp(tmp, f"{URI}/{name}")
             os.remove(tmp)
+            sizes = {k: len(b) for k, (_, b) in parts.items()}
             print(f"{name}: {len(parts) // 3} shards from {f}, RMS error against BF16 {rms:.3e}", flush=True)
-        head, _ = st_read(open(dst, "rb").read(1 << 20))   # the header is within the first MiB
-        for k, e in head.items():
-            if k != "__metadata__":
-                wmap[k] = name
-                nbytes += e["data_offsets"][1] - e["data_offsets"][0]
+        else:   # written by an earlier run: its header, through the mount (the first MiB)
+            head, _ = st_read(open(dst, "rb").read(1 << 20))
+            sizes = {k: e["data_offsets"][1] - e["data_offsets"][0] for k, e in head.items() if k != "__metadata__"}
+        for k, n in sizes.items():
+            wmap[k] = name
+            nbytes += n
     json.dump({"source": f"{SRC}@{SRC_REV}", "bytes": nbytes, "weight_map": wmap}, open(os.path.join(out_dir, "ple8.json"), "w"),
               indent=1)
     print(f"{out_dir}: {len(wmap) // 3} shards in {len(files)} files")
@@ -192,7 +200,7 @@ def pack(repo, out_dir):
     for i in range(0, len(names), 6):   # the 8-bit files, six a commit (Xet sends each chunk once across the packs)
         batch = names[i:i + 6]
         for f in batch:
-            shutil.copyfile(os.path.join(out_dir, f), os.path.join(up, f))
+            hf_cp(f"{URI}/{f}", os.path.join(up, f))
         api.create_commit(repo, [CommitOperationAdd(f, os.path.join(up, f)) for f in batch],
                           commit_message=f"The 8-bit PLE table, files {i + 1} to {i + len(batch)}", revision=ref)
         for f in batch:
