@@ -7,6 +7,17 @@
 | `NSLM_MODEL_DIR` | | The model folder for the tests (Windows build) |
 | `NSLM_API_KEY=KEY` | | `nslm-serve`: each request needs `Authorization: Bearer KEY`. Needed to listen off loopback (`--host`) |
 
+## Start scripts
+
+`start-here.sh` and `start-here.ps1` read these variables.
+
+| Variable | Default | Use |
+|---|---|---|
+| `NSLM_DL_JOBS=N` | 8 | The number of pack files that download at the same time |
+| `NSLM_NO_HF=1` | off | Do not use `hf`. curl downloads each file |
+| `HF_TOKEN=TOKEN` | the token of `hf auth login` | The Hugging Face token for the download |
+| `NSLM_PACKS` | the three packs | Another pack table: lines of `name repository revision RAM VRAM MacGB downloadGB` (tests) |
+
 ## Metal engine
 
 | Variable | Default | Use |

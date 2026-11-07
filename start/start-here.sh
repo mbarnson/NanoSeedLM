@@ -132,17 +132,24 @@ line=$(awk -v n="$pick" '$1 == n' <<<"$PACKS")
 read -r _ repo rev _ <<<"$line"
 root=${2:-}
 [ -n "$root" ] || [ -n "${1:-}" ] || read -r -p "Model folder [$here/models] " root
+case $root in "~") root=$HOME ;; "~/"*) root=$HOME/${root#"~/"} ;; esac   # read -r keeps ~: else a folder named ~ here
 dir=${root:-$here/models}/${repo#*/}
 mkdir -p "$dir"
 
 # the files at their pinned revisions, each checked by size and SHA-256. .nslm-verified lists "path size id" for each
 # file checked at this revision (id: a large file's SHA-256, git:BLOB for a small one). An earlier revision's line or
 # v0.1.0's bare path matches nothing: then a large file of the right size and SHA-256 stays, and any other downloads again.
-auth=()   # used as ${auth[@]+"${auth[@]}"}: bash 3.2 (macOS) calls an empty array unbound under set -u
-[ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+# the token: HF_TOKEN, or the one that "hf auth login" saved (a signed-in download has higher rate limits). curl reads
+# it from a file of mode 600, so it is not in the process list
+tok=${HF_TOKEN:-}
+tf=${HF_TOKEN_PATH:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/token}
+if [ -z "$tok" ] && [ -f "$tf" ]; then tok=$(tr -d ' \r\n' <"$tf"); fi
+hdr=$(mktemp)   # 600
+trap 'rm -f "$hdr"' EXIT
+if [ -n "$tok" ]; then printf 'Authorization: Bearer %s\n' "$tok" >"$hdr"; fi
 files() {   # lines "path size id" of the pack
     local t
-    t=$(curl -fsSL ${auth[@]+"${auth[@]}"} "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true") ||
+    t=$(curl -fsSL -H "@$hdr" "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true") ||
         fail "Cannot list $repo."
     if [ -n "$mac" ]; then   # JavaScript for Automation reads JSON on each Mac. python3 can be a stub that asks for Xcode
         osascript -l JavaScript -e 'function run(a) { return JSON.parse(a[0]).filter(f => f.type == "file" &&
@@ -161,8 +168,10 @@ old=$(cat "$ver") check=0 need=0 hashed=0
 : >"$ver"
 while read -r p s h; do
     case $p in /* | *..*) fail "The pack lists an unsafe path: $p" ;; esac
-    if grep -qxF "$p $s $h" <<<"$old"; then echo "$p $s $h" >>"$ver"; continue; fi
     f=$dir/$p
+    if grep -qxF "$p $s $h" <<<"$old" && [ -f "$f" ] && [ $(( $(wc -c <"$f") )) -eq "$s" ]; then   # checked before
+        echo "$p $s $h" >>"$ver"; continue
+    fi
     if [ -f "$f" ] && [ $(( $(wc -c <"$f") )) -eq "$s" ] && [ "${h#git:}" = "$h" ]; then   # from an earlier download
         [ "$hashed" -eq 0 ] && echo "Checking the files of an earlier download (SHA-256)..."
         hashed=1
@@ -193,25 +202,88 @@ if [ "$need" -gt 1073741824 ] && [ -z "${1:-}" ]; then
 elif [ "$need" -gt 1073741824 ]; then
     echo "The download starts in 5 s (Ctrl+C stops it)."; sleep 5   # a folder typo
 fi
-total=$(( $(wc -l <<<"$list") )) i=0
-while read -r p s h; do
-    i=$((i + 1))
-    grep -qxF "$p $s $h" "$ver" && continue
-    dst=$dir/$p
-    mkdir -p "$(dirname "$dst")"
-    echo "[$i/$total] $p ($(awk -v n="$s" 'BEGIN {if (n < 1e9) printf "%.0f MB", n / 1e6; else printf "%.1f GB", n / 1e9}'))"
-    have=0
-    [ -f "$dst.part" ] && have=$(( $(wc -c <"$dst.part") ))
-    if [ "$have" -ne "$s" ]; then   # into FILE.part: a stalled connection resumes it, and FILE appears once it checks out
-        curl -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst.part" \
-            "https://huggingface.co/$repo/resolve/$rev/$p" </dev/null ||
-            fail "The download of $p stopped. Run start-here.sh again to resume."
+# The download: NSLM_DL_JOBS files at once (8). hf, when it is installed (NSLM_NO_HF=1: not), then curl for each file
+# that remains. Each file is checked by its size and SHA-256 before it joins .nslm-verified.
+jobs=${NSLM_DL_JOBS:-8}
+say() { if [ -t 1 ]; then printf '\r\033[K%s\n' "$*"; else printf '%s\n' "$*"; fi; }
+ok1() {   # ok1 FILE SIZE ID: FILE has the size, and a large file has the SHA-256
+    [ -f "$1" ] && [ $(( $(wc -c <"$1") )) -eq "$2" ] && { [ "${3#git:}" != "$3" ] || [ "$(sha "$1")" = "$3" ]; }
+}
+chk1() {   # chk1 PATH SIZE ID (an xargs job): a file of hf's that checks out joins .nslm-verified. Another goes
+    if ok1 "$dir/$1" "$2" "$3"; then echo "$1 $2 $3" >>"$ver"; rm -f "$dir/$1.part"; else rm -f "$dir/$1"; fi
+}
+get1() {   # get1 PATH SIZE ID (an xargs job): curl into FILE.part (a stalled connection resumes it), then FILE if it checks out
+    local d=$dir/$1
+    mkdir -p "$(dirname "$d")"
+    if ! ok1 "$d.part" "$2" "$3"; then
+        if [ -f "$d.part" ] && [ $(( $(wc -c <"$d.part") )) -ge "$2" ]; then rm -f "$d.part"; fi
+        curl -fsSL --retry 20 --speed-limit 100000 --speed-time 60 -C - -H "@$hdr" -o "$d.part" \
+            "https://huggingface.co/$repo/resolve/$rev/$1" </dev/null || { say "The download of $1 stopped."; return 0; }
+        local n=$(( $(wc -c <"$d.part") ))
+        if [ "$n" -lt "$2" ]; then say "$1 is not complete."; return 0; fi   # the next run resumes it
+        if ! ok1 "$d.part" "$2" "$3"; then rm -f "$d.part"; say "$1 failed its size or SHA-256 check and was removed."; return 0; fi
     fi
-    [ $(( $(wc -c <"$dst.part") )) -eq "$s" ] || fail "$p has the wrong size. Run start-here.sh again."
-    if [ "${h#git:}" = "$h" ] && [ "$(sha "$dst.part")" != "$h" ]; then rm -f "$dst.part"; fail "$p failed its SHA-256 check and was removed. Run start-here.sh again."; fi
-    mv -f "$dst.part" "$dst"
-    echo "$p $s $h" >>"$ver"
-done <<<"$list"
+    mv -f "$d.part" "$d"
+    echo "$1 $2 $3" >>"$ver"
+    say "$1"
+}
+todo() { while read -r p s h; do grep -qxF "$p $s $h" "$ver" || echo "$p $s $h"; done <<<"$list"; }
+export dir repo rev ver hdr
+export -f say ok1 chk1 get1 sha
+todo=$(todo)
+hf=   # the hf command of huggingface_hub
+if [ -z "${NSLM_NO_HF:-}" ] && hf version 2>/dev/null | grep -q huggingface_hub; then hf=1; fi
+if [ -n "$todo" ] && [ -z "$hf" ] && [ -z "${NSLM_NO_HF:-}" ]; then
+    echo "Tip: hf can download faster. It uses Hugging Face's Xet transfers and your login. To install it:"
+    echo "  pip install -U huggingface_hub && hf auth login"
+    echo "Then run start-here.sh again. It continues the download."
+elif [ -n "$todo" ] && [ -z "$tok" ]; then
+    echo "Tip: \"hf auth login\" (a free Hugging Face account) gives the download higher rate limits."
+fi
+if [ -n "$todo" ] && [ -n "$hf" ]; then
+    echo "Downloading with hf ($(hf version 2>/dev/null | head -1)), $jobs files at once:"
+    # shellcheck disable=SC2046   # the paths have no spaces ("path size id" lines)
+    hf download "$repo" $(awk '{print $1}' <<<"$todo") --revision "$rev" --local-dir "$dir" --max-workers "$jobs" </dev/null ||
+        echo "hf stopped. curl downloads the files that remain."
+    echo "Checking the files (SHA-256)..."
+    xargs -n 3 -P "$jobs" "$BASH" -c 'chk1 "$@"' _ <<<"$todo" || true
+    todo=$(todo)
+fi
+if [ -n "$todo" ]; then
+    n=$(( $(wc -l <<<"$todo") ))
+    need=$(while read -r p s _; do   # the bytes that remain: FILE.part files count
+        have=0
+        [ -f "$dir/$p.part" ] && have=$(( $(wc -c <"$dir/$p.part") ))
+        echo $((s > have ? s - have : s))
+    done <<<"$todo" | awk '{s += $1} END {printf "%.0f", s}')
+    echo "Downloading $n files with curl, $jobs at once:"
+    stamp=$dir/.nslm-stamp
+    : >"$stamp"
+    got() {   # bytes now in FILE.part files and in files written since the start
+        find "$dir" -type f ! -path '*/.*' \( -name '*.part' -o -newer "$stamp" \) -exec ls -ln {} + 2>/dev/null |
+            awk '{s += $5} END {printf "%.0f", s}'
+    }
+    (   # a progress line every 2 s on a terminal, else every 60 s
+        b0=$(got) t0=$SECONDS st=2
+        [ -t 1 ] || st=60
+        while sleep "$st"; do
+            b=$(( $(got) - b0 )) dt=$(( SECONDS - t0 ))
+            l=$(awk -v b="$b" -v t="$dt" -v n="$need" 'BEGIN { r = b / (t > 0 ? t : 1)
+                printf "%.1f of %.1f GB, %.0f MB/s", b / 1e9, n / 1e9, r / 1e6
+                if (r > 0 && n > b) printf ", %.0f min left", (n - b) / r / 60 }')
+            if [ -t 1 ]; then printf '\r\033[K%s' "$l"; else echo "$l"; fi
+        done
+    ) &
+    mon=$!
+    xargs -n 3 -P "$jobs" "$BASH" -c 'get1 "$@"' _ <<<"$todo" || true
+    kill "$mon" 2>/dev/null || true
+    wait "$mon" 2>/dev/null || true
+    rm -f "$stamp"
+    [ -t 1 ] && printf '\r\033[K'
+    todo=$(todo)
+    [ -z "$todo" ] || fail "$(( $(wc -l <<<"$todo") )) files did not download or check out (see above). Run start-here.sh again to resume."
+fi
+rm -f "$hdr"
 pline="# the pack's own 8-bit PLE table (Q4E_PLE_GGUF=FILE reads another, as a GGUF)"   # run-PACK.sh's line for the table
 dline="# MTP drafts: Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3 (they break even on an RTX 4080)"   # and for the drafts
 [ -n "$mac" ] && dline="export Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3   # 2 MTP drafts: 32% faster on an M4 Max, the same text"

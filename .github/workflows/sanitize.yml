@@ -13,7 +13,7 @@ jobs:
     container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     timeout-minutes: 60
     steps:
-      - run: apt-get update -qq && apt-get install -y -qq git libicu-dev cmake ninja-build >/dev/null
+      - run: apt-get update -qq && apt-get install -y -qq git libicu-dev cmake ninja-build python3 >/dev/null   # python3: the pack checks of test_start_here
       - uses: actions/checkout@v4
       - name: build
         run: |

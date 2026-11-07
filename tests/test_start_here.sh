@@ -36,13 +36,24 @@ echo "NVIDIA GeForce RTX 4080, 16376, 580.00"
 EOF
 cat >"$t/good/curl" <<'EOF'
 #!/bin/sh
-# the last argument is the URL. -o names the output file. Files come from $NSLM_TEST_REL
-o= u=
-while [ $# -gt 0 ]; do case $1 in -o) o=$2; shift ;; http*) u=$1 ;; esac; shift; done
-echo "curl $u" >>"$NSLM_TEST_REL/../curl.log"
-f=$NSLM_TEST_REL/${u##*/}
+# Files come from $NSLM_TEST_REL: a release file by its name, the pack's tree (to stdout) and its files (pack/PATH).
+# -o names the output file, and -C - resumes into it. A pack file logs its -H file and how many run at once.
+o= u= c= h=
+while [ $# -gt 0 ]; do case $1 in -o) o=$2; shift ;; -C) c=$2; shift ;; -H) h=$2; shift ;; http*) u=$1 ;; esac; shift; done
+R=$NSLM_TEST_REL
+echo "curl $u" >>"$R/../curl.log"
+case $u in
+*/api/models/*) cat "$R/tree.json"; exit 0 ;;
+*/resolve/*)
+    x=${u#*/resolve/} && f=$R/pack/${x#*/}
+    case $h in @*) cat "${h#@}" >>"$R/../headers.log" ;; esac
+    mkdir -p "$R/../run" && : >"$R/../run/$$" && ls "$R/../run" | wc -l >>"$R/../conc.log"
+    sleep 1
+    rm -f "$R/../run/$$" ;;
+*) f=$R/${u##*/} ;;
+esac
 [ -f "$f" ] || exit 22
-cp "$f" "$o"
+if [ "$c" = - ] && [ -f "$o" ]; then n=$(wc -c <"$o"); tail -c +$((n + 1)) "$f" >>"$o"; else cp "$f" "$o"; fi
 EOF
 cat >"$t/good/cmake" <<'EOF'
 #!/bin/sh
@@ -151,5 +162,85 @@ check "a wrong SHA-256 unpacks nothing" '[ ! -e "$rf/$bin/nslm-serve" ]'
 rm -f "$t/rel/SHA256SUMS" "$t/rel/$asset.tar.gz"
 run "$rf/start-here.sh" "$t/good"
 check "no release: the run stops with the build guide" '[ "$(cat "$t/rc")" = 1 ] && grep -q "docs/guides/build.md" "$t/log"'
+
+# 8. the pack download: files run at the same time, hf when it is installed, each file checked by its SHA-256
+if [ "$(uname -s)" != Darwin ] && ! command -v python3 >/dev/null; then
+    echo "skip the pack download checks (no python3 to read the file list)"
+else
+    mkdir -p "$t/rel/pack/sub" "$t/nohf" "$t/hfbin" "$t/hfhome"
+    printf '#!/bin/sh\nexit 1\n' >"$t/nohf/hf"
+    cat >"$t/hfbin/hf" <<'EOF'
+#!/bin/sh
+# hf version, and hf download REPO FILES... --local-dir D: copies the files from $NSLM_TEST_REL/pack, except
+# $NSLM_TEST_HF_SKIP, a file that hf misses (then hf fails)
+case $1 in version) echo "huggingface_hub version: 9.9.9"; exit 0 ;; download) shift 2 ;; *) exit 2 ;; esac
+d= fs=
+while [ $# -gt 0 ]; do case $1 in --local-dir) d=$2; shift ;; --revision | --max-workers) shift ;; --*) ;; *) fs="$fs $1" ;; esac; shift; done
+echo "hf$fs" >>"$NSLM_TEST_REL/../hf.log"
+for f in $fs; do
+    [ "$f" = "${NSLM_TEST_HF_SKIP:-}" ] && continue
+    mkdir -p "$d/$(dirname "$f")" && cp "$NSLM_TEST_REL/pack/$f" "$d/$f"
+done
+[ -z "${NSLM_TEST_HF_SKIP:-}" ]
+EOF
+    chmod +x "$t/nohf/hf" "$t/hfbin/hf"
+    echo "filetoken" >"$t/hfhome/token"
+    echo '{"model_type": "test"}' >"$t/rel/pack/config.json"
+    for f in a.safetensors sub/b.safetensors L0_up_proj.blkt; do head -c 300000 /dev/urandom >"$t/rel/pack/$f"; done
+    tree() {   # tree [PATH SHA]: the pack's file list, with a wrong SHA-256 for PATH
+        local s f n
+        printf '[{"type": "file", "path": ".gitattributes", "size": 5, "oid": "g0"}, {"type": "directory", "path": "sub"}'
+        printf ', {"type": "file", "path": "config.json", "size": %d, "oid": "g1"}' "$(wc -c <"$t/rel/pack/config.json")"
+        for f in a.safetensors sub/b.safetensors L0_up_proj.blkt; do
+            s=$(sha "$t/rel/pack/$f") n=$(($(wc -c <"$t/rel/pack/$f")))
+            [ "$f" = "${1:-}" ] && s=$2
+            printf ', {"type": "file", "path": "%s", "size": %d, "oid": "g2", "lfs": {"oid": "%s", "size": %d}}' "$f" "$n" "$s" "$n"
+        done
+        echo ']'
+    }
+    pk=$t/pk
+    mkdir -p "$pk/$bin"
+    cp "$repo/start/start-here.sh" "$pk/"
+    for b in nslm-chat nslm-serve; do printf '#!/bin/sh\nexit 2\n' >"$pk/$bin/$b"; chmod +x "$pk/$bin/$b"; done
+    m=$t/models/tiny
+    runp() {   # runp PATH_PREFIX: start-here.sh TINY in $pk. It stops at the chat (the stub nslm-chat)
+        rm -f "$t/curl.log" "$t/conc.log" "$t/headers.log" "$t/hf.log"
+        (cd "$t" && env -u HF_TOKEN HF_HOME="$t/hfhome" NSLM_PACKS="TINY test/tiny 0123abc 1 0 1 1" PATH="$1:$PATH" \
+            bash "$pk/start-here.sh" TINY "$t/models" >"$t/log" 2>&1)
+        echo $? >"$t/rc"
+    }
+    same() { for f in config.json a.safetensors sub/b.safetensors L0_up_proj.blkt; do cmp -s "$t/rel/pack/$f" "$m/$f" || return 1; done; }
+    tree >"$t/rel/tree.json"
+
+    runp "$t/nohf:$t/good"
+    check "curl: each file downloads and checks out" 'same && [ "$(wc -l <"$m/.nslm-verified")" -eq 4 ] && grep -q "nslm-chat failed" "$t/log"'
+    check "curl: files download at the same time" '[ "$(sort -n "$t/conc.log" | tail -1)" -ge 2 ]'
+    check "curl: the token of hf auth login" 'grep -q "Authorization: Bearer filetoken" "$t/headers.log"'
+    check "curl: no dot file downloads" '[ ! -e "$m/.gitattributes" ]'
+    check "curl: a tip tells how to install hf" 'grep -q "pip install -U huggingface_hub" "$t/log"'
+
+    rm -f "$m/a.safetensors" && head -c 1000 "$t/rel/pack/a.safetensors" >"$m/a.safetensors.part"
+    runp "$t/nohf:$t/good"
+    check "curl: a FILE.part resumes" 'same && [ ! -e "$m/a.safetensors.part" ] && [ "$(grep -c resolve "$t/curl.log")" -eq 1 ]'
+
+    # a folder answer of ~/DIR is the home folder's DIR (read -r does not expand ~)
+    mkdir -p "$t/home"
+    (cd "$t" && env -u HF_TOKEN HOME="$t/home" HF_HOME="$t/hfhome" NSLM_PACKS="TINY test/tiny 0123abc 1 0 1 1" \
+        PATH="$t/nohf:$t/good:$PATH" bash "$pk/start-here.sh" TINY "~/mm" >"$t/log" 2>&1)
+    check "a folder ~/DIR is in the home folder" '[ -f "$t/home/mm/tiny/a.safetensors" ] && [ ! -e "$t/~" ] && [ ! -e "$pk/~" ]'
+
+    rm -rf "$m"
+    NSLM_TEST_HF_SKIP=sub/b.safetensors runp "$t/hfbin:$t/good"
+    check "hf: hf downloads the files" 'grep -q "a.safetensors" "$t/hf.log" 2>/dev/null'
+    check "hf: curl downloads the file that hf misses" 'same && [ "$(grep -c resolve "$t/curl.log")" -eq 1 ] && grep -q "resolve/0123abc/sub/b.safetensors" "$t/curl.log"'
+    check "hf: no tip with hf and a login" '! grep -q "Tip:" "$t/log"'
+    check "hf: each file checks out" '[ "$(wc -l <"$m/.nslm-verified")" -eq 4 ] && grep -q "nslm-chat failed" "$t/log"'
+
+    rm -rf "$m"
+    tree a.safetensors 0000000000000000000000000000000000000000000000000000000000000000 >"$t/rel/tree.json"
+    runp "$t/nohf:$t/good"
+    check "a wrong SHA-256: the file goes, and the run stops" '[ ! -e "$m/a.safetensors" ] && [ ! -e "$m/a.safetensors.part" ] && [ "$(cat "$t/rc")" = 1 ] && grep -q "a.safetensors failed its size or SHA-256 check" "$t/log" && grep -q "Run start-here.sh again" "$t/log"'
+    check "a wrong SHA-256: the other files check out" '[ "$(wc -l <"$m/.nslm-verified")" -eq 3 ] && ! grep -q "nslm-chat failed" "$t/log"'
+fi
 
 [ "$fails" -eq 0 ] && echo "start-here: all checks passed" || { echo "start-here: $fails checks failed"; exit 1; }
