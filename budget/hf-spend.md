@@ -95,4 +95,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI f6d5402 (6aee84a7e6320c66fad4f3fb): nanoseedlm_ple.py and the pack tool, 47 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $24.71 |
 
+| Linux hardening check a8a3416 (6aee90d90e0338d1bb82a2c9): nslm-serve and nslm-chat built with GCC; PIE, full RELRO, stack protector, FORTIFY | cpu-upgrade ($0.03/h) | about 2 | under $0.01 | |
+
 Left this week: about $0.29.
