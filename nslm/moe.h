@@ -27,6 +27,11 @@ int ns_open_bank(NsModel* m, const char* dir, char* err, int errlen);
 // The folder's banks added to m (ns_open's), each in place of m's tensor of its name.  0 (also with no bank), or -1 with err.
 // The banks stay mapped for the process.
 int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen);
+// Plan tcq-safetensors: the trellis banks (.blkt) of folder dir as safetensors shards model-tcq-NNNNN-of-NNNNN.safetensors,
+// one a layer (the MTP head's under its mtp.* names), with the entries NAME.tcq_words, .tcq_scales, .tcq_params and
+// .tcq_err (model_st.h), listed in the index. The folder is read again, each stream is compared with its bank's, and
+// then the banks go. The other files do not change. The same folder gives the same files. 0, 1 (no bank), or -1 with err.
+int nslm_tcq_to_st(const char* dir, char* err, int errlen);
 
 // Copies an MLX loader and the nanoseedlm_seeds.py beside it into dir.  -1 when either is missing.
 int nslm_copy_loader(const char* loader, const char* dir);
@@ -36,7 +41,7 @@ void nslm_copy_model_files(const char* from, const char* to);
 int nslm_copy_file(const char* from, const char* to);   // 0, or -1
 // A trellis pack (nslm-qwen4-pack --tq): every tensor of base but the routed experts (each layer's switch_mlp and the
 // MTP head's), in shards of at most shard bytes, and the banks L{l}_{proj}.blkt of layers 0 to n (n: the head, when
-// base has one) from tq, with down_proj's from tq_down (NULL: tq).  dense8 (NULL: none): an 8-bit MLX folder whose
+// base has one) from tq, with down_proj's from tq_down (NULL: tq), as the shards of nslm_tcq_to_st.  dense8 (NULL: none): an 8-bit MLX folder whose
 // modules take the place of base's quantized ones but the PLE table's, its groups of 128 split into 64 (the same weights).
 // config.json loses the experts' quantization entries.  loader (NULL: none): config.json's model_file, copied with
 // nanoseedlm_seeds.py and nanoseedlm_trellis.py from beside it, for mlx-vlm and oMLX.  0, or -1 with err.

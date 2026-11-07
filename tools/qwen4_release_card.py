@@ -281,6 +281,8 @@ Download the engine ([releases]({GITHUB}/releases), or [build it]({GITHUB}/blob/
 folder. Then chat, or serve an OpenAI-compatible API. The engines read the pack's own 8-bit PLE table. On macOS, use
 `out/bin` in place of `build/bin`.
 
+The `model-tcq-*` shards need engine v0.1.2 or later.
+
 ```bash
 hf download txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} --local-dir Qwen3.8-Flash-Next-NanoSeedLM-{name}
 build/bin/nslm-chat --model Qwen3.8-Flash-Next-NanoSeedLM-{name} "Why do tide pools matter?"
@@ -300,10 +302,11 @@ Read [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 
 - `model-*.safetensors`: the dense weights (8-bit MLX), the vision tower and the MTP head. `model-ple8-*.safetensors`:
   the PLE table (8-bit MLX, group 32, from Qwen's BF16).
-- `L{{layer}}_{{gate_proj,up_proj,down_proj}}.blkt`: the trellis-coded routed experts of layers 0 to 47 and of the MTP
-  head (layer 48). Read [the format]({GITHUB}/blob/main/docs/reference/model-folder.md).
+- `model-tcq-*.safetensors`: the trellis-coded routed experts of layers 0 to 47 and of the MTP head, one shard
+  a layer. Each projection has the entries `NAME.tcq_words`, `NAME.tcq_scales`, `NAME.tcq_params` and
+  `NAME.tcq_err`. Read [the format]({GITHUB}/blob/main/docs/reference/model-folder.md).
 - `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`, `nanoseedlm_trellis.py`: the MLX model files. `nanoseedlm_qwen4.py`
-  puts the trellis banks in place of the routed experts.
+  puts the trellis experts in place of the routed experts.
 - `config.json`: the configuration of the 8-bit MLX model, with `model_file`. The tokenizer and the chat template.
 - `LICENSE`: the Qwen Community License 1.0.
 

@@ -153,6 +153,94 @@ static void tcq_check(void) {
     qwen4_ref_close(r);
 }
 
+// Plan tcq-safetensors: the head fixture as a pack has it, without routed experts and with the banks as model-tcq-*
+// shards (nslm_tcq_to_st, no .blkt): the engine gives the .blkt folder's logits, bit for bit, with 2 drafts a step too
+static int raw_copy(void* ctx, int t, int s, uint8_t* dst, uint64_t len) { (void) s; memcpy(dst, ((const uint8_t**) ctx)[t], len); return 0; }
+static int strip_experts(const char* from, const char* to, char* err, int errlen) {   // from's tensors but switch_mlp's, banks
+    static const char* sh[2] = {"model.safetensors", "model-mtp.safetensors"};
+    StFile f[2];
+    int n = 0, rc = 0;
+    mkdir(to, 0755);
+    for (int k = 0; k < 2; ++k) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s", from, sh[k]);
+        if (st_open_file(&f[k], path, err, errlen)) { while (k--) st_close_file(&f[k]); return -1; }
+    }
+    NsSpec* sp = (NsSpec*) calloc((size_t) (f[0].n + f[1].n), sizeof(NsSpec));
+    NsRaw* rw = (NsRaw*) calloc((size_t) (f[0].n + f[1].n), sizeof(NsRaw));
+    const uint8_t** src = (const uint8_t**) calloc((size_t) (f[0].n + f[1].n), sizeof(uint8_t*));
+    for (int k = 0; k < 2; ++k) {
+        for (int i = 0; i < f[k].n; ++i) {
+            const StEntry* e = &f[k].e[i];
+            if (strstr(e->name, ".mlp.switch_mlp.")) continue;
+            sp[n] = (NsSpec) {e->name, NS_RAW, 1, 1, 1};
+            rw[n] = (NsRaw) {e->dtype, e->ndim, {0}, e->end - e->begin};
+            memcpy(rw[n].shape, e->shape, sizeof rw[n].shape);
+            src[n++] = st_data(&f[k], e);
+        }
+    }
+    rc = ns_write_raw(to, sp, rw, n, 1u << 30, NULL, raw_copy, src, err, errlen);
+    for (int k = 0; k < 2; ++k) st_close_file(&f[k]);
+    free(sp); free(rw); free(src);
+    char a[1024], b[1024];
+    snprintf(a, sizeof a, "%s/config.json", from);
+    snprintf(b, sizeof b, "%s/config.json", to);
+    if (!rc) rc = copy_file(a, b);
+    const char* proj[3] = {"gate_proj", "up_proj", "down_proj"};
+    for (int l = 0; !rc && l < 256; ++l)
+        for (int p = 0; !rc && p < 3; ++p) {
+            snprintf(a, sizeof a, "%s/L%d_%s.blkt", from, l, proj[p]);
+            snprintf(b, sizeof b, "%s/L%d_%s.blkt", to, l, proj[p]);
+            if (!access(a, R_OK)) rc = copy_file(a, b);
+        }
+    return rc;
+}
+static void tcq_st_check(void) {
+    char dir[512], st[512], err[512] = "";
+    const char* tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    snprintf(dir, sizeof dir, "%s/nslm_qwen4_tiny_tcq_head_metal", tmp);
+    snprintf(st, sizeof st, "%s/nslm_qwen4_tiny_tcq_st_metal", tmp);
+    if (tcq_fixture(dir, 1, err, sizeof err) || strip_experts(dir, st, err, sizeof err) || nslm_tcq_to_st(st, err, sizeof err)) {
+        CHECK(0, "the safetensors trellis fixture: %s", err);
+        return;
+    }
+    char bk[1100];
+    snprintf(bk, sizeof bk, "%s/L0_up_proj.blkt", st);
+    CHECK(access(bk, F_OK) != 0, "the converted fixture has .blkt banks");
+    enum { N = 28, NP = 20, ND = 12 };
+    float* lg[2] = {NULL, NULL};
+    int32_t tok[2][ND], ids[N];
+    int V = 0;
+    for (int run = 0; run < 2; ++run) {
+        Q4EOpts o;
+        memset(&o, 0, sizeof o);
+        o.max_pos = 96;
+        o.mtp = 2;
+        Q4Eng* e = q4e_open(run ? st : dir, &o, err, sizeof err);
+        CHECK(e != NULL, "open the %s trellis fixture: %s", run ? "safetensors" : ".blkt", err);
+        if (!e) break;
+        V = q4e_cfg(e)->vocab;
+        for (int i = 0; i < N; ++i) ids[i] = (i * 37 + 11) % V;
+        lg[run] = (float*) malloc(sizeof(float) * (size_t) (N + 3) * V);
+        int rc = q4e_forward(e, ids, NP, lg[run]);
+        for (int t = NP; !rc && t < N; ++t) rc = q4e_forward(e, ids + t, 1, lg[run] + (size_t) t * V);
+        int32_t row[3] = {argmax(lg[run] + (size_t) (N - 1) * V, V), 0, 0};
+        for (int k = 0; !rc && k < ND; ++k) {   // drafts: the head's banks too
+            rc = q4e_draft(e, 2, row + 1) || q4e_forward_keep(e, row, 3, lg[run] + (size_t) N * V) || q4e_accept(e, 1);
+            tok[run][k] = row[1] * 4096 + row[2];
+            row[0] = argmax(lg[run] + (size_t) N * V, V);
+        }
+        CHECK(rc == 0, "the %s trellis fixture, forward: %s", run ? "safetensors" : ".blkt", q4e_error(e));
+        q4e_close(e);
+    }
+    if (lg[0] && lg[1]) {
+        const int same = !memcmp(lg[0], lg[1], sizeof(float) * (size_t) (N + 3) * V) && !memcmp(tok[0], tok[1], sizeof tok[0]);
+        printf("trellis experts in model-tcq-* shards: the logits and drafts of the .blkt folder, %s\n", same ? "bit for bit" : "DIFFERENT");
+        CHECK(same, "the safetensors trellis fixture differs from the .blkt one");
+    }
+    free(lg[0]); free(lg[1]);
+}
+
 // The MTP head with trellis experts (the bank L{n_layer}, ns_add_banks' head rule): the head opens; greedy decode with 1 to
 // 3 drafts a step gives the tokens of decode without drafts (plan gate MB, as test_qwen4_mtp's decode); and the head runs
 // its bank (draft 1 differs from the same fixture's without the head bank, as the C reference's does)
@@ -371,6 +459,7 @@ int main(void) {
     st_close_file(&st);
     tcq_check();
     tcq_head_check();
+    tcq_st_check();
     res_check();
     printf("test_qwen4_metal: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

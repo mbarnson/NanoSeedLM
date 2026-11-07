@@ -198,6 +198,164 @@ int ns_add_banks(NsModel* m, const char* dir, char* err, int errlen) {
     return 0;
 }
 
+// ---- plan tcq-safetensors: a folder's .blkt banks as safetensors shards ----
+
+typedef struct { const uint8_t* p[12]; uint64_t len[12]; } TcqFill;   // a layer's shard: 3 projections x 4 entries
+static int tcq_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) {
+    const TcqFill* f = (const TcqFill*) ctx;
+    if (s || len != f->len[t]) return -1;
+    memcpy(dst, f->p[t], len);
+    return 0;
+}
+static char* read_text(const char* path, size_t* n) {
+    FILE* f = fopen(path, "rb");
+    const long m = f && !fseek(f, 0, SEEK_END) ? ftell(f) : -1;
+    char* s = m >= 0 && !fseek(f, 0, SEEK_SET) ? (char*) malloc((size_t) m + 1) : NULL;
+    if (s && fread(s, 1, (size_t) m, f) != (size_t) m) { free(s); s = NULL; }
+    if (f) fclose(f);
+    if (s) { s[m] = 0; *n = (size_t) m; }
+    return s;
+}
+static int same_streams(const NsTensor* a, const NsTensor* b) {
+    int ok = a && b && a->enc == b->enc && a->group == b->group && a->slices == b->slices && a->rows == b->rows && a->cols == b->cols;
+    for (int s = 0; ok && s < 4; ++s) ok = a->s[s].len == b->s[s].len && (!a->s[s].len || !memcmp(a->s[s].p, b->s[s].p, a->s[s].len));
+    return ok;
+}
+
+static void unmap_banks(NsModel* b) {   // ns_open_bank keeps its banks mapped for the process
+    for (int i = 0; i < b->n; ++i) {
+        const NsTensor* t = &b->t[i];
+        const uint8_t* h = t->s[0].p - 8 * (uint64_t) t->slices - sizeof(MoeBlkHeader);
+        munmap((void*) h, sizeof(MoeBlkHeader) + 8 * (uint64_t) t->slices + t->s[0].len + t->s[1].len);
+    }
+    free(b->t);
+    memset(b, 0, sizeof *b);
+}
+
+int nslm_tcq_to_st(const char* dir, char* err, int errlen) {
+    static const char* kp[3] = {"gate_proj", "up_proj", "down_proj"};
+    static const char* suf[4] = {".tcq_words", ".tcq_scales", ".tcq_params", ".tcq_err"};
+    NsModel v, b;
+    if (ns_open(&v, dir, err, errlen)) return -1;
+    int rc = ns_open_bank(&b, dir, err, errlen);
+    if (rc) { ns_close(&v); return rc > 0 ? 1 : -1; }
+    int maxl = -1, done = 0;
+    int* lay = (int*) malloc(sizeof(int) * (size_t) b.n), *proj = (int*) malloc(sizeof(int) * (size_t) b.n);
+    for (int i = 0; !rc && i < b.n; ++i) {   // each bank's layer and projection; the head's gets its mtp.* name
+        int l = -1, at = 0;
+        sscanf(b.t[i].name, "language_model.model.layers.%d.mlp.switch_mlp.%n", &l, &at);
+        proj[i] = -1;
+        for (int p = 0; at && p < 3; ++p) if (!strncmp(b.t[i].name + at, kp[p], strlen(kp[p]))) proj[i] = p;
+        lay[i] = l;
+        if (b.t[i].enc != NS_TCQ || l < 0 || proj[i] < 0) { rc = snprintf(err, (size_t) errlen, "%s: not a trellis bank (.blkt)", b.t[i].name); break; }
+        maxl = l > maxl ? l : maxl;
+        const NsTensor* t = bank_target(&v, &b.t[i]);
+        if (t && !same_streams(t, &b.t[i]))   // a folder tensor of this name: ns_add_banks replaces it, a shard cannot
+            rc = snprintf(err, (size_t) errlen, "%s: the folder has this tensor; remove it before the conversion", b.t[i].name);
+        done += t != NULL;   // converted before: the banks only go
+    }
+    if (!rc && done && done != b.n) rc = snprintf(err, (size_t) errlen, "%s: %d of %d banks are in the shards; restore the index", dir, done, b.n);
+    int nl = 0;   // the layers that have banks, in order: shard k of nl
+    for (int l = 0; !rc && !done && l <= maxl; ++l) {
+        int any = 0;
+        for (int i = 0; i < b.n; ++i) any |= lay[i] == l;
+        nl += any;
+    }
+    char ipath[2048];
+    snprintf(ipath, sizeof ipath, "%s/model.safetensors.index.json", dir);
+    size_t itn = 0;
+    char* itext = !rc && !done ? read_text(ipath, &itn) : NULL;
+    Json* idx = itext ? json_parse(itext, itn, err, errlen) : NULL;
+    free(itext);
+    Json* wm = json_get(idx, "weight_map");   // no index: ns_open lists the folder's model*.safetensors
+    if (!rc && !done && itn && !wm) rc = snprintf(err, (size_t) errlen, "%s: no weight_map", ipath);
+    uint64_t added = 0;
+    for (int l = 0, k = 0; !rc && !done && l <= maxl; ++l) {
+        int at[3] = {-1, -1, -1}, n = 0;
+        for (int i = 0; i < b.n; ++i) if (lay[i] == l) at[proj[i]] = i;
+        if (at[0] < 0 && at[1] < 0 && at[2] < 0) continue;
+        ++k;
+        char shard[64], path[2048], tmp[2100], names[12][176];
+        snprintf(shard, sizeof shard, "model-tcq-%05d-of-%05d.safetensors", k, nl);
+        snprintf(path, sizeof path, "%s/%s", dir, shard);
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        NsSpec sp[12];
+        NsRaw raw[12];
+        TcqFill fc;
+        int32_t prm[3][4];
+        Buf meta = {0};
+        buf_puts(&meta, "\"nanoseedlm\": \"trellis-coded routed experts (nslm/trellis.h): NAME.tcq_words, NAME.tcq_scales, "
+                        "NAME.tcq_params (L, K, T, cols), NAME.tcq_err (relative errors)\"");
+        for (int p = 0; p < 3; ++p) {
+            if (at[p] < 0) continue;
+            const NsTensor* t = &b.t[at[p]];
+            const uint64_t E = (uint64_t) t->slices, R = (uint64_t) t->rows;
+            const MoeBlkHeader* h = (const MoeBlkHeader*) (t->s[0].p - 8 * E) - 1;   // map_bank: header, rel[E], wrel[E], words
+            const int L = t->group & 255, K = t->group >> 8 & 255, T = t->group >> 16;
+            const size_t base = strlen(t->name) - 7;   // without .weight
+            prm[p][0] = L; prm[p][1] = K; prm[p][2] = T; prm[p][3] = t->cols;
+            const uint64_t nw = nslm_tq_row_words(t->cols, T, L, K), nb = (uint64_t) ((t->cols + T - 1) / T);
+            const struct { const char* dt; int nd; int64_t sh[3]; const uint8_t* src; uint64_t len; } e[4] = {
+                {"U32", 3, {(int64_t) E, (int64_t) R, (int64_t) nw}, t->s[0].p, t->s[0].len},
+                {"BF16", 3, {(int64_t) E, (int64_t) R, (int64_t) nb}, t->s[1].p, t->s[1].len},
+                {"I32", 1, {4}, (const uint8_t*) prm[p], sizeof prm[p]},
+                {"F32", 2, {2, (int64_t) E}, (const uint8_t*) (h + 1), 8 * E}};
+            for (int q = 0; q < 4; ++q, ++n) {
+                snprintf(names[n], sizeof names[n], "%.*s%s", (int) base, t->name, suf[q]);
+                sp[n] = (NsSpec) {names[n], NS_RAW, 1, 1, 1};
+                raw[n] = (NsRaw) {e[q].dt, e[q].nd, {0}, e[q].len};
+                memcpy(raw[n].shape, e[q].sh, sizeof e[q].sh);
+                fc.p[n] = e[q].src; fc.len[n] = e[q].len;
+                added += e[q].len;
+                if (wm) json_set(wm, names[n], json_str(shard));
+            }
+            char m[512];   // the encoder's own numbers (the header's)
+            snprintf(m, sizeof m, ", \"%.*s.tcq_n0\": \"%.9g\", \"%.*s.tcq_seconds\": \"%.17g\"", (int) base, t->name, (double) h->n0,
+                     (int) base, t->name, h->seconds);
+            buf_puts(&meta, m);
+        }
+        char why[256] = "";
+        if (ns_write_shard(tmp, sp, raw, n, meta.p, tcq_fill, &fc, why, sizeof why) || rename(tmp, path))
+            rc = snprintf(err, (size_t) errlen, "%s: cannot write (%s)", path, why[0] ? why : strerror(errno));
+        free(meta.p);
+    }
+    if (!rc && !done && idx) {   // the index lists the new entries, and its total grows by their bytes
+        Json* ts = json_get(json_get(idx, "metadata"), "total_size");
+        if (ts && ts->t == J_INT) ts->i += (int64_t) added;
+        Buf o = {0};
+        json_dump_indent(&o, idx, 0);
+        buf_puts(&o, "\n");
+        char tmp[2100];
+        snprintf(tmp, sizeof tmp, "%s.tmp", ipath);
+        FILE* f = fopen(tmp, "wb");
+        if (!f || fwrite(o.p, 1, o.n, f) != o.n || fclose(f) || rename(tmp, ipath)) {
+            if (f) fclose(f);
+            rc = snprintf(err, (size_t) errlen, "%s: cannot write", ipath);
+        }
+        free(o.p);
+    }
+    if (!rc) {   // the folder read again: each bank's streams in a shard, byte for byte; then the banks go
+        NsModel c;
+        const int opened = !ns_open(&c, dir, err, errlen);
+        if (!opened) rc = -1;
+        for (int i = 0; !rc && i < b.n; ++i)
+            if (!same_streams(ns_find(&c, b.t[i].name), &b.t[i])) rc = snprintf(err, (size_t) errlen, "%s: the shard differs from the bank", b.t[i].name);
+        if (opened) ns_close(&c);
+        const int nb = b.n;
+        if (!rc) unmap_banks(&b);   // first: Windows does not delete a mapped file
+        for (int i = 0; !rc && i < nb; ++i) {
+            char path[2048];
+            snprintf(path, sizeof path, "%s/L%d_%s.blkt", dir, lay[i], kp[proj[i]]);
+            if (unlink(path)) rc = snprintf(err, (size_t) errlen, "%s: %s", path, strerror(errno));
+        }
+    }
+    json_free(idx);
+    free(lay); free(proj);
+    unmap_banks(&b);
+    ns_close(&v);
+    return rc ? -1 : 0;
+}
+
 int nslm_copy_file(const char* from, const char* to) {
     FILE* a = fopen(from, "rb");
     if (!a) return -1;

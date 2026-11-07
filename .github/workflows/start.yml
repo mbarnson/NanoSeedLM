@@ -1,6 +1,8 @@
 # The start scripts in a clone on Windows: start-here.ps1 parses in Windows PowerShell 5.1 (START-HERE.bat's), gets
 # the release engine of VERSION (the runner has no CUDA, so no build), and downloads a tiny pack (12.5 MB, 9 files) with
 # curl, then with hf. The chat fails without a GPU: the run reaches it. start-here.sh runs in ctest (sanitize.yml).
+# Before the release of VERSION is published (a VERSION change), stub binaries take the engine's place: the job then
+# checks the download only.
 name: start
 on:
   push:
@@ -26,6 +28,20 @@ jobs:
           if ($e) { $e | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
           New-Item -ItemType Directory stub | Out-Null
           Set-Content -Encoding ascii stub\nvidia-smi.cmd '@echo NVIDIA GeForce RTX 4080, 16376, 580.00'
+      - name: the engine of VERSION, or stubs before its release
+        shell: powershell
+        run: |
+          $v = 'v' + (Get-Content -Raw VERSION).Trim()
+          & curl.exe -fsIL -o NUL "https://github.com/mbarnson/NanoSeedLM/releases/download/$v/SHA256SUMS"
+          if ($LASTEXITCODE) {
+              Write-Host "$v is not published: stub nslm-chat.exe and nslm-serve.exe (exit 2), the download checks only"
+              New-Item -ItemType Directory -Force build\bin | Out-Null
+              foreach ($b in 'nslm-chat', 'nslm-serve') {
+                  Add-Type -TypeDefinition 'public static class P { public static int Main() { return 2; } }' -OutputAssembly "build\bin\$b.exe" -OutputType ConsoleApplication
+              }
+              "NSLM_STUB_ENGINE=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+          exit 0   # not curl's exit code: the runner's wrapper exits with $LASTEXITCODE
       - name: curl (NSLM_NO_HF=1)
         shell: cmd
         run: |
@@ -46,7 +62,8 @@ jobs:
         shell: powershell
         run: |
           function Need($file, $words) { $o = Get-Content -Raw $file; foreach ($w in $words) { if (-not $o.Contains($w)) { throw "$file has no line '$w'" } } }
-          Need out1.txt @('Downloading the engine v', 'Downloading 9 files with curl, 8 at once', 'The pack is ready', 'exit 1')
+          if (-not $env:NSLM_STUB_ENGINE) { Need out1.txt @('Downloading the engine v') }
+          Need out1.txt @('Downloading 9 files with curl, 8 at once', 'The pack is ready', 'exit 1')
           Need out2.txt @('Downloading with hf, 8 files at once', 'The pack is ready', 'exit 1')
           foreach ($m in 'm1', 'm2') {
               $n = @(Get-Content "$m\tiny-random-gpt2\.nslm-verified").Count

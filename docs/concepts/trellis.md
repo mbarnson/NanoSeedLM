@@ -104,8 +104,8 @@ shared memory, then uses the same tensor-core GEMM as the seeds. The Metal kerne
 ### Files
 
 `nslm-moe --codec tq --tq-k K --tq-l L` writes one bank file for each layer and projection
-(`L{layer}_{proj}.blkt`). A trellis pack is a model folder with these files beside its shards. Read
-[The model folder format](../reference/model-folder.md).
+(`L{layer}_{proj}.blkt`). `nslm-qwen4-pack --tq` puts the banks into safetensors shards, `model-tcq-*.safetensors`, one
+shard for each layer, with the same bytes. Read [The model folder format](../reference/model-folder.md).
 
 ## Measurements
 

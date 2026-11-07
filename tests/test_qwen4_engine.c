@@ -285,6 +285,27 @@ static void tcq_check(void) {
                "the cache %s\n", d, am, N, same ? "changes nothing" : "changes the logits");
         CHECK(d < 3e-2 && am <= N / 16 && same, "trellis experts: %.1e from the reference, %d argmax rows, cache same %d", d, am, same);
     }
+    {   // plan tcq-safetensors: the banks as model-tcq-* shards (nslm_tcq_to_st, no .blkt) give the logits, bit for bit
+        char st[600];
+        snprintf(st, sizeof st, "%s_st", dir);
+        float* sl = (float*) malloc(sizeof(float) * (size_t) N * V);
+        int rc = tcq_fixture(st, err, sizeof err) || nslm_tcq_to_st(st, err, sizeof err);
+        CHECK(rc == 0, "the safetensors trellis fixture: %s", err);
+        Q4EOpts o;
+        memset(&o, 0, sizeof o);
+        o.max_pos = 64;
+        Q4Eng* e = rc ? NULL : q4e_open(st, &o, err, sizeof err);
+        CHECK(rc || e, "open the safetensors trellis fixture: %s", err);
+        if (e) {
+            rc = q4e_forward(e, ids, NP, sl);
+            for (int t = NP; !rc && t < N; ++t) rc = q4e_forward(e, ids + t, 1, sl + (size_t) t * V);
+            const int same = !rc && lg[0] && !memcmp(lg[0], sl, sizeof(float) * (size_t) N * V);
+            printf("trellis experts in model-tcq-* shards: the logits of the .blkt folder, %s\n", same ? "bit for bit" : "DIFFERENT");
+            CHECK(same, "the safetensors trellis fixture differs from the .blkt one (%s)", rc ? q4e_error(e) : "logits");
+            q4e_close(e);
+        }
+        free(sl);
+    }
     {   // the CPU tail computes seed experts only
         Q4EOpts o;
         memset(&o, 0, sizeof o);

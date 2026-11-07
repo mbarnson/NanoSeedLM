@@ -959,3 +959,11 @@ v0.1.1. The Q8_0 table's difference with drafts comes from its draft counts, not
 pc-cuda found that any web page could use the server: replies allowed every origin, and there was no key or Host
 check. The plan adds an API key off loopback, a loopback Host, origins only by `--allow-origin`, a sanitizer job and
 hardening flags for v0.1.1. Fuzzing and CodeQL follow. Read [the plan](plans/2026-11-06-server-hardening.md).
+
+## [2026-11-07] result | Trellis experts in safetensors shards
+
+Matt asked for packs without a format of our own. The three trellis packs now carry their routed experts in 49
+`model-tcq-*` safetensors shards, not in 147 `.blkt` banks, with the same bytes (TCQ4 `37f9319`, TCQ3-D4 `b3bc4f8`,
+TCQ3 `603685c`). The Metal engine and mlx-vlm give the same text, CUDA gives the same logits, and decode is within
+0.7%. The packs need engine v0.1.2 (code `cdabec6`). The old revisions stay for v0.1.1. Read
+[the result](results/2026-11-07-tcq-safetensors.md) and [the plan](plans/2026-11-07-tcq-safetensors.md).

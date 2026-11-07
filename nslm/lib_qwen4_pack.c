@@ -123,7 +123,7 @@ int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, co
         ++n;
     }
     if (!rc) mkdir(out, 0755);
-    if (!rc && ns_write_raw(out, spec, raw, n, shard, "\"nanoseedlm\": \"qwen4_exp, trellis-coded routed experts in L*_*.blkt\"",
+    if (!rc && ns_write_raw(out, spec, raw, n, shard, "\"nanoseedlm\": \"qwen4_exp, trellis-coded routed experts in model-tcq-*.safetensors\"",
                             raw_fill, src, err, errlen)) rc = -1;
     if (!rc) {
         Json* c = config_tq(cfg, loader);
@@ -155,6 +155,7 @@ int nslm_qwen4_pack_tq(const char* base, const char* tq, const char* tq_down, co
             snprintf(to, sizeof to, "%s/L%d_%s.blkt", out, l, kp[p]);
             if (nslm_copy_file(path, to)) rc = snprintf(err, (size_t) errlen, "%s: cannot copy to %s", path, to);
         }
+    if (!rc && nslm_tcq_to_st(out, err, errlen) != 0) rc = -1;   // the banks as safetensors shards (plan tcq-safetensors)
     for (int k = 0; k < nsh; ++k) { st_close_file(&sh[k]); free((char*) shn[k]); }
     for (int k = 0; k < nk; ++k) free(owned[k]);
     free(sh); free(shn); free(spec); free(raw); free(src); free(owned);
