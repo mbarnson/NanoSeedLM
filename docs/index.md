@@ -71,6 +71,7 @@ Dated measurements. Each page gives the result, its status, the setup and the da
 - [2026-11-06: MTP drafts in nslm-serve, with sampling](plans/2026-11-06-serve-drafts.md): draft. Speculative sampling with
   the MTP head's drafts, so the server drafts at any temperature with its sampler's distribution.
 - [2026-11-06: An nslm-serve that a stranger cannot use](plans/2026-11-06-server-hardening.md): in progress. An API key
+- [2026-11-07: An 8-bit PLE table in each pack](plans/2026-11-07-ple-8bit.md): in progress, for v0.1.1. One 8-bit table for every runtime
   off loopback, no wildcard CORS, a loopback Host, sanitizers in CI, hardening flags.
 - [2026-11-06: MTP drafts that the sampler keeps more often](plans/2026-11-06-draft-acceptance.md): draft. Drafts sampled
   from the head's distribution, as Strata does, and a confidence gate. For the RTX 4080's bar of 60 tokens per second.
@@ -195,6 +196,7 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   +5.7% on the RTX 4080 at 32K, a 15K prompt +5% to +6% on the M4 Max. The KL change is at the noise floor.
 - [2026-11-06: The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md): 0.0060 more than Unsloth's Q8_0
 - [2026-11-06: P4 as shipped against BF16](results/2026-11-06-p4-as-shipped-kld.md): KL 0.169, most of it from the 4-bit dense weights
+- [2026-11-07: The 8-bit PLE table](results/2026-11-07-ple8-encoding.md): 0.88 times Q8_0's row error, the 4-bit table 15 times
   table (0.0199 to 0.0259 on Q8_0). The start scripts take the Q8_0 table by default.
 - [2026-11-06: The PLE rows on a host pool on the M4 Max](results/2026-11-06-ple-pool-m4max.md): the same text, no speed
   beyond the noise. The host reads the rows of 256 tokens in 5 to 17 ms.

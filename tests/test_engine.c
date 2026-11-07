@@ -663,8 +663,9 @@ static void test_mla_ranks(const int ranks[5], const char* dir) {
                        grew / 1e6, 3000.0 * per / 1e6, kept / 1e6, (double) (m3.gpu_allocated - m0.gpu_allocated) / 1e6);
                 CHECK(grew <= 3000.0 * per + 64e6 + 2e6 * 4 * 5, "MLA KV pages: %.0f bytes backed for 3000 positions", grew);
                 // (this model's 3000 positions fit one 64 MB heap, so the 100-token prompt keeps it: no partial hand-back here)
-                CHECK(kept <= grew && m3.gpu_allocated <= m0.gpu_allocated, "MLA KV pages: not given back (%.0f, %.0f)",
-                      kept, (double) (m3.gpu_allocated - m0.gpu_allocated));
+                // compute-sanitizer holds freed memory in quarantine, so the free memory does not rise (pc-cuda)
+                CHECK(getenv("CUDA_INJECTION64_PATH") || (kept <= grew && m3.gpu_allocated <= m0.gpu_allocated),
+                      "MLA KV pages: not given back (%.0f, %.0f)", kept, (double) (m3.gpu_allocated - m0.gpu_allocated));
             }
             free(big);
             eng_close(ep);
