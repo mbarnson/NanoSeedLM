@@ -8,7 +8,7 @@ The build puts the tools in `out/bin` (macOS) or `build/bin` (Windows, Linux).
 |---|---|
 | `nslm-chat` | Run one prompt (K2-Horizon-MoVA or Qwen3.8-Flash-Next). Read [Run and serve](../guides/run-and-serve.md) |
 | `nslm-serve` | OpenAI-compatible HTTP server (K2-Horizon-MoVA or Qwen3.8-Flash-Next) |
-| `start/START-HERE.bat`, `start/start-here.sh` | The start from a release archive: check the machine, download and check a pack, chat once, serve. Read [Run and serve](../guides/run-and-serve.md) |
+| `start/START-HERE.bat`, `start/start-here.sh` | The start from a release archive or a source checkout: check the machine, get the engine (the release download or a build), download and check a pack, chat once, serve. Read [Run and serve](../guides/run-and-serve.md) |
 
 ## Measure
 

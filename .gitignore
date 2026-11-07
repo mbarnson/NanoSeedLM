@@ -5,3 +5,7 @@ __pycache__/
 .DS_Store
 build/
 out/
+# start/start-here.sh and START-HERE.bat in a checkout: the model packs and the scripts that they write
+/models/
+/run-*.sh
+/run-*.bat

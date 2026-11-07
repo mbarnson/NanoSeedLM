@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # start/start-here.sh [PACK [MODEL_FOLDER]] - NanoSeedLM's start on Linux (CUDA) and macOS (Metal), from the engine
-# folder: check the machine, pick a pack, download and check it, chat once, write run-PACK.sh and serve. Rerun: resume.
+# folder or a source checkout: check the machine, get the engine, pick a pack, download and check it, chat once, write
+# run-PACK.sh and serve. Rerun: resume.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+src=   # a source checkout keeps this script in start/: the engine folder is the checkout, and the script builds the engine
+if [ -f "$here/../start/start-here.sh" ] && [ -f "$here/../Makefile" ] && [ -f "$here/../CMakeLists.txt" ]; then
+    here=$(cd "$here/.." && pwd) src=1
+fi
 cd "$here"
 fail() { printf '\n%s\n' "$*" >&2; exit 1; }
 
@@ -37,7 +42,75 @@ else
     echo "GPU: $gpu, $vram GB, driver $drv. RAM: $ram GB."
     [ "${drv%%.*}" -ge 570 ] || fail "The driver is older than 570 (CUDA 12.8). Update it: https://www.nvidia.com/drivers"
 fi
-[ -x "$bin/nslm-serve" ] || fail "$bin/nslm-serve is missing. Unpack the whole engine archive, then run start-here.sh in it."
+
+# the engine (nslm-chat, nslm-serve). The signed release of this version, when it is built from this engine source:
+# a release folder, or a checkout at the release's engine source. A checkout with other engine source builds it, and
+# downloads the release only when it has no compiler or the build fails.
+gh=https://github.com/mbarnson/NanoSeedLM/releases
+tag=
+if [ -f VERSION ]; then tag=v$(tr -d ' \r\n' <VERSION)
+elif [ -f README.txt ]; then tag=$(sed -n '1s/^NanoSeedLM engine \(v[0-9][0-9.]*\):.*/\1/p' README.txt); fi
+have() { [ -x "$bin/nslm-serve" ] && [ -x "$bin/nslm-chat" ]; }
+dev() { [ -z "$mac" ] || xcode-select -p >/dev/null 2>&1; }   # git and clang on a Mac: else a stub asks to install them
+cancc() {   # the compilers of a build
+    if [ -n "$mac" ]; then dev && xcrun -sdk macosx -f metal >/dev/null 2>&1
+    else cmake --version >/dev/null 2>&1 && { command -v nvcc >/dev/null || [ -x /usr/local/cuda/bin/nvcc ]; }; fi
+}
+build() {   # make (macOS) or CMake (Linux) builds the two binaries, again when their source changes
+    if [ -n "$mac" ]; then
+        local tg="out/res/kernels_moe.metallib out/res/kernels_qwen4.metallib out/bin/nslm-chat out/bin/nslm-serve"
+        if make -q $tg 2>/dev/null; then return 0; fi
+        echo "Building nslm-chat and nslm-serve from this checkout (make)..."
+        make -j "$(sysctl -n hw.ncpu)" $tg || return 1
+    else
+        echo "Building nslm-chat and nslm-serve from this checkout (CMake and CUDA, some minutes the first time)..."
+        if [ ! -f build/CMakeCache.txt ]; then   # for this GPU only: a shorter build
+            local g=()
+            command -v ninja >/dev/null && g=(-G Ninja)
+            cmake -S . -B build ${g[@]+"${g[@]}"} -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native || return 1
+        fi
+        cmake --build build --target nslm-chat nslm-serve --parallel || return 1
+    fi
+}
+fetch() {   # the release archive of $tag, checked against the release's SHA256SUMS. Only its out/ or build/ unpacks
+    local a sub t want
+    [ -n "$tag" ] || { echo "This folder does not name its version (VERSION or README.txt)." >&2; return 1; }
+    if [ -n "$mac" ]; then a=nslm-$tag-macos-arm64-metal sub=out
+    elif [ "$(uname -m)" = x86_64 ]; then a=nslm-$tag-linux-x64-cuda12.8 sub=build
+    else echo "The releases have no Linux engine for $(uname -m)." >&2; return 1; fi
+    t=$(mktemp -d)
+    echo "Downloading the engine $tag from GitHub ($a.tar.gz)..."
+    if ! curl -fsSL --retry 5 -o "$t/$a.tar.gz" "$gh/download/$tag/$a.tar.gz" ||
+        ! curl -fsSL --retry 5 -o "$t/SHA256SUMS" "$gh/download/$tag/SHA256SUMS"; then
+        rm -rf "$t"; echo "Cannot download the engine $tag from $gh." >&2; return 1
+    fi
+    want=$(awk -v f="$a.tar.gz" '$2 == f || $2 == "*" f {print $1}' "$t/SHA256SUMS")
+    if [ -z "$want" ] || [ "$(sha "$t/$a.tar.gz")" != "$want" ]; then
+        rm -rf "$t"; fail "The engine archive $a.tar.gz failed its SHA-256 check. Run start-here.sh again."
+    fi
+    if ! tar -xzf "$t/$a.tar.gz" -C "$t" "$a/$sub"; then rm -rf "$t"; echo "Cannot unpack $a.tar.gz." >&2; return 1; fi
+    mkdir -p "$sub" && cp -R "$t/$a/$sub/." "$sub/"
+    rm -rf "$t"
+}
+same=   # a checkout whose engine source is the source of the release $tag
+if [ -n "$src" ] && [ -n "$tag" ] && [ -e .git ] && dev && command -v git >/dev/null &&
+    git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null 2>&1 &&
+    git diff --quiet "$tag" -- engine harness nslm win Makefile CMakeLists.txt 2>/dev/null; then
+    same=1
+fi
+nobuild="Build the engine (docs/guides/build.md), or download it from $gh."
+if [ -n "$src" ] && [ -z "$same" ] && cancc; then   # other engine source than the release
+    if ! build; then
+        echo "The build failed (see above). The release $tag comes from an earlier source. Downloading it instead."
+        fetch || fail "$nobuild"
+    fi
+elif ! have; then
+    [ -n "$src" ] && [ -z "$same" ] && echo "No compiler for a build. The release $tag comes from an earlier source."
+    if ! fetch; then
+        { [ -n "$src" ] && cancc && build; } || fail "$nobuild"
+    fi
+fi
+have || fail "$bin/nslm-serve is missing. $nobuild"
 
 rec=
 while read -r n _ _ r v m _; do

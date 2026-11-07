@@ -6,6 +6,9 @@ $PSNativeCommandUseErrorActionPreference = $false   # PowerShell 7: the script r
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$src = $false   # a source checkout keeps this script in start\: the engine folder is the checkout, and the script builds it
+$up = Split-Path -Parent $here
+if ((Test-Path "$up\start\start-here.ps1") -and (Test-Path "$up\win\build.bat") -and (Test-Path "$up\CMakeLists.txt")) { $here = $up; $src = $true }
 Set-Location $here
 function Fail($m) { Write-Host "`n$m" -ForegroundColor Red; exit 1 }
 
@@ -17,7 +20,6 @@ $packs = [ordered]@{
 }
 
 Write-Host "NanoSeedLM: Qwen3.8-Flash-Next on this PC`n"
-if (-not (Test-Path build\bin\nslm-serve.exe)) { Fail "build\bin\nslm-serve.exe is missing. Unpack the whole engine zip, then run START-HERE.bat in it." }
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { Fail "No NVIDIA driver found. Install driver 570 or newer: https://www.nvidia.com/drivers" }
 $g = ((& nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits) | Select-Object -First 1).Split(',') | ForEach-Object { $_.Trim() }
 $vram = [math]::Round([double]$g[1] / 1024)
@@ -25,6 +27,64 @@ $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory 
 Write-Host "GPU: $($g[0]), $vram GB, driver $($g[2]). RAM: $ram GB."
 if ([int]$g[2].Split('.')[0] -lt 570) { Fail "The driver is older than 570 (CUDA 12.8). Update it: https://www.nvidia.com/drivers" }
 if ($vram -lt 12) { Write-Host "Warning: less than 12 GB of VRAM. The engine may not fit." -ForegroundColor Yellow }
+
+# the engine (nslm-chat, nslm-serve), as in start-here.sh. The signed release of this version, when it is built from
+# this engine source: a release folder, or a checkout at the release's engine source. A checkout with other engine
+# source builds it (win\build.bat), and downloads the release only when it has no compiler or the build fails.
+$gh = 'https://github.com/mbarnson/NanoSeedLM/releases'
+$tag = $null
+if (Test-Path VERSION) { $tag = 'v' + (Get-Content -Raw VERSION).Trim() }
+elseif ((Test-Path README.txt) -and ((Get-Content README.txt -TotalCount 1) -match '^NanoSeedLM engine (v[0-9][0-9.]*):')) { $tag = $Matches[1] }
+function Have { (Test-Path build\bin\nslm-serve.exe) -and (Test-Path build\bin\nslm-chat.exe) }
+function CanCC {   # Visual Studio's C++ tools and CUDA. win\build.bat also needs CMake and Ninja
+    $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vsw)) { return $false }
+    $vs = & $vsw -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    [bool]$vs -and ([bool](Get-Command nvcc -ErrorAction SilentlyContinue) -or [bool]$env:CUDA_PATH)
+}
+function Build {   # again when the source changes. The first build is for this GPU only: a shorter build
+    Write-Host "Building the engine from this checkout (win\build.bat: Visual Studio and CUDA, some minutes the first time)..."
+    if (-not (Test-Path build\build.ninja) -and -not $env:NSLM_CMAKE_ARGS) { $env:NSLM_CMAKE_ARGS = '-DCMAKE_CUDA_ARCHITECTURES=native' }
+    & cmd /c "win\build.bat" | Out-Host
+    ($LASTEXITCODE -eq 0) -and (Have)
+}
+function Fetch {   # the release zip of $tag, checked against the release's SHA256SUMS. Only its build\bin is copied
+    if (-not $tag) { Write-Host "This folder does not name its version (VERSION or README.txt)."; return $false }
+    $a = "nslm-$tag-windows-x64-cuda12.8"
+    $t = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory $t | Out-Null
+    Write-Host "Downloading the engine $tag from GitHub ($a.zip)..."
+    & curl.exe -fsSL --retry 5 -o "$t\$a.zip" "$gh/download/$tag/$a.zip"
+    if (-not $LASTEXITCODE) { & curl.exe -fsSL --retry 5 -o "$t\SHA256SUMS" "$gh/download/$tag/SHA256SUMS" }
+    if ($LASTEXITCODE) { Remove-Item -Recurse -Force $t; Write-Host "Cannot download the engine $tag from $gh."; return $false }
+    $want = $null
+    foreach ($l in Get-Content "$t\SHA256SUMS") { $w = $l -split '\s+\*?'; if ($w.Count -ge 2 -and $w[1] -eq "$a.zip") { $want = $w[0] } }
+    if (-not $want -or (Get-FileHash -Algorithm SHA256 "$t\$a.zip").Hash.ToLower() -ne $want) {
+        Remove-Item -Recurse -Force $t
+        Fail "The engine archive $a.zip failed its SHA-256 check. Run START-HERE.bat again."
+    }
+    Expand-Archive -Path "$t\$a.zip" -DestinationPath "$t\x"
+    New-Item -ItemType Directory -Force build\bin | Out-Null
+    Copy-Item -Force "$t\x\$a\build\bin\*" build\bin\
+    Remove-Item -Recurse -Force $t
+    Have
+}
+$same = $false   # a checkout whose engine source is the source of the release $tag
+if ($src -and $tag -and (Test-Path .git) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+    $null = & git rev-parse -q --verify "refs/tags/$tag^{commit}"
+    if (-not $LASTEXITCODE) { $null = & git diff --quiet $tag -- engine harness nslm win Makefile CMakeLists.txt; $same = -not $LASTEXITCODE }
+}
+$nobuild = "Build the engine (docs\guides\build.md), or download it from $gh."
+if ($src -and -not $same -and (CanCC)) {   # other engine source than the release
+    if (-not (Build)) {
+        Write-Host "The build failed (see above). The release $tag comes from an earlier source. Downloading it instead."
+        if (-not (Fetch)) { Fail $nobuild }
+    }
+} elseif (-not (Have)) {
+    if ($src -and -not $same) { Write-Host "No compiler for a build. The release $tag comes from an earlier source." }
+    if (-not (Fetch)) { if (-not ($src -and (CanCC) -and (Build))) { Fail $nobuild } }
+}
+if (-not (Have)) { Fail "build\bin\nslm-serve.exe is missing. $nobuild" }
 
 function Fits($have, $size) { $have -ge 0.9 * $size }   # a 64 GB PC may report 62 GB: 90% of a size counts as that size
 $rec = $null
