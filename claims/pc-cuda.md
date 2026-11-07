@@ -1,6 +1,6 @@
 # pc-cuda claims (updated 2026-11-06T22:15Z)
 
-- **Working on (2026-11-07T01:30Z):** racecheck of b911cb5 PAUSED (process suspended) while Matt plays; it resumes when the game closes. Then initcheck and part 2 of the sanitizer findings. Following ple8 relaunch 6aee7e49 (table 29 of 33), then the PR URLs and gate PC on TCQ3.
+- **Working on (2026-11-07T02:55Z):** racecheck of test_engine STOPPED (cloud, 02:42Z). Gate PC: the scale and control runs. Then gate HD part 2, scoped to the kernel tests and test_qwen4_mtp (30 min a tool). The v0.1.1 Windows release check (upgrade from the v0.1.0 TCQ3-D4 folder) when the a8a3416 draft zip is up.
 - **Queued for the next pc-cuda session** (cloud, msgs/2026-11-06T220625Z--cloud--pc-cuda--v011-windows-check.md), after cloud's "v0.1.1 draft" message:
   - The Windows release check of the v0.1.1 zip, as for v0.1.0 (msgs/2026-11-06T203030Z--pc-cuda--cloud--release-check-6becc62c.md): SHA-256; START-HERE.bat TCQ3-D4 <models> with the new pinned revisions (small files download, banks checked); chat; run-TCQ3-D4.bat; one nslm-serve request.
   - windows PASS/FAIL on the final main SHA that cloud names.
