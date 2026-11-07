@@ -4,7 +4,8 @@
 #   - a checkout without a compiler, and a release folder without its binaries, download the release archive of their
 #     version and check its SHA-256 against the release's SHA256SUMS
 # Stubs on PATH: curl (a local release), nvidia-smi and cmake (Linux), xcode-select and xcrun (macOS). The unknown pack
-# NOPE stops each run before the pack download. Usage: tests/test_start_here.sh (from any folder).
+# NOPE stops each run before the pack download, or the RAM check stops it on a machine of less than 64 GB.
+# Usage: tests/test_start_here.sh (from any folder).
 set -u
 repo=$(cd "$(dirname "$0")/.." && pwd)
 t=$(mktemp -d)
@@ -12,6 +13,9 @@ trap 'rm -rf "$t"' EXIT
 fails=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
+past() {   # the run got past the engine step: the pack question, or the RAM check of a small machine (a CI runner)
+    grep -q -e "Unknown pack NOPE" -e "needs 64 GB of RAM" "$t/log"
+}
 check() { if eval "$2"; then ok "$1"; else bad "$1"; echo "     output:"; sed 's/^/     | /' "$t/log"; fi; }
 
 if [ "$(uname -s)" = Darwin ]; then bin=out/bin asset=nslm-v9.9.9-macos-arm64-metal sub=out
@@ -70,7 +74,7 @@ run() {   # run DIR PATH_PREFIX: the start script of folder DIR, with the stubs 
     echo $? >"$t/rc"
 }
 
-# 1. a checkout without binaries builds them, then reaches the pack question
+# 1. a checkout without binaries builds them, then passes the engine step
 co=$t/checkout
 mkdir -p "$co/start"
 cp "$repo/start/start-here.sh" "$co/start/"
@@ -85,13 +89,13 @@ EOF
 run "$co/start/start-here.sh" "$t/good"
 check "a checkout builds the engine" '[ -x "$co/$bin/nslm-serve" ] && [ -x "$co/$bin/nslm-chat" ]'
 check "a checkout says that it builds" 'grep -q "Building nslm-chat and nslm-serve" "$t/log"'
-check "a checkout reaches the pack question" 'grep -q "Unknown pack NOPE" "$t/log" && ! grep -q "is missing" "$t/log"'
+check "a checkout passes the engine step" 'past && ! grep -q "is missing" "$t/log"'
 check "a checkout does not download" '[ ! -f "$t/curl.log" ]'
 
 # 2. a checkout with current binaries builds nothing
 if [ "$(uname -s)" = Darwin ]; then
     run "$co/start/start-here.sh" "$t/good"
-    check "current binaries build nothing" '! grep -q "Building" "$t/log" && grep -q "Unknown pack NOPE" "$t/log"'
+    check "current binaries build nothing" '! grep -q "Building" "$t/log" && past'
 fi
 
 # 3. a checkout at the tag of its VERSION downloads the signed release, also with a compiler
@@ -103,7 +107,7 @@ if command -v git >/dev/null; then
     run "$co/start/start-here.sh" "$t/good"
     check "the release's source: the signed release downloads" 'grep -q "releases/download/v9.9.9/$asset.tar.gz" "$t/curl.log" 2>/dev/null'
     check "the release's source: nothing builds" '! grep -q "Building" "$t/log" && [ -x "$co/$bin/nslm-serve" ]'
-    check "the release's source: the run reaches the pack question" 'grep -q "Unknown pack NOPE" "$t/log"'
+    check "the release's source: the run passes the engine step" 'past'
     # a change of the engine source after the tag: a build
     rm -rf "$co/out" "$co/build" "$t/curl.log"
     echo "int y;" >>"$co/engine/x.c"
@@ -123,7 +127,7 @@ run "$co/start/start-here.sh" "$t/none:$t/good"
 check "no compiler: the release of VERSION downloads" 'grep -q "releases/download/v9.9.9/$asset.tar.gz" "$t/curl.log"'
 check "no compiler: the binaries unpack into the checkout" '[ -x "$co/$bin/nslm-serve" ] && [ -x "$co/$bin/nslm-chat" ]'
 check "no compiler: the archive does not replace start-here.sh" 'cmp -s "$repo/start/start-here.sh" "$co/start/start-here.sh" && [ ! -f "$co/start-here.sh" ]'
-check "no compiler: the run reaches the pack question" 'grep -q "Unknown pack NOPE" "$t/log"'
+check "no compiler: the run passes the engine step" 'past'
 
 # 4. a release folder without its binaries downloads them (the tag is in README.txt)
 rf=$t/release
@@ -134,7 +138,7 @@ rm -f "$t/curl.log"
 run "$rf/start-here.sh" "$t/good"
 check "a release folder downloads its binaries" '[ -x "$rf/$bin/nslm-serve" ] && [ -x "$rf/$bin/nslm-chat" ]'
 check "a release folder keeps its start-here.sh" 'cmp -s "$repo/start/start-here.sh" "$rf/start-here.sh"'
-check "a release folder reaches the pack question" 'grep -q "Unknown pack NOPE" "$t/log"'
+check "a release folder passes the engine step" 'past'
 
 # 5. a wrong SHA-256 stops the run and unpacks nothing
 rm -rf "$rf/out" "$rf/build"
