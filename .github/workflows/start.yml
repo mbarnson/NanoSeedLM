@@ -41,6 +41,7 @@ jobs:
               }
               "NSLM_STUB_ENGINE=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           }
+          exit 0   # not curl's exit code: the runner's wrapper exits with $LASTEXITCODE
       - name: curl (NSLM_NO_HF=1)
         shell: cmd
         run: |
