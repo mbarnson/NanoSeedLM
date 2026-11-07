@@ -199,7 +199,9 @@ test-mlx:
 # the MLX goldens of test_affine are built first (macOS has MLX); test_mova_cfg and test_tokenizer read MOVA_DIR (a model
 # folder) and are skipped without one.  A test that exits 77 is skipped.
 test: $(TESTS) $(OUT)/test/affine/index.txt
-	@for t in $(TESTS); do echo "== $$t"; $$t; r=$$?; if [ $$r -eq 77 ]; then echo "(skipped)"; elif [ $$r -ne 0 ]; then exit 1; fi; done; echo "all tests passed"
+	@for t in $(TESTS); do echo "== $$t"; $$t; r=$$?; if [ $$r -eq 77 ]; then echo "(skipped)"; elif [ $$r -ne 0 ]; then exit 1; fi; done
+	@echo "== tests/test_start_here.sh"; bash tests/test_start_here.sh
+	@echo "all tests passed"
 
 clean:
 	rm -rf $(OUT)

@@ -24,6 +24,22 @@ reads another table from an Unsloth engram GGUF instead ([the 8-bit table](../re
 On a PC, the engines need an NVIDIA GPU of sm_80 or newer and driver 570 or newer. On a Mac, they need Apple Silicon and
 macOS 15 or newer. The smallest pack needs 64 GB of RAM.
 
+### Start from a source checkout
+
+Run `start/start-here.sh` (Linux, macOS) or `start\START-HERE.bat` (Windows) from a clone of the repository. The
+script uses the checkout as the engine folder. It gets the engine in one of these ways:
+
+- If the engine source is the source of the release that `VERSION` names, the script downloads that release's engine.
+  The macOS engine is signed and notarized. The script checks the SHA-256 against the release's `SHA256SUMS`.
+- If the engine source is different, the script builds `nslm-chat` and `nslm-serve`. It uses `make` on a Mac,
+  CMake on Linux and `win\build.bat` on Windows. Later runs build again only when the source changes.
+- If no compiler is available, or the build fails, the script downloads the release engine. It tells you that this
+  engine comes from an earlier source.
+
+The engine source is `engine/`, `harness/`, `nslm/`, `win/`, `Makefile` and `CMakeLists.txt`. The model packs go to
+`models/`, and the script writes `run-PACK.sh` (or `run-PACK.bat`) in the checkout. Git ignores the three.
+`git clean -x` deletes them.
+
 ## Get a model folder
 
 Download a model from [the model list](../reference/models.md), or make one. Read

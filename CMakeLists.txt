@@ -96,6 +96,9 @@ foreach(t affine emulate gguf kvq lfsr linalg model_st moe ple qwen4_ref search 
   add_test(NAME test_${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
 set_tests_properties(test_affine PROPERTIES SKIP_RETURN_CODE 77)
+if(NOT WIN32)   # start/start-here.sh gets its engine: a build, or the release archive (stubs for the toolchain and curl)
+  add_test(NAME test_start_here COMMAND bash tests/test_start_here.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "^(Clang|AppleClang)$")   # the CPU seed kernels exist only in Clang builds
   add_executable(test_cpu_seed4 tests/test_cpu_seed4.c)
   target_link_libraries(test_cpu_seed4 nslm)
