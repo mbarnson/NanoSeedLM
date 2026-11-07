@@ -18,6 +18,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))   # nanoseedlm_seeds.py ships
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from nanoseedlm_seeds import SeedSwitchGLU, SeedSwitchLinear, _module, seed_p  # noqa: E402
+try:   # mlx-vlm's SSD PLE for the packs' 8-bit table (nanoseedlm_ple.py beside this loader)
+    import nanoseedlm_ple  # noqa: E402,F401
+except ImportError:
+    pass
 from mlx_vlm.models.qwen4_exp import *  # noqa: E402,F401,F403  (ModelConfig, TextConfig, LanguageModel, ...)
 from mlx_vlm.models.qwen4_exp import Model as _Qwen4Model  # noqa: E402
 

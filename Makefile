@@ -191,10 +191,12 @@ $(BIN)/nslm-qwen4-gen: harness/nslm-qwen4-gen.c $(Q4E_O) $(HARN_O) $(LIB_O) $(HA
 $(OUT)/test/affine/index.txt: tools/mova_affine_golden.py tools/mova_common.py
 	$(PY) tools/mova_affine_golden.py --out $(OUT)/test/affine
 
-# the MLX loaders (tools/nanoseedlm_k2.py; tools/nanoseedlm_trellis.py through nanoseedlm_qwen4.py, which needs cc); OMLX_K2_MODEL = oMLX's k2_horizon_model.py
+# the MLX loaders (tools/nanoseedlm_k2.py; tools/nanoseedlm_trellis.py through nanoseedlm_qwen4.py, which needs cc;
+# tools/nanoseedlm_ple.py, mlx-vlm's SSD PLE at 8 bits); OMLX_K2_MODEL = oMLX's k2_horizon_model.py
 test-mlx:
 	$(PY) tools/test_nanoseedlm_k2.py
 	$(PY) tools/test_nanoseedlm_trellis.py
+	$(PY) tools/test_nanoseedlm_ple.py
 
 # the MLX goldens of test_affine are built first (macOS has MLX); test_mova_cfg and test_tokenizer read MOVA_DIR (a model
 # folder) and are skipped without one.  A test that exits 77 is skipped.

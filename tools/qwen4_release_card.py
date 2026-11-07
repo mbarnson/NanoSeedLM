@@ -187,6 +187,9 @@ def view(name):
     src, dst = f"Qwen3.8-Flash-Next-NanoSeedLM-{name}", f"Qwen3.8-Flash-Next-NanoSeedLM-{name}-ssd-ple"
     if not name.startswith("TCQ"):
         return f"""```python
+import sys
+sys.path.insert(0, "{src}")
+import nanoseedlm_ple   # mlx-vlm's SSD PLE for the 8-bit table: it ships in the pack
 from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
 prepare_external_ple_model("{src}", "{dst}")
 ```"""
@@ -195,7 +198,9 @@ prepare_external_ple_model("{src}", "{dst}")
 banks in place of copying them, so the view takes no more disk. Make the view on the disk that holds the pack.
 
 ```python
-import os, shutil
+import os, shutil, sys
+sys.path.insert(0, "{src}")
+import nanoseedlm_ple   # mlx-vlm's SSD PLE for the 8-bit table: it ships in the pack
 from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
 copy2 = shutil.copy2
 shutil.copy2 = lambda s, d, **k: os.link(s, d) if str(s).endswith(".blkt") else copy2(s, d, **k)   # link the banks

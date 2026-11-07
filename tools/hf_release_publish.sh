@@ -12,7 +12,7 @@ pip install -q "huggingface_hub[hf_xet]" >/dev/null 2>&1
 for P in $PACKS; do
     R=txgsync/Qwen3.8-Flash-Next-NanoSeedLM-$P
     [ -f "$CARDS/$P.md" ] && [ -f "$OUT/$P/config.json" ] || { echo "$P: no card $CARDS/$P.md or no folder $OUT/$P"; exit 1; }
-    for f in nanoseedlm_qwen4.py nanoseedlm_seeds.py nanoseedlm_trellis.py LICENSE; do   # mlx-vlm and oMLX load these
+    for f in nanoseedlm_qwen4.py nanoseedlm_seeds.py nanoseedlm_trellis.py nanoseedlm_ple.py LICENSE; do   # mlx-vlm and oMLX load these
         [ -f "$OUT/$P/$f" ] || { echo "$P: no $f (nslm-qwen4-pack --tq --loader writes the MLX files)"; exit 1; }
     done
     grep -q '"model_file"' "$OUT/$P/config.json" || { echo "$P: config.json has no model_file"; exit 1; }
