@@ -18,9 +18,9 @@ function Fail($m) {
 
 # name = repository, revision, least RAM GB, least VRAM GB, download GB (the model cards' "For" column)
 $packs = [ordered]@{
-    'TCQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4', '4e0d254480f24d444082e935c9b182a4e582730f', 96, 24, 128)
-    'TCQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4', 'e29730a3fea357b710f0b5bd57158c74a82cd7f1', 96, 16, 117)
-    'TCQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3', 'a850ead9cc4e852b9566aaec851213f7e813d193', 64, 12, 112)
+    'TCQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4', '37f93190f0220c749ff5bd81b2153b02bf3c4b49', 96, 24, 128)
+    'TCQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4', 'b3bc4f82a7b6d0abfaec07f8619fd5256be97aa2', 96, 16, 117)
+    'TCQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3', '603685c39c0328133872f0c6f9a657bf81def07e', 64, 12, 112)
 }
 if ($env:NSLM_PACKS) {   # another table, as start-here.sh reads it: lines "name repository revision RAM VRAM MacGB downloadGB"
     $packs = [ordered]@{}

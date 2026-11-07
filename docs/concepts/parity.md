@@ -69,7 +69,7 @@ same results as the engine.
 | Seed search | Yes | Yes | No |
 | Seed search of other block sizes (C = 12 and 16, `searchc.cu`) | No | Yes | No |
 | Trellis encoder (`nslm_tq_gpu_encode`, `test_trellis_gpu`: the C encoder's words) | Yes (`trellis.metal`) | Yes (`trellis.cu`) | No |
-| Trellis-coded experts in the qwen4 engine (`MF_TCQ`, `.blkt` banks, `tcq_case`) | Yes (gathers, prompt GEMM) | Yes (gathers) | No |
+| Trellis-coded experts in the qwen4 engine (`MF_TCQ`, `model-tcq-*` shards or `.blkt` banks, `tcq_case`) | Yes (gathers, prompt GEMM) | Yes (gathers) | No |
 
 ## See also
 

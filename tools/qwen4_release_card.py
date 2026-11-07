@@ -281,6 +281,8 @@ Download the engine ([releases]({GITHUB}/releases), or [build it]({GITHUB}/blob/
 folder. Then chat, or serve an OpenAI-compatible API. The engines read the pack's own 8-bit PLE table. On macOS, use
 `out/bin` in place of `build/bin`.
 
+The `model-tcq-*` shards need engine v0.1.2 or later.
+
 ```bash
 hf download txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} --local-dir Qwen3.8-Flash-Next-NanoSeedLM-{name}
 build/bin/nslm-chat --model Qwen3.8-Flash-Next-NanoSeedLM-{name} "Why do tide pools matter?"

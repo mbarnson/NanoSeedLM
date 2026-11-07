@@ -16,17 +16,34 @@ Each tensor `NAME.weight` is stored in one of these encodings:
 
 Read [SeedLM](../concepts/seedlm.md) for how the engine makes weights from seeds.
 
-## Trellis expert banks
+## Trellis-coded experts
 
-A folder can also hold trellis-coded experts as bank files, `L{layer}_{gate_proj,up_proj,down_proj}.blkt`
-(`nslm-moe --codec tq`). The engine and the C reference add them with `ns_add_banks`. Each bank becomes the tensor
-`language_model.model.layers.L.mlp.switch_mlp.PROJ.weight`, in place of the folder's tensor of that name if it has
-one. The safetensors shards must stay whole, because the reader opens every shard that the index names.
+A trellis pack holds its routed experts in the shards `model-tcq-NNNNN-of-NNNNN.safetensors`, one shard for each layer
+and one for the MTP head (plan [tcq-safetensors](../plans/2026-11-07-tcq-safetensors.md)). Each projection is a logical
+tensor `NAME.weight` of four entries. `NAME` is `language_model.model.layers.L.mlp.switch_mlp.PROJ`, or
+`mtp.layers.0.mlp.switch_mlp.PROJ` for the head.
 
-A bank of layer n can be the MTP head's (`mtp.layers.0.mlp.switch_mlp.PROJ.weight`). That is so when the folder has
-the routers (`mlp.gate.weight`) of layer n - 1 and of the head, and no router for layer n. For Qwen3.8-Flash-Next, it
-is layer 48.
-`nslm-qwen4-pack --tq` writes a folder without the routed experts, so its banks are the only experts.
+| Entry | Type | Shape | Contents |
+|---|---|---|---|
+| `NAME.tcq_words` | U32 | [E, rows, nw] | Each row's blocks of T weights as one bit stream, `nw = nslm_tq_row_words(cols, T, L, K)` |
+| `NAME.tcq_scales` | BF16 | [E, rows, ceil(cols / T)] | One scale for each block |
+| `NAME.tcq_params` | I32 | [4] | L, K, T, cols |
+| `NAME.tcq_err` | F32 | [2, E] | Each expert's relative error: plain, then imatrix-weighted (square roots). The engines do not read it |
+
+The shard's `__metadata__` also has the encode's numbers: `NAME.tcq_n0` and `NAME.tcq_seconds`.
+`nslm-qwen4-pack --tq` writes a folder without the routed experts, so these entries are its only experts.
+
+### Bank files
+
+The encoder writes one bank file for each layer and projection, `L{layer}_{gate_proj,up_proj,down_proj}.blkt`
+(`nslm-moe --codec tq`). The engines, the C reference and the MLX loader also read banks beside a folder's shards, with
+`ns_add_banks`. Each bank becomes the tensor `language_model.model.layers.L.mlp.switch_mlp.PROJ.weight`, in place of
+the folder's tensor of that name if it has one. A bank of layer n is the MTP head's
+(`mtp.layers.0.mlp.switch_mlp.PROJ.weight`) when the folder has the routers (`mlp.gate.weight`) of layer n - 1 and of
+the head, and no router for layer n. For Qwen3.8-Flash-Next, it is layer 48.
+
+`nslm-qwen4-pack --tcq-st DIR` converts a folder's banks into `model-tcq-*` shards in place. It adds them to the index,
+compares each stream with its bank, and then deletes the banks. The same folder gives the same files each time.
 
 | Part | Contents |
 |---|---|

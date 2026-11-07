@@ -13,9 +13,9 @@ fail() { printf '\n%s\n' "$*" >&2; exit 1; }
 
 # name, repository, revision, least RAM and VRAM GB of a PC, least memory GB of a Mac (the cards' "For" column),
 # download GB. NSLM_PACKS: another table
-PACKS=${NSLM_PACKS:-"TCQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4 4e0d254480f24d444082e935c9b182a4e582730f 96 24 128 128
-TCQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4 e29730a3fea357b710f0b5bd57158c74a82cd7f1 96 16 96 117
-TCQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3 a850ead9cc4e852b9566aaec851213f7e813d193 64 12 96 112"}
+PACKS=${NSLM_PACKS:-"TCQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4 37f93190f0220c749ff5bd81b2153b02bf3c4b49 96 24 128 128
+TCQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4 b3bc4f82a7b6d0abfaec07f8619fd5256be97aa2 96 16 96 117
+TCQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3 603685c39c0328133872f0c6f9a657bf81def07e 64 12 96 112"}
 fits() { [ $(($1 * 10)) -ge $(($2 * 9)) ]; }   # a 64 GB PC reports about 62 GB: 90% of a size counts as that size
 
 echo "NanoSeedLM: Qwen3.8-Flash-Next on this machine"
