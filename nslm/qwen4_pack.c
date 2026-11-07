@@ -3,6 +3,8 @@
 // modules of an 8-bit MLX folder; the loader when there is one, for mlx-vlm and oMLX).
 //   nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR) --out DIR [--loader tools/nanoseedlm_qwen4.py] [--shard-gb 4.5]
 //   nslm-qwen4-pack --base DIR --tq DIR [--tq-down DIR] [--dense8 DIR] --out DIR [--loader FILE] [--shard-gb 4.5]
+//   nslm-qwen4-pack --tcq-st DIR [--loader FILE]   a trellis folder's .blkt banks as model-tcq-*.safetensors shards, in
+//                                                  place (nslm_tcq_to_st); --loader: copy the MLX loader files again
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,7 +119,18 @@ int main(int argc, char** argv) {
     const char* loader = opt(argc, argv, "--loader", NULL);
     if (!loader) loader = find_loader(argv[0], lbuf, sizeof lbuf);
     const uint64_t shard = (uint64_t) (atof(opt(argc, argv, "--shard-gb", "4.5")) * 1e9);
-    const char* tq = opt(argc, argv, "--tq", NULL);
+    const char* tq = opt(argc, argv, "--tq", NULL), *tst = opt(argc, argv, "--tcq-st", NULL);
+    if (tst && !base && !out && !tq && !blk) {   // plan tcq-safetensors
+        char e[512] = "";
+        const int rc = nslm_tcq_to_st(tst, e, sizeof e);
+        if (rc < 0) { fprintf(stderr, "%s\n", e); return 1; }
+        if (opt(argc, argv, "--loader", NULL) && (nslm_copy_loader(loader, tst) || nslm_copy_beside(loader, "nanoseedlm_trellis.py", tst))) {
+            fprintf(stderr, "%s: cannot copy the loader, nanoseedlm_seeds.py and nanoseedlm_trellis.py to %s\n", loader, tst);
+            return 1;
+        }
+        printf(rc ? "%s: no .blkt bank, nothing to convert\n" : "%s: the trellis banks are model-tcq-*.safetensors shards now\n", tst);
+        return 0;
+    }
     if (tq && base && out && !blk) {
         char e[512];
         FILE* lf = fopen(loader, "rb");
@@ -132,7 +145,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (!base || !out || !blk3 == !blk4) {
-        fprintf(stderr, "usage: nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR | --tq DIR [--tq-down DIR] [--dense8 DIR]) --out DIR [--loader FILE] [--shard-gb 4.5]\n");
+        fprintf(stderr, "usage: nslm-qwen4-pack --base DIR (--blk DIR | --blk4 DIR | --tq DIR [--tq-down DIR] [--dense8 DIR]) --out DIR [--loader FILE] [--shard-gb 4.5]\n"
+                        "       nslm-qwen4-pack --tcq-st DIR [--loader FILE]\n");
         return 2;
     }
     FILE* lf = fopen(loader, "rb");   // before the pack's hours, not after

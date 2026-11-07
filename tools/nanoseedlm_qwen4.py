@@ -34,7 +34,7 @@ class Model(_Qwen4Model):
             self.update_modules(tree_unflatten([(p, SeedSwitchLinear(kb * 8, n, e, seed_p(weights, p)))]))
         for glu in {p.rsplit(".", 1)[0] for p in seeded}:
             _module(self, glu).__class__ = SeedSwitchGLU
-        if glob.glob(os.path.join(_HERE, "L*_*_proj.blkt")):   # trellis banks: nanoseedlm_trellis.py ships with them
+        if any(k.endswith(".tcq_words") for k in weights) or glob.glob(os.path.join(_HERE, "L*_*_proj.blkt")):   # trellis experts
             from nanoseedlm_trellis import add_banks
             weights = add_banks(self, weights, _HERE, self.config.text_config.num_hidden_layers)
         return weights

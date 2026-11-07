@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include "format.h"
@@ -17,6 +18,56 @@ static int fails = 0;
 static int zero_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) { (void) ctx; (void) t; (void) s; memset(dst, 0, len); return 0; }
 static int seq_fill(void* ctx, int t, int s, uint8_t* dst, uint64_t len) { (void) ctx; (void) t; (void) s; for (uint64_t i = 0; i < len; ++i) dst[i] = (uint8_t) i; return 0; }
 #define CHECK(c, ...) do { if (!(c)) { ++fails; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+// plan tcq-safetensors: a folder's files copied (no subfolders), two files compared, a folder's files that end in suf
+static void copy_dir(const char* from, const char* to) {
+    mkdir(to, 0755);
+    DIR* d = opendir(from);
+    for (struct dirent* de; d && (de = readdir(d));) {
+        if (de->d_name[0] == '.') continue;
+        char a[512], b[512];
+        snprintf(a, sizeof a, "%s/%s", from, de->d_name);
+        snprintf(b, sizeof b, "%s/%s", to, de->d_name);
+        nslm_copy_file(a, b);
+    }
+    if (d) closedir(d);
+}
+static int same_file(const char* a, const char* b) {
+    FILE* x = fopen(a, "rb"), *y = fopen(b, "rb");
+    int same = x && y;
+    while (same) {
+        const int c = fgetc(x), e = fgetc(y);
+        same = c == e;
+        if (c == EOF) break;
+    }
+    if (x) fclose(x);
+    if (y) fclose(y);
+    return same;
+}
+static int count_ending(const char* dir, const char* suf) {
+    int n = 0;
+    DIR* d = opendir(dir);
+    for (struct dirent* de; d && (de = readdir(d));) {
+        const size_t a = strlen(de->d_name), b = strlen(suf);
+        n += a >= b && !strcmp(de->d_name + a - b, suf);
+    }
+    if (d) closedir(d);
+    return n;
+}
+// The tensors of a and b that are NS_TCQ: the same names, shapes, codes and streams, byte for byte
+static int same_tcq(const NsModel* a, const NsModel* b) {
+    int na = 0, nb = 0, ok = 1;
+    for (int i = 0; i < a->n; ++i) {
+        const NsTensor* x = &a->t[i];
+        if (x->enc != NS_TCQ) continue;
+        ++na;
+        const NsTensor* y = ns_find(b, x->name);
+        ok &= y && y->enc == NS_TCQ && y->group == x->group && y->slices == x->slices && y->rows == x->rows && y->cols == x->cols;
+        for (int s = 0; ok && s < 4; ++s) ok &= y->s[s].len == x->s[s].len && (!x->s[s].len || !memcmp(y->s[s].p, x->s[s].p, x->s[s].len));
+    }
+    for (int i = 0; i < b->n; ++i) nb += b->t[i].enc == NS_TCQ;
+    return ok && na && na == nb;
+}
 
 int main(void) {
     // ---- index lookup ----
@@ -271,8 +322,10 @@ int main(void) {
             }
         CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, NULL, "out/test_moe_qpack", 1u << 20, berr, sizeof berr) == 0,
               "pack: %s", berr);
-        CHECK(ns_open(&m, "out/test_moe_qpack", berr, sizeof berr) == 0 && m.n == 4 && ns_add_banks(&m, "out/test_moe_qpack", berr, sizeof berr) == 0,
-              "packed folder: %s", berr);
+        CHECK(ns_open(&m, "out/test_moe_qpack", berr, sizeof berr) == 0 && m.n == 10 && ns_add_banks(&m, "out/test_moe_qpack", berr, sizeof berr) == 0,
+              "packed folder (its banks in shards): %d tensors, %s", m.n, berr);
+        CHECK(count_ending("out/test_moe_qpack", ".blkt") == 0 && count_ending("out/test_moe_qpack", "-of-00002.safetensors") >= 2,
+              "the pack has .blkt files, or no model-tcq shards");
         t = ns_find(&m, "language_model.model.layers.0.linear_attn.out_proj.weight");
         const NsTensor* hu = ns_find(&m, "mtp.layers.0.mlp.switch_mlp.up_proj.weight");
         CHECK(t && t->s[0].len == 4 && t->s[0].p[0] == 0 && t->s[0].p[3] == 3 && hu && hu->enc == NS_TCQ && m.n == 10,
@@ -325,6 +378,46 @@ int main(void) {
             cf = fopen(lp, "rb");
             CHECK(cf != NULL, "%s not copied", lp);
             if (cf) fclose(cf);
+        }
+        // plan tcq-safetensors: a folder with .blkt banks converted in place (nslm_tcq_to_st). Its tensors with ns_add_banks
+        // are byte for byte the converted folder's, the banks go, and a second folder converts to the same files
+        {
+            const NsSpec cs[3] = {bs[0], bs[2], bs[4]};   // a tensor, the routers of layer 0 and of the head
+            const NsRaw cr[3] = {br[0], br[2], br[4]};
+            mkdir("out/test_moe_tc", 0755);
+            CHECK(ns_write_raw("out/test_moe_tc", cs, cr, 3, 1u << 20, NULL, seq_fill, NULL, berr, sizeof berr) == 0, "tc folder: %s", berr);
+            copy_dir("out/test_moe_qbanks", "out/test_moe_tc");   // banks of layer 0 and of 1, the head (one layer, an MTP router)
+            NsModel ref, cv;
+            CHECK(ns_open(&ref, "out/test_moe_tc", berr, sizeof berr) == 0 && ns_add_banks(&ref, "out/test_moe_tc", berr, sizeof berr) == 0,
+                  "tc reference: %s", berr);
+            copy_dir("out/test_moe_tc", "out/test_moe_tc1");
+            copy_dir("out/test_moe_tc", "out/test_moe_tc2");
+            CHECK(nslm_tcq_to_st("out/test_moe_tc1", berr, sizeof berr) == 0, "convert: %s", berr);
+            CHECK(nslm_tcq_to_st("out/test_moe_tc2", berr, sizeof berr) == 0, "convert again: %s", berr);
+            CHECK(count_ending("out/test_moe_tc1", ".blkt") == 0, "the banks are still there");
+            CHECK(ns_open(&cv, "out/test_moe_tc1", berr, sizeof berr) == 0 && ns_add_banks(&cv, "out/test_moe_tc1", berr, sizeof berr) == 0,
+                  "converted folder: %s", berr);
+            CHECK(same_tcq(&ref, &cv) && cv.n == ref.n, "the converted tensors differ (%d, %d tensors)", cv.n, ref.n);
+            const NsTensor* hq = ns_find(&cv, "mtp.layers.0.mlp.switch_mlp.down_proj.weight");
+            CHECK(hq && hq->enc == NS_TCQ && hq->s[0].shard > 0, "the head's down_proj is not a trellis tensor in a shard");
+            static const char* tf[3] = {"model-tcq-00001-of-00002.safetensors", "model-tcq-00002-of-00002.safetensors", "model.safetensors.index.json"};
+            for (int k = 0; k < 3; ++k) {
+                char a[256], b2[256];
+                snprintf(a, sizeof a, "out/test_moe_tc1/%s", tf[k]);
+                snprintf(b2, sizeof b2, "out/test_moe_tc2/%s", tf[k]);
+                CHECK(same_file(a, b2), "%s differs between two conversions, or is missing", tf[k]);
+            }
+            FILE* tsf = fopen("out/test_moe_tc1/model-tcq-00002-of-00002.safetensors", "rb");   // the head's: plain safetensors entries
+            char th[4096] = "";
+            if (tsf) { th[fread(th, 1, sizeof th - 1, tsf)] = 0; fclose(tsf); }
+            CHECK(strstr(th + 8, "\"mtp.layers.0.mlp.switch_mlp.up_proj.tcq_words\": {\"dtype\": \"U32\"") &&
+                  strstr(th + 8, "\"mtp.layers.0.mlp.switch_mlp.up_proj.tcq_scales\": {\"dtype\": \"BF16\"") &&
+                  strstr(th + 8, "\"mtp.layers.0.mlp.switch_mlp.up_proj.tcq_params\": {\"dtype\": \"I32\", \"shape\": [4]") &&
+                  strstr(th + 8, "\"mtp.layers.0.mlp.switch_mlp.up_proj.tcq_err\": {\"dtype\": \"F32\", \"shape\": [2, 2]"),
+                  "the head's shard header: %.300s", th + 8);
+            CHECK(nslm_tcq_to_st("out/test_moe_tc1", berr, sizeof berr) == 1, "a converted folder converted again");
+            ns_close(&cv);
+            ns_close(&ref);
         }
         remove("out/test_moe_qbanks/L1_down_proj.blkt");   // a missing bank: refused
         CHECK(nslm_qwen4_pack_tq("out/test_moe_qbase", "out/test_moe_qbanks", NULL, NULL, NULL, "out/test_moe_qpack2", 1u << 20, berr, sizeof berr) != 0 &&

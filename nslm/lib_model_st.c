@@ -11,22 +11,25 @@
 #include <unistd.h>
 
 #include "json.h"
+#include "trellis.h"
 
-static const char* SUF[6][4] = {
+static const char* SUF[9][4] = {
     [NS_BF16] = {"", NULL, NULL, NULL},
     [NS_SEED4] = {".seeds", ".nibbles", ".exp_bias", NULL},
     [NS_Q8] = {".weight", ".scales", ".biases", NULL},
     [NS_Q4] = {".weight", ".scales", ".biases", NULL},
     [NS_SEED4P4] = {".seeds", ".coefs", ".exp_bias", ".codes"},
     [NS_SEED6P8] = {".seeds", ".coefs", ".exp_bias", ".codes"},
+    [NS_TCQ] = {".tcq_words", ".tcq_scales", NULL, NULL},
 };
-static const char* DT[6][4] = {
+static const char* DT[9][4] = {
     [NS_BF16] = {"BF16", NULL, NULL, NULL},
     [NS_SEED4] = {"U16", "U16", "I32", NULL},
     [NS_Q8] = {"U32", "BF16", "BF16", NULL},
     [NS_Q4] = {"U32", "BF16", "BF16", NULL},
     [NS_SEED4P4] = {"U16", "U16", "I32", "U8"},
     [NS_SEED6P8] = {"U16", "U32", "I32", "U8"},
+    [NS_TCQ] = {"U32", "BF16", NULL, NULL},
 };
 
 static uint64_t stream_len(int enc, int slices, int rows, int cols, int group, int s) {
@@ -38,6 +41,12 @@ static uint64_t stream_len(int enc, int slices, int rows, int cols, int group, i
     case NS_SEED4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : 0;
     case NS_SEED4P4: return s < 2 ? 2 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
     case NS_SEED6P8: return s == 0 ? 2 * (n / 8) : s == 1 ? 4 * (n / 8) : s == 2 ? 4 * (uint64_t) slices : n / 16;
+    case NS_TCQ: {   // group = L | K << 8 | T << 16: each row's words, then a BF16 scale for each block of T
+        const int L = group & 255, K = group >> 8 & 255, T = group >> 16;
+        if (T < 1 || K < 1 || K >= L || L > NSLM_TQ_MAXL) return 0;
+        const uint64_t sr = (uint64_t) slices * (uint64_t) rows;
+        return s == 0 ? 4 * sr * nslm_tq_row_words(cols, T, L, K) : s == 1 ? 2 * sr * (uint64_t) ((cols + T - 1) / T) : 0;
+    }
     case NS_SEEDS3: {   // blocks of 12, the last one of a row padded; one exponent code byte each
         const uint64_t nb = (uint64_t) slices * (uint64_t) rows * (uint64_t) ((cols + 11) / 12);
         return s < 2 ? 2 * nb : s == 2 ? 4 * (uint64_t) slices : nb;
@@ -194,7 +203,23 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
         char base[160], logical[176];
         const size_t L = strlen(nm);
         int64_t S, R, C;
-        if (ends(nm, ".seeds") || ends(nm, ".scales")) {
+        if (ends(nm, ".tcq_words")) {   // trellis rows (plan tcq-safetensors): NAME.tcq_params holds L, K, T and cols
+            snprintf(base, sizeof base, "%.*s", (int) (L - 10), nm);
+            snprintf(logical, sizeof logical, "%s.weight", base);
+            char k[176];
+            snprintf(k, sizeof k, "%s.tcq_params", base);
+            const Ref* pr = lookup(refs, nr, k);
+            int32_t pv[4] = {0};
+            if (pr && !strcmp(pr->e->dtype, "I32") && pr->e->end - pr->e->begin == sizeof pv)
+                memcpy(pv, m->sh[pr->shard].map + m->sh[pr->shard].data + pr->e->begin, sizeof pv);
+            if (!pr || pv[2] < 1 || pv[1] < 1 || pv[1] >= pv[0] || pv[0] > NSLM_TQ_MAXL || pv[2] > 65535 || pv[3] < 1 ||
+                e->ndim != 3 || dims(e, 1, &S, &R, &C) || C != (int64_t) nslm_tq_row_words(pv[3], pv[2], pv[0], pv[1])) {
+                snprintf(err, (size_t) errlen, "%s: not a trellis tensor (I32 L, K, T, cols in %s, U32 [E, rows, words])", nm, k);
+                free(refs);
+                goto done;
+            }
+            if (add(m, m, refs, nr, base, logical, NS_TCQ, pv[0] | pv[1] << 8 | pv[2] << 16, S, R, pv[3], err, errlen)) { free(refs); goto done; }
+        } else if (ends(nm, ".seeds") || ends(nm, ".scales")) {
             const int seeds = ends(nm, ".seeds");
             snprintf(base, sizeof base, "%.*s", (int) (L - (seeds ? 6 : 7)), nm);
             snprintf(logical, sizeof logical, "%s.weight", base);
@@ -230,6 +255,7 @@ int ns_open(NsModel* m, const char* dir, char* err, int errlen) {
             }
             if (add(m, m, refs, nr, base, logical, enc, group, S, R, C, err, errlen)) { free(refs); goto done; }
         } else if (!strcmp(e->dtype, "BF16")) {
+            if (ends(nm, ".tcq_scales")) continue;   // a trellis tensor's scales: its .tcq_words entry reads them
             if (ends(nm, ".biases")) {   // a quantized tensor's biases
                 char k[176];
                 snprintf(k, sizeof k, "%.*s.scales", (int) (L - 7), nm);
@@ -312,22 +338,20 @@ int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, cons
     return ns_write_raw(dir, t, NULL, n, shard_bytes, meta, fill, ctx, err, errlen);
 }
 
-int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, const char* meta, NsFill fill,
-                 void* ctx, char* err, int errlen) {
-    Ent* ents = (Ent*) calloc((size_t) n * 4, sizeof(Ent));
+// The entries of tensors t (with raw[i] for each NS_RAW one), in shards of at most shard_bytes: ents[*ne] (n * 4 room)
+static int plan_ents(const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, Ent* ents, int* ne_out, int* nsh_out,
+                     uint64_t* total_out, char* err, int errlen) {
     int ne = 0, nsh = 0;
     uint64_t cur = 0, total = 0;
     for (int i = 0; i < n; ++i) {
         if ((t[i].enc == NS_Q8 || t[i].enc == NS_Q4) && t[i].cols % 64) {   // affine g64: whole groups per row
             snprintf(err, (size_t) errlen, "%s: %d columns, not a multiple of the Q8 / Q4 group of 64", t[i].name, t[i].cols);
-            free(ents);
             return -1;
         }
         uint64_t tb = 0;
         const NsRaw* r = t[i].enc == NS_RAW && raw ? &raw[i] : NULL;
         if (t[i].enc == NS_RAW && (!r || r->ndim < 0 || r->ndim > 8 || !r->dtype)) {
             snprintf(err, (size_t) errlen, "%s: a raw tensor needs a dtype and at most 8 dimensions", t[i].name);
-            free(ents);
             return -1;
         }
         for (int s = 0; s < 4; ++s) tb += spec_len(&t[i], r, s);
@@ -343,7 +367,7 @@ int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint
             else if (L > 7 && ends(t[i].name, ".weight")) snprintf(e->name, sizeof e->name, "%.*s%s", (int) (L - 7), t[i].name, SUF[t[i].enc][s]);
             else if (t[i].enc == NS_Q8 || t[i].enc == NS_Q4)   // a name without .weight (MLA projections): X, X.scales, X.biases
                 snprintf(e->name, sizeof e->name, "%s%s", t[i].name, s ? SUF[t[i].enc][s] : "");
-            else { snprintf(err, (size_t) errlen, "%s: a seed-encoded tensor must be named *.weight", t[i].name); free(ents); return -1; }
+            else { snprintf(err, (size_t) errlen, "%s: a seed-encoded tensor must be named *.weight", t[i].name); return -1; }
             e->dtype = r ? r->dtype : DT[t[i].enc][s];
             ent_shape(e, &t[i], r, s);
             e->len = len;
@@ -352,12 +376,19 @@ int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint
             e->shard = nsh - 1;
         }
     }
-    char(*shards)[64] = calloc((size_t) nsh, 64);
+    *ne_out = ne; *nsh_out = nsh; *total_out = total;
+    return 0;
+}
+
+// Shard k of ents at paths[k], for k < nsh: the header padded to a page, page-multiple entries first. fill() gives the
+// data in tensor and stream order
+static int write_shards(char (*paths)[2048], int nsh, Ent* ents, int ne, const char* meta, NsFill fill, void* ctx, char* err,
+                        int errlen) {
     uint64_t* data = (uint64_t*) calloc((size_t) nsh, sizeof(uint64_t));
     int* fds = (int*) calloc((size_t) nsh, sizeof(int));
     int rc = -1;
+    for (int k = 0; k < nsh; ++k) fds[k] = -1;
     for (int k = 0; k < nsh; ++k) {
-        snprintf(shards[k], 64, "model-%05d-of-%05d.safetensors", k + 1, nsh);
         // layout: page-multiple entries first, then the rest
         uint64_t off = 0;
         for (int pass = 0; pass < 2; ++pass)
@@ -379,13 +410,11 @@ int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint
         buf_puts(&h, "}");
         while ((8 + h.n) % NS_PAGE) buf_puts(&h, " ");
         data[k] = 8 + h.n;
-        char path[2048];
-        snprintf(path, sizeof path, "%s/%s", dir, shards[k]);
-        fds[k] = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        fds[k] = open(paths[k], O_CREAT | O_TRUNC | O_WRONLY, 0644);
         const uint64_t hn = h.n;
         if (fds[k] < 0 || pwrite(fds[k], &hn, 8, 0) != 8 || pwrite(fds[k], h.p, h.n, 8) != (ssize_t) h.n ||
             ftruncate(fds[k], (off_t) (data[k] + off))) {
-            snprintf(err, (size_t) errlen, "%s: %s", path, strerror(errno));
+            snprintf(err, (size_t) errlen, "%s: %s", paths[k], strerror(errno));
             free(h.p);
             goto done;
         }
@@ -406,9 +435,46 @@ int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint
         }
         free(b);
     }
+    rc = 0;
+    for (int k = 0; k < nsh; ++k) {   // a failed close can lose written data
+        if (fds[k] >= 0 && close(fds[k]) && !rc) { snprintf(err, (size_t) errlen, "%s: %s", paths[k], strerror(errno)); rc = -1; }
+        fds[k] = -1;
+    }
+done:
+    for (int k = 0; k < nsh; ++k) if (fds[k] >= 0) close(fds[k]);
+    free(fds); free(data);
+    return rc;
+}
+
+int ns_write_shard(const char* path, const NsSpec* t, const NsRaw* raw, int n, const char* meta, NsFill fill, void* ctx, char* err,
+                   int errlen) {
+    Ent* ents = (Ent*) calloc((size_t) n * 4 + 1, sizeof(Ent));
+    char(*paths)[2048] = calloc(1, 2048);
+    int ne = 0, nsh = 0, rc = -1;
+    uint64_t total = 0;
+    if (ents && paths && !plan_ents(t, raw, n, UINT64_MAX, ents, &ne, &nsh, &total, err, errlen)) {
+        snprintf(paths[0], 2048, "%s", path);
+        rc = write_shards(paths, nsh, ents, ne, meta, fill, ctx, err, errlen);
+    }
+    free(paths); free(ents);
+    return rc;
+}
+
+int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, const char* meta, NsFill fill,
+                 void* ctx, char* err, int errlen) {
+    Ent* ents = (Ent*) calloc((size_t) n * 4 + 1, sizeof(Ent));
+    int ne = 0, nsh = 0, rc = -1;
+    uint64_t total = 0;
+    if (plan_ents(t, raw, n, shard_bytes, ents, &ne, &nsh, &total, err, errlen)) { free(ents); return -1; }
+    char(*shards)[64] = calloc((size_t) nsh + 1, 64);
+    char(*paths)[2048] = calloc((size_t) nsh + 1, 2048);
+    for (int k = 0; k < nsh; ++k) {
+        snprintf(shards[k], 64, "model-%05d-of-%05d.safetensors", k + 1, nsh);
+        snprintf(paths[k], 2048, "%s/%s", dir, shards[k]);
+    }
+    if (write_shards(paths, nsh, ents, ne, meta, fill, ctx, err, errlen)) goto done;
     rc = write_index(dir, ents, ne, shards, total, err, errlen);
 done:
-    for (int k = 0; k < nsh; ++k) if (fds[k] > 0) close(fds[k]);
-    free(fds); free(data); free(shards); free(ents);
+    free(paths); free(shards); free(ents);
     return rc;
 }

@@ -213,16 +213,18 @@ def test_switch_glu():
 def tiny_folder(head: bool):
     """tcq_fixture's folder for the MLX loader: the tiny model without its routed experts, banks L0..L3 (L4: the MTP head)
     from nslm_tq_encode_row (L 12, K 3, T = cols, tcq_fixture's weights), and the loader beside them."""
-    src, d = ROOT / "tests" / "data" / "qwen4_tiny", TMP / ("tiny_head" if head else "tiny")
-    d.mkdir()
+    src = ROOT / "tests" / "data" / "qwen4_tiny"
+    d = Path(tempfile.mkdtemp(prefix="tiny_head_" if head else "tiny_", dir=TMP))   # a new folder each call
     cfg = json.loads((src / "config.json").read_text())
     cfg["model_file"] = "nanoseedlm_qwen4.py"
     (d / "config.json").write_text(json.dumps(cfg, indent=1))
     w = mx.load(str(src / "model.safetensors"))
     mx.save_safetensors(str(d / "model.safetensors"), {k: v for k, v in w.items() if ".switch_mlp." not in k},
                         metadata={"format": "mlx"})
-    if head:
-        shutil.copy(src / "model-mtp.safetensors", d)
+    if head:   # without the head's routed experts, as nslm-qwen4-pack --tq writes it
+        h = mx.load(str(src / "model-mtp.safetensors"))
+        mx.save_safetensors(str(d / "model-mtp.safetensors"), {k: v for k, v in h.items() if ".switch_mlp." not in k},
+                            metadata={"format": "mlx"})
     for f in ("nanoseedlm_qwen4.py", "nanoseedlm_seeds.py", "nanoseedlm_trellis.py"):
         shutil.copy(TOOLS / f, d)
     t = cfg["text_config"]
@@ -277,6 +279,44 @@ def test_tiny_model():
           f"max |logit| {scale:.3f}, argmax {agree} of 48: ", end="")
     assert err < 1e-4 * scale and err1 < 1e-4 * scale and agree == 48
     print("ok")
+
+
+def converted(d: Path) -> Path:
+    """A copy of folder d with its .blkt banks as model-tcq-*.safetensors shards: nslm-qwen4-pack --tcq-st (plan
+    tcq-safetensors), the C converter that made the published packs."""
+    pack = ROOT / "out" / "bin" / "nslm-qwen4-pack"
+    assert pack.exists(), f"{pack}: build it first (make)"
+    c = d.parent / (d.name + "_st")
+    shutil.copytree(d, c)
+    subprocess.run([str(pack), "--tcq-st", str(c)], check=True, stdout=subprocess.DEVNULL)
+    assert not list(c.glob("*.blkt")) and list(c.glob("model-tcq-*.safetensors"))
+    return c
+
+
+def test_tiny_model_safetensors_banks():
+    """The banks as safetensors entries (NAME.tcq_words, .tcq_scales, .tcq_params, .tcq_err) load as the .blkt banks do:
+    every layer's experts are TrellisSwitchLinear, the strict load has no stray entry, and the logits are equal."""
+    from mlx_vlm.utils import load_model
+    d = tiny_folder(head=False)
+    a, b = load_model(d, strict=True), load_model(converted(d), strict=True)
+    n = b.config.text_config.num_hidden_layers
+    for layer in range(n):
+        glu = b.language_model.model.layers[layer].mlp.switch_mlp
+        assert type(glu) is tq.TrellisSwitchGLU and all(type(getattr(glu, p)) is tq.TrellisSwitchLinear for p in PROJ)
+    ids = mx.array([[(37 * i + 11) % 512 for i in range(48)]])
+    for k in (48, 1):   # the GEMM path and the mat-vec path
+        x, y = a.language_model(ids[:, :k]).logits, b.language_model(ids[:, :k]).logits
+        assert mx.array_equal(x, y).item(), (k, float(mx.abs(x - y).max()))
+    print("test_tiny_model_safetensors_banks: ok")
+
+
+def test_tiny_model_safetensors_head_without_mtp():
+    """The head's entries (mtp.layers.0.mlp.switch_mlp.*.tcq_*) are dropped when the model has no MTP module."""
+    from mlx_vlm.utils import load_model
+    model = load_model(converted(tiny_folder(head=True)), strict=True)
+    names = [k for k, _ in tree_flatten(model.parameters()) if k.endswith(".words")]
+    assert len(names) == 3 * model.config.text_config.num_hidden_layers and not any(k.startswith("mtp.") for k in names)
+    print("test_tiny_model_safetensors_head_without_mtp: ok")
 
 
 def test_tiny_model_head_bank_without_mtp():

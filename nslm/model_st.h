@@ -15,6 +15,10 @@
 //            NAME.exp_bias I32   [slices]
 //            NAME.codes    U8    [slices, rows, cols / 16]   (4-bit exponent codes, low nibble first)
 //   SEED6P8  as SEED4P4 with NAME.coefs U32 [slices, rows, cols / 8]   (P = 8; searchp.h)
+//   TCQ      NAME.tcq_words  U32  [slices, rows, nslm_tq_row_words(cols, T, L, K)]   (trellis.h)
+//            NAME.tcq_scales BF16 [slices, rows, ceil(cols / T)]
+//            NAME.tcq_params I32  [4]: L, K, T, cols
+//            NAME.tcq_err    F32  [2, slices]: each slice's relative error, plain and imatrix-weighted (not read)
 // The writer pads each header so the data starts on a 16 KiB page and puts entries whose size is a page multiple
 // first: those map into GPU buffers without a copy.
 #pragma once
@@ -77,3 +81,6 @@ int ns_write(const char* dir, const NsSpec* t, int n, uint64_t shard_bytes, cons
 // ns_write with raw[i] describing each NS_RAW tensor t[i] (raw may be NULL when there is none).
 int ns_write_raw(const char* dir, const NsSpec* t, const NsRaw* raw, int n, uint64_t shard_bytes, const char* meta, NsFill fill,
                  void* ctx, char* err, int errlen);
+// One shard at path with every tensor of t (no index). 0, or -1 with err.
+int ns_write_shard(const char* path, const NsSpec* t, const NsRaw* raw, int n, const char* meta, NsFill fill, void* ctx, char* err,
+                   int errlen);

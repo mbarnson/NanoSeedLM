@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""NanoSeedLM for MLX: trellis-coded routed experts (nslm/trellis.h format v0) from nslm-moe's .blkt banks.
+"""NanoSeedLM for MLX: trellis-coded routed experts (nslm/trellis.h format v0) from a folder's safetensors entries
+NAME.tcq_words, NAME.tcq_scales and NAME.tcq_params (nslm/model_st.h), or from nslm-moe's .blkt banks.
 
 A bank L{l}_{gate,up,down}_proj.blkt holds one projection of a layer's experts: E slices of rows x cols weights. A row is
 cut into blocks of T weights; block b is a stream of n = K T + L - K bits from bit b n of the row's 32-bit words
@@ -47,6 +48,20 @@ def read_bank(path: str) -> dict:
         words = np.fromfile(f, np.uint32, e * rows * nw).reshape(e, rows, nw)
         scales = np.fromfile(f, np.uint16, e * rows * nb).reshape(e, rows, nb)
     return dict(rows=rows, cols=cols, experts=e, L=L, K=K, T=T, words=words, scales=scales)
+
+
+TCQ = (".tcq_words", ".tcq_scales", ".tcq_params", ".tcq_err")
+
+
+def entry_bank(weights: dict, prefix: str) -> dict:
+    """A bank from the safetensors entries PREFIX.tcq_*: words (E, rows, nw) uint32, scales (E, rows, nb) as BF16 bits,
+    params L, K, T, cols."""
+    L, K, T, cols = (int(v) for v in np.array(weights[prefix + ".tcq_params"]).tolist())
+    words, scales = weights[prefix + ".tcq_words"], weights[prefix + ".tcq_scales"]
+    e, rows, nw = words.shape
+    if words.dtype != mx.uint32 or nw != row_words(cols, T, L, K) or tuple(scales.shape) != (e, rows, (cols + T - 1) // T):
+        raise ValueError(f"{prefix}: not a trellis tensor (L {L}, K {K}, T {T}, {cols} columns, words {words.shape})")
+    return dict(rows=rows, cols=cols, experts=e, L=L, K=K, T=T, words=words, scales=scales.view(mx.uint16))
 
 
 _HEADER = """
@@ -291,10 +306,14 @@ class TrellisSwitchGLU(SeedSwitchGLU):
 
 
 def add_banks(model: nn.Module, weights: dict, folder: str, n_layers: int) -> dict:
-    """Each L{l}_{proj}.blkt in folder replaces layer l's switch_mlp projection (whatever weights the layer has, as
-    ns_add_banks does); l = n_layers is the MTP head's (mtp.layers.0), used when the model has an MTP module. The
+    """Each projection with the entries NAME.tcq_* in weights, or with L{l}_{proj}.blkt in folder, becomes a trellis
+    projection in place of layer l's switch_mlp projection (whatever weights the layer has, as ns_add_banks does);
+    l = n_layers is the MTP head's (mtp.layers.0), used when the model has an MTP module (else its entries go). The
     projection's tensors leave weights and its streams join them (for the strict load). Returns weights."""
     glus = set()
+    if "mtp" not in model:   # mlx-vlm drops mtp.*: so do the head's trellis entries
+        for k in [k for k in weights if k.startswith("mtp.") and k.endswith(TCQ)]:
+            del weights[k]
     for layer in range(n_layers + 1):
         if layer < n_layers:
             glu = f"language_model.model.layers.{layer}.mlp.switch_mlp"
@@ -303,13 +322,16 @@ def add_banks(model: nn.Module, weights: dict, folder: str, n_layers: int) -> di
         else:
             continue
         for p in PROJ:
-            path = os.path.join(folder, f"L{layer}_{p}.blkt")
-            if not os.path.exists(path):
+            prefix, path = f"{glu}.{p}", os.path.join(folder, f"L{layer}_{p}.blkt")
+            if prefix + ".tcq_words" in weights:
+                bank = entry_bank(weights, prefix)
+            elif os.path.exists(path):
+                bank = read_bank(path)
+            else:
                 continue
-            prefix = f"{glu}.{p}"
             for k in [k for k in weights if k.startswith(prefix + ".")]:
                 del weights[k]
-            lin = TrellisSwitchLinear(read_bank(path))
+            lin = TrellisSwitchLinear(bank)
             model.update_modules(tree_unflatten([(prefix, lin)]))
             weights[prefix + ".words"], weights[prefix + ".block_scales"] = lin.words, lin.block_scales
             glus.add(glu)
