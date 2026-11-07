@@ -62,37 +62,58 @@ root=${2:-}
 dir=${root:-$here/models}/${repo#*/}
 mkdir -p "$dir"
 
-# the files at their pinned revisions, each checked by size and SHA-256 (verified ones are listed in .nslm-verified)
+# the files at their pinned revisions, each checked by size and SHA-256. .nslm-verified lists "path size id" for each
+# file checked at this revision (id: a large file's SHA-256, git:BLOB for a small one). An earlier revision's line or
+# v0.1.0's bare path matches nothing: then a large file of the right size and SHA-256 stays, and any other downloads again.
 auth=()   # used as ${auth[@]+"${auth[@]}"}: bash 3.2 (macOS) calls an empty array unbound under set -u
 [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
-files() {   # lines "path size sha256" of the pack (sha256 - for small files)
+files() {   # lines "path size id" of the pack
     local t
     t=$(curl -fsSL ${auth[@]+"${auth[@]}"} "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true") ||
         fail "Cannot list $repo."
     if [ -n "$mac" ]; then   # JavaScript for Automation reads JSON on each Mac. python3 can be a stub that asks for Xcode
         osascript -l JavaScript -e 'function run(a) { return JSON.parse(a[0]).filter(f => f.type == "file" &&
-            f.path[0] != ".").map(f => f.path + " " + f.size + " " + ((f.lfs || {}).oid || "-")).join("\n") }' "$t"
+            f.path[0] != ".").map(f => f.path + " " + f.size + " " + (f.lfs ? f.lfs.oid : "git:" + f.oid)).join("\n") }' "$t"
     else
         command -v python3 >/dev/null || fail "start-here.sh needs python3 to read the file list. Install python3."
         python3 -I -c 'import json, sys
 for f in json.load(sys.stdin):
-    if f["type"] == "file" and not f["path"].startswith("."): print(f["path"], f["size"], (f.get("lfs") or {}).get("oid", "-"))' <<<"$t"
+    if f["type"] == "file" and not f["path"].startswith("."): print(f["path"], f["size"], (f.get("lfs") or {}).get("oid") or "git:" + f["oid"])' <<<"$t"
     fi
 }
 list=$(files)
-touch "$dir/.nslm-verified"
-check=0 need=0   # files to check; bytes to download (a partial file resumes)
-while read -r p s _; do
-    grep -qxF "$p" "$dir/.nslm-verified" && continue
+ver=$dir/.nslm-verified
+touch "$ver"
+old=$(cat "$ver") check=0 need=0 hashed=0
+: >"$ver"
+while read -r p s h; do
+    case $p in /* | *..*) fail "The pack lists an unsafe path: $p" ;; esac
+    if grep -qxF "$p $s $h" <<<"$old"; then echo "$p $s $h" >>"$ver"; continue; fi
+    f=$dir/$p
+    if [ -f "$f" ] && [ $(( $(wc -c <"$f") )) -eq "$s" ] && [ "${h#git:}" = "$h" ]; then   # from an earlier download
+        [ "$hashed" -eq 0 ] && echo "Checking the files of an earlier download (SHA-256)..."
+        hashed=1
+        if [ "$(sha "$f")" = "$h" ]; then echo "$p $s $h" >>"$ver"; continue; fi
+    fi
+    rm -f "$f"   # an older or broken version: a download starts over, and never writes through a hard link
     check=$((check + 1)) have=0
-    [ -f "$dir/$p" ] && have=$(( $(wc -c <"$dir/$p") ))
-    if [ "$have" -gt "$s" ]; then rm -f "$dir/$p"; have=0; fi
+    [ -f "$f.part" ] && have=$(( $(wc -c <"$f.part") ))
+    if [ "$have" -gt "$s" ]; then rm -f "$f.part"; have=0; fi
     need=$((need + s - have))
 done <<<"$list"
+gone=0   # the files of an earlier download that this revision does not have
+while read -r p _; do
+    case $p in "" | /* | *..*) continue ;; esac
+    [ -f "$dir/$p" ] || continue
+    awk -v p="$p" '$1 == p {f = 1} END {exit !f}' <<<"$list" && continue
+    gone=$((gone + $(wc -c <"$dir/$p")))
+    rm -f "$dir/$p"
+done <<<"$old"
+[ "$gone" -gt 0 ] && echo "Removed $(awk -v n="$gone" 'BEGIN {printf "%.1f", n / 1e9}') GB of earlier files that this revision of the pack does not have."
 free=$(( $(df -Pk "$dir" | awk 'NR == 2 {print $4}') * 1024 ))
 [ "$need" -le "$free" ] || fail "The download needs $((need / 1000000000)) GB and the disk has $((free / 1000000000)) GB free."
 echo
-echo "$check files to check, $(awk -v n="$need" 'BEGIN {printf "%.1f", n / 1e9}') GB to download into ${root:-$here/models}"
+echo "$check files to download, $(awk -v n="$need" 'BEGIN {printf "%.1f", n / 1e9}') GB into ${root:-$here/models}"
 if [ "$need" -gt 1073741824 ] && [ -z "${1:-}" ]; then
     read -r -p "Start? [Y/n] " a
     case $a in [nN]*) echo "Stopped. Run start-here.sh again."; exit 0 ;; esac
@@ -102,20 +123,21 @@ fi
 total=$(( $(wc -l <<<"$list") )) i=0
 while read -r p s h; do
     i=$((i + 1))
-    grep -qxF "$p" "$dir/.nslm-verified" && continue
+    grep -qxF "$p $s $h" "$ver" && continue
     dst=$dir/$p
     mkdir -p "$(dirname "$dst")"
     echo "[$i/$total] $p ($(awk -v n="$s" 'BEGIN {if (n < 1e9) printf "%.0f MB", n / 1e6; else printf "%.1f GB", n / 1e9}'))"
     have=0
-    [ -f "$dst" ] && have=$(( $(wc -c <"$dst") ))
-    if [ "$have" -ne "$s" ]; then
-        curl -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst" \
-            "https://huggingface.co/$repo/resolve/$rev/$p" </dev/null ||   # a stalled connection: a new one resumes
+    [ -f "$dst.part" ] && have=$(( $(wc -c <"$dst.part") ))
+    if [ "$have" -ne "$s" ]; then   # into FILE.part: a stalled connection resumes it, and FILE appears once it checks out
+        curl -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst.part" \
+            "https://huggingface.co/$repo/resolve/$rev/$p" </dev/null ||
             fail "The download of $p stopped. Run start-here.sh again to resume."
     fi
-    [ $(( $(wc -c <"$dst") )) -eq "$s" ] || fail "$p has the wrong size. Run start-here.sh again."
-    if [ "$h" != - ] && [ "$(sha "$dst")" != "$h" ]; then rm -f "$dst"; fail "$p failed its SHA-256 check and was removed. Run start-here.sh again."; fi
-    echo "$p" >>"$dir/.nslm-verified"
+    [ $(( $(wc -c <"$dst.part") )) -eq "$s" ] || fail "$p has the wrong size. Run start-here.sh again."
+    if [ "${h#git:}" = "$h" ] && [ "$(sha "$dst.part")" != "$h" ]; then rm -f "$dst.part"; fail "$p failed its SHA-256 check and was removed. Run start-here.sh again."; fi
+    mv -f "$dst.part" "$dst"
+    echo "$p $s $h" >>"$ver"
 done <<<"$list"
 pline="# the pack's own 8-bit PLE table (Q4E_PLE_GGUF=FILE reads another, as a GGUF)"   # run-PACK.sh's line for the table
 dline="# MTP drafts: Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3 (they break even on an RTX 4080)"   # and for the drafts

@@ -35,6 +35,9 @@ Changes since v0.1.0:
   oMLX. Its row error against BF16 is 0.88 times that of Unsloth's Q8_0 table. The start scripts no longer download
   Unsloth's table. The packs are now 112 to 131 GB. v0.1.0's start scripts read the packs' newest files, which its
   engine cannot read: use this release.
+- Upgrading a v0.1.0 folder: run this release's start script on it. It checks each file by SHA-256, keeps the ones
+  that did not change, downloads the changed ones (about 58 GB for a TCQ pack), and removes the old PLE shards. The
+  folder Qwen3.8-Flash-Next-GGUF, Unsloth's table from v0.1.0, is no longer used: delete it to free 54.4 GB.
 - nslm-serve: a stranger cannot use it.
   - Each reply used to allow every web origin. Now a browser origin needs --allow-origin.
   - Without a key, the server takes only a loopback Host, which stops DNS rebinding.

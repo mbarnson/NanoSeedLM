@@ -50,50 +50,77 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 $hdr = @{}
 $auth = @()
 if ($env:HF_TOKEN) { $hdr['Authorization'] = "Bearer $env:HF_TOKEN"; $auth = @('-H', "Authorization: Bearer $env:HF_TOKEN") }
-function Files($r, $v, $d) {   # the files of repository r at revision v, to download into folder d
+# .nslm-verified lists "path size id" for each file checked at this revision (id: a large file's SHA-256, git:BLOB for a
+# small one). An earlier revision's line or v0.1.0's bare path matches nothing: then a large file of the right size and
+# SHA-256 stays, and any other file downloads again.
+function Files($r, $v) {   # the files of repository r at revision v
     $u = "https://huggingface.co/api/models/$r/tree/$($v)?recursive=true"
     $t = Invoke-RestMethod -Headers $hdr $u   # PowerShell 5.1: one array object
     @($t | Where-Object { $_.type -eq 'file' -and -not $_.path.StartsWith('.') } | ForEach-Object {
-        [pscustomobject]@{ r = $r; v = $v; d = $d; path = $_.path; size = $_.size; oid = $(if ($_.lfs) { $_.lfs.oid }) } })
+        $sha = $(if ($_.lfs) { $_.lfs.oid })
+        [pscustomobject]@{ path = $_.path; size = $_.size; sha = $sha; id = $(if ($sha) { $sha } else { "git:$($_.oid)" }) } })
 }
-$files = @(Files $repo $rev $dir)
-$ok = @{}
+function Line($f) { "$($f.path) $($f.size) $($f.id)" }
+$files = @(Files $repo $rev)
 $okf = Join-Path $dir '.nslm-verified'
-if (Test-Path $okf) { Get-Content $okf | ForEach-Object { $ok["$dir|$_"] = 1 } }
-$check, $need = 0, 0   # files to check; bytes to download (a partial file resumes)
+$old = @(if (Test-Path $okf) { Get-Content $okf })
+$ok = @{}
+foreach ($l in $old) { $ok[$l] = 1 }
+$new = [System.Collections.Generic.List[string]]::new()
+$check, $need, $hashed = 0, 0, $false
 foreach ($f in $files) {
-    if ($ok.ContainsKey("$($f.d)|$($f.path)")) { continue }
+    if ($f.path.StartsWith('/') -or $f.path.Contains('..')) { Fail "The pack lists an unsafe path: $($f.path)" }
+    if ($ok.ContainsKey((Line $f))) { $new.Add((Line $f)); continue }
+    $dst = Join-Path $dir $f.path
+    if ($f.sha -and (Test-Path $dst) -and (Get-Item $dst).Length -eq $f.size) {   # from an earlier download
+        if (-not $hashed) { Write-Host "Checking the files of an earlier download (SHA-256)..."; $hashed = $true }
+        if ((Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -eq $f.sha) { $new.Add((Line $f)); continue }
+    }
+    if (Test-Path $dst) { Remove-Item $dst }   # an older or broken version: a download starts over, never through a hard link
     $check += 1
-    $dst = Join-Path $f.d $f.path
     $have = 0
-    if (Test-Path $dst) { $have = (Get-Item $dst).Length }
-    if ($have -gt $f.size) { Remove-Item $dst; $have = 0 }
+    if (Test-Path "$dst.part") { $have = (Get-Item "$dst.part").Length }
+    if ($have -gt $f.size) { Remove-Item "$dst.part"; $have = 0 }
     $need += $f.size - $have
 }
+Set-Content $okf $new
+$paths = @{}
+foreach ($f in $files) { $paths[$f.path] = 1 }
+$gone = 0   # the files of an earlier download that this revision does not have
+foreach ($l in $old) {
+    $p = ($l -split ' ')[0]
+    if (-not $p -or $p.StartsWith('/') -or $p.Contains('..') -or $paths.ContainsKey($p)) { continue }
+    $q = Join-Path $dir $p
+    if (Test-Path $q) { $gone += (Get-Item $q).Length; Remove-Item $q }
+}
+if ($gone) { Write-Host ("Removed {0:N1} GB of earlier files that this revision of the pack does not have." -f ($gone / 1e9)) }
 $free = (Get-Item $dir).PSDrive.Free
 if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N0} GB free." -f ($need / 1e9), ($free / 1e9)) }
-Write-Host ("`n{0} files to check, {1:N1} GB to download into {2}" -f $check, ($need / 1e9), $root)
+Write-Host ("`n{0} files to download, {1:N1} GB into {2}" -f $check, ($need / 1e9), $root)
 if ($need -gt 1GB -and -not $Pack -and (Read-Host "Start? [Y/n]") -match '^[nN]') { Write-Host "Stopped. Run START-HERE.bat again."; exit 0 }
 if ($need -gt 1GB -and $Pack) { Write-Host "The download starts in 5 s (Ctrl+C stops it)."; Start-Sleep 5 }   # a folder typo
+$ok = @{}
+foreach ($l in $new) { $ok[$l] = 1 }
 $i = 0
 foreach ($f in $files) {
     $i += 1
-    if ($ok.ContainsKey("$($f.d)|$($f.path)")) { continue }
-    $dst = Join-Path $f.d $f.path
+    if ($ok.ContainsKey((Line $f))) { continue }
+    $dst = Join-Path $dir $f.path
     New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
     $have = 0
-    if (Test-Path $dst) { $have = (Get-Item $dst).Length }
+    if (Test-Path "$dst.part") { $have = (Get-Item "$dst.part").Length }
     Write-Host ("[{0}/{1}] {2} ({3})" -f $i, $files.Count, $f.path, $(if ($f.size -lt 1e9) { "{0:N0} MB" -f ($f.size / 1e6) } else { "{0:N1} GB" -f ($f.size / 1e9) }))
-    if ($have -ne $f.size) {
-        & curl.exe -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - --progress-bar @auth -o $dst "https://huggingface.co/$($f.r)/resolve/$($f.v)/$($f.path)"   # a stalled connection: a new one resumes
+    if ($have -ne $f.size) {   # into FILE.part: a stalled connection resumes it, and FILE appears once it checks out
+        & curl.exe -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - --progress-bar @auth -o "$dst.part" "https://huggingface.co/$repo/resolve/$rev/$($f.path)"
         if ($LASTEXITCODE) { Fail "The download of $($f.path) stopped (curl $LASTEXITCODE). Run START-HERE.bat again to resume." }
     }
-    if ((Get-Item $dst).Length -ne $f.size) { Fail "$($f.path) has the wrong size. Run START-HERE.bat again." }
-    if ($f.oid -and (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -ne $f.oid) {
-        Remove-Item $dst
+    if ((Get-Item "$dst.part").Length -ne $f.size) { Fail "$($f.path) has the wrong size. Run START-HERE.bat again." }
+    if ($f.sha -and (Get-FileHash -Algorithm SHA256 "$dst.part").Hash.ToLower() -ne $f.sha) {
+        Remove-Item "$dst.part"
         Fail "$($f.path) failed its SHA-256 check and was removed. Run START-HERE.bat again."
     }
-    Add-Content (Join-Path $f.d '.nslm-verified') $f.path
+    Move-Item -Force "$dst.part" $dst
+    Add-Content $okf (Line $f)
 }
 $pline = 'rem the pack''s own 8-bit PLE table (set Q4E_PLE_GGUF=FILE reads another, as a GGUF)'
 
