@@ -8,8 +8,8 @@ Requirements:
 To start: double-click START-HERE.bat (Windows), or run ./start-here.sh (Linux, macOS). It checks this machine,
 recommends a pack, downloads and checks it, chats once, writes run-PACK.bat (or run-PACK.sh) and starts the server on
 http://127.0.0.1:8080/v1. Run it again to resume a download. Arguments skip the questions, for example
-START-HERE.bat TCQ3-D4 D:\models or ./start-here.sh TCQ4 ~/models. It also downloads Unsloth's Q8_0 PLE table
-(54.4 GB, read from the disk), because the KL on the model cards is with that table. NSLM_PLE=pack skips it.
+START-HERE.bat TCQ3-D4 D:\models or ./start-here.sh TCQ4 ~/models. Each pack carries its PLE table at 8 bits. The
+engines read it from the disk, and the page cache holds the rows in use.
 
 To run by hand, run the commands from this folder. The binaries are in build/bin (Windows, Linux) or out/bin
 (macOS, with the Metal kernels in out/res). The macOS binaries are signed with a Developer ID and notarized by Apple.
@@ -24,5 +24,32 @@ Then chat, or serve an OpenAI-compatible API (macOS: out/bin in place of build/b
   build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4 --ctx 32768 --port 8080
 
 Models: https://huggingface.co/txgsync (Qwen3.8-Flash-Next-NanoSeedLM-TCQ4, -TCQ3-D4 and -TCQ3).
+All packs: https://huggingface.co/collections/txgsync/qwen38-flash-next-trellis-seedlm-oqe-mxfp4-6aebb5915b4644081194047a
 Guide: https://github.com/mbarnson/NanoSeedLM/blob/main/docs/guides/run-and-serve.md
+Serving to other machines: nslm-serve listens on 127.0.0.1 only. --host 0.0.0.0 needs an API key (NSLM_API_KEY=KEY,
+or --api-key KEY), and clients then send "Authorization: Bearer KEY". A web page can use the server only with
+--allow-origin ORIGIN.
+
+Changes since v0.1.0:
+- The packs carry an 8-bit PLE table, made from Qwen's BF16 table: every runtime reads it, the engines, mlx-vlm and
+  oMLX. Its row error against BF16 is 0.88 times that of Unsloth's Q8_0 table. The start scripts no longer download
+  Unsloth's table. The packs are now 112 to 131 GB. v0.1.0's start scripts read the packs' newest files, which its
+  engine cannot read: use this release.
+- nslm-serve: a stranger cannot use it.
+  - Each reply used to allow every web origin. Now a browser origin needs --allow-origin.
+  - Without a key, the server takes only a loopback Host, which stops DNS rebinding.
+  - An API key is needed off loopback.
+  - Sanitizers (ASan, UBSan and LeakSanitizer, compute-sanitizer, MSVC ASan) found and fixed reads past the end of a
+    crafted model file's header and JSON. The builds have stack protection, _FORTIFY_SOURCE, full RELRO and Control
+    Flow Guard.
+- MTP drafts in nslm-serve and nslm-chat at any temperature. A draft comes from the MTP head's distribution, and the
+  sampler keeps it with min(1, p/q), so each token keeps the sampler's distribution. Q4E_DRAFTS=2 turns them on, and
+  Q4E_DRAFT_MIN_P=0.3 verifies only the drafts that the head is sure of. On a Mac, run-PACK.sh turns them on. Then the
+  M4 Max decodes TCQ4 32% faster at temperature 0, with the same text, and 16% faster at 1.0. On the RTX 4080 they break
+  even, so they stay off there.
+- The KV cache of Qwen3.8-Flash-Next is BF16. At a 32K context the RTX 4080 keeps 379 more experts in VRAM, and
+  decode is 5.7% faster.
+- Metal: merged projections, TCQ4 decode 5.9% faster with the same text.
+- start-here: TCQ3 for a 12 or 16 GB GPU. Sizes in decimal GB. A stalled download resumes on a new connection.
+
 This is a research preview. License: LICENSE (MIT). Each model has its own license.
