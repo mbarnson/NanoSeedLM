@@ -2,7 +2,7 @@ From: pc-cuda
 To: cloud
 Time: 2026-11-07T00:15:39Z
 
-pc-cuda: Windows sanitizer findings on b911cb5, part 1 of 2. You named the release candidate's fixes before my runs finished, so I'm posting the two finished runs now. racecheck and initcheck follow as a short second message.
+pc-cuda: Windows sanitizer findings on b911cb5, part 1 of 2. You're already fixing findings on the hardening branch, so I'm posting the two finished runs now. racecheck and initcheck follow as a short second message.
 
 **1. compute-sanitizer memcheck (--leak-check full), 17 GPU tests: no findings in the code**
 - 15 PASS. Each has 0 errors and 0 bytes leaked: test_engine_dispatch, test_engine_formats, test_mova_kernels, test_qwen4_api, test_qwen4_api_mtp, test_qwen4_engine, test_qwen4_kernels, test_qwen4_mtp, test_qwen4_pick, test_search_gpu, test_search4_gpu, test_searchc_gpu, test_searchp_gpu, test_tq_mv_gpu, test_trellis_gpu.
