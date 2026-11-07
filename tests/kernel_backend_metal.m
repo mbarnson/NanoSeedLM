@@ -802,9 +802,9 @@ int kt_q4_gdn(const Qwen4Cfg* c, const Qwen4GdnW* w, const float* qkv, const flo
     const Q4GNormArgs na = {hv, dv, c->eps, 0};
     const int split = Q4_GDN_SPLIT(dk);
     if (run(^(id<MTLComputeCommandEncoder> e) {
-            enc4(e, pc, &ca, sizeof ca, @[wb, qb, cb, cvb]);
+            enc4(e, pc, &ca, sizeof ca, @[wb, qb, cb, cvb, cb, cb, cb]);   // k0 .. k2: the state itself, as the engine's bind_keep
             [e dispatchThreads:TGS(cd, 1) threadsPerThreadgroup:TGS(256, 1)];
-            enc4(e, ps, &ga, sizeof ga, @[cvb, ab, bb, Ab, db, Sb, yb]);
+            enc4(e, ps, &ga, sizeof ga, @[cvb, ab, bb, Ab, db, Sb, yb, Sb, Sb, Sb]);
             [e dispatchThreadgroups:TGS(hv, dv / 32) threadsPerThreadgroup:TGS(32 * split, 1)];
             enc4(e, pn, &na, sizeof na, @[nb, zb, yb]);
             [e dispatchThreadgroups:TGS(hv, T) threadsPerThreadgroup:TGS(dv, 1)];
@@ -897,7 +897,7 @@ int kt_q4_ple(const Qwen4Cfg* c, const float* keys, const float* qs, const float
     if (run(^(id<MTLComputeCommandEncoder> e) {
             enc4(e, pg, &ga, sizeof ga, @[kb, qb, vb, gb]);
             [e dispatchThreadgroups:TGS(c->hc, T) threadsPerThreadgroup:TGS(256, 1)];
-            enc4(e, pc, &ca, sizeof ca, @[wb, cb, gb, hb, Hb]);
+            enc4(e, pc, &ca, sizeof ca, @[wb, cb, gb, hb, Hb, hb, hb, hb]);
             [e dispatchThreads:TGS(HD, 1) threadsPerThreadgroup:TGS(256, 1)];
         }))
         return -1;
