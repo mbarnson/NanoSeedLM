@@ -11,9 +11,9 @@ function Fail($m) { Write-Host "`n$m" -ForegroundColor Red; exit 1 }
 
 # name = repository, revision, least RAM GB, least VRAM GB, download GB (the model cards' "For" column)
 $packs = [ordered]@{
-    'TCQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4', 'REV_TCQ4', 96, 24, 128)
-    'TCQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4', 'REV_TCQ3D4', 96, 16, 117)
-    'TCQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3', 'REV_TCQ3', 64, 12, 112)
+    'TCQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4', '4e0d254480f24d444082e935c9b182a4e582730f', 96, 24, 128)
+    'TCQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4', 'e29730a3fea357b710f0b5bd57158c74a82cd7f1', 96, 16, 117)
+    'TCQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3', 'a850ead9cc4e852b9566aaec851213f7e813d193', 64, 12, 112)
 }
 
 Write-Host "NanoSeedLM: Qwen3.8-Flash-Next on this PC`n"
