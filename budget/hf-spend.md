@@ -89,4 +89,6 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | Linux CI 8bfed94 (6aee712e0e0338d1bb827f51): v0.1.1 code candidate, 47 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | about $24.59 |
 
-Left this week: about $0.41.
+| ple8 (6aee71f5e6320c66fad4e025): the 8-bit PLE table (hf_ple8.py table) and a PR on each of the five packs; launched by pc-cuda 2026-11-07T00:34Z on Matt's approval; RUNNING | cpu-upgrade ($0.03/h) | up to 360 | up to $0.18 (reserved) | up to about $24.77 |
+
+Left this week: about $0.23 if the job runs its full 6 h (about $0.41 before it).
