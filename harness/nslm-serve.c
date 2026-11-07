@@ -1053,7 +1053,7 @@ static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_conns;   // connection threads running
 
 static void* handle_conn(void* arg) {
-    Conn c = {(sock_t) (intptr_t) arg, false};
+    Conn c = {.fd = (sock_t) (intptr_t) arg};
     Request r;
     const int rc = read_request(&c, &r);
     if (rc > 0) send_error(&c, rc, "bad request");
@@ -1306,7 +1306,7 @@ int main(int argc, char** argv) {
         if (!full) ++g_conns;
         pthread_mutex_unlock(&g_conn_lock);
         if (full) {
-            Conn c = {fd, false};
+            Conn c = {.fd = fd};
             send_error(&c, 503, "too many connections");
             sock_close(fd);
             continue;
