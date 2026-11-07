@@ -91,8 +91,8 @@ about 1 min), rtx-pro-6000, about $0.15 together.
 
 | ple8 (6aee71f5e6320c66fad4e025): evicted at 27.5 min in the table step (the bucket mount's local copies filled 50 GB); 28 of 33 table files in the bucket, no PRs | cpu-upgrade ($0.03/h) | 27.5 | about $0.014 | about $24.61 |
 
-| ple8 relaunch (6aee7e490e0338d1bb828c5c): src-86f55a9, the table files by hf cp; the rest of the table and a PR on each of the five packs; launched by pc-cuda 2026-11-07T01:2xZ on Matt's approval; RUNNING | cpu-upgrade ($0.03/h) | up to 360 | up to $0.18 (reserved) | up to about $24.79 |
+| ple8 relaunch (6aee7e490e0338d1bb828c5c): src-86f55a9; table files 29-33 by hf cp, then a PR on each of the five packs (discussions/1), all ready, not merged; COMPLETED | cpu-upgrade ($0.03/h) | 38.0 | about $0.019 | about $24.63 |
 
 | Linux CI f6d5402 (6aee84a7e6320c66fad4f3fb): nanoseedlm_ple.py and the pack tool, 47 PASS | rtx-pro-6000 ($2.75/h) | about 2 | about $0.08 | up to about $24.87 |
 
-Left this week: about $0.13 if the relaunch runs its full 6 h (about $0.31 before it).
+Left this week: about $0.37.
