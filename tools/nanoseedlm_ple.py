@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""NanoSeedLM for MLX: mlx-vlm's SSD PLE (qwen4_exp/ple_storage.py, 0.7.11 and 0.7.12) for an 8-bit table too.
+"""NanoSeedLM for MLX: the opt-in SSD-PLE path (mlx-vlm's qwen4_exp/ple_storage.py, 0.7.11 and 0.7.12) for an 8-bit
+table too.
 
-mlx-vlm takes a PLE table as 4 bits, group 32: a row width of 8 values a packed word, and each row decoded at 4 bits.
-The packs ship an 8-bit table (plan ple-8bit). Importing this module patches ple_storage in place, so the row width
-comes from the bits and each row is decoded with its own bits and group. A 4-bit table reads as before. The functions
-below follow mlx-vlm's (MIT), with the bits taken from the table's quantization.
+mlx-vlm's resident path reads a PLE table at any precision (BF16, 8-bit, 4-bit). Its SSD-PLE path, the folder view of
+the cards' snippet, has layouts for 4-bit affine (group 32) and nvfp4 only: a row width of 8 values a packed word, and
+each row decoded at 4 bits. The packs ship an 8-bit table (plan ple-8bit). Importing this module patches ple_storage
+in place: the row width comes from the bits, and each row is decoded with its own bits and group. A 4-bit table reads
+as before. The functions below follow mlx-vlm's (MIT), with the bits taken from the table's quantization.
 """
 
 import json

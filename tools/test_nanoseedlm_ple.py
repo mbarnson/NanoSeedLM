@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""tools/nanoseedlm_ple.py: mlx-vlm's SSD PLE reads an 8-bit table row for row as its tensors give it, and a 4-bit table
-as unpatched mlx-vlm does. It also makes the view (prepare_external_ple_model) of a pack with the 8-bit table.
+"""tools/nanoseedlm_ple.py: the opt-in SSD-PLE path (ple_storage.py) reads an 8-bit table row for row as its tensors
+give it, and a 4-bit table as unpatched mlx-vlm does. It also makes the view (prepare_external_ple_model) of a pack with the 8-bit table.
 
   python tools/test_nanoseedlm_ple.py      (needs mlx and mlx-vlm with qwen4_exp/ple_storage.py)
 """
