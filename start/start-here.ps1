@@ -10,13 +10,24 @@ $src = $false   # a source checkout keeps this script in start\: the engine fold
 $up = Split-Path -Parent $here
 if ((Test-Path "$up\start\start-here.ps1") -and (Test-Path "$up\win\build.bat") -and (Test-Path "$up\CMakeLists.txt")) { $here = $up; $src = $true }
 Set-Location $here
-function Fail($m) { Write-Host "`n$m" -ForegroundColor Red; exit 1 }
+$hfile = $null   # the token for curl, as a header file
+function Fail($m) {
+    if ($script:hfile) { Remove-Item -Force -ErrorAction SilentlyContinue $script:hfile }
+    Write-Host "`n$m" -ForegroundColor Red; exit 1
+}
 
 # name = repository, revision, least RAM GB, least VRAM GB, download GB (the model cards' "For" column)
 $packs = [ordered]@{
     'TCQ4'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4', '4e0d254480f24d444082e935c9b182a4e582730f', 96, 24, 128)
     'TCQ3-D4' = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4', 'e29730a3fea357b710f0b5bd57158c74a82cd7f1', 96, 16, 117)
     'TCQ3'    = @('txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3', 'a850ead9cc4e852b9566aaec851213f7e813d193', 64, 12, 112)
+}
+if ($env:NSLM_PACKS) {   # another table, as start-here.sh reads it: lines "name repository revision RAM VRAM MacGB downloadGB"
+    $packs = [ordered]@{}
+    foreach ($l in ($env:NSLM_PACKS -split "`n")) {
+        $w = -split $l
+        if ($w.Count -ge 7) { $packs[$w[0]] = @($w[1], $w[2], [int]$w[3], [int]$w[4], [int]$w[6]) }
+    }
 }
 
 Write-Host "NanoSeedLM: Qwen3.8-Flash-Next on this PC`n"
@@ -102,14 +113,20 @@ if (-not $packs.Contains($pick)) { Fail "Unknown pack $pick. Use TCQ4, TCQ3-D4 o
 $root = $ModelDir
 if (-not $root -and -not $Pack) { $root = Read-Host "Model folder [$here\models]" }
 if (-not $root) { $root = "$here\models" }
+if ($root -eq '~' -or $root.StartsWith('~\') -or $root.StartsWith('~/')) { $root = $HOME + $root.Substring(1) }   # curl.exe keeps ~
 $repo, $rev = $packs[$pick][0], $packs[$pick][1]
 $dir = Join-Path $root ($repo.Split('/')[1])
 New-Item -ItemType Directory -Force $dir | Out-Null
 
 # the files at their pinned revisions, each checked by size and SHA-256 (verified ones are listed in .nslm-verified)
+# The token: HF_TOKEN, or the one that "hf auth login" saved (a signed-in download has higher rate limits). curl reads
+# it from a file, so it is not in the process list.
+$tok = $env:HF_TOKEN
+$tf = $(if ($env:HF_TOKEN_PATH) { $env:HF_TOKEN_PATH } elseif ($env:HF_HOME) { Join-Path $env:HF_HOME 'token' } else { Join-Path $HOME '.cache\huggingface\token' })
+if (-not $tok -and (Test-Path $tf)) { $tok = (Get-Content -Raw $tf).Trim() }
 $hdr = @{}
-$auth = @()
-if ($env:HF_TOKEN) { $hdr['Authorization'] = "Bearer $env:HF_TOKEN"; $auth = @('-H', "Authorization: Bearer $env:HF_TOKEN") }
+$hfile = [IO.Path]::GetTempFileName()
+if ($tok) { $hdr['Authorization'] = "Bearer $tok"; [IO.File]::WriteAllText($hfile, "Authorization: Bearer $tok") }
 # .nslm-verified lists "path size id" for each file checked at this revision (id: a large file's SHA-256, git:BLOB for a
 # small one). An earlier revision's line or v0.1.0's bare path matches nothing: then a large file of the right size and
 # SHA-256 stays, and any other file downloads again.
@@ -130,8 +147,8 @@ $new = [System.Collections.Generic.List[string]]::new()
 $check, $need, $hashed = 0, 0, $false
 foreach ($f in $files) {
     if ($f.path.StartsWith('/') -or $f.path.Contains('..')) { Fail "The pack lists an unsafe path: $($f.path)" }
-    if ($ok.ContainsKey((Line $f))) { $new.Add((Line $f)); continue }
     $dst = Join-Path $dir $f.path
+    if ($ok.ContainsKey((Line $f)) -and (Test-Path $dst) -and (Get-Item $dst).Length -eq $f.size) { $new.Add((Line $f)); continue }   # checked before
     if ($f.sha -and (Test-Path $dst) -and (Get-Item $dst).Length -eq $f.size) {   # from an earlier download
         if (-not $hashed) { Write-Host "Checking the files of an earlier download (SHA-256)..."; $hashed = $true }
         if ((Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -eq $f.sha) { $new.Add((Line $f)); continue }
@@ -159,29 +176,94 @@ if ($need -gt $free) { Fail ("The download needs {0:N0} GB and the disk has {1:N
 Write-Host ("`n{0} files to download, {1:N1} GB into {2}" -f $check, ($need / 1e9), $root)
 if ($need -gt 1GB -and -not $Pack -and (Read-Host "Start? [Y/n]") -match '^[nN]') { Write-Host "Stopped. Run START-HERE.bat again."; exit 0 }
 if ($need -gt 1GB -and $Pack) { Write-Host "The download starts in 5 s (Ctrl+C stops it)."; Start-Sleep 5 }   # a folder typo
-$ok = @{}
-foreach ($l in $new) { $ok[$l] = 1 }
-$i = 0
-foreach ($f in $files) {
-    $i += 1
-    if ($ok.ContainsKey((Line $f))) { continue }
+# The download, as in start-here.sh: NSLM_DL_JOBS files at once (8). hf, when it is installed (NSLM_NO_HF=1: not), then
+# curl for each file that remains. Each file is checked by its size and SHA-256 before it joins .nslm-verified.
+$jobs = $(if ($env:NSLM_DL_JOBS) { [int]$env:NSLM_DL_JOBS } else { 8 })
+function Good($p, $f) {   # file p has f's size, and a large file has its SHA-256
+    (Test-Path $p) -and ((Get-Item $p).Length -eq $f.size) -and (-not $f.sha -or (Get-FileHash -Algorithm SHA256 $p).Hash.ToLower() -eq $f.sha)
+}
+function Todo {   # the files that are not in .nslm-verified
+    $v = @{}
+    if (Test-Path $okf) { foreach ($l in Get-Content $okf) { $v[$l] = 1 } }
+    @($files | Where-Object { -not $v.ContainsKey((Line $_)) })
+}
+$todo = @(Todo)
+$hf = (-not $env:NSLM_NO_HF) -and [bool](Get-Command hf -ErrorAction SilentlyContinue)
+if ($todo.Count -and -not $hf -and -not $env:NSLM_NO_HF) {
+    Write-Host "Tip: hf can download faster. It uses Hugging Face's Xet transfers and your login. To install it:"
+    Write-Host "  pip install -U huggingface_hub; hf auth login"
+    Write-Host "Then run START-HERE.bat again. It continues the download."
+} elseif ($todo.Count -and -not $tok) {
+    Write-Host 'Tip: "hf auth login" (a free Hugging Face account) gives the download higher rate limits.'
+}
+if ($todo.Count -and $hf) {
+    Write-Host "Downloading with hf, $jobs files at once:"
+    & hf download $repo @($todo | ForEach-Object { $_.path }) --revision $rev --local-dir $dir --max-workers $jobs
+    if ($LASTEXITCODE) { Write-Host "hf stopped. curl downloads the files that remain." }
+    Write-Host "Checking the files (SHA-256)..."
+    foreach ($f in $todo) {
+        $dst = Join-Path $dir $f.path
+        if (Good $dst $f) {
+            Add-Content $okf (Line $f)
+            if (Test-Path "$dst.part") { Remove-Item "$dst.part" }
+        } elseif (Test-Path $dst) { Remove-Item $dst }
+    }
+    $todo = @(Todo)
+}
+function Start-Curl($f) {   # curl into FILE.part (a stalled connection resumes it). $null: FILE.part is complete
     $dst = Join-Path $dir $f.path
     New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-    $have = 0
-    if (Test-Path "$dst.part") { $have = (Get-Item "$dst.part").Length }
-    Write-Host ("[{0}/{1}] {2} ({3})" -f $i, $files.Count, $f.path, $(if ($f.size -lt 1e9) { "{0:N0} MB" -f ($f.size / 1e6) } else { "{0:N1} GB" -f ($f.size / 1e9) }))
-    if ($have -ne $f.size) {   # into FILE.part: a stalled connection resumes it, and FILE appears once it checks out
-        & curl.exe -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - --progress-bar @auth -o "$dst.part" "https://huggingface.co/$repo/resolve/$rev/$($f.path)"
-        if ($LASTEXITCODE) { Fail "The download of $($f.path) stopped (curl $LASTEXITCODE). Run START-HERE.bat again to resume." }
-    }
-    if ((Get-Item "$dst.part").Length -ne $f.size) { Fail "$($f.path) has the wrong size. Run START-HERE.bat again." }
-    if ($f.sha -and (Get-FileHash -Algorithm SHA256 "$dst.part").Hash.ToLower() -ne $f.sha) {
+    if ((Test-Path "$dst.part") -and (Get-Item "$dst.part").Length -ge $f.size) {
+        if (Good "$dst.part" $f) { return $null }
         Remove-Item "$dst.part"
-        Fail "$($f.path) failed its SHA-256 check and was removed. Run START-HERE.bat again."
     }
+    $a = '-fsSL --retry 20 --speed-limit 100000 --speed-time 60 -C - -H "@{0}" -o "{1}.part" "https://huggingface.co/{2}/resolve/{3}/{4}"' -f $hfile, $dst, $repo, $rev, $f.path
+    Start-Process curl.exe -ArgumentList $a -NoNewWindow -PassThru
+}
+function Finish($f) {   # FILE.part becomes FILE if it checks out
+    $dst = Join-Path $dir $f.path
+    if (-not (Test-Path "$dst.part")) { Write-Host "The download of $($f.path) stopped."; return }
+    if ((Get-Item "$dst.part").Length -lt $f.size) { Write-Host "$($f.path) is not complete."; return }   # the next run resumes it
+    if (-not (Good "$dst.part" $f)) { Remove-Item "$dst.part"; Write-Host "$($f.path) failed its size or SHA-256 check and was removed."; return }
     Move-Item -Force "$dst.part" $dst
     Add-Content $okf (Line $f)
+    Write-Host $f.path
 }
+function Got {   # the bytes of the files in $todo: FILE, else FILE.part
+    $b = 0
+    foreach ($f in $todo) {
+        $dst = Join-Path $dir $f.path
+        if (Test-Path $dst) { $b += $f.size } elseif (Test-Path "$dst.part") { $b += (Get-Item "$dst.part").Length }
+    }
+    $b
+}
+if ($todo.Count) {
+    Write-Host "Downloading $($todo.Count) files with curl, $jobs at once:"
+    $run = @{}   # path -> @(file, curl process or $null)
+    $next, $b0, $t0, $shown = 0, (Got), (Get-Date), (Get-Date)
+    $all = 0
+    foreach ($f in $todo) { $all += $f.size }
+    while ($next -lt $todo.Count -or $run.Count) {
+        foreach ($k in @($run.Keys)) {
+            $p = $run[$k][1]
+            if (-not $p -or $p.HasExited) { Finish $run[$k][0]; $run.Remove($k) }
+        }
+        while ($next -lt $todo.Count -and $run.Count -lt $jobs) {
+            $f = $todo[$next]; $next += 1
+            $run[$f.path] = @($f, (Start-Curl $f))
+        }
+        if (((Get-Date) - $shown).TotalSeconds -ge 30) {   # a progress line every 30 s
+            $shown = Get-Date
+            $b = (Got) - $b0; $s = ((Get-Date) - $t0).TotalSeconds
+            Write-Host ("{0:N1} of {1:N1} GB, {2:N0} MB/s" -f (((Got)) / 1e9), ($all / 1e9), ($b / [math]::Max($s, 1) / 1e6))
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    $todo = @(Todo)
+    if ($todo.Count) { Fail "$($todo.Count) files did not download or check out (see above). Run START-HERE.bat again to resume." }
+}
+Remove-Item -Force -ErrorAction SilentlyContinue $hfile
+$hfile = $null
 $pline = 'rem the pack''s own 8-bit PLE table (set Q4E_PLE_GGUF=FILE reads another, as a GGUF)'
 
 Write-Host "`nThe pack is ready. One short chat:"

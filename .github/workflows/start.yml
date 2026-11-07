@@ -1,0 +1,55 @@
+# The start scripts in a clone on Windows: start-here.ps1 parses in Windows PowerShell 5.1 (START-HERE.bat's), gets
+# the release engine of VERSION (the runner has no CUDA, so no build), and downloads a tiny pack (12.5 MB, 9 files) with
+# curl, then with hf. The chat fails without a GPU: the run reaches it. start-here.sh runs in ctest (sanitize.yml).
+name: start
+on:
+  push:
+    branches: [main, 'claude/**', 'mac/**']
+    paths: [start/**, VERSION, .github/workflows/start.yml]
+  pull_request:
+    paths: [start/**, VERSION, .github/workflows/start.yml]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      NSLM_PACKS: TINY hf-internal-testing/tiny-random-gpt2 71034c5d8bde858ff824298bdedc65515b97d2b9 1 0 1 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse start-here.ps1
+        shell: powershell
+        run: |
+          $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$pwd\start\start-here.ps1", [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          New-Item -ItemType Directory stub | Out-Null
+          Set-Content -Encoding ascii stub\nvidia-smi.cmd '@echo NVIDIA GeForce RTX 4080, 16376, 580.00'
+      - name: curl (NSLM_NO_HF=1)
+        shell: cmd
+        run: |
+          set "PATH=%CD%\stub;%PATH%"
+          set NSLM_NO_HF=1
+          powershell -NoProfile -ExecutionPolicy Bypass -File start\start-here.ps1 TINY "%CD%\m1" > out1.txt 2>&1
+          echo exit %errorlevel%>> out1.txt
+          type out1.txt
+      - name: hf
+        shell: cmd
+        run: |
+          python -m pip install -q -U huggingface_hub
+          set "PATH=%CD%\stub;%PATH%"
+          powershell -NoProfile -ExecutionPolicy Bypass -File start\start-here.ps1 TINY "%CD%\m2" > out2.txt 2>&1
+          echo exit %errorlevel%>> out2.txt
+          type out2.txt
+      - name: check
+        shell: powershell
+        run: |
+          function Need($file, $words) { $o = Get-Content -Raw $file; foreach ($w in $words) { if (-not $o.Contains($w)) { throw "$file has no line '$w'" } } }
+          Need out1.txt @('Downloading the engine v', 'Downloading 9 files with curl, 8 at once', 'The pack is ready', 'exit 1')
+          Need out2.txt @('Downloading with hf, 8 files at once', 'The pack is ready', 'exit 1')
+          foreach ($m in 'm1', 'm2') {
+              $n = @(Get-Content "$m\tiny-random-gpt2\.nslm-verified").Count
+              if ($n -ne 9) { throw "$m checked $n files, not 9" }
+          }
+          if (-not (Test-Path build\bin\nslm-serve.exe)) { throw "no build\bin\nslm-serve.exe" }

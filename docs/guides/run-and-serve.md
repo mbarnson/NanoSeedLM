@@ -14,8 +14,18 @@ The [releases](https://github.com/mbarnson/NanoSeedLM/releases) have built engin
    them as arguments, for example `START-HERE.bat TCQ3-D4 D:\models` or `./start-here.sh TCQ4 ~/models`.
 
 The script checks the GPU, the driver, the RAM and the disk. It downloads the pack from Hugging Face and checks the
-SHA-256 of each file. It asks before a download of more than 1 GB. Then it runs one short chat, writes `run-PACK.bat` (or `run-PACK.sh`) and starts `nslm-serve` on
-port 8080. If the download stops, run the script again. It continues from the last file.
+SHA-256 of each file. It asks before a download of more than 1 GB. Then it runs one short chat, writes `run-PACK.bat`
+(or `run-PACK.sh`) and starts `nslm-serve` on port 8080. If the download stops, run the script again. It continues
+the files that are not complete.
+
+The download gets 8 files at the same time (`NSLM_DL_JOBS`). It works in one of these ways:
+
+- If `hf` (`pip install -U huggingface_hub`) is installed, `hf download` gets the files. It uses Hugging Face's Xet
+  transfers. The script then checks each file. curl gets each file that `hf` does not get.
+- Else curl gets the files. The script tells you how to install `hf`.
+
+Both use your Hugging Face token: `HF_TOKEN`, or the token that `hf auth login` saved. A signed-in download has higher
+rate limits. A model folder of `~/DIR` is the folder `DIR` in your home folder.
 
 Each pack carries its PLE n-gram table at 8 bits (57.6 GB, MLX's form, group 32, from Qwen's BF16 table). The engines
 memory-map it, so it stays on the disk, and the page cache keeps the rows that a session reads. `Q4E_PLE_GGUF=FILE`
