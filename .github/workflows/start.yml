@@ -32,7 +32,7 @@ jobs:
           set "PATH=%CD%\stub;%PATH%"
           set NSLM_NO_HF=1
           powershell -NoProfile -ExecutionPolicy Bypass -File start\start-here.ps1 TINY "%CD%\m1" > out1.txt 2>&1
-          echo exit %errorlevel%>> out1.txt
+          >> out1.txt echo exit %errorlevel%
           type out1.txt
       - name: hf
         shell: cmd
@@ -40,7 +40,7 @@ jobs:
           python -m pip install -q -U huggingface_hub
           set "PATH=%CD%\stub;%PATH%"
           powershell -NoProfile -ExecutionPolicy Bypass -File start\start-here.ps1 TINY "%CD%\m2" > out2.txt 2>&1
-          echo exit %errorlevel%>> out2.txt
+          >> out2.txt echo exit %errorlevel%
           type out2.txt
       - name: check
         shell: powershell

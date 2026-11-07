@@ -102,9 +102,12 @@ $rec = $null
 foreach ($n in $packs.Keys) { $p = $packs[$n]; if (-not $rec -and (Fits $ram $p[2]) -and (Fits $vram $p[3])) { $rec = $n } }
 if (-not $rec) { if (-not (Fits $ram 64)) { Fail "The smallest pack (TCQ3) needs 64 GB of RAM. This PC has $ram GB." }; $rec = 'TCQ3' }
 Write-Host "`nPacks (KL against BF16: lower is closer to the original model):"
-Write-Host "  TCQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TCQ4'][4]) GB download)"
-Write-Host "  TCQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TCQ3-D4'][4]) GB download)"
-Write-Host "  TCQ3     0.0778  for a 12 or 16 GB GPU with 64 GB of RAM ($($packs['TCQ3'][4]) GB download)"
+if ($env:NSLM_PACKS) { foreach ($n in $packs.Keys) { Write-Host "  $n  ($($packs[$n][4]) GB download)" } }
+else {
+    Write-Host "  TCQ4     0.0415  for a GPU of 24 GB or more with 96 to 128 GB of RAM ($($packs['TCQ4'][4]) GB download)"
+    Write-Host "  TCQ3-D4  0.0638  for a 16 GB GPU with 96 to 128 GB of RAM ($($packs['TCQ3-D4'][4]) GB download)"
+    Write-Host "  TCQ3     0.0778  for a 12 or 16 GB GPU with 64 GB of RAM ($($packs['TCQ3'][4]) GB download)"
+}
 Write-Host "Each pack carries its PLE table at 8 bits. It stays on the disk, and the page cache holds the rows in use."
 $pick = $Pack
 if (-not $pick) { $pick = Read-Host "Pack [$rec]" }
