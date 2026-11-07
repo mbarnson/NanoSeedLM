@@ -173,7 +173,8 @@ else
 #!/bin/sh
 # hf version, and hf download REPO FILES... --local-dir D: copies the files from $NSLM_TEST_REL/pack, except
 # $NSLM_TEST_HF_SKIP, a file that hf misses (then hf fails)
-case $1 in version) echo "huggingface_hub version: 9.9.9"; exit 0 ;; download) shift 2 ;; *) exit 2 ;; esac
+# (hf 2.x prints its version without the word huggingface_hub: the script asks download --help for --local-dir)
+case $1 in version) echo "hf 9.9.9"; exit 0 ;; download) [ "${2:-}" = --help ] && { echo "  --local-dir LOCAL_DIR"; exit 0; }; shift 2 ;; *) exit 2 ;; esac
 d= fs=
 while [ $# -gt 0 ]; do case $1 in --local-dir) d=$2; shift ;; --revision | --max-workers) shift ;; --*) ;; *) fs="$fs $1" ;; esac; shift; done
 echo "hf$fs" >>"$NSLM_TEST_REL/../hf.log"

@@ -4,7 +4,8 @@
 `L{layer}_{proj}.blkt` bank files. The bytes of the codes and the scales do not change, so the engines and the MLX
 loader give the same tokens. Standard tools can read every file of a pack.
 
-**Status.** In progress. TS1 to TS4 pass on the M4 Max (TA, TC). TS5 runs as an HF job.
+**Status.** Done for v0.1.2, but for one check. TS1 to TS6 pass (TA to TD). For TS7, CUDA gives the same logits on the
+tiny model in Linux CI. The real TCQ3 on CUDA did not run yet. Read [the result](../results/2026-11-07-tcq-safetensors.md).
 
 ## Why
 

@@ -232,7 +232,8 @@ export dir repo rev ver hdr
 export -f say ok1 chk1 get1 sha
 todo=$(todo)
 hf=   # the hf command of huggingface_hub
-if [ -z "${NSLM_NO_HF:-}" ] && hf version 2>/dev/null | grep -q huggingface_hub; then hf=1; fi
+# hf of huggingface_hub 0.34 to 2.x: its download command has --local-dir (hf version's words differ between them)
+if [ -z "${NSLM_NO_HF:-}" ] && hf download --help 2>/dev/null | grep -q -e --local-dir; then hf=1; fi
 if [ -n "$todo" ] && [ -z "$hf" ] && [ -z "${NSLM_NO_HF:-}" ]; then
     echo "Tip: hf can download faster. It uses Hugging Face's Xet transfers and your login. To install it:"
     echo "  pip install -U huggingface_hub && hf auth login"
@@ -241,7 +242,7 @@ elif [ -n "$todo" ] && [ -z "$tok" ]; then
     echo "Tip: \"hf auth login\" (a free Hugging Face account) gives the download higher rate limits."
 fi
 if [ -n "$todo" ] && [ -n "$hf" ]; then
-    echo "Downloading with hf ($(hf version 2>/dev/null | head -1)), $jobs files at once:"
+    echo "Downloading with hf ($(hf version 2>/dev/null | head -1 | tr -d '\033')), $jobs files at once:"
     # shellcheck disable=SC2046   # the paths have no spaces ("path size id" lines)
     hf download "$repo" $(awk '{print $1}' <<<"$todo") --revision "$rev" --local-dir "$dir" --max-workers "$jobs" </dev/null ||
         echo "hf stopped. curl downloads the files that remain."

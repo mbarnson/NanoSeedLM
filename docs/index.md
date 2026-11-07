@@ -72,6 +72,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
   the MTP head's drafts, so the server drafts at any temperature with its sampler's distribution.
 - [2026-11-06: An nslm-serve that a stranger cannot use](plans/2026-11-06-server-hardening.md): done for v0.1.1. An API key
   off loopback, no wildcard CORS, a loopback Host, sanitizers in CI, hardening flags.
+- [2026-11-07: Trellis experts in safetensors shards](plans/2026-11-07-tcq-safetensors.md): done for v0.1.2. The packs
+  carry their routed experts in `model-tcq-*` shards, not in `.blkt` bank files, with the same bytes.
 - [2026-11-07: An 8-bit PLE table in each pack](plans/2026-11-07-ple-8bit.md): done for v0.1.1. One 8-bit table for
   every runtime, made from Qwen's BF16 table.
 - [2026-11-06: MTP drafts that the sampler keeps more often](plans/2026-11-06-draft-acceptance.md): draft. Drafts sampled
@@ -198,6 +200,8 @@ Dated measurements. Each page gives the result, its status, the setup and the da
 - [2026-11-06: The KL of the 4-bit PLE table](results/2026-11-06-ple-table-kld.md): 0.0060 more than Unsloth's Q8_0
 - [2026-11-06: P4 as shipped against BF16](results/2026-11-06-p4-as-shipped-kld.md): KL 0.169, most of it from the 4-bit dense weights
 - [2026-11-07: The 8-bit PLE table](results/2026-11-07-ple8-encoding.md): 0.88 times Q8_0's row error, the 4-bit table 15 times
+- [2026-11-07: Trellis experts in safetensors shards](results/2026-11-07-tcq-safetensors.md): the same text as the `.blkt`
+  packs in the Metal engine and mlx-vlm, the same logits on CUDA, decode within 0.7%
 - [2026-11-07: The 8-bit PLE table in the CUDA engine](results/2026-11-07-ple8-engine-kl-4080.md): 35% closer to the Q8_0 table's run than the 4-bit table
   table (0.0199 to 0.0259 on Q8_0). The start scripts take the Q8_0 table by default.
 - [2026-11-06: The PLE rows on a host pool on the M4 Max](results/2026-11-06-ple-pool-m4max.md): the same text, no speed
