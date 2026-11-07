@@ -12,17 +12,16 @@ DOCS = GITHUB + "/blob/main/docs/results/"
 OMLX_PR = "https://github.com/jundot/omlx/pull/5112"
 OMLX_FORK = "https://github.com/mbarnson/omlx/tree/fix/qwen4-exp-custom-model-file"
 BLOG = "https://barnson.org/2026/10/07/nanoseedlm-llm-inference-using-pseudo-random-numbers/"
-PLE_FILE = "engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file"
 ORDER = ["TCQ4", "TCQ3-D4", "TCQ3", "P4", "P3"]
 
 # name: expert code, bits for each expert weight, expert GB, dense weights, download GB, resident GB (PLE on disk),
 # KL against BF16 as shipped (TCQ: from the logs; None: not measured), the experts' KL with Q8_0 dense, runtimes
 PACKS = {
-    "TCQ4": ("Trellis K4", 4.125, 62.3, "8-bit", 101.9, 70, None, 0.0398, "Engines, mlx-vlm, oMLX"),
-    "TCQ3-D4": ("Trellis K3, down K4", 3.458, 52.2, "8-bit", 91.6, 60, None, None, "Engines, mlx-vlm, oMLX"),
-    "TCQ3": ("Trellis K3", 3.125, 47.2, "8-bit", 86.5, 55, None, 0.0765, "Engines, mlx-vlm, oMLX"),
-    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 105.7, 74, 0.169, 0.0408, "Engines, mlx-vlm, oMLX"),
-    "P3": ("Seeds P3", 4.0, 60.4, "4-bit", 98.2, 66, 0.182, 0.0600, "Engines, mlx-vlm, oMLX"),
+    "TCQ4": ("Trellis K4", 4.125, 62.3, "8-bit", 127.5, 70, None, 0.0398, "Engines, mlx-vlm, oMLX"),
+    "TCQ3-D4": ("Trellis K3, down K4", 3.458, 52.2, "8-bit", 117.2, 60, None, None, "Engines, mlx-vlm, oMLX"),
+    "TCQ3": ("Trellis K3", 3.125, 47.2, "8-bit", 112.1, 55, None, 0.0765, "Engines, mlx-vlm, oMLX"),
+    "P4": ("Seeds P4", 4.5, 68.0, "4-bit", 131.3, 74, 0.169, 0.0408, "Engines, mlx-vlm, oMLX"),
+    "P3": ("Seeds P3", 4.0, 60.4, "4-bit", 123.8, 66, 0.182, 0.0600, "Engines, mlx-vlm, oMLX"),
 }
 # Decode of 4,096 tokens and after 30K, prompt tok/s at 30K, in nslm-serve's long runs (absent: not measured)
 M4 = "M4 Max, Metal"
@@ -35,6 +34,10 @@ SPEED = {
     "P4": {},
     "P3": {M4: ("46.9", "45.1", "462")},
 }
+# oMLX 29ee79c on the M4 Max with the 8-bit PLE table, SSD PLE on, temperature 0 (gate PB of plan ple-8bit)
+OMLX_NOTE = {n: f"We tested this pack in oMLX with SSD PLE on an M4 Max: MTP on gives the same text as MTP off, at {on} "
+                f"tokens per second against {off}." for n, on, off in (("TCQ4", "about 84", "49"), ("P3", "about 89", "52"))}
+OMLX_SAME = "Its PLE table is the same file as TCQ4's and P3's, which we tested in oMLX with SSD PLE."
 UNSLOTH = [("UD-Q4_K_XL", 5.101, 0.0304), ("UD-IQ4_XS", 3.999, 0.0509), ("UD-Q3_K_XL", 3.720, 0.0593),
            ("UD-IQ3_XXS", 3.331, 0.0735), ("UD-Q2_K_XL", 3.049, 0.0994)]
 
@@ -103,10 +106,11 @@ expert weights, their dense weights, and the runtimes that load them.
 
 - **Bits** are the bits for each expert weight. **Memory** counts the weights that stay resident, about. The PLE
   n-gram table stays on the disk, and the page cache holds the rows that a session reads.
-- **KL as shipped** is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2. Lower is closer to the
-  original model.
+- **KL as shipped** is against BF16 in llama.cpp, on 64 windows of 2,048 tokens of wikitext-2, with Unsloth's Q8_0 PLE
+  table. Lower is closer to the original model.
 - **Engines** are the NanoSeedLM engines: CUDA on Linux and Windows, Metal on macOS. oMLX needs the fix in
-  [jundot/omlx#5112]({OMLX_PR}). We tested each pack in oMLX, and P3 and TCQ4 in mlx-vlm.
+  [jundot/omlx#5112]({OMLX_PR}). We tested TCQ4 and P3 in oMLX with the 8-bit PLE table, and each pack with the
+  earlier 4-bit table.
 
 **The trade-offs.**
 
@@ -120,10 +124,11 @@ expert weights, their dense weights, and the runtimes that load them.
 - **Runtimes.** Each pack carries its MLX model files, so mlx-vlm runs it with Trust Remote Code. oMLX runs it with
   the fix in [jundot/omlx#5112]({OMLX_PR}). The NanoSeedLM engines run each pack too. The start scripts of the engine
   release prepare the TCQ packs.
-- **The PLE table.** Each pack carries the 4-bit MLX PLE table (32 GB). In the NanoSeedLM engines, Unsloth's Q8_0 table
-  (54.4 GB) lowers the KL by about 0.006, and the start scripts download it.
+- **The PLE table.** Each pack carries the PLE n-gram table at 8 bits (57.6 GB, MLX's form, group 32), made from Qwen's
+  BF16 table. Every runtime reads it. Its row error against BF16 is 0.88 times that of Unsloth's Q8_0 table
+  ([the encoding]({DOCS}2026-11-07-ple8-encoding.md)). A 4-bit table would add about 0.006 to the KL.
 
-Decode in tokens per second: `nslm-serve --ctx 32768` with the Q8_0 PLE table, 4,096 tokens, thinking on, temperature
+Decode in tokens per second: `nslm-serve --ctx 32768` with Unsloth's Q8_0 PLE table, 4,096 tokens, thinking on, temperature
 0, without MTP drafts, the mean of two runs. The machines are an M4 Max with 128 GB and an RTX 4080 (16 GB) with
 128 GB of RAM. Read the runs on [the M4 Max]({DOCS}2026-11-06-long-bench-m4max.md) and
 [the RTX 4080]({DOCS}2026-11-06-long-bench-4080.md). The 12 GB GPU is [the RTX 4080 with 4 GB kept free]({DOCS}2026-11-06-tcq3-12gb.md).
@@ -182,28 +187,6 @@ def speed(name):
 """
 
 
-def view(name):
-    """The SSD-PLE folder view of mlx-vlm. It copies each file but the shards, so the TCQ banks are linked instead."""
-    src, dst = f"Qwen3.8-Flash-Next-NanoSeedLM-{name}", f"Qwen3.8-Flash-Next-NanoSeedLM-{name}-ssd-ple"
-    if not name.startswith("TCQ"):
-        return f"""```python
-from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
-prepare_external_ple_model("{src}", "{dst}")
-```"""
-    banks = {"TCQ4": 63.6, "TCQ3-D4": 53.3, "TCQ3": 48.2}[name]   # the .blkt files, the MTP head's included
-    return f"""The view copies each file that is not a shard, and the trellis banks are {banks} GB. This snippet links the
-banks in place of copying them, so the view takes no more disk. Make the view on the disk that holds the pack.
-
-```python
-import os, shutil
-from mlx_vlm.models.qwen4_exp.ple_storage import prepare_external_ple_model
-copy2 = shutil.copy2
-shutil.copy2 = lambda s, d, **k: os.link(s, d) if str(s).endswith(".blkt") else copy2(s, d, **k)   # link the banks
-prepare_external_ple_model("{src}", "{dst}")
-shutil.copy2 = copy2
-```"""
-
-
 def mlx(name, note):
     """The mlx-vlm and oMLX sections of a card (each pack carries its model files)."""
     dl = PACKS[name][4]
@@ -214,10 +197,9 @@ python -m mlx_vlm.generate --model txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} 
     --prompt "Why do tide pools matter?" --max-tokens 256
 ```
 
-The pack is {dl} GB, and macOS gives the GPU about three quarters of its memory. So keep the PLE table on the SSD: make
-a folder view with mlx-vlm, and run that folder.
-
-{view(name)}
+mlx-vlm loads the whole pack, {dl} GB, and macOS gives the GPU about three quarters of its memory. So mlx-vlm needs a Mac
+with about {dl / 0.75:.0f} GB. On a 128 GB Mac, use oMLX with SSD PLE (below) or the NanoSeedLM engines: both keep the PLE
+table on the SSD.
 
 ### oMLX
 
@@ -238,8 +220,7 @@ def tcq(name, k):
              "TCQ3": "K = 3 for `gate_proj`, `up_proj` and `down_proj`"}[name]
     m, (d, d30, _) = next(iter(SPEED[name].items()))
     uns = "\n".join(f"| Unsloth {n} | {b:.3f} | {v:.4f} |" for n, b, v in UNSLOTH)
-    omlx_note = "We tested this repository's files in oMLX: MTP on gives the same text as MTP off, and the PLE table stays on the SSD." + \
-        (" We also tested them in mlx-vlm 0.7.12." if name == "TCQ4" else "")
+    omlx_note = OMLX_NOTE.get(name, OMLX_SAME)
     tested = ("- We emulated a 12 GB GPU on the RTX 4080, with 4 GB more of VRAM kept free. We did not test a PC with 64 GB\n"
               "  of RAM yet. There, close other large programs: the experts and the page cache need most of the RAM.\n") if name == "TCQ3" else ""
     return f"""{yaml(name)}
@@ -253,8 +234,8 @@ decodes at {d} tokens per second, and at {d30} after a prompt of 30,000 tokens.
 > also runs in mlx-vlm with Trust Remote Code, and in oMLX with the fix in [jundot/omlx#5112]({OMLX_PR}).
 
 **Start.** Unpack the [engine release]({GITHUB}/releases) for your machine. Then run `START-HERE.bat {name}` (Windows) or
-`./start-here.sh {name}` (Linux, macOS). The script checks the machine, downloads and checks this pack and Unsloth's
-Q8_0 PLE table, and starts an OpenAI-compatible server on port 8080.
+`./start-here.sh {name}` (Linux, macOS). The script checks the machine, downloads and checks this pack, and starts an
+OpenAI-compatible server on port 8080.
 
 {family(name)}
 ## How it works
@@ -267,7 +248,8 @@ memory, and a cache keeps the experts in use in VRAM.
 ## Quality
 
 This pack's experts and dense weights are written into Unsloth's Q8_0 GGUF, so llama.cpp runs this pack's weights. The
-PLE table is Unsloth's Q8_0.
+PLE table in these runs is Unsloth's Q8_0. The pack's own 8-bit table has a lower row error against BF16, so its KL
+should be the same within the error. That is not yet measured in llama.cpp.
 
 | | Mean KLD | Median KLD | 99% KLD | Top-1 | Perplexity |
 |---|---|---|---|---|---|
@@ -295,19 +277,12 @@ Unsloth's packs, measured in the same way (with their own dense weights):
 
 ### NanoSeedLM engines
 
-Download the engine ([releases]({GITHUB}/releases), or [build it]({GITHUB}/blob/main/docs/guides/build.md)), this
-folder, and Unsloth's Q8_0 PLE table:
+Download the engine ([releases]({GITHUB}/releases), or [build it]({GITHUB}/blob/main/docs/guides/build.md)) and this
+folder. Then chat, or serve an OpenAI-compatible API. The engines read the pack's own 8-bit PLE table. On macOS, use
+`out/bin` in place of `build/bin`.
 
 ```bash
 hf download txgsync/Qwen3.8-Flash-Next-NanoSeedLM-{name} --local-dir Qwen3.8-Flash-Next-NanoSeedLM-{name}
-hf download unsloth/Qwen3.8-Flash-Next-GGUF {PLE_FILE} --local-dir unsloth-engram
-```
-
-Then chat, or serve an OpenAI-compatible API with the Q8_0 table. On macOS, use `out/bin` in place of `build/bin`. On
-Windows, use `set Q4E_PLE_GGUF=...` in place of `export`.
-
-```bash
-export Q4E_PLE_GGUF=unsloth-engram/{PLE_FILE}
 build/bin/nslm-chat --model Qwen3.8-Flash-Next-NanoSeedLM-{name} "Why do tide pools matter?"
 build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-{name} --ctx 32768 --port 8080
 ```
@@ -319,12 +294,12 @@ Read [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 
 - This is a research preview. Its output is not identical to the output of the original model.
 - mlx-vlm and oMLX need Trust Remote Code. The NanoSeedLM engines do not.
-- In the MLX runtimes, this pack reads the 4-bit PLE table of the folder, not Unsloth's Q8_0 table.
 {tested}- We did not test image or video input.
 
 ## Files
 
-- `model-*.safetensors`: the dense weights (8-bit MLX), the PLE table (4-bit MLX), the vision tower and the MTP head.
+- `model-*.safetensors`: the dense weights (8-bit MLX), the vision tower and the MTP head. `model-ple8-*.safetensors`:
+  the PLE table (8-bit MLX, group 32, from Qwen's BF16).
 - `L{{layer}}_{{gate_proj,up_proj,down_proj}}.blkt`: the trellis-coded routed experts of layers 0 to 47 and of the MTP
   head (layer 48). Read [the format]({GITHUB}/blob/main/docs/reference/model-folder.md).
 - `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`, `nanoseedlm_trellis.py`: the MLX model files. `nanoseedlm_qwen4.py`
@@ -337,7 +312,7 @@ Read [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 Base model: Qwen, [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (Qwen Community License 1.0).
 Dense weights: [mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp)
 and [mlx-community/Qwen3.8-Flash-Next-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp).
-PLE table: [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF). Activation statistics: Unsloth's imatrix.
+PLE table: Qwen's BF16, in 8 bits by `tools/hf_ple8.py`. Activation statistics: Unsloth's imatrix.
 Trellis code: QTIP ([arXiv:2406.11235](https://arxiv.org/abs/2406.11235)). Code: [NanoSeedLM]({GITHUB}).
 """
 
@@ -353,11 +328,11 @@ def seeds(name):
                   f"experts are on Unsloth's quality curve: {kq8:.4f} at 4.5 bits, {rel} it.",
             "P3": f"As shipped, its KL against BF16 is {kl(shipped)}, and its 4-bit dense weights cause most of it."}[name]
     run = ""
-    omlx_note = "SSD PLE and MTP work, and MTP on gives the same text as MTP off."
+    omlx_note = OMLX_NOTE.get(name, OMLX_SAME)
     return f"""{yaml(name)}
 # Qwen3.8-Flash-Next-NanoSeedLM-{name}
 
-**Qwen3.8-Flash-Next with SeedLM seed experts, for MLX on a 128 GB Mac.** Its 120.8 B routed expert weights are seeds of
+**Qwen3.8-Flash-Next with SeedLM seed experts, for oMLX on a 128 GB Mac.** Its 120.8 B routed expert weights are seeds of
 a linear feedback shift register: {egb} GB, at {bits:.1f} bits each. It runs in mlx-vlm and oMLX as well as in the
 NanoSeedLM engines. {lead} For the lowest KL, use [TCQ4]({HF}TCQ4).
 
@@ -370,19 +345,21 @@ NanoSeedLM engines. {lead} For the lowest KL, use [TCQ4]({HF}TCQ4).
 Each block of 8 expert weights is a 16-bit LFSR seed, {p} int4 coefficients and a 4-bit exponent code
 ([SeedLM](https://arxiv.org/abs/2410.10714)). The GPU runs the register inside the matrix multiply and rebuilds the
 weights there, so the pack stores no expert weight. The seed search tried all 65,535 seeds for each block. It weighted
-the error of each weight by the mean square of its input activation, from Unsloth's imatrix. All other weights come
-unchanged from [mlx-community/Qwen3.8-Flash-Next-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp)
-(4-bit affine, group size 32), with its MTP head.
+the error of each weight by the mean square of its input activation, from Unsloth's imatrix. The PLE table is 8-bit,
+from Qwen's BF16 table. All other weights come unchanged from
+[mlx-community/Qwen3.8-Flash-Next-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp) (4-bit
+affine, group size 32), with its MTP head.
 
 | Part | {name} | mlx-community 4-bit |
 |---|---|---|
 | Routed experts | Seeds P{p}, {bits:.1f} bits | 4-bit affine, 5.0 bits |
+| The PLE table | 8-bit affine, from BF16 | 4-bit affine |
 | All other weights | The same tensors | 4-bit affine, 8-bit routers |
 | Size | {dl} GB | 113.3 GB |
 
 The routed experts are 120.8 B weights (48 layers of 512 experts). The other weights are attention, DeltaNet, the shared
-experts and the routers. They also include the PLE table, the embedding, the LM head, the vision tower and the MTP head. The 4-bit affine
-weights use groups of 32 and the routers groups of 64.
+experts and the routers. They also include the embedding, the LM head, the vision tower and the MTP head. The 4-bit
+affine weights use groups of 32 and the routers groups of 64.
 
 ## Quality
 
@@ -413,8 +390,7 @@ build/bin/nslm-chat --model Qwen3.8-Flash-Next-NanoSeedLM-{name} "Why do tide po
 build/bin/nslm-serve --model Qwen3.8-Flash-Next-NanoSeedLM-{name} --ctx 32768 --port 8080
 ```
 
-The engines memory-map the PLE table, so it stays on the disk. For a lower KL, download Unsloth's Q8_0 table and set
-`Q4E_PLE_GGUF` to it, as on the TCQ cards. `Q4E_DRAFTS=2` turns on the MTP drafts. Read
+The engines memory-map the pack's 8-bit PLE table, so it stays on the disk. `Q4E_DRAFTS=2` turns on the MTP drafts. Read
 [Run and serve]({GITHUB}/blob/main/docs/guides/run-and-serve.md).
 
 {mlx(name, omlx_note)}
@@ -428,6 +404,7 @@ The engines memory-map the PLE table, so it stays on the disk. For a lower KL, d
 ## Files
 
 - `model-*.safetensors`: the weights. `NAME.seeds`, `NAME.nibbles` and `NAME.exp_bias` hold the routed experts.
+  `model-ple8-*.safetensors`: the PLE table (8-bit MLX, group 32, from Qwen's BF16).
 - `nanoseedlm_qwen4.py`, `nanoseedlm_seeds.py`: the MLX model files.
 - `config.json`: the configuration of the 4-bit MLX model, with `model_file`.
 - `LICENSE`: the Qwen Community License 1.0.
@@ -436,6 +413,7 @@ The engines memory-map the PLE table, so it stays on the disk. For a lower KL, d
 
 Base model: Qwen, [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (Qwen Community License 1.0).
 MLX conversion: [mlx-community/Qwen3.8-Flash-Next-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp).
+PLE table: Qwen's BF16, in 8 bits by `tools/hf_ple8.py`.
 Activation statistics: [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) imatrix. Method: SeedLM
 ([arXiv:2410.10714](https://arxiv.org/abs/2410.10714)). Code: [NanoSeedLM]({GITHUB}).
 """

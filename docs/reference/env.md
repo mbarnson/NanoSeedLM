@@ -33,7 +33,6 @@
 | `Q4E_VRAM_EXPERTS=1` | off | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --vram-experts` |
 | `Q4E_STREAM_EXPERTS=1` | off | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --stream-experts` |
 | `Q4E_PLE_GGUF=FILE` | | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --ple-gguf FILE` |
-| `NSLM_PLE=pack` | `q8` | The start scripts: use the pack's 4-bit PLE table, and do not download Unsloth's Q8_0 table |
 | `Q4E_ROWS=N` | 4096 or 16384 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: `nslm-qwen4-gen --prompt-rows N` |
 | `Q4E_PASS_ROWS=N` | 32768, or 8192 under 32 GB of VRAM | Qwen3.8-Flash-Next on CUDA: the most prompt rows of one layer-major pass. Each row keeps 40 KB of VRAM |
 | `Q4E_DRAFTS=K` | 0 | Qwen3.8-Flash-Next in `nslm-chat` and `nslm-serve`: 1 to 3 MTP drafts a forward, as `nslm-qwen4-gen --drafts K`. Each token keeps the sampler's distribution. At temperature 0 the text does not change. Set, it opens the MTP head, which every forward runs. `nslm-serve` drafts while one request decodes |

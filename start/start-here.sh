@@ -8,12 +8,9 @@ fail() { printf '\n%s\n' "$*" >&2; exit 1; }
 
 # name, repository, revision, least RAM and VRAM GB of a PC, least memory GB of a Mac (the cards' "For" column),
 # download GB. NSLM_PACKS: another table
-PACKS=${NSLM_PACKS:-"TCQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4 25339937b55f9efbe384a3f8cb2bc92d86ecfa32 96 24 128 102
-TCQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4 7e5edb2be58071fbe5a5133421ab6c1f2f0de58f 96 16 96 92
-TCQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3 5f2a859927d2215081a7ac5684dbae5da6517104 64 12 96 87"}
-# Unsloth's Q8_0 PLE table: the KL on the model cards is with it. NSLM_PLE=pack keeps the pack's 4-bit table
-E_REPO=unsloth/Qwen3.8-Flash-Next-GGUF E_REV=d96201194f103c906994f283f504209dc8d2a10c
-E_FILE=engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file
+PACKS=${NSLM_PACKS:-"TCQ4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ4 REV_TCQ4 96 24 128 128
+TCQ3-D4 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3-D4 REV_TCQ3D4 96 16 96 117
+TCQ3 txgsync/Qwen3.8-Flash-Next-NanoSeedLM-TCQ3 REV_TCQ3 64 12 96 112"}
 fits() { [ $(($1 * 10)) -ge $(($2 * 9)) ]; }   # a 64 GB PC reports about 62 GB: 90% of a size counts as that size
 
 echo "NanoSeedLM: Qwen3.8-Flash-Next on this machine"
@@ -50,10 +47,10 @@ done <<<"$PACKS"
 if [ -z "$rec" ]; then fits "$ram" 64 || fail "The smallest pack (TCQ3) needs 64 GB of RAM. This machine has $ram GB."; rec=TCQ3; fi
 echo
 echo "Packs (KL against BF16: lower is closer to the original model):"
-echo "  TCQ4     0.0415  a GPU of 24 GB or more with 96 to 128 GB of RAM, or a 128 GB Mac (102 GB download)"
-echo "  TCQ3-D4  0.0638  a 16 GB GPU with 96 to 128 GB of RAM, or a 96 GB Mac (92 GB download)"
-echo "  TCQ3     0.0778  a 12 or 16 GB GPU with 64 GB of RAM, or a 96 GB Mac (87 GB download)"
-echo "Each pack runs with Unsloth's Q8_0 PLE table (54.4 GB more), as on the model cards. NSLM_PLE=pack skips it."
+echo "  TCQ4     0.0415  a GPU of 24 GB or more with 96 to 128 GB of RAM, or a 128 GB Mac (128 GB download)"
+echo "  TCQ3-D4  0.0638  a 16 GB GPU with 96 to 128 GB of RAM, or a 96 GB Mac (117 GB download)"
+echo "  TCQ3     0.0778  a 12 or 16 GB GPU with 64 GB of RAM, or a 96 GB Mac (112 GB download)"
+echo "Each pack carries its PLE table at 8 bits. It stays on the disk, and the page cache holds the rows in use."
 pick=${1:-}   # given: no questions
 [ -n "$pick" ] || read -r -p "Pack [$rec] " pick
 pick=${pick:-$rec}
@@ -62,24 +59,16 @@ line=$(awk -v n="$pick" '$1 == n' <<<"$PACKS")
 read -r _ repo rev _ <<<"$line"
 root=${2:-}
 [ -n "$root" ] || [ -n "${1:-}" ] || read -r -p "Model folder [$here/models] " root
-dir=${root:-$here/models}/${repo#*/} edir=${root:-$here/models}/${E_REPO#*/}
-ple=${NSLM_PLE:-q8}
-if [ "$ple" = q8 ] && [ -z "${1:-}" ]; then
-    read -r -p "Also download Unsloth's Q8_0 PLE table (54.4 GB), as on the model card? [Y/n] " a
-    case $a in [nN]*) ple=pack ;; esac
-fi
-[ "$ple" = q8 ] || edir=$dir
-mkdir -p "$dir" "$edir"
+dir=${root:-$here/models}/${repo#*/}
+mkdir -p "$dir"
 
 # the files at their pinned revisions, each checked by size and SHA-256 (verified ones are listed in .nslm-verified)
 auth=()   # used as ${auth[@]+"${auth[@]}"}: bash 3.2 (macOS) calls an empty array unbound under set -u
 [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
-src() { if [ "$1" = E ]; then r=$E_REPO v=$E_REV d=$edir; else r=$repo v=$rev d=$dir; fi; }   # P: the pack, E: the table
-files() {   # files P|E [SUBFOLDER]: lines "P|E path size sha256" (sha256 - for small files)
+files() {   # lines "path size sha256" of the pack (sha256 - for small files)
     local t
-    src "$1"
-    t=$(curl -fsSL ${auth[@]+"${auth[@]}"} "https://huggingface.co/api/models/$r/tree/$v${2:+/$2}?recursive=true") ||
-        fail "Cannot list $r."
+    t=$(curl -fsSL ${auth[@]+"${auth[@]}"} "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true") ||
+        fail "Cannot list $repo."
     if [ -n "$mac" ]; then   # JavaScript for Automation reads JSON on each Mac. python3 can be a stub that asks for Xcode
         osascript -l JavaScript -e 'function run(a) { return JSON.parse(a[0]).filter(f => f.type == "file" &&
             f.path[0] != ".").map(f => f.path + " " + f.size + " " + ((f.lfs || {}).oid || "-")).join("\n") }' "$t"
@@ -88,22 +77,16 @@ files() {   # files P|E [SUBFOLDER]: lines "P|E path size sha256" (sha256 - for 
         python3 -I -c 'import json, sys
 for f in json.load(sys.stdin):
     if f["type"] == "file" and not f["path"].startswith("."): print(f["path"], f["size"], (f.get("lfs") or {}).get("oid", "-"))' <<<"$t"
-    fi | sed "s/^/$1 /"
+    fi
 }
-list=$(files P)
-if [ "$ple" = q8 ]; then
-    e=$(files E "${E_FILE%/*}" | awk -v f="$E_FILE" '$2 == f')
-    [ -n "$e" ] || fail "Cannot find $E_FILE in $E_REPO."
-    list+=$'\n'$e
-fi
-touch "$dir/.nslm-verified" "$edir/.nslm-verified"
+list=$(files)
+touch "$dir/.nslm-verified"
 check=0 need=0   # files to check; bytes to download (a partial file resumes)
-while read -r k p s _; do
-    src "$k"
-    grep -qxF "$p" "$d/.nslm-verified" && continue
+while read -r p s _; do
+    grep -qxF "$p" "$dir/.nslm-verified" && continue
     check=$((check + 1)) have=0
-    [ -f "$d/$p" ] && have=$(( $(wc -c <"$d/$p") ))
-    if [ "$have" -gt "$s" ]; then rm -f "$d/$p"; have=0; fi
+    [ -f "$dir/$p" ] && have=$(( $(wc -c <"$dir/$p") ))
+    if [ "$have" -gt "$s" ]; then rm -f "$dir/$p"; have=0; fi
     need=$((need + s - have))
 done <<<"$list"
 free=$(( $(df -Pk "$dir" | awk 'NR == 2 {print $4}') * 1024 ))
@@ -117,28 +100,26 @@ elif [ "$need" -gt 1073741824 ]; then
     echo "The download starts in 5 s (Ctrl+C stops it)."; sleep 5   # a folder typo
 fi
 total=$(( $(wc -l <<<"$list") )) i=0
-while read -r k p s h; do
+while read -r p s h; do
     i=$((i + 1))
-    src "$k"
-    grep -qxF "$p" "$d/.nslm-verified" && continue
-    dst=$d/$p
+    grep -qxF "$p" "$dir/.nslm-verified" && continue
+    dst=$dir/$p
     mkdir -p "$(dirname "$dst")"
     echo "[$i/$total] $p ($(awk -v n="$s" 'BEGIN {if (n < 1e9) printf "%.0f MB", n / 1e6; else printf "%.1f GB", n / 1e9}'))"
     have=0
     [ -f "$dst" ] && have=$(( $(wc -c <"$dst") ))
     if [ "$have" -ne "$s" ]; then
         curl -fL --retry 20 --speed-limit 100000 --speed-time 60 -C - -# ${auth[@]+"${auth[@]}"} -o "$dst" \
-            "https://huggingface.co/$r/resolve/$v/$p" </dev/null ||   # a stalled connection: a new one resumes
+            "https://huggingface.co/$repo/resolve/$rev/$p" </dev/null ||   # a stalled connection: a new one resumes
             fail "The download of $p stopped. Run start-here.sh again to resume."
     fi
     [ $(( $(wc -c <"$dst") )) -eq "$s" ] || fail "$p has the wrong size. Run start-here.sh again."
     if [ "$h" != - ] && [ "$(sha "$dst")" != "$h" ]; then rm -f "$dst"; fail "$p failed its SHA-256 check and was removed. Run start-here.sh again."; fi
-    echo "$p" >>"$d/.nslm-verified"
+    echo "$p" >>"$dir/.nslm-verified"
 done <<<"$list"
-pline="# the pack's own PLE table"   # run-PACK.sh's line for the table
+pline="# the pack's own 8-bit PLE table (Q4E_PLE_GGUF=FILE reads another, as a GGUF)"   # run-PACK.sh's line for the table
 dline="# MTP drafts: Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3 (they break even on an RTX 4080)"   # and for the drafts
 [ -n "$mac" ] && dline="export Q4E_DRAFTS=2 Q4E_DRAFT_MIN_P=0.3   # 2 MTP drafts: 32% faster on an M4 Max, the same text"
-[ "$ple" = q8 ] && export Q4E_PLE_GGUF="$edir/$E_FILE" && pline="export Q4E_PLE_GGUF=\"$Q4E_PLE_GGUF\""
 
 echo
 echo "The pack is ready. One short chat:"

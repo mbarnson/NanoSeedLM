@@ -17,9 +17,9 @@ The script checks the GPU, the driver, the RAM and the disk. It downloads the pa
 SHA-256 of each file. It asks before a download of more than 1 GB. Then it runs one short chat, writes `run-PACK.bat` (or `run-PACK.sh`) and starts `nslm-serve` on
 port 8080. If the download stops, run the script again. It continues from the last file.
 
-The script also downloads Unsloth's Q8_0 PLE table (`engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file`, 54.4 GB) and
-sets `Q4E_PLE_GGUF` to it. The KL on the model cards is with this table. The engines memory-map it, so it stays on the
-disk, and the page cache keeps the rows that a session reads. To use the pack's own 4-bit table, set `NSLM_PLE=pack`.
+Each pack carries its PLE n-gram table at 8 bits (57.6 GB, MLX's form, group 32, from Qwen's BF16 table). The engines
+memory-map it, so it stays on the disk, and the page cache keeps the rows that a session reads. `Q4E_PLE_GGUF=FILE`
+reads another table from an Unsloth engram GGUF instead ([the 8-bit table](../results/2026-11-07-ple8-encoding.md)).
 
 On a PC, the engines need an NVIDIA GPU of sm_80 or newer and driver 570 or newer. On a Mac, they need Apple Silicon and
 macOS 15 or newer. The smallest pack needs 64 GB of RAM.
